@@ -1,12 +1,12 @@
 //! The lookup contract (BRC-24 LookupService, issue #36): a lookup service
-//! is a program. The overlay engine launches it on each `/lookup` naming the
-//! service, with args
+//! is a program. A lookup is a read (#40): the overlay engine's `/lookup`
+//! route calls it (an in-VM call, fn "lookup", nothing written) with
 //!
 //!   {kind: "lookup-call", service, query}          (query: the client's JSON as dag-cbor)
 //!
 //! and it answers over the admitted maps — the overlay's state in the
 //! instance's chain+settlement core (the head `wallet`, read only) — with a
-//! record, kept in its thread and its CID printed on stdout:
+//! record, the call's answer (dag-cbor on stdout):
 //!
 //!   {kind: "lookup-answer", type: "output-list", outputs: [{beef, outputIndex, context?}]}
 //!   {kind: "lookup-answer", type: "freeform", result}
@@ -66,17 +66,16 @@ pub fn answerRecord(a: std.mem.Allocator, wal: *Wallet, answer: AnswerFn, args: 
     }
 }
 
-/// The program's main: answer the step's lookup-call over the shared state
-/// (read only: no head moves), keep and print the answer record.
+/// The program's main: answer a call of fn "lookup" over the shared state
+/// (a read: the answer record is the call's answer, nothing is kept).
 pub fn main(comptime answer: AnswerFn) u8 {
     const vm = @import("vm.zig");
     const S = struct {
         fn run(a: std.mem.Allocator) anyerror!void {
-            const step = try vm.input(a);
-            const s = vm.store();
-            var wal = try Wallet.load(a, s, try vm.head(a, vm.state_head), try vm.network(step));
-            const rec = try answerRecord(a, &wal, answer, step.get("args") orelse return error.BadInput);
-            _ = try vm.finish(a, s, rec);
+            const in = try vm.input(a);
+            if (!std.mem.eql(u8, in.getText("kind") orelse "", "call") or !std.mem.eql(u8, in.getText("fn") orelse "", "lookup")) return error.CalledOnly;
+            var wal = try Wallet.load(a, vm.store(), try vm.head(a, vm.state_head), try vm.network(in));
+            try vm.answer(a, try answerRecord(a, &wal, answer, try vm.callArg(a, in)));
         }
     };
     return vm.main("lookup", S.run);

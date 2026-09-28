@@ -1,8 +1,9 @@
-//! overlay: the overlay engine (issue #36), a handler program for plain
-//! entries the router admits (sender-less subscriptions):
+//! overlay: the overlay engine (issue #36). Called (#40), it is the
+//! overlay's front-door route handlers (routes.zig: submit, lookup, the
+//! listings and documentation); stepped, a handler program for the plain
+//! entries admitted into it (sender-less subscriptions):
 //!
-//!   box `submit`  {kind: "submit", beef, topics: [text], offChainValues?}   BRC-22 POST /submit
-//!   box `lookup`  {kind: "lookup", service, query}                          BRC-24 POST /lookup
+//!   box `submit`  {kind: "submit", beef, topics: [text], offChainValues?}   what POST /submit admits
 //!   box `chain`   {kind: "header" | "proof" | "status", …}                  the chain feed (docs/WALLET.md),
 //!                                                                          for an instance without a wallet program
 //!
@@ -19,17 +20,17 @@
 //! contract) with the transaction and its previous coins; the thread waits
 //! on them. Then, with their admittance records (`resolved`): record each
 //! topic's judgement (overlay.apply: held transactions, admitted outputs,
-//! consumed coins, rel `admits`), save, and answer the STEAK. A lookup is the
-//! same shape with the service's program. Every step keeps its result record
+//! consumed coins, rel `admits`), save. The route's `then` call reads the
+//! STEAK back from the `applied` records. Every step keeps its result record
 //! and prints its CID:
 //!
 //!   {kind: "overlay-result", op: "submit", txid, steak: {topic: {outputsToAdmit, coinsToRetain, coinsRemoved}}, refs}
-//!   {kind: "overlay-result", op: "lookup", service, answer: <lookup-answer CID>}
-//!   {kind: "overlay-result", op, error}                   refused (bad BEEF, SPV, unknown service …)
+//!   {kind: "overlay-result", op, error}                   refused (bad BEEF, SPV …)
 const std = @import("std");
 const w = @import("wallet");
 const vm = @import("vm.zig");
 const topic = @import("topic.zig");
+const routes = @import("routes.zig");
 
 const cbor = w.cbor;
 const Value = cbor.Value;
@@ -39,25 +40,8 @@ pub fn main() u8 {
     return vm.main("overlay", run);
 }
 
-/// A name → program map from genesis defaults (a JSON object in a string).
-fn configMap(a: std.mem.Allocator, step: Value, key: []const u8) !std.json.ObjectMap {
-    const text = if (step.get("defaults")) |d| d.getText(key) orelse "{}" else "{}";
-    const j = std.json.parseFromSliceLeaky(std.json.Value, a, text, .{}) catch return error.BadConfig;
-    if (j != .object) return error.BadConfig;
-    return j.object;
-}
-
-/// The program record a served name runs: genesis `programs` by the configured name.
-fn programFor(a: std.mem.Allocator, step: Value, map: std.json.ObjectMap, name: []const u8) !?[]const u8 {
-    const v = map.get(name) orelse return null;
-    if (v != .string) return error.BadConfig;
-    const progs = step.get("programs") orelse return error.BadConfig;
-    return progs.getCid(v.string) orelse {
-        std.log.err("config names program {s}, not in the genesis programs", .{v.string});
-        _ = a;
-        return error.BadConfig;
-    };
-}
+const configMap = routes.configMap;
+const programFor = routes.programFor;
 
 fn txCid(txid: [32]u8) [37]u8 {
     return .{ 0x01, 0xb1, 0x01, 0x56, 0x20 } ++ txid;
@@ -99,6 +83,7 @@ fn servedTopics(a: std.mem.Allocator, ev: Value, served: std.json.ObjectMap) ![]
 fn run(a: std.mem.Allocator) anyerror!void {
     const s = vm.store();
     const step = try vm.input(a);
+    if (std.mem.eql(u8, step.getText("kind") orelse "", "call")) return routes.call(a, step);
     const args = step.get("args") orelse return error.BadInput;
     const ev_cid = args.getCid("event") orelse return error.BadInput;
     const ev = try s.getValue(a, ev_cid);
@@ -121,7 +106,7 @@ fn run(a: std.mem.Allocator) anyerror!void {
             var launched: usize = 0;
             for (topics, previous) |t, p| {
                 if (try w.overlay.isApplied(&wal, t, sub.txid)) continue;
-                const prog = (try programFor(a, step, served, t)).?;
+                const prog = (try programFor(step, served, t)).?;
                 var es: std.ArrayList(cbor.Entry) = .empty;
                 try es.appendSlice(a, &.{
                     .{ .key = "kind", .value = .{ .text = "topic-call" } },
@@ -180,37 +165,6 @@ fn run(a: std.mem.Allocator) anyerror!void {
             try fields.append(a, .{ .key = "state", .value = .{ .cid = new_state } });
         }
         _ = try vm.finish(a, s, try resultRecord(a, "submit", fields.items));
-    } else if (std.mem.eql(u8, kind, "lookup")) {
-        const service = ev.getText("service") orelse return error.BadEvent;
-        if (resolved) |rs| {
-            // Step two: the service's answer record.
-            for (rs) |r| {
-                const res = r.get("result") orelse continue;
-                if (!std.mem.eql(u8, r.getText("state") orelse "", "finished")) {
-                    _ = try vm.finish(a, s, try resultRecord(a, "lookup", &.{
-                        .{ .key = "service", .value = .{ .text = service } },
-                        .{ .key = "error", .value = .{ .text = std.mem.trim(u8, res.getBytes("stderr") orelse "failed", " \n") } },
-                    }));
-                    return;
-                }
-                const out = std.mem.trim(u8, res.getBytes("stdout") orelse return error.BadAnswer, " \n");
-                const cid = try a.alloc(u8, out.len / 2);
-                _ = std.fmt.hexToBytes(cid, out) catch return error.BadAnswer;
-                _ = try vm.finish(a, s, try resultRecord(a, "lookup", &.{
-                    .{ .key = "service", .value = .{ .text = service } },
-                    .{ .key = "answer", .value = .{ .cid = cid } },
-                }));
-                return;
-            }
-            return error.BadAnswer;
-        }
-        const served = try configMap(a, step, "overlayLookups");
-        const prog = (try programFor(a, step, served, service)) orelse return refused(a, "lookup", error.UnsupportedService);
-        _ = try vm.launch(a, prog, try s.putValue(a, .{ .map = try a.dupe(cbor.Entry, &.{
-            .{ .key = "kind", .value = .{ .text = "lookup-call" } },
-            .{ .key = "service", .value = .{ .text = service } },
-            .{ .key = "query", .value = ev.get("query") orelse .null },
-        }) }));
     } else if (std.mem.eql(u8, kind, "header") or std.mem.eql(u8, kind, "proof") or std.mem.eql(u8, kind, "status")) {
         // The chain feed, as the wallet takes it (an instance with a wallet routes `chain` to the wallet instead).
         var fields: std.ArrayList(cbor.Entry) = .empty;
