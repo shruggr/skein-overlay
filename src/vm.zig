@@ -1,7 +1,8 @@
 //! The skein calls as a program sees them (preview1 `skein` imports,
 //! kernel-zig program.zig), and the few helpers every overlay program needs:
-//! the step's input, the store as wallet-zig's `Store`, keep-and-print of a
-//! result record. wasm32-wasi only.
+//! the step's (or call's) input, the store as wallet-zig's `Store`,
+//! keep-and-print of a result record, in-VM calls and a call's answer.
+//! wasm32-wasi only.
 const std = @import("std");
 const w = @import("wallet");
 
@@ -17,6 +18,7 @@ pub const sk = struct {
     pub extern "skein" fn launch(prog: [*]const u8, prog_len: u32, args: [*]const u8, args_len: u32, out: [*]u8, cap: u32) i32;
     pub extern "skein" fn head(name: [*]const u8, name_len: u32, out: [*]u8, cap: u32) i32;
     pub extern "skein" fn advance(name: [*]const u8, name_len: u32, tree: [*]const u8, tree_len: u32) i32;
+    pub extern "skein" fn call(prog: [*]const u8, prog_len: u32, func: [*]const u8, func_len: u32, arg: [*]const u8, arg_len: u32, out: [*]u8, cap: u32) i32;
     pub extern "skein" fn take(out: [*]u8, cap: u32) i32;
     pub extern "skein" fn @"error"(out: [*]u8, cap: u32) i32;
 };
@@ -35,9 +37,9 @@ pub fn lastError() []const u8 {
 }
 
 /// Run an import that writes (out, cap), taking the held result when it did not fit.
-pub fn result(arena: std.mem.Allocator, call: anytype, args: anytype) ![]u8 {
+pub fn result(arena: std.mem.Allocator, import: anytype, args: anytype) ![]u8 {
     var buf = try arena.alloc(u8, 4096);
-    const n = @call(.auto, call, args ++ .{ buf.ptr, @as(u32, @intCast(buf.len)) });
+    const n = @call(.auto, import, args ++ .{ buf.ptr, @as(u32, @intCast(buf.len)) });
     if (n < 0) return failed();
     const len: usize = @intCast(n);
     if (len <= buf.len) return buf[0..len];
@@ -84,6 +86,22 @@ pub fn keep(cid: []const u8) !void {
 /// Launch `program` (a program record's CID) on `args` (a record's CID): a child thread; the step then waits on it.
 pub fn launch(a: std.mem.Allocator, program: []const u8, args: []const u8) ![]u8 {
     return result(a, sk.launch, .{ program.ptr, @as(u32, @intCast(program.len)), args.ptr, @as(u32, @intCast(args.len)) });
+}
+
+/// An in-VM call (#40): `program`'s function `func` on `arg` (dag-cbor) → its answer (dag-cbor), or the callee's error (`lastError`).
+pub fn call(a: std.mem.Allocator, program: []const u8, func: []const u8, arg: Value) !Value {
+    const bytes = try cbor.encode(a, arg);
+    return cbor.decode(a, try result(a, sk.call, .{ program.ptr, @as(u32, @intCast(program.len)), func.ptr, @as(u32, @intCast(func.len)), bytes.ptr, @as(u32, @intCast(bytes.len)) }));
+}
+
+/// The answer of a call: dag-cbor on stdout.
+pub fn answer(a: std.mem.Allocator, v: Value) !void {
+    try std.fs.File.stdout().writeAll(try cbor.encode(a, v));
+}
+
+/// A call's argument: the input's `arg` bytes as dag-cbor.
+pub fn callArg(a: std.mem.Allocator, in: Value) !Value {
+    return cbor.decode(a, in.getBytes("arg") orelse return error.BadInput);
 }
 
 pub fn hexAlloc(a: std.mem.Allocator, b: []const u8) ![]u8 {
