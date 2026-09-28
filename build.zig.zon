@@ -1,0 +1,15 @@
+.{
+    .name = .skein_overlay,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.15.2",
+    .fingerprint = 0x61cfd392818dcb20,
+    .dependencies = .{
+        .wallet = .{ .path = "../../wallet-zig" },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "test.zig",
+    },
+}
