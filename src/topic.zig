@@ -1,17 +1,20 @@
 //! The topic contract (BRC-22 TopicManager, issues #36, #50): a topic
-//! manager is a program. The overlay engine (engine.zig) launches it on each
-//! submitted transaction that names its topic, with args
+//! manager is a program the overlay calls — an in-VM call of fn "identify",
+//! in the front door's `/submit` call (writing nothing: if no topic takes the
+//! transaction, nothing persists) and, only if its previous coins moved
+//! before the entry was processed, again in that step (submit.zig) — with
 //!
 //!   {kind: "topic-call", topic, tx: <bitcoin-tx CID>, previousCoins: [input index], offChainValues?: bytes}
 //!
 //! where previousCoins are the inputs spending outputs live in the topic
 //! (BRC-22 step 4). No BEEF crosses into the topic: it reads the transaction
-//! and its inputs' source outputs as records, through `get` (a transaction's
-//! block, decoded). The program answers with a record, kept in its thread and
-//! its CID printed on stdout:
+//! and its inputs' source outputs as records, through `get` (in the submit's
+//! call, through the call's in-memory overlay, where the BEEF was decoded).
+//! The call's answer (dag-cbor on stdout):
 //!
 //!   {kind: "admittance", topic, txid, outputsToAdmit: [output index], coinsToRetain: [input index]}
 //!
+//! identify(tx: cid, previousCoins, offChain?) → {outputsToAdmit, coinsToRetain}.
 //! A topic program is `pub fn main() u8 { return topic.main(identify); }`
 //! with `identify(arena, Call) !Instructions` — the TopicManager's
 //! identifyAdmissibleOutputs. `judge` is the same over any store (tests).
@@ -107,14 +110,14 @@ pub fn instructionsOf(a: std.mem.Allocator, rec: Value) !Instructions {
     return .{ .outputs_to_admit = try uintList(a, rec.get("outputsToAdmit")), .coins_to_retain = try uintList(a, rec.get("coinsToRetain")) };
 }
 
-/// The program's main: judge the step's args, keep and print the admittance record.
+/// The program's main: a call of fn "identify"; its answer is the admittance record.
 pub fn main(comptime identify: Identify) u8 {
     const vm = @import("vm.zig");
     const S = struct {
         fn run(a: std.mem.Allocator) anyerror!void {
-            const step = try vm.input(a);
-            const rec = try judge(a, vm.store(), identify, step.get("args") orelse return error.BadInput);
-            _ = try vm.finish(a, vm.store(), rec);
+            const in = try vm.input(a);
+            if (!std.mem.eql(u8, in.getText("kind") orelse "", "call") or !std.mem.eql(u8, in.getText("fn") orelse "", "identify")) return error.CalledOnly;
+            try vm.answer(a, try judge(a, vm.store(), identify, try vm.callArg(a, in)));
         }
     };
     return vm.main("topic", S.run);

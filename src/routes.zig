@@ -11,16 +11,19 @@
 //!   GET  /getDocumentationForTopicManager?manager=…              fn "topicDocumentation"
 //!   GET  /getDocumentationForLookupServiceProvider?lookupService=…  fn "lookupDocumentation"
 //!
-//! A submit is the one write. The handler checks it as a read — the BEEF
-//! against the held headers (SPV), which requested topics this instance
-//! serves, which of them judged the transaction before — and answers at once
-//! when nothing is new (a bad BEEF, no served topic, a dupe: nothing is
-//! written). Otherwise it returns the entry for the host to admit — the plain
-//! event {kind: "submit", beef, topics, offChainValues?} in box `submit`,
-//! which engine.zig steps on (launching the topics' programs, recording their
-//! judgements) — and `then`: a call of fn "submitted" the host makes once
-//! that entry is processed, which reads the STEAK from the state (each
-//! topic's `applied` record; a dupe's is empty).
+//! A submit is the one write (#50, submit.zig). The handler decodes the BEEF
+//! once into records in its call's in-memory overlay, checks SPV over them,
+//! and calls each requested topic this instance serves and has not judged
+//! the transaction for (fn "identify", on the transaction's CID). Nothing is
+//! written when nothing is new: a bad BEEF or a refusal (no topic took
+//! anything) answers 400, a dupe everywhere the empty STEAK; the overlay is
+//! dropped. Otherwise it returns the entry for the host to admit — the plain
+//! event {kind: "submit", txid, txs, nodes, proofs, topics: [judgement],
+//! offChainValues?} in box `submit`, which engine.zig steps on (holding the
+//! records, recording the judgements, calling the lookup services' hooks) —
+//! and `then`: a call of fn "submitted" the host makes once that entry is
+//! processed, which reads the STEAK from the state (each topic's `applied`
+//! record; a dupe's is empty).
 //!
 //! A lookup is a read: the service's program is called (fn "lookup", the
 //! lookup contract, lookup.zig) and its answer shaped for the wire; nothing
@@ -292,28 +295,27 @@ fn submit(a: Allocator, in: Value, req: Value) !Value {
     const map = try configMap(a, in, "overlayTopics");
     const topics = try served(a, requested, map);
     var wal = try load(a, in);
-    // The BEEF, decoded once into records (#50): in this call's overlay, gone unless admitted.
-    const checked = submit_mod.decodeAndVerify(&wal, body) catch |e| return failure(a, 400, @errorName(e));
-    const sub = checked.subject;
-    // Topics that judged it before: a dupe answers with nothing new.
-    var dupes: std.ArrayList(Value) = .empty;
-    var fresh: usize = 0;
-    for (topics) |t| {
-        if (try w.overlay.isApplied(&wal, t, sub.txid)) try dupes.append(a, .{ .text = t }) else fresh += 1;
-    }
-    if (fresh == 0) {
-        const entries = try a.alloc([3][]const u64, topics.len);
-        for (entries) |*e| e.* = .{ &.{}, &.{}, &.{} };
-        return respond(a, 200, "application/json", try jsonOf(a, Steak{ .topics = topics, .entries = entries }));
-    }
+    // The BEEF decoded once into records in this call's overlay, verified, judged by the topics (#50).
+    // Refused, or a dupe everywhere: the call answers, no entry, the overlay is dropped — nothing persists.
+    const routed = switch (try submit_mod.route(a, vm.caller(), &wal, in, body, topics, off)) {
+        .refused => |why| return failure(a, 400, why),
+        .unchanged => {
+            const entries = try a.alloc([3][]const u64, topics.len);
+            for (entries) |*e| e.* = .{ &.{}, &.{}, &.{} };
+            return respond(a, 200, "application/json", try jsonOf(a, Steak{ .topics = topics, .entries = entries }));
+        },
+        .admit => |x| x,
+    };
     const names = try a.alloc(Value, topics.len);
     for (topics, names) |t, *n| n.* = .{ .text = t };
-    const ev = try submit_mod.event(a, checked.decoded, topics, off);
+    const dupes = try a.alloc(Value, routed.dupes.len);
+    for (routed.dupes, dupes) |t, *n| n.* = .{ .text = t };
+    const ev = routed.event;
     const self = (in.get("programs") orelse return error.BadInput).getCid("overlay") orelse return error.NoOverlayProgram;
     const then_arg = try cbor.encode(a, .{ .map = try a.dupe(cbor.Entry, &.{
-        .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &w.header.toHex(sub.txid)) } },
+        .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &w.header.toHex(routed.txid)) } },
         .{ .key = "topics", .value = .{ .array = names } },
-        .{ .key = "dupes", .value = .{ .array = dupes.items } },
+        .{ .key = "dupes", .value = .{ .array = dupes } },
     }) });
     return .{ .map = try a.dupe(cbor.Entry, &.{
         .{ .key = "status", .value = .{ .uint = 202 } },

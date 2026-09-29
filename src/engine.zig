@@ -1,35 +1,34 @@
-//! overlay: the overlay engine (issue #36). Called (#40), it is the
+//! overlay: the overlay engine (issues #36, #50). Called (#40), it is the
 //! overlay's front-door route handlers (routes.zig: submit, lookup, the
 //! listings and documentation); stepped, a handler program for the plain
 //! entries admitted into it (sender-less subscriptions):
 //!
-//!   box `submit`  {kind: "submit", beef, topics: [text], offChainValues?}   what POST /submit admits
-//!   box `chain`   {kind: "header" | "proof" | "status", …}                  the chain feed (docs/WALLET.md),
-//!                                                                          for an instance without a wallet program
+//!   box `submit`  {kind: "submit", txid, txs, nodes, proofs, topics, offChainValues?}   what POST /submit admits (submit.zig)
+//!   box `chain`   {kind: "header" | "proof" | "status", …}                               the chain feed (docs/WALLET.md),
+//!                                                                                       for an instance without a wallet program
 //!
 //! The state is the instance's chain+settlement core: the record the head
 //! `wallet` names (wallet-zig: headers, transactions, proofs, settlement, and
 //! the overlay's maps, overlay.zig), shared with a wallet in the same
-//! instance. The topics and lookup services it serves are genesis config:
-//! defaults.overlayTopics = JSON {"tm_x": "<bin/ program name>", …},
-//! defaults.overlayLookups = JSON {"ls_x": "<bin/ program name>", …}.
+//! instance. Each lookup service keeps its own state under its own head
+//! (`ls:<service>`, lookup.zig). The topics and lookup services are genesis
+//! config: defaults.overlayTopics = JSON {"tm_x": "<bin/ program name>", …},
+//! defaults.overlayLookups = JSON {"ls_x": {"program": "<bin/ program name>",
+//! "topics": ["tm_x", …]}, …} (or "ls_x": "<name>": every served topic).
 //!
-//! A submit is two steps. First: verify the BEEF against the held headers
-//! (SPV), and for each requested topic this instance serves and has not
-//! judged the transaction for, launch the topic's program (topic.zig's
-//! contract) with the transaction and its previous coins; the thread waits
-//! on them. Then, with their admittance records (`resolved`): record each
-//! topic's judgement (overlay.apply: held transactions, admitted outputs,
-//! the previous coins spent by its held transaction, rel `admits`), save. The route's `then` call reads the
-//! STEAK back from the `applied` records. Every step keeps its result record
-//! and prints its CID:
+//! A submit is one step, after the route decoded and judged it in its call
+//! (submit.zig): hold the records the entry carries, record each topic's
+//! judgement (overlay.apply), call the listening lookup services' hooks
+//! (`admitted`, `spent`), save. A rejection (a `status` entry, a competing
+//! proof) calls `rejected` for each judgement it removed. The route's `then`
+//! call reads the STEAK back from the `applied` records. Every step keeps
+//! its result record and prints its CID:
 //!
-//!   {kind: "overlay-result", op: "submit", txid, steak: {topic: {outputsToAdmit, coinsToRetain, coinsRemoved}}, refs}
-//!   {kind: "overlay-result", op, error}                   refused (bad BEEF, SPV …)
+//!   {kind: "overlay-result", op: "submit", txid, steak: {topic: {outputsToAdmit, coinsToRetain, coinsRemoved}}, refs, state}
+//!   {kind: "overlay-result", op, error}                   refused
 const std = @import("std");
 const w = @import("wallet");
 const vm = @import("vm.zig");
-const topic = @import("topic.zig");
 const routes = @import("routes.zig");
 const submit = @import("submit.zig");
 
@@ -39,13 +38,6 @@ const Wallet = w.wallet.Wallet;
 
 pub fn main() u8 {
     return vm.main("overlay", run);
-}
-
-const configMap = routes.configMap;
-const programFor = routes.programFor;
-
-fn txCid(txid: [32]u8) [37]u8 {
-    return .{ 0x01, 0xb1, 0x01, 0x56, 0x20 } ++ txid;
 }
 
 fn uints(a: std.mem.Allocator, xs: []const u32) ![]Value {
@@ -68,19 +60,6 @@ fn refused(a: std.mem.Allocator, op: []const u8, e: anyerror) !void {
     _ = try vm.finish(a, vm.store(), try resultRecord(a, op, &.{.{ .key = "error", .value = .{ .text = @errorName(e) } }}));
 }
 
-/// The requested topics this instance serves, in request order, once each.
-fn servedTopics(a: std.mem.Allocator, ev: Value, served: std.json.ObjectMap) ![]const []const u8 {
-    const req = ev.getArray("topics") orelse return error.BadEvent;
-    var out: std.ArrayList([]const u8) = .empty;
-    outer: for (req) |t| {
-        if (t != .text) return error.BadEvent;
-        if (!served.contains(t.text)) continue;
-        for (out.items) |x| if (std.mem.eql(u8, x, t.text)) continue :outer;
-        try out.append(a, t.text);
-    }
-    return out.items;
-}
-
 fn run(a: std.mem.Allocator) anyerror!void {
     const s = vm.store();
     const step = try vm.input(a);
@@ -92,85 +71,28 @@ fn run(a: std.mem.Allocator) anyerror!void {
     const state = try vm.head(a, vm.state_head);
     var wal = try Wallet.load(a, s, state, try vm.network(step));
     wal.now = @intCast(step.getUint("at") orelse return error.BadInput);
-    const resolved = step.getArray("resolved");
+    var fields: std.ArrayList(cbor.Entry) = .empty;
 
     if (std.mem.eql(u8, kind, "submit")) {
-        const served = try configMap(a, step, "overlayTopics");
-        const topics = try servedTopics(a, ev, served);
-        // The records the front door decoded (#50), held: kept blocks, `txs`, proofs from the merkle nodes.
-        const sub = submit.hold(&wal, ev) catch |e| return refused(a, "submit", e);
-        // Previous coins per topic, from the state as it stands before any judgement.
-        const previous = try a.alloc([]const u32, topics.len);
-        for (topics, previous) |t, *p| p.* = try w.overlay.previousCoins(&wal, t, sub.tx);
-
-        if (resolved == null) {
-            // Step one: launch each topic that has not judged this transaction, on its CID.
-            var launched: usize = 0;
-            for (topics, previous) |t, p| {
-                if (try w.overlay.isApplied(&wal, t, sub.txid)) continue;
-                const prog = (try programFor(step, served, t)).?;
-                var es: std.ArrayList(cbor.Entry) = .empty;
-                try es.appendSlice(a, &.{
-                    .{ .key = "kind", .value = .{ .text = "topic-call" } },
-                    .{ .key = "topic", .value = .{ .text = t } },
-                    .{ .key = "tx", .value = .{ .cid = sub.cid } },
-                    .{ .key = "previousCoins", .value = .{ .array = try uints(a, p) } },
-                });
-                if (ev.getBytes("offChainValues")) |o| try es.append(a, .{ .key = "offChainValues", .value = .{ .bytes = o } });
-                _ = try vm.launch(a, prog, try s.putValue(a, .{ .map = es.items }));
-                launched += 1;
-            }
-            if (launched > 0) {
-                // Waiting on the topics; the held records are the state's already.
-                try vm.advance(vm.state_head, try wal.save());
-                return;
-            }
-        }
-
-        // Step two (or nothing to launch): each topic's admittance, recorded.
+        // The records the route decoded, held; each judgement recorded; the lookup services' hooks (#50).
+        const done = submit.step(a, vm.caller(), &wal, step, ev) catch |e| return refused(a, "submit", e);
+        for (done.records) |c| try vm.keep(c);
         var steak: std.ArrayList(cbor.Entry) = .empty;
-        for (topics, previous) |t, p| {
-            var ins: ?w.overlay.Instructions = null;
-            if (resolved) |rs| for (rs) |r| {
-                const res = r.get("result") orelse continue;
-                if (!std.mem.eql(u8, r.getText("state") orelse "", "finished")) continue;
-                const out = std.mem.trim(u8, res.getBytes("stdout") orelse continue, " \n");
-                const cid = try a.alloc(u8, out.len / 2);
-                _ = std.fmt.hexToBytes(cid, out) catch continue;
-                const rec = s.getValue(a, cid) catch continue;
-                if (!std.mem.eql(u8, rec.getText("topic") orelse "", t)) continue;
-                ins = topic.instructionsOf(a, rec) catch null;
-            };
-            // A topic that failed, or whose instructions do not fit the transaction, admits nothing.
-            const applied: w.overlay.Applied = if (ins) |i| w.overlay.apply(&wal, sub, t, p, i) catch |e| switch (e) {
-                error.BadInstructions => .{},
-                else => return e,
-            } else .{};
-            for (applied.records) |c| try vm.keep(c);
-            try steak.append(a, .{ .key = t, .value = .{ .map = try a.dupe(cbor.Entry, &.{
-                .{ .key = "outputsToAdmit", .value = .{ .array = try uints(a, applied.outputs_to_admit) } },
-                .{ .key = "coinsToRetain", .value = .{ .array = try uints(a, applied.coins_to_retain) } },
-                .{ .key = "coinsRemoved", .value = .{ .array = try uints(a, applied.coins_removed) } },
-            }) } });
-        }
-        var fields: std.ArrayList(cbor.Entry) = .empty;
+        for (done.topics, done.applied) |t, ap| try steak.append(a, .{ .key = t, .value = .{ .map = try a.dupe(cbor.Entry, &.{
+            .{ .key = "outputsToAdmit", .value = .{ .array = try uints(a, ap.outputs_to_admit) } },
+            .{ .key = "coinsToRetain", .value = .{ .array = try uints(a, ap.coins_to_retain) } },
+            .{ .key = "coinsRemoved", .value = .{ .array = try uints(a, ap.coins_removed) } },
+        }) } });
         try fields.appendSlice(a, &.{
-            .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &w.header.toHex(sub.txid)) } },
+            .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &w.header.toHex(done.subject.txid)) } },
             .{ .key = "steak", .value = .{ .map = steak.items } },
             .{ .key = "refs", .value = .{ .array = try a.dupe(Value, &.{.{ .map = try a.dupe(cbor.Entry, &.{
-                .{ .key = "to", .value = .{ .cid = try a.dupe(u8, &txCid(sub.txid)) } },
+                .{ .key = "to", .value = .{ .cid = done.subject.cid } },
                 .{ .key = "rel", .value = .{ .text = "mentions" } },
             }) }}) } },
         });
-        {
-            const new_state = try wal.save();
-            try vm.advance(vm.state_head, new_state);
-            try fields.append(a, .{ .key = "state", .value = .{ .cid = new_state } });
-        }
-        _ = try vm.finish(a, s, try resultRecord(a, "submit", fields.items));
     } else if (std.mem.eql(u8, kind, "header") or std.mem.eql(u8, kind, "proof") or std.mem.eql(u8, kind, "status")) {
         // The chain feed, as the wallet takes it (an instance with a wallet routes `chain` to the wallet instead).
-        var fields: std.ArrayList(cbor.Entry) = .empty;
         try fields.append(a, .{ .key = "event", .value = .{ .text = kind } });
         if (std.mem.eql(u8, kind, "header")) {
             const res = try wal.addHeaders(&.{ev.getBytes("raw") orelse return error.BadEvent});
@@ -189,9 +111,10 @@ fn run(a: std.mem.Allocator) anyerror!void {
                 .{ .key = "outcome", .value = .{ .text = @tagName(outcome) } },
             });
         }
-        const new_state = try wal.save();
-        try vm.advance(vm.state_head, new_state);
-        try fields.append(a, .{ .key = "state", .value = .{ .cid = new_state } });
-        _ = try vm.finish(a, s, try resultRecord(a, "event", fields.items));
     } else return error.BadEvent;
+
+    const new_state = try wal.save();
+    try vm.advance(vm.state_head, new_state);
+    try fields.append(a, .{ .key = "state", .value = .{ .cid = new_state } });
+    _ = try vm.finish(a, s, try resultRecord(a, if (std.mem.eql(u8, kind, "submit")) "submit" else "event", fields.items));
 }

@@ -103,6 +103,15 @@ pub fn call(a: std.mem.Allocator, program: []const u8, func: []const u8, arg: Va
     return cbor.decode(a, try result(a, sk.call, .{ program.ptr, @as(u32, @intCast(program.len)), func.ptr, @as(u32, @intCast(func.len)), bytes.ptr, @as(u32, @intCast(bytes.len)) }));
 }
 
+fn callerImpl(_: *anyopaque, a: std.mem.Allocator, program: []const u8, func: []const u8, arg: Value) anyerror!Value {
+    return call(a, program, func, arg);
+}
+
+/// The overlay's calls of topics and lookup services (#50), over the `call` import.
+pub fn caller() w.overlay.Caller {
+    return .{ .ctx = &dummy, .callFn = callerImpl };
+}
+
 /// The answer of a call: dag-cbor on stdout.
 pub fn answer(a: std.mem.Allocator, v: Value) !void {
     try std.fs.File.stdout().writeAll(try cbor.encode(a, v));
