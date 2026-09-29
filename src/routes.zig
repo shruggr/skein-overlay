@@ -15,9 +15,9 @@
 //! once into records in its call's in-memory overlay, checks SPV over them,
 //! and calls each requested topic this instance serves and has not judged
 //! the transaction for (fn "identify", on the transaction's CID). Nothing is
-//! written when nothing is new: a bad BEEF or a refusal (no topic took
-//! anything) answers 400, a dupe everywhere the empty STEAK; the overlay is
-//! dropped. Otherwise it returns the entry for the host to admit — the plain
+//! written when nothing is new: a bad BEEF answers 400; a valid transaction
+//! no topic took, or a dupe everywhere, answers 200 with the empty STEAK
+//! (BRC-22); the overlay is dropped. Otherwise it returns the entry for the host to admit — the plain
 //! event {kind: "submit", txid, txs, nodes, proofs, topics: [judgement],
 //! offChainValues?} in box `submit`, which engine.zig steps on (holding the
 //! records, recording the judgements, calling the lookup services' hooks) —
@@ -295,7 +295,8 @@ fn submit(a: Allocator, in: Value, req: Value) !Value {
     // Refused, or a dupe everywhere: the call answers, no entry, the overlay is dropped — nothing persists.
     const routed = switch (try submit_mod.route(a, vm.caller(), &wal, in, body, topics, off)) {
         .refused => |why| return failure(a, 400, why),
-        .unchanged => {
+        // Valid but admitted nowhere, or a dupe everywhere: BRC-22's answer is 200 with an empty STEAK.
+        .nothing, .unchanged => {
             const entries = try a.alloc([3][]const u64, topics.len);
             for (entries) |*e| e.* = .{ &.{}, &.{}, &.{} };
             return respond(a, 200, "application/json", try jsonOf(a, Steak{ .topics = topics, .entries = entries }));

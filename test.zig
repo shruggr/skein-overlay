@@ -289,8 +289,8 @@ test "the submission flow: parse once, persist only on admission, a lookup servi
         const before = try inst.snapshot();
         const parses = beef.parses;
         const r = try inst.route(bytes);
-        try std.testing.expect(r == .refused);
-        try std.testing.expect(std.mem.startsWith(u8, r.refused, "NotAdmitted"));
+        try std.testing.expect(r == .nothing);
+        try std.testing.expect(std.mem.startsWith(u8, r.nothing, "NotAdmitted"));
         try std.testing.expectEqual(parses + 1, beef.parses);
         try std.testing.expectEqual(@as(usize, 1), inst.count("identify")); // the topic was asked, in the call
         // The store is as it was, block for block.
@@ -396,9 +396,9 @@ test "the submission flow: parse once, persist only on admission, a lookup servi
         const live = try inst.look(&.{ .{ .key = "topic", .value = .{ .text = "tm_demo" } }, .{ .key = "includeSpent", .value = .{ .boolean = true } } });
         try std.testing.expectEqual(@as(usize, 1), live.len);
         try std.testing.expectEqualSlices(u8, &t1.txid, &(try subjectOf(a, live[0])));
-        // Resubmitting it is refused.
+        // Resubmitting it admits nothing (200, empty STEAK).
         const r = try inst.route(try atomic(a, t2));
-        try std.testing.expectEqualStrings("TransactionRejected", r.refused);
+        try std.testing.expectEqualStrings("TransactionRejected", r.nothing);
     }
 
     // ------------------------------------------------ T3 spends the token and admits none: the coin removed

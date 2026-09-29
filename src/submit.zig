@@ -71,8 +71,10 @@ pub fn identify(a: Allocator, caller: ov.Caller, program: []const u8, topic: []c
 }
 
 pub const Routed = union(enum) {
-    /// Nothing to admit: the error message (400).
+    /// The BEEF does not decode or verify: the error message (400).
     refused: []const u8,
+    /// A valid transaction no served topic admitted (BRC-22: 200 with an empty STEAK); the reasons, for the log.
+    nothing: []const u8,
     /// Every served topic judged it before (a dupe): nothing new.
     unchanged,
     /// The entry to admit, and the topics that were dupes.
@@ -83,7 +85,11 @@ pub const Routed = union(enum) {
 /// requested ones this instance serves; `in` is the call's input (genesis
 /// `defaults`, `programs`).
 pub fn route(a: Allocator, caller: ov.Caller, wal: *Wallet, in: Value, beef: []const u8, topics: []const []const u8, off: ?[]const u8) !Routed {
-    const c = decodeAndVerify(wal, beef) catch |e| return .{ .refused = @errorName(e) };
+    const c = decodeAndVerify(wal, beef) catch |e| switch (e) {
+        // A known-rejected transaction is a valid request that admits nothing (200, empty STEAK).
+        error.TransactionRejected => return .{ .nothing = @errorName(e) },
+        else => return .{ .refused = @errorName(e) },
+    };
     const served = try ov.configObject(a, in, "overlayTopics");
     var dupes: std.ArrayList([]const u8) = .empty;
     var judged: std.ArrayList(Judged) = .empty;
@@ -106,7 +112,7 @@ pub fn route(a: Allocator, caller: ov.Caller, wal: *Wallet, in: Value, beef: []c
         if (ov.takes(previous, ins)) try judged.append(a, .{ .topic = t, .previous = previous, .ins = ins });
     }
     if (dupes.items.len == topics.len) return .unchanged;
-    if (judged.items.len == 0) return .{ .refused = if (why.items.len > 0) why.items else "NotAdmitted: no topic admitted an output or consumed a previous coin" };
+    if (judged.items.len == 0) return .{ .nothing = if (why.items.len > 0) why.items else "NotAdmitted: no topic admitted an output or consumed a previous coin" };
     return .{ .admit = .{ .event = try event(a, c.decoded, judged.items, off), .txid = c.subject.txid, .dupes = dupes.items } };
 }
 

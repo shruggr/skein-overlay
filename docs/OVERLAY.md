@@ -82,12 +82,13 @@ overlay.
 
 **Nothing persists until admitted.** If no topic takes anything (no output
 admitted and no previous coin consumed), or every such topic's program fails,
-the call answers 400 `{status: "error", message}` (`NotAdmitted: …`, or
-`<topic>: <error>`) and returns no entry. The overlay is dropped with the
-call, and the store is byte for byte what it was (equiv/overlay.ts checks
-the store file). A bad BEEF answers the same way. A transaction every
-served topic judged before (a dupe) answers 200 with the empty STEAK, also
-writing nothing.
+or the transaction is one we already rejected, the call answers **200 with the
+empty STEAK** (BRC-22 and overlay-express's answer; the reasons are kept for
+the log) and returns no entry. The overlay is dropped with the call, and the
+store is byte for byte what it was (equiv/overlay.ts checks the store file).
+Only a BEEF that does not decode or verify answers 400
+`{status: "error", message}`. A transaction every served topic judged before
+(a dupe) answers the empty STEAK too, also writing nothing.
 
 **Admitted: one step.** Otherwise the handler returns the entry for the host
 to admit: a plain event in box `submit` carrying the decoded records and the
