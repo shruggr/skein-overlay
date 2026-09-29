@@ -95,7 +95,7 @@ to admit: a plain event in box `submit` carrying the decoded records and the
 judgements, not a BEEF:
 
 ```
-{kind: "submit", txid (hex), txs: [bytes], nodes: [bytes], proofs: [{txid: bytes, height}],
+{kind: "submit", txid (hex), txs: [bytes], nodes: [bytes], proofs: [{txid: bytes, height, depth, position}],
  topics: [{topic, previousCoins, outputsToAdmit, coinsToRetain}], offChainValues?: bytes}
 ```
 

@@ -126,6 +126,8 @@ pub fn event(a: Allocator, d: ov.Decoded, judged: []const Judged, off: ?[]const 
     for (d.proven, proofs) |p, *o| o.* = .{ .map = try a.dupe(cbor.Entry, &.{
         .{ .key = "txid", .value = .{ .bytes = try a.dupe(u8, &p.txid) } },
         .{ .key = "height", .value = .{ .uint = p.height } },
+        .{ .key = "depth", .value = .{ .uint = p.pos.depth } },
+        .{ .key = "position", .value = .{ .uint = p.pos.offset } },
     }) };
     const topics = try a.alloc(Value, judged.len);
     for (judged, topics) |j, *o| o.* = .{ .map = try a.dupe(cbor.Entry, &.{
@@ -161,7 +163,13 @@ pub fn hold(wal: *Wallet, ev: Value) !ov.Subject {
     for (proofs_v, proven) |v, *o| {
         const t = v.getBytes("txid") orelse return error.BadEvent;
         if (t.len != 32) return error.BadEvent;
-        o.* = .{ .txid = t[0..32].*, .height = @intCast(v.getUint("height") orelse return error.BadEvent) };
+        const depth = v.getUint("depth") orelse return error.BadEvent;
+        if (depth > 64) return error.BadEvent;
+        o.* = .{
+            .txid = t[0..32].*,
+            .height = @intCast(v.getUint("height") orelse return error.BadEvent),
+            .pos = .{ .depth = @intCast(depth), .offset = v.getUint("position") orelse return error.BadEvent },
+        };
     }
     try ov.holdDecoded(wal, txs, nodes, proven);
     return ov.subjectOf(wal, try w.header.fromHex(ev.getText("txid") orelse return error.BadEvent));
