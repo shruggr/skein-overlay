@@ -1,4 +1,4 @@
-// The overlay programs (issue #36): Zig 0.15.2, wasm32-wasi, over wallet-zig
+// The overlay programs (issue #36): Zig 0.16.0, wasm32-wasi, over wallet-zig
 // (the chain+settlement core and the overlay's maps, a path dependency).
 //
 //   zig build         → zig-out/bin/overlay.wasm (the engine), topic-demo.wasm (tm_demo), lookup-demo.wasm (ls_demo)
