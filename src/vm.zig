@@ -57,11 +57,15 @@ fn putImpl(_: *anyopaque, arena: std.mem.Allocator, bytes: []const u8) anyerror!
 fn putBlockImpl(_: *anyopaque, cid: []const u8, bytes: []const u8) anyerror!void {
     if (sk.putblock(cid.ptr, @intCast(cid.len), bytes.ptr, @intCast(bytes.len)) < 0) return failed();
 }
+fn keepImpl(_: *anyopaque, cid: []const u8) anyerror!void {
+    if (sk.keep(cid.ptr, @intCast(cid.len)) < 0) return failed();
+}
 var dummy: u8 = 0;
 
-/// The record store through the `skein` get/put/putblock imports.
+/// The record store through the `skein` get/put/putblock/keep imports: the
+/// bitcoin blocks held are kept, so their links are the kernel's edges (#42).
 pub fn store() w.store.Store {
-    return .{ .ptr = &dummy, .getFn = getImpl, .putFn = putImpl, .putBlockFn = putBlockImpl };
+    return .{ .ptr = &dummy, .getFn = getImpl, .putFn = putImpl, .putBlockFn = putBlockImpl, .keepFn = keepImpl };
 }
 
 /// The step's input record (kernel-zig scheduler.zig stepBody).
