@@ -112,9 +112,14 @@ pub fn caller() w.overlay.Caller {
     return .{ .ctx = &dummy, .callFn = callerImpl };
 }
 
+/// The program's Io: one single-threaded WASI process, no concurrency.
+pub fn io() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
 /// The answer of a call: dag-cbor on stdout.
 pub fn answer(a: std.mem.Allocator, v: Value) !void {
-    try std.fs.File.stdout().writeAll(try cbor.encode(a, v));
+    try std.Io.File.stdout().writeStreamingAll(io(), try cbor.encode(a, v));
 }
 
 /// A call's argument: the input's `arg` bytes as dag-cbor.
@@ -137,7 +142,7 @@ pub fn hexAlloc(a: std.mem.Allocator, b: []const u8) ![]u8 {
 pub fn finish(a: std.mem.Allocator, s: w.store.Store, rec: Value) ![]const u8 {
     const c = try s.putValue(a, rec);
     try keep(c);
-    try std.fs.File.stdout().writeAll(try std.mem.concat(a, u8, &.{ try hexAlloc(a, c), "\n" }));
+    try std.Io.File.stdout().writeStreamingAll(io(), try std.mem.concat(a, u8, &.{ try hexAlloc(a, c), "\n" }));
     return c;
 }
 
@@ -148,7 +153,7 @@ pub fn main(comptime name: []const u8, comptime run: fn (std.mem.Allocator) anye
     run(arena_state.allocator()) catch |e| {
         var buf: [1400]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, name ++ ": {s}{s}{s}\n", .{ @errorName(e), if (last_error_len > 0) ": " else "", last_error[0..last_error_len] }) catch name ++ ": error\n";
-        std.fs.File.stderr().writeAll(msg) catch {};
+        std.Io.File.stderr().writeStreamingAll(io(), msg) catch {};
         return 1;
     };
     return 0;
