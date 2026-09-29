@@ -46,15 +46,17 @@ them from its system tree's `bin/`.
 ## One chain, one settlement: how the wallet and the overlay split
 
 There is one state record, the one the head `wallet` names (`wallet-state`).
-It holds the chain tracker, the transactions, the proofs, the `spenders`, the
-`dependents` relations and the settlement (`rejected`). These are the
+It holds the chain tracker, the transactions, the proofs, the
+`dependents` relations and the settlement (`rejected`); who spends what is
+the kernel's `spends` edges (#42: every held transaction is a kept
+bitcoin-tx block, each input an edge). These are the
 wallet's records and maps, unchanged. The overlay's maps are added to the
 same record (wallet.zig `map_names`), and wallet-zig's `Wallet` is the core
 both programs load:
 
 - **The wallet program** writes actions, outputs, drafts and broadcasts.
 - **The overlay engine** writes the transactions a topic took (held like
-  any other, through `putTx`, so each input is a `spends` relation) and the
+  any other, through `putTx`: kept, so each input is a `spends` edge) and the
   overlay maps.
 - **Both** apply headers, proofs and statuses the same way (`addHeaders`,
   `applyStatus`).
@@ -84,7 +86,8 @@ An old wallet binary would drop the overlay's maps from the record, so
 **Spent within a topic is a join, not a table (#36 notes).** An admitted
 output is spent when the wallet's `spent[outpoint]` names a spender — the
 first transaction we hold that spends it and is not rejected (the `spends`
-edge, topic-independent: docs/WALLET.md). There is no `consumed` or
+edge in the kernel's index, read with `edges`, topic-independent:
+docs/WALLET.md). There is no `consumed` or
 `spentAdmitted` map. The one bit those carried — whether the topic kept the
 coin for history — is the topic's judgement of the *spending* transaction,
 so it lives on that transaction's `applied` record (`coinsToRetain`, input
@@ -133,7 +136,7 @@ wallet's `dependents` record this with rel `admits`, tag `m` for an
 them:
 
 - **A rejected transaction's admittances and judgements vanish.** Its
-  spenders are rejected in turn (`spends`), so the rejection bubbles down a
+  spenders are rejected in turn (its `spends` edges), so the rejection bubbles down a
   token's history.
 - **A rejected spend gives back what it consumed.** `spent` counts only
   spenders that are not rejected, so the admitted outputs it spent are live
