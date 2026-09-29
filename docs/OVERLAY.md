@@ -23,7 +23,7 @@ are not ported.
 
 | where | what |
 |---|---|
-| `wallet-zig/src/overlay.zig` | The overlay's state in the chain and settlement core. It verifies a submission, gives the previous coins, records a topic's judgement, rebuilds the derived maps, and answers lookups with each output's BEEF. |
+| `wallet-zig/src/overlay.zig` | The overlay's state in the chain and settlement core. It verifies a submission, gives the previous coins, records a topic's judgement, maintains the derived maps, and answers lookups with each output's BEEF. |
 | `programs/overlay/src/engine.zig` → `overlay.wasm` | The engine: called, the front door's route handlers (`routes.zig`); stepped, the handler for the `submit` and `chain` entries. |
 | `programs/overlay/src/routes.zig` | The route handlers (#40): the overlay-express wire contract. |
 | `programs/overlay/src/topic.zig` | The topic contract (a library). |
@@ -59,8 +59,9 @@ both programs load:
 - **Both** apply headers, proofs and statuses the same way (`addHeaders`,
   `applyStatus`).
 
-`Wallet.save` rebuilds every derived map, the overlay's included. So a
-rejection is reflected at once, whichever program learned it.
+The derived maps, the overlay's included, are maintained where a fact
+changes (#41; docs/WALLET.md "Derived maps are maintained"), not rebuilt at
+save. So a rejection is reflected at once, whichever program learned it.
 
 When an instance runs both programs, the chain feed (box `chain`) should be
 routed to the wallet, because only the wallet re-broadcasts after a reorg. An
@@ -80,7 +81,16 @@ An old wallet binary would drop the overlay's maps from the record, so
 | `applied` | tp ‖ txid → applied record | the topic judged this transaction (a later submission is a dupe) |
 | `spentAdmitted` | tp ‖ outpoint → spender (32) ‖ retained (1) | derived: consumed by a transaction that is not rejected |
 | `byTopic` | tp ‖ 0 (unspent) \| 1 (spent) ‖ outpoint → null | derived |
-| `byScript` | sha256(locking script) ‖ tp ‖ 0 \| 1 ‖ outpoint → null | derived |
+| `byScript` | sha256(locking script) ‖ tp ‖ 0 \| 1 ‖ outpoint → null | derived (the demo lookup's `scriptHash` query) |
+
+**Maintained (#41).** A judgement (`apply`) writes each admittance's
+`byTopic` / `byScript` key, and for each previous coin it consumed recomputes
+that coin's `spentAdmitted` (the first judged spender, lowest txid, that is
+not rejected) and moves its `byTopic` / `byScript` key to the spent side. A
+rejection (`Wallet.reject`) removes each vanished admittance with its derived
+keys (`unadmit`), and for each vanished judgement recomputes the coins its
+transaction consumed in that topic (`unjudged`): they move back to unspent
+unless another judged spender stands.
 
 **Records.**
 
@@ -112,7 +122,7 @@ them:
   token's history.
 - **A rejected spend gives back what it consumed.** `spentAdmitted` counts
   only spenders that are not rejected, so the consumed admitted outputs are
-  live in the topic again at the next save.
+  live in the topic again as the rejection is applied.
 
 Rejections come from the same sources as the wallet's (docs/WALLET.md,
 "Settlement"):
