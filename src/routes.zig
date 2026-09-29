@@ -11,16 +11,19 @@
 //!   GET  /getDocumentationForTopicManager?manager=…              fn "topicDocumentation"
 //!   GET  /getDocumentationForLookupServiceProvider?lookupService=…  fn "lookupDocumentation"
 //!
-//! A submit is the one write. The handler checks it as a read — the BEEF
-//! against the held headers (SPV), which requested topics this instance
-//! serves, which of them judged the transaction before — and answers at once
-//! when nothing is new (a bad BEEF, no served topic, a dupe: nothing is
-//! written). Otherwise it returns the entry for the host to admit — the plain
-//! event {kind: "submit", beef, topics, offChainValues?} in box `submit`,
-//! which engine.zig steps on (launching the topics' programs, recording their
-//! judgements) — and `then`: a call of fn "submitted" the host makes once
-//! that entry is processed, which reads the STEAK from the state (each
-//! topic's `applied` record; a dupe's is empty).
+//! A submit is the one write (#50, submit.zig). The handler decodes the BEEF
+//! once into records in its call's in-memory overlay, checks SPV over them,
+//! and calls each requested topic this instance serves and has not judged
+//! the transaction for (fn "identify", on the transaction's CID). Nothing is
+//! written when nothing is new: a bad BEEF or a refusal (no topic took
+//! anything) answers 400, a dupe everywhere the empty STEAK; the overlay is
+//! dropped. Otherwise it returns the entry for the host to admit — the plain
+//! event {kind: "submit", txid, txs, nodes, proofs, topics: [judgement],
+//! offChainValues?} in box `submit`, which engine.zig steps on (holding the
+//! records, recording the judgements, calling the lookup services' hooks) —
+//! and `then`: a call of fn "submitted" the host makes once that entry is
+//! processed, which reads the STEAK from the state (each topic's `applied`
+//! record; a dupe's is empty).
 //!
 //! A lookup is a read: the service's program is called (fn "lookup", the
 //! lookup contract, lookup.zig) and its answer shaped for the wire; nothing
@@ -29,6 +32,7 @@
 const std = @import("std");
 const w = @import("wallet");
 const vm = @import("vm.zig");
+const submit_mod = @import("submit.zig");
 
 const cbor = w.cbor;
 const Value = cbor.Value;
@@ -194,21 +198,17 @@ fn writeVarInt(a: Allocator, out: *std.ArrayList(u8), v: u64) !void {
 // ---------------------------------------------------------------- config
 
 /// A name → program map from genesis defaults (a JSON object in a string).
-pub fn configMap(a: Allocator, in: Value, key: []const u8) !std.json.ObjectMap {
-    const text = if (in.get("defaults")) |d| d.getText(key) orelse "{}" else "{}";
-    const j = std.json.parseFromSliceLeaky(std.json.Value, a, text, .{}) catch return error.BadConfig;
-    if (j != .object) return error.BadConfig;
-    return j.object;
-}
+pub const configMap = w.overlay.configObject;
 
 /// The program record a served name runs: genesis `programs` by the configured name.
-pub fn programFor(in: Value, map: std.json.ObjectMap, name: []const u8) !?[]const u8 {
-    const v = map.get(name) orelse return null;
-    if (v != .string) return error.BadConfig;
-    const progs = in.get("programs") orelse return error.BadConfig;
-    return progs.getCid(v.string) orelse {
-        std.log.err("config names program {s}, not in the genesis programs", .{v.string});
-        return error.BadConfig;
+pub const programFor = w.overlay.configuredProgram;
+
+/// The `bin/` program name a configured name runs (a string, or `{program, …}`).
+fn programName(v: std.json.Value) ![]const u8 {
+    return switch (v) {
+        .string => |s| s,
+        .object => |o| if (o.get("program")) |p| (if (p == .string) p.string else error.BadConfig) else error.BadConfig,
+        else => error.BadConfig,
     };
 }
 
@@ -291,39 +291,34 @@ fn submit(a: Allocator, in: Value, req: Value) !Value {
     const map = try configMap(a, in, "overlayTopics");
     const topics = try served(a, requested, map);
     var wal = try load(a, in);
-    const sub = w.overlay.verify(&wal, body) catch |e| return failure(a, 400, @errorName(e));
-    // Topics that judged it before: a dupe answers with nothing new.
-    var dupes: std.ArrayList(Value) = .empty;
-    var fresh: usize = 0;
-    for (topics) |t| {
-        if (try w.overlay.isApplied(&wal, t, sub.txid)) try dupes.append(a, .{ .text = t }) else fresh += 1;
-    }
-    if (fresh == 0) {
-        const entries = try a.alloc([3][]const u64, topics.len);
-        for (entries) |*e| e.* = .{ &.{}, &.{}, &.{} };
-        return respond(a, 200, "application/json", try jsonOf(a, Steak{ .topics = topics, .entries = entries }));
-    }
+    // The BEEF decoded once into records in this call's overlay, verified, judged by the topics (#50).
+    // Refused, or a dupe everywhere: the call answers, no entry, the overlay is dropped — nothing persists.
+    const routed = switch (try submit_mod.route(a, vm.caller(), &wal, in, body, topics, off)) {
+        .refused => |why| return failure(a, 400, why),
+        .unchanged => {
+            const entries = try a.alloc([3][]const u64, topics.len);
+            for (entries) |*e| e.* = .{ &.{}, &.{}, &.{} };
+            return respond(a, 200, "application/json", try jsonOf(a, Steak{ .topics = topics, .entries = entries }));
+        },
+        .admit => |x| x,
+    };
     const names = try a.alloc(Value, topics.len);
     for (topics, names) |t, *n| n.* = .{ .text = t };
-    var ev: std.ArrayList(cbor.Entry) = .empty;
-    try ev.appendSlice(a, &.{
-        .{ .key = "kind", .value = .{ .text = "submit" } },
-        .{ .key = "beef", .value = .{ .bytes = body } },
-        .{ .key = "topics", .value = .{ .array = names } },
-    });
-    if (off) |o| try ev.append(a, .{ .key = "offChainValues", .value = .{ .bytes = o } });
+    const dupes = try a.alloc(Value, routed.dupes.len);
+    for (routed.dupes, dupes) |t, *n| n.* = .{ .text = t };
+    const ev = routed.event;
     const self = (in.get("programs") orelse return error.BadInput).getCid("overlay") orelse return error.NoOverlayProgram;
     const then_arg = try cbor.encode(a, .{ .map = try a.dupe(cbor.Entry, &.{
-        .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &w.header.toHex(sub.txid)) } },
+        .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &w.header.toHex(routed.txid)) } },
         .{ .key = "topics", .value = .{ .array = names } },
-        .{ .key = "dupes", .value = .{ .array = dupes.items } },
+        .{ .key = "dupes", .value = .{ .array = dupes } },
     }) });
     return .{ .map = try a.dupe(cbor.Entry, &.{
         .{ .key = "status", .value = .{ .uint = 202 } },
         .{ .key = "type", .value = .{ .text = "application/json" } },
         .{ .key = "body", .value = .{ .bytes = "{}" } },
         .{ .key = "admit", .value = .{ .array = try a.dupe(Value, &.{.{ .map = try a.dupe(cbor.Entry, &.{
-            .{ .key = "event", .value = .{ .map = ev.items } },
+            .{ .key = "event", .value = ev },
             .{ .key = "box", .value = .{ .text = "submit" } },
         }) }}) } },
         .{ .key = "then", .value = .{ .map = try a.dupe(cbor.Entry, &.{
@@ -426,8 +421,7 @@ fn listing(a: Allocator, in: Value, key: []const u8) !Value {
     try jw.beginObject();
     var it = map.iterator();
     while (it.next()) |e| {
-        if (e.value_ptr.* != .string) return error.BadConfig;
-        const d = try description(a, in, e.value_ptr.string);
+        const d = try description(a, in, try programName(e.value_ptr.*));
         const first = std.mem.trim(u8, d[0 .. std.mem.indexOfScalar(u8, d, '\n') orelse d.len], " \t\r");
         try jw.objectField(e.key_ptr.*);
         try jw.write(.{ .name = e.key_ptr.*, .shortDescription = first });
@@ -439,6 +433,5 @@ fn listing(a: Allocator, in: Value, key: []const u8) !Value {
 fn documentation(a: Allocator, in: Value, key: []const u8, name: []const u8, what: []const u8) !Value {
     const map = try configMap(a, in, key);
     const v = map.get(name) orelse return failure(a, 400, try std.fmt.allocPrint(a, "{s} not found: {s}", .{ what, name }));
-    if (v != .string) return error.BadConfig;
-    return respond(a, 200, "text/markdown", try description(a, in, v.string));
+    return respond(a, 200, "text/markdown", try description(a, in, try programName(v)));
 }
