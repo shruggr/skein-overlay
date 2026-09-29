@@ -21,6 +21,7 @@ pub const sk = struct {
     pub extern "skein" fn call(prog: [*]const u8, prog_len: u32, func: [*]const u8, func_len: u32, arg: [*]const u8, arg_len: u32, out: [*]u8, cap: u32) i32;
     pub extern "skein" fn take(out: [*]u8, cap: u32) i32;
     pub extern "skein" fn @"error"(out: [*]u8, cap: u32) i32;
+    pub extern "skein" fn edges(to: [*]const u8, to_len: u32, rel: [*]const u8, rel_len: u32, out: [*]u8, cap: u32) i32;
 };
 
 var last_error: [1024]u8 = undefined;
@@ -60,12 +61,16 @@ fn putBlockImpl(_: *anyopaque, cid: []const u8, bytes: []const u8) anyerror!void
 fn keepImpl(_: *anyopaque, cid: []const u8) anyerror!void {
     if (sk.keep(cid.ptr, @intCast(cid.len)) < 0) return failed();
 }
+fn edgesImpl(_: *anyopaque, arena: std.mem.Allocator, to: []const u8, rel: ?[]const u8) anyerror![]const w.store.Edge {
+    const r = rel orelse "";
+    return w.store.decodeEdges(arena, try result(arena, sk.edges, .{ to.ptr, @as(u32, @intCast(to.len)), r.ptr, @as(u32, @intCast(r.len)) }));
+}
 var dummy: u8 = 0;
 
 /// The record store through the `skein` get/put/putblock/keep imports: the
 /// bitcoin blocks held are kept, so their links are the kernel's edges (#42).
 pub fn store() w.store.Store {
-    return .{ .ptr = &dummy, .getFn = getImpl, .putFn = putImpl, .putBlockFn = putBlockImpl, .keepFn = keepImpl };
+    return .{ .ptr = &dummy, .getFn = getImpl, .putFn = putImpl, .putBlockFn = putBlockImpl, .keepFn = keepImpl, .edgesFn = edgesImpl };
 }
 
 /// The step's input record (kernel-zig scheduler.zig stepBody).
