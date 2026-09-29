@@ -77,20 +77,33 @@ An old wallet binary would drop the overlay's maps from the record, so
 | map | key → value | |
 |---|---|---|
 | `admitted` | tp ‖ outpoint → admittance record | an output a topic admitted |
-| `consumed` | tp ‖ outpoint ‖ spending txid → retained (bool) | an admitted output a later judged transaction spends |
-| `applied` | tp ‖ txid → applied record | the topic judged this transaction (a later submission is a dupe) |
-| `spentAdmitted` | tp ‖ outpoint → spender (32) ‖ retained (1) | derived: consumed by a transaction that is not rejected |
-| `byTopic` | tp ‖ 0 (unspent) \| 1 (spent) ‖ outpoint → null | derived |
+| `applied` | tp ‖ txid → applied record | the topic's judgement of this transaction: a later submission is a dupe; which previous coins it retained |
+| `byTopic` | tp ‖ 0 (unspent) \| 1 (spent) ‖ outpoint → null | derived: `admitted` joined to the spends edge |
 | `byScript` | sha256(locking script) ‖ tp ‖ 0 \| 1 ‖ outpoint → null | derived (the demo lookup's `scriptHash` query) |
 
+**Spent within a topic is a join, not a table (#36 notes).** An admitted
+output is spent when the wallet's `spent[outpoint]` names a spender — the
+first transaction we hold that spends it and is not rejected (the `spends`
+edge, topic-independent: docs/WALLET.md). There is no `consumed` or
+`spentAdmitted` map. The one bit those carried — whether the topic kept the
+coin for history — is the topic's judgement of the *spending* transaction,
+so it lives on that transaction's `applied` record (`coinsToRetain`, input
+indices; the STEAK as stored). `overlay.spender(topic, txid, vout)` gives
+both: the spender, and whether this topic judged it and retained the coin.
+
 **Maintained (#41).** A judgement (`apply`) writes each admittance's
-`byTopic` / `byScript` key, and for each previous coin it consumed recomputes
-that coin's `spentAdmitted` (the first judged spender, lowest txid, that is
-not rejected) and moves its `byTopic` / `byScript` key to the spent side. A
-rejection (`Wallet.reject`) removes each vanished admittance with its derived
-keys (`unadmit`), and for each vanished judgement recomputes the coins its
-transaction consumed in that topic (`unjudged`): they move back to unspent
-unless another judged spender stands.
+`byTopic` / `byScript` key under its current state. The previous coins it
+consumes turn spent through the transaction's own `spends` edges (held by
+`apply`): `Wallet.refreshSpent` → `overlay.spentChanged` moves the keys of
+every topic that admitted the outpoint (found through `dependents`, tag `m`).
+A rejection (`Wallet.reject`) removes each vanished admittance with its keys
+(`unadmit`) and its `applied` record; the coins the rejected transaction
+spent move back to unspent the same way, unless another spender stands.
+
+**Sync note (GASP, later).** Other overlay engines answer history /
+`consumedBy` from per-topic tables. Here the answer is the shared spends edge
+joined to `applied`; wire answers for sync are to be derived from those, not
+from a stored consumed table.
 
 **Records.**
 
@@ -103,7 +116,9 @@ The step keeps both. Their `refs` give the kernel `admits` edges
 (docs/VM.md, "Edges").
 
 **Previous coins** (BRC-22's `previousCoins`) are the inputs that spend an
-output live in the topic: admitted, and not in `spentAdmitted`.
+output live in the topic: admitted, and not spent by another transaction we
+hold that is not rejected (the one being judged does not count: it may be
+held already, judged by another topic).
 
 **Retained and removed coins.** A retained coin and a removed coin are both
 spent. The difference is that `coinsToRetain` keeps the old output queryable
@@ -120,9 +135,10 @@ them:
 - **A rejected transaction's admittances and judgements vanish.** Its
   spenders are rejected in turn (`spends`), so the rejection bubbles down a
   token's history.
-- **A rejected spend gives back what it consumed.** `spentAdmitted` counts
-  only spenders that are not rejected, so the consumed admitted outputs are
-  live in the topic again as the rejection is applied.
+- **A rejected spend gives back what it consumed.** `spent` counts only
+  spenders that are not rejected, so the admitted outputs it spent are live
+  in the topic again as the rejection is applied; its `applied` record (the
+  retention) vanishes with it.
 
 Rejections come from the same sources as the wallet's (docs/WALLET.md,
 "Settlement"):

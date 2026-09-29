@@ -20,7 +20,7 @@
 //! contract) with the transaction and its previous coins; the thread waits
 //! on them. Then, with their admittance records (`resolved`): record each
 //! topic's judgement (overlay.apply: held transactions, admitted outputs,
-//! consumed coins, rel `admits`), save. The route's `then` call reads the
+//! the previous coins spent by its held transaction, rel `admits`), save. The route's `then` call reads the
 //! STEAK back from the `applied` records. Every step keeps its result record
 //! and prints its CID:
 //!
