@@ -95,7 +95,7 @@ to admit: a plain event in box `submit` carrying the decoded records and the
 judgements, not a BEEF:
 
 ```
-{kind: "submit", txid (hex), txs: [bytes], nodes: [bytes], proofs: [{txid: bytes, height}],
+{kind: "submit", txid (hex), txs: [bytes], nodes: [bytes], proofs: [{txid: bytes, height, depth, position}],
  topics: [{topic, previousCoins, outputsToAdmit, coinsToRetain}], offChainValues?: bytes}
 ```
 
@@ -103,7 +103,7 @@ The engine, stepped on it, does everything in that one step:
 
 1. **Holds the records** (`holdDecoded`): each transaction's block is kept and
    put in `txs` (so #42's `spends` edges appear), the merkle nodes are kept
-   (`child` edges), and each proven transaction's proof is recorded from the
+   (no edges: a proof reads down from the root), and each proven transaction's proof is recorded from the
    header its nodes reach (`Wallet.putProofAt`).
 2. **Records each judgement** (`apply`): the admittances and the `applied`
    record. The previous coins are taken again. If they moved since the call
