@@ -31,6 +31,7 @@ const w = @import("wallet");
 const vm = @import("vm.zig");
 const topic = @import("topic.zig");
 const routes = @import("routes.zig");
+const submit = @import("submit.zig");
 
 const cbor = w.cbor;
 const Value = cbor.Value;
@@ -96,13 +97,14 @@ fn run(a: std.mem.Allocator) anyerror!void {
     if (std.mem.eql(u8, kind, "submit")) {
         const served = try configMap(a, step, "overlayTopics");
         const topics = try servedTopics(a, ev, served);
-        const sub = w.overlay.verify(&wal, ev.getBytes("beef") orelse return error.BadEvent) catch |e| return refused(a, "submit", e);
+        // The records the front door decoded (#50), held: kept blocks, `txs`, proofs from the merkle nodes.
+        const sub = submit.hold(&wal, ev) catch |e| return refused(a, "submit", e);
         // Previous coins per topic, from the state as it stands before any judgement.
         const previous = try a.alloc([]const u32, topics.len);
         for (topics, previous) |t, *p| p.* = try w.overlay.previousCoins(&wal, t, sub.tx);
 
         if (resolved == null) {
-            // Step one: launch each topic that has not judged this transaction.
+            // Step one: launch each topic that has not judged this transaction, on its CID.
             var launched: usize = 0;
             for (topics, previous) |t, p| {
                 if (try w.overlay.isApplied(&wal, t, sub.txid)) continue;
@@ -111,20 +113,22 @@ fn run(a: std.mem.Allocator) anyerror!void {
                 try es.appendSlice(a, &.{
                     .{ .key = "kind", .value = .{ .text = "topic-call" } },
                     .{ .key = "topic", .value = .{ .text = t } },
-                    .{ .key = "beef", .value = .{ .bytes = ev.getBytes("beef").? } },
-                    .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &w.header.toHex(sub.txid)) } },
+                    .{ .key = "tx", .value = .{ .cid = sub.cid } },
                     .{ .key = "previousCoins", .value = .{ .array = try uints(a, p) } },
                 });
                 if (ev.getBytes("offChainValues")) |o| try es.append(a, .{ .key = "offChainValues", .value = .{ .bytes = o } });
                 _ = try vm.launch(a, prog, try s.putValue(a, .{ .map = es.items }));
                 launched += 1;
             }
-            if (launched > 0) return; // waiting on the topics
+            if (launched > 0) {
+                // Waiting on the topics; the held records are the state's already.
+                try vm.advance(vm.state_head, try wal.save());
+                return;
+            }
         }
 
         // Step two (or nothing to launch): each topic's admittance, recorded.
         var steak: std.ArrayList(cbor.Entry) = .empty;
-        var mutated = false;
         for (topics, previous) |t, p| {
             var ins: ?w.overlay.Instructions = null;
             if (resolved) |rs| for (rs) |r| {
@@ -143,7 +147,6 @@ fn run(a: std.mem.Allocator) anyerror!void {
                 else => return e,
             } else .{};
             for (applied.records) |c| try vm.keep(c);
-            mutated = mutated or applied.records.len > 0;
             try steak.append(a, .{ .key = t, .value = .{ .map = try a.dupe(cbor.Entry, &.{
                 .{ .key = "outputsToAdmit", .value = .{ .array = try uints(a, applied.outputs_to_admit) } },
                 .{ .key = "coinsToRetain", .value = .{ .array = try uints(a, applied.coins_to_retain) } },
@@ -159,7 +162,7 @@ fn run(a: std.mem.Allocator) anyerror!void {
                 .{ .key = "rel", .value = .{ .text = "mentions" } },
             }) }}) } },
         });
-        if (mutated) {
+        {
             const new_state = try wal.save();
             try vm.advance(vm.state_head, new_state);
             try fields.append(a, .{ .key = "state", .value = .{ .cid = new_state } });

@@ -29,6 +29,7 @@
 const std = @import("std");
 const w = @import("wallet");
 const vm = @import("vm.zig");
+const submit_mod = @import("submit.zig");
 
 const cbor = w.cbor;
 const Value = cbor.Value;
@@ -291,7 +292,9 @@ fn submit(a: Allocator, in: Value, req: Value) !Value {
     const map = try configMap(a, in, "overlayTopics");
     const topics = try served(a, requested, map);
     var wal = try load(a, in);
-    const sub = w.overlay.verify(&wal, body) catch |e| return failure(a, 400, @errorName(e));
+    // The BEEF, decoded once into records (#50): in this call's overlay, gone unless admitted.
+    const checked = submit_mod.decodeAndVerify(&wal, body) catch |e| return failure(a, 400, @errorName(e));
+    const sub = checked.subject;
     // Topics that judged it before: a dupe answers with nothing new.
     var dupes: std.ArrayList(Value) = .empty;
     var fresh: usize = 0;
@@ -305,13 +308,7 @@ fn submit(a: Allocator, in: Value, req: Value) !Value {
     }
     const names = try a.alloc(Value, topics.len);
     for (topics, names) |t, *n| n.* = .{ .text = t };
-    var ev: std.ArrayList(cbor.Entry) = .empty;
-    try ev.appendSlice(a, &.{
-        .{ .key = "kind", .value = .{ .text = "submit" } },
-        .{ .key = "beef", .value = .{ .bytes = body } },
-        .{ .key = "topics", .value = .{ .array = names } },
-    });
-    if (off) |o| try ev.append(a, .{ .key = "offChainValues", .value = .{ .bytes = o } });
+    const ev = try submit_mod.event(a, checked.decoded, topics, off);
     const self = (in.get("programs") orelse return error.BadInput).getCid("overlay") orelse return error.NoOverlayProgram;
     const then_arg = try cbor.encode(a, .{ .map = try a.dupe(cbor.Entry, &.{
         .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &w.header.toHex(sub.txid)) } },
@@ -323,7 +320,7 @@ fn submit(a: Allocator, in: Value, req: Value) !Value {
         .{ .key = "type", .value = .{ .text = "application/json" } },
         .{ .key = "body", .value = .{ .bytes = "{}" } },
         .{ .key = "admit", .value = .{ .array = try a.dupe(Value, &.{.{ .map = try a.dupe(cbor.Entry, &.{
-            .{ .key = "event", .value = .{ .map = ev.items } },
+            .{ .key = "event", .value = ev },
             .{ .key = "box", .value = .{ .text = "submit" } },
         }) }}) } },
         .{ .key = "then", .value = .{ .map = try a.dupe(cbor.Entry, &.{

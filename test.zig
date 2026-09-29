@@ -8,6 +8,7 @@ const topic = @import("src/topic.zig");
 const lookup = @import("src/lookup.zig");
 const demo = @import("src/topic_demo.zig");
 const ls = @import("src/lookup_demo.zig");
+const submit = @import("src/submit.zig");
 
 const bsvz = w.bsvz;
 const beef = w.beef;
@@ -42,15 +43,25 @@ fn spend(a: std.mem.Allocator, src: *const bsvz.transaction.Transaction, vout: u
     return .{ .tx = tx, .raw = raw, .txid = beef.txidOf(raw) };
 }
 
-fn args(a: std.mem.Allocator, t: []const u8, bytes: []const u8, previous: []const u32) !Value {
+fn args(a: std.mem.Allocator, t: []const u8, txid: [32]u8, previous: []const u32) !Value {
     const pc = try a.alloc(Value, previous.len);
     for (previous, pc) |p, *v| v.* = .{ .uint = p };
     return .{ .map = try a.dupe(w.cbor.Entry, &.{
         .{ .key = "kind", .value = .{ .text = "topic-call" } },
         .{ .key = "topic", .value = .{ .text = t } },
-        .{ .key = "beef", .value = .{ .bytes = bytes } },
+        .{ .key = "tx", .value = .{ .cid = try a.dupe(u8, &w.store.hashCid(.tx, txid)) } },
         .{ .key = "previousCoins", .value = .{ .array = pc } },
     }) };
+}
+
+/// A submission as the engine takes it (#50): decoded once and verified (the route), then held (the step).
+fn submitted(a: std.mem.Allocator, wal: *w.wallet.Wallet, bytes: []const u8) !w.overlay.Subject {
+    const before = beef.parses;
+    const c = try submit.decodeAndVerify(wal, bytes);
+    const sub = try submit.hold(wal, try submit.event(a, c.decoded, &.{"tm_demo"}, null));
+    try std.testing.expectEqual(before + 1, beef.parses);
+    try std.testing.expectEqualSlices(u8, &c.subject.txid, &sub.txid);
+    return sub;
 }
 
 fn query(a: std.mem.Allocator, fields: []const w.cbor.Entry) !Value {
@@ -104,18 +115,18 @@ test "topic and lookup contracts: tm_demo judges, the engine records, ls_demo an
     const t1_beef = try beef.serialize(a, .{ .version = beef.V2, .bumps = bumps, .entries = e1 });
 
     // The topic contract: args in, admittance record out.
-    const rec1 = try topic.judge(a, demo.identify, try args(a, "tm_demo", t1_beef, &.{}));
+    wal = try w.wallet.Wallet.load(a, s, s0, .regtest);
+    const sub1 = try submitted(a, &wal, t1_beef);
+    const rec1 = try topic.judge(a, s, demo.identify, try args(a, "tm_demo", t1.txid, &.{}));
     try std.testing.expectEqualStrings("admittance", rec1.getText("kind").?);
     try std.testing.expectEqualStrings(&hdr.toHex(t1.txid), rec1.getText("txid").?);
     const ins1 = try topic.instructionsOf(a, rec1);
     try std.testing.expectEqualSlices(u32, &.{0}, ins1.outputs_to_admit);
     try std.testing.expectEqual(@as(usize, 0), ins1.coins_to_retain.len);
-    try std.testing.expectError(error.BadArgs, topic.judge(a, demo.identify, .{ .map = &.{} }));
-    try std.testing.expectError(error.InvalidBeef, topic.judge(a, demo.identify, try args(a, "tm_demo", "junk", &.{})));
+    try std.testing.expectError(error.BadArgs, topic.judge(a, s, demo.identify, .{ .map = &.{} }));
+    try std.testing.expectError(error.UnknownTransaction, topic.judge(a, s, demo.identify, try args(a, "tm_demo", .{0x5a} ** 32, &.{})));
 
-    // The engine's part: verify, record.
-    wal = try w.wallet.Wallet.load(a, s, s0, .regtest);
-    const sub1 = try w.overlay.verify(&wal, t1_beef);
+    // The engine's part: record.
     _ = try w.overlay.apply(&wal, sub1, "tm_demo", &.{}, ins1);
     const s1 = try wal.save();
 
@@ -153,10 +164,10 @@ test "topic and lookup contracts: tm_demo judges, the engine records, ls_demo an
     const e2 = try a.dupe(beef.Entry, &.{.{ .txid = t2.txid, .format = .raw, .raw = t2.raw, .tx = t2.tx }});
     const t2_beef = try beef.serialize(a, .{ .version = beef.V2, .atomic = t2.txid, .bumps = &.{}, .entries = e2 });
     wal = try w.wallet.Wallet.load(a, s, s1, .regtest);
-    const sub2 = try w.overlay.verify(&wal, t2_beef);
+    const sub2 = try submitted(a, &wal, t2_beef);
     const prev = try w.overlay.previousCoins(&wal, "tm_demo", sub2.tx);
     try std.testing.expectEqualSlices(u32, &.{0}, prev);
-    const ins2 = try topic.instructionsOf(a, try topic.judge(a, demo.identify, try args(a, "tm_demo", t2_beef, prev)));
+    const ins2 = try topic.instructionsOf(a, try topic.judge(a, s, demo.identify, try args(a, "tm_demo", t2.txid, prev)));
     try std.testing.expectEqual(@as(usize, 0), ins2.outputs_to_admit.len);
     try std.testing.expectEqual(@as(usize, 0), ins2.coins_to_retain.len);
     const applied = try w.overlay.apply(&wal, sub2, "tm_demo", prev, ins2);
