@@ -111,6 +111,8 @@ fn run(a: std.mem.Allocator) anyerror!void {
                 .{ .key = "outcome", .value = .{ .text = @tagName(outcome) } },
             });
         }
+        // The judgements a rejection removed: each topic's lookup services are told (#50).
+        try w.overlay.hookRejected(a, vm.caller(), step, wal.unapplied.items);
     } else return error.BadEvent;
 
     const new_state = try wal.save();

@@ -195,6 +195,7 @@ pub fn step(a: Allocator, caller: ov.Caller, wal: *Wallet, in: Value, ev: Value)
         };
         if (ap.records.len == 0) continue;
         try records.appendSlice(a, ap.records);
+        try ov.hookAdmitted(a, caller, in, t.*, sub, previous, ap.*);
     }
     return .{ .subject = sub, .topics = topics, .applied = applied, .records = records.items };
 }

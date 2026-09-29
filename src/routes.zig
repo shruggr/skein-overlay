@@ -198,21 +198,17 @@ fn writeVarInt(a: Allocator, out: *std.ArrayList(u8), v: u64) !void {
 // ---------------------------------------------------------------- config
 
 /// A name → program map from genesis defaults (a JSON object in a string).
-pub fn configMap(a: Allocator, in: Value, key: []const u8) !std.json.ObjectMap {
-    const text = if (in.get("defaults")) |d| d.getText(key) orelse "{}" else "{}";
-    const j = std.json.parseFromSliceLeaky(std.json.Value, a, text, .{}) catch return error.BadConfig;
-    if (j != .object) return error.BadConfig;
-    return j.object;
-}
+pub const configMap = w.overlay.configObject;
 
 /// The program record a served name runs: genesis `programs` by the configured name.
-pub fn programFor(in: Value, map: std.json.ObjectMap, name: []const u8) !?[]const u8 {
-    const v = map.get(name) orelse return null;
-    if (v != .string) return error.BadConfig;
-    const progs = in.get("programs") orelse return error.BadConfig;
-    return progs.getCid(v.string) orelse {
-        std.log.err("config names program {s}, not in the genesis programs", .{v.string});
-        return error.BadConfig;
+pub const programFor = w.overlay.configuredProgram;
+
+/// The `bin/` program name a configured name runs (a string, or `{program, …}`).
+fn programName(v: std.json.Value) ![]const u8 {
+    return switch (v) {
+        .string => |s| s,
+        .object => |o| if (o.get("program")) |p| (if (p == .string) p.string else error.BadConfig) else error.BadConfig,
+        else => error.BadConfig,
     };
 }
 
@@ -425,8 +421,7 @@ fn listing(a: Allocator, in: Value, key: []const u8) !Value {
     try jw.beginObject();
     var it = map.iterator();
     while (it.next()) |e| {
-        if (e.value_ptr.* != .string) return error.BadConfig;
-        const d = try description(a, in, e.value_ptr.string);
+        const d = try description(a, in, try programName(e.value_ptr.*));
         const first = std.mem.trim(u8, d[0 .. std.mem.indexOfScalar(u8, d, '\n') orelse d.len], " \t\r");
         try jw.objectField(e.key_ptr.*);
         try jw.write(.{ .name = e.key_ptr.*, .shortDescription = first });
@@ -438,6 +433,5 @@ fn listing(a: Allocator, in: Value, key: []const u8) !Value {
 fn documentation(a: Allocator, in: Value, key: []const u8, name: []const u8, what: []const u8) !Value {
     const map = try configMap(a, in, key);
     const v = map.get(name) orelse return failure(a, 400, try std.fmt.allocPrint(a, "{s} not found: {s}", .{ what, name }));
-    if (v != .string) return error.BadConfig;
-    return respond(a, 200, "text/markdown", try description(a, in, v.string));
+    return respond(a, 200, "text/markdown", try description(a, in, try programName(v)));
 }

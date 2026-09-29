@@ -136,9 +136,9 @@ const Instance = struct {
             return topic.judge(a, self.current, demo.identify, arg);
         }
         if (std.mem.eql(u8, program, self.lookup_prog)) {
-            if (!std.mem.eql(u8, func, "lookup")) return error.UnknownFunction;
-            var wal = try w.wallet.Wallet.load(a, self.current, self.wallet, .regtest);
-            return lookup.answerRecord(a, &wal, ls.answer, arg);
+            const h = try lookup.handle(a, ls.spec, self.current, .regtest, self.ls_state, self.wallet, func, arg);
+            if (h.state) |c| self.ls_state = c;
+            return h.answer;
         }
         return error.UnknownProgram;
     }
@@ -193,6 +193,7 @@ const Instance = struct {
         var wal = try w.wallet.Wallet.load(self.a, self.ms.store(), self.wallet, .regtest);
         wal.now = self.now;
         _ = try wal.applyStatus(txid, tx_status, null);
+        try w.overlay.hookRejected(self.a, self.caller(), self.in, wal.unapplied.items);
         self.wallet = try wal.save();
     }
 
@@ -313,11 +314,13 @@ test "the submission flow: parse once, persist only on admission, a lookup servi
         // Parsed once: the route decoded it; the topic, the step and the hooks read records.
         try std.testing.expectEqual(parses + 1, beef.parses);
         try std.testing.expectEqualSlices(u32, &.{0}, done.applied[0].outputs_to_admit);
+        try std.testing.expectEqual(@as(usize, 1), inst.count("admitted"));
+        try std.testing.expectEqual(@as(usize, 0), inst.count("spent"));
         // What the step persisted: the decoded blocks (the transactions; this BUMP reveals no node:
         // a one-transaction block), the judgement and admittance (reachable from the new wallet
-        // state) — and nothing else.
+        // state), the service's map (from its new state) — and nothing else.
         const decoded = [_][37]u8{ w.store.hashCid(.tx, fund_txid), w.store.hashCid(.tx, t1.txid) };
-        const kept = try reachable(a, ms.store(), &.{inst.wallet.?});
+        const kept = try reachable(a, ms.store(), &.{ inst.wallet.?, inst.ls_state.? });
         var fresh: usize = 0;
         var it = ms.blocks.iterator();
         while (it.next()) |e| {
@@ -365,6 +368,8 @@ test "the submission flow: parse once, persist only on admission, a lookup servi
             .{ .key = "outputIndex", .value = .{ .uint = 1 } },
         });
         try std.testing.expectEqual(@as(usize, 0), by_op.len); // the change was not admitted
+        // The shared wallet maps no longer index by script (#50): the service does.
+        for (w.wallet.map_names) |n| try std.testing.expect(!std.mem.eql(u8, n, "byScript"));
     }
 
     // ------------------------------------------------ T2 spends the token into a new one: `spent`
@@ -373,6 +378,7 @@ test "the submission flow: parse once, persist only on admission, a lookup servi
         inst.now = 2000;
         const done = try inst.submitted(try atomic(a, t2));
         try std.testing.expectEqualSlices(u32, &.{0}, done.applied[0].coins_to_retain);
+        try std.testing.expectEqual(@as(usize, 1), inst.count("spent"));
         const live = try inst.look(&.{.{ .key = "topic", .value = .{ .text = "tm_demo" } }});
         try std.testing.expectEqual(@as(usize, 1), live.len);
         try std.testing.expectEqualSlices(u8, &t2.txid, &(try subjectOf(a, live[0])));
@@ -386,6 +392,7 @@ test "the submission flow: parse once, persist only on admission, a lookup servi
     {
         inst.now = 3000;
         try inst.status(t2.txid, "DOUBLE_SPEND_ATTEMPTED");
+        try std.testing.expectEqual(@as(usize, 1), inst.count("rejected"));
         const live = try inst.look(&.{ .{ .key = "topic", .value = .{ .text = "tm_demo" } }, .{ .key = "includeSpent", .value = .{ .boolean = true } } });
         try std.testing.expectEqual(@as(usize, 1), live.len);
         try std.testing.expectEqualSlices(u8, &t1.txid, &(try subjectOf(a, live[0])));
@@ -401,6 +408,7 @@ test "the submission flow: parse once, persist only on admission, a lookup servi
         const done = try inst.submitted(try atomic(a, t3));
         try std.testing.expectEqual(@as(usize, 0), done.applied[0].outputs_to_admit.len);
         try std.testing.expectEqualSlices(u32, &.{0}, done.applied[0].coins_removed);
+        try std.testing.expectEqual(@as(usize, 2), inst.count("spent"));
         try std.testing.expectEqual(@as(usize, 0), (try inst.look(&.{.{ .key = "topic", .value = .{ .text = "tm_demo" } }})).len);
         try std.testing.expectEqual(@as(usize, 1), (try inst.look(&.{ .{ .key = "topic", .value = .{ .text = "tm_demo" } }, .{ .key = "includeSpent", .value = .{ .boolean = true } } })).len);
     }
