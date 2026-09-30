@@ -1,6 +1,7 @@
 //! The overlay's submission flow natively (#36, #50), as the engine runs it:
-//! the route's half over an in-memory overlay (the front-door call: dropped
-//! afterwards), the step's half over the store, the tm_demo topic and the
+//! the route's half over an in-memory write cache (in the VM, the front
+//! door's step on the request, #68; dropped afterwards here), the step's half
+//! over the store, the tm_demo topic and the
 //! ls_demo lookup service called through a dispatch table in place of the
 //! VM's `call`. Checked: the BEEF is parsed once per submit; a refused
 //! submit leaves the store as it was; an admitted one persists exactly the

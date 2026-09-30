@@ -21,14 +21,17 @@
 //! the transaction mined, broadcast it through the host's route
 //! (defaults.walletArc, #58) over the recorded `http` import (#57); once ARC
 //! takes it, record each topic's judgement (overlay.apply) and call the
-//! listening lookup services' hooks (`admitted`, `spent`); save. While the
-//! transaction is pending or unproven the thread awaits its CID with a
-//! deadline (defaults.overlayRecheckMs): a `status` / `proof` entry for it,
-//! or the deadline (ARC asked again), steps the same thread — admitting a
-//! submission ARC had not taken yet, proving it, or rejecting it (the
-//! admittances unwind through `admits`, #37). A rejection calls `rejected`
-//! for each judgement it removed. The route's `then` call reads the STEAK
-//! back from the `applied` records (503 while the broadcast is pending).
+//! listening lookup services' hooks (`admitted`, `spent`); save. While ARC
+//! has not taken it the thread awaits its CID with a deadline
+//! (defaults.overlayRecheckMs): a `status` / `proof` entry for it, or the
+//! deadline (ARC asked again), steps the same thread — admitting it once
+//! ARC has it, or rejecting it. Once admitted or rejected the thread
+//! finishes (#66): the request that launched it (POST /submit), and any
+//! resubmission awaiting it, answer from the state — the STEAK from the
+//! `applied` records, or the rejection. A later status or proof (mined, a
+//! double spend) settles it through the chain feed (box `chain`, below):
+//! a rejection unwinds the admittances through `admits` (#37) and calls
+//! `rejected` for each judgement it removed.
 //! Every step keeps its result record and prints its CID:
 //!
 //!   {kind: "overlay-result", op: "submit" | "callback", txid, gate, outcome, arc?, steak?, awaiting?, event? | woke?, refs, state}
@@ -121,8 +124,11 @@ fn run(a: std.mem.Allocator) anyerror!void {
             }) } });
             try fields.append(a, .{ .key = "steak", .value = .{ .map = steak.items } });
         }
-        if (done.outcome == .pending) {
-            // Rest until a `status` / `proof` entry for the transaction (its CID is its txid), or the deadline.
+        if (done.gate == .pending) {
+            // ARC has not taken it: rest until a `status` / `proof` entry for the transaction (its CID
+            // is its txid), or the deadline (ARC asked again). Once the gate is decided — admitted or
+            // rejected — the submission's thread finishes (#66: a client waiting on it is answered);
+            // a later status or proof settles it through the chain feed (box `chain`), nobody waiting.
             try vm.awaitRecord(done.subject.cid);
             try vm.deadline(wal.now + (try submit.Gate.of(step)).recheck_ms);
             try fields.append(a, .{ .key = "awaiting", .value = .{ .boolean = true } });

@@ -346,7 +346,7 @@ fn gated(a: Allocator, caller: ov.Caller, wal: *Wallet, in: Value, ev: Value, ar
     switch (verdictOf(ans)) {
         .accepted => {
             out.gate = .accepted;
-            try wal.noteSubmission(txid, arc, ans.tx_status, "admitted");
+            try wal.noteSubmission(txid, arc, ans.tx_status, "admitted", in.getCid("thread"));
             out.outcome = try wal.applyStatus(txid, ans.tx_status, ans.merkle_path);
             if (out.outcome != .rejected) try admit(a, caller, wal, in, ev, out);
         },
@@ -357,7 +357,7 @@ fn gated(a: Allocator, caller: ov.Caller, wal: *Wallet, in: Value, ev: Value, ar
         },
         .transient => {
             out.gate = .pending;
-            try wal.noteSubmission(txid, arc, ans.tx_status, "pending");
+            try wal.noteSubmission(txid, arc, ans.tx_status, "pending", in.getCid("thread"));
             out.outcome = .pending;
         },
     }

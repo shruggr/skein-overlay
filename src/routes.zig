@@ -13,29 +13,29 @@
 //!   GET  /getDocumentationForTopicManager?manager=…              fn "topicDocumentation"
 //!   GET  /getDocumentationForLookupServiceProvider?lookupService=…  fn "lookupDocumentation"
 //!
-//! A submit is the one write (#50, submit.zig). The handler decodes the BEEF
-//! once into records in its call's in-memory overlay, checks SPV over them,
-//! and calls each requested topic this instance serves and has not judged
-//! the transaction for (fn "identify", on the transaction's CID). Nothing is
-//! written when nothing is new: a bad BEEF answers 400; a valid transaction
-//! no topic took answers 200 with the empty STEAK (BRC-22); the overlay is
-//! dropped. Otherwise it returns the entry for the host to admit — the plain
-//! event {kind: "submit", txid, txs, nodes, proofs, topics: [judgement],
-//! offChainValues?} in box `submit`, which engine.zig steps on (holding the
+//! Every request is appended, and the front door's step calls these (#68).
+//! A submit (#50, submit.zig): the handler decodes the BEEF once into
+//! records in the step's write cache, checks SPV over them, and calls each
+//! requested topic this instance serves and has not judged the transaction
+//! for (fn "identify", on the transaction's CID). A bad BEEF answers 400; a
+//! valid transaction no topic took answers 200 with the empty STEAK
+//! (BRC-22); nothing is admitted. Otherwise it launches the submission's
+//! thread — engine.zig stepped on the submit record {kind: "submit", txid,
+//! txs, nodes, proofs, topics: [judgement], offChainValues?} (holding the
 //! records, broadcasting it unless mined, and only once ARC takes it
 //! recording the judgements and calling the lookup services' hooks, #57) —
-//! and `then`: a call of fn "submitted" the host makes once that entry is
-//! processed, which reads the answer from the state: the STEAK (each topic's
-//! `applied` record); 503 with Retry-After while ARC has not taken the
-//! transaction; 400 if ARC rejected it. A resubmission (judged before, or
-//! awaiting ARC) appends nothing and gets the same `then`: its answer is
-//! the state's, so a client retrying after a 503 gets the STEAK once
-//! admitted.
+//! and answers {wait: true}: the request's thread waits on it (#66), and
+//! when it comes to rest the handler is called again (`resolved`) and
+//! answers from the state: the STEAK (each topic's `applied` record); 400
+//! if ARC rejected it; 503 with Retry-After if it ended still pending. A
+//! resubmission judged before answers the STEAK at once; one while the
+//! first awaits ARC awaits that same thread (the broadcast record names
+//! it) and gets the same answer.
 //!
 //! A lookup is a read: the service's program is called (fn "lookup", the
-//! lookup contract, lookup.zig) and its answer shaped for the wire; nothing
-//! is written. Listings and documentation are the program records'
-//! `description`.
+//! lookup contract, lookup.zig) and its answer shaped for the wire; it
+//! writes nothing but the request's own record. Listings and documentation
+//! are the program records' `description`.
 const std = @import("std");
 const w = @import("wallet");
 const vm = @import("vm.zig");
@@ -233,8 +233,6 @@ pub fn call(a: Allocator, in: Value) !void {
     const arg = try vm.callArg(a, in);
     const out = if (eql(u8, func, "submit"))
         try submit(a, in, arg)
-    else if (eql(u8, func, "submitted"))
-        try submitted(a, in, arg)
     else if (eql(u8, func, "lookup"))
         try lookup(a, in, arg)
     else if (eql(u8, func, "listTopicManagers"))
@@ -299,8 +297,12 @@ fn submit(a: Allocator, in: Value, req: Value) !Value {
     const map = try configMap(a, in, "overlayTopics");
     const topics = try served(a, requested, map);
     var wal = try load(a, in);
-    // The BEEF decoded once into records in this call's overlay, verified, judged by the topics (#50).
-    // Refused, or nothing new: the call writes nothing, and the overlay is dropped — nothing persists.
+    // Called again (#66): the submission's thread this request waited on has come to rest — the answer is the state's.
+    if (req.get("resolved") != null) {
+        const b = w.beef.parse(a, body) catch return failure(a, 400, "Invalid BEEF");
+        return submitted(a, in, &wal, b.subject() orelse return failure(a, 400, "Invalid BEEF"), topics);
+    }
+    // The BEEF decoded once into records in the step's write cache, verified, judged by the topics (#50).
     const routed = switch (try submit_mod.route(a, vm.caller(), &wal, in, body, topics, off)) {
         .refused => |why| return failure(a, 400, why),
         // Valid but admitted nowhere: BRC-22's answer is 200 with an empty STEAK.
@@ -309,48 +311,43 @@ fn submit(a: Allocator, in: Value, req: Value) !Value {
             for (entries) |*e| e.* = .{ &.{}, &.{}, &.{} };
             return respond(a, 200, "application/json", try jsonOf(a, Steak{ .topics = topics, .entries = entries }));
         },
-        // Resubmitted (#57): judged already, or held and awaiting ARC. Nothing new to admit; the answer is
-        // read from the state, as after the first submission's step: the STEAK once admitted, 503 while pending.
-        .unchanged, .pending => |txid| return answeredLater(a, in, txid, topics, null),
+        // Resubmitted, judged already (#57): the answer is the state's, now.
+        .unchanged => |txid| return submitted(a, in, &wal, txid, topics),
+        // Resubmitted while the first submission's thread awaits ARC (#66): this request waits on that
+        // same thread and gets the same answer, from the state, once it comes to rest.
+        .pending => |txid| {
+            const rec = (try wal.awaitingRecord(txid)) orelse return submitted(a, in, &wal, txid, topics);
+            const thread = rec.getCid("thread") orelse return submitted(a, in, &wal, txid, topics);
+            vm.awaitRecord(thread) catch return submitted(a, in, &wal, txid, topics); // at rest already: the state answers
+            return waiting(a);
+        },
         .admit => |x| x,
     };
-    return answeredLater(a, in, routed.txid, topics, routed.event);
+    // The submission's thread (engine.zig, stepped on the submit record as a `submit` event would be):
+    // launched by this request's step, which waits on it; its answer, when it comes to rest, is the state's.
+    const self = (in.get("programs") orelse return error.BadInput).getCid("overlay") orelse return error.NoOverlayProgram;
+    const ev = try vm.store().putValue(a, routed.event);
+    const args = try vm.store().putValue(a, .{ .map = try a.dupe(cbor.Entry, &.{
+        .{ .key = "event", .value = .{ .cid = ev } },
+        .{ .key = "box", .value = .{ .text = "submit" } },
+    }) });
+    _ = try vm.launch(a, self, args);
+    return waiting(a);
 }
 
-/// An answer a step computes: the entry to admit (if any), and `then`, a call of fn "submitted" the host
-/// makes once it is processed, which reads the answer from the state.
-fn answeredLater(a: Allocator, in: Value, txid: [32]u8, topics: []const []const u8, ev: ?Value) !Value {
-    const names = try a.alloc(Value, topics.len);
-    for (topics, names) |t, *n| n.* = .{ .text = t };
-    const self = (in.get("programs") orelse return error.BadInput).getCid("overlay") orelse return error.NoOverlayProgram;
-    const then_arg = try cbor.encode(a, .{ .map = try a.dupe(cbor.Entry, &.{
-        .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &w.header.toHex(txid)) } },
-        .{ .key = "topics", .value = .{ .array = names } },
-    }) });
-    var es: std.ArrayList(cbor.Entry) = .empty;
-    try es.appendSlice(a, &.{
-        .{ .key = "status", .value = .{ .uint = 202 } },
-        .{ .key = "type", .value = .{ .text = "application/json" } },
-        .{ .key = "body", .value = .{ .bytes = "{}" } },
-        .{ .key = "then", .value = .{ .map = try a.dupe(cbor.Entry, &.{
-            .{ .key = "program", .value = .{ .cid = self } },
-            .{ .key = "fn", .value = .{ .text = "submitted" } },
-            .{ .key = "arg", .value = .{ .bytes = then_arg } },
-        }) } },
-    });
-    if (ev) |e| try es.append(a, .{ .key = "admit", .value = .{ .array = try a.dupe(Value, &.{.{ .map = try a.dupe(cbor.Entry, &.{
-        .{ .key = "event", .value = e },
-        .{ .key = "box", .value = .{ .text = "submit" } },
-    }) }}) } });
-    return .{ .map = es.items };
+/// A route handler's "not yet" (#66): it launched, or awaits, the thread its answer depends on.
+fn waiting(a: Allocator) !Value {
+    return .{ .map = try a.dupe(cbor.Entry, &.{.{ .key = "wait", .value = .{ .boolean = true } }}) };
 }
 
 /// The same submit, arriving as a GossipSub message on a `libp2p:<topic>` route (#57): the message's
 /// topic is the one requested, its body the BEEF (no off-chain values), and the route's half runs
-/// unchanged. The answer is the libp2p handler contract (docs/MESSAGES.md, "libp2p"): accept with the
-/// same submit entry POST /submit returns (the front door forwards it after the message's own `p2p`
-/// entry); ignore — no forward, no penalty — when nothing is new or the BEEF is refused (a refusal may
-/// be this instance's missing headers, not the publisher's fault). No `then`: nothing to answer.
+/// unchanged. The answer is the libp2p handler contract (docs/MESSAGES.md, "libp2p"): accept, admitting
+/// the submit record as an event in box `submit` (routed after the message's own `p2p` event: the
+/// `submit` subscription launches the same engine thread POST /submit launches), so the verdict goes
+/// back at once — GossipSub's validator waits on nothing further; ignore — no forward, no penalty —
+/// when nothing is new or the BEEF is refused (a refusal may be this instance's missing headers, not
+/// the publisher's fault).
 fn gossip(a: Allocator, in: Value, req: Value) !Value {
     const t = req.getText("topic") orelse return verdictOf(a, "ignore", "not a topic message");
     const body = req.getBytes("body") orelse "";
@@ -386,10 +383,8 @@ fn verdictOf(a: Allocator, v: []const u8, reason: []const u8) !Value {
 /// message}; otherwise the STEAK from each topic's `applied` record (this submission's judgement or an
 /// earlier one's: a resubmission answers what was admitted; a topic that took nothing, or admitted
 /// nothing: empty). A STEAK only ever names outputs of a transaction ARC took, or a mined one.
-fn submitted(a: Allocator, in: Value, arg: Value) !Value {
-    var wal = try load(a, in);
-    const txid = try w.header.fromHex(arg.getText("txid") orelse return error.BadInput);
-    if (try submit_mod.isPending(&wal, txid)) {
+fn submitted(a: Allocator, in: Value, wal: *Wallet, txid: [32]u8, topics: []const []const u8) !Value {
+    if (try submit_mod.isPending(wal, txid)) {
         const retry = (try submit_mod.Gate.of(in)).retryAfter();
         return .{ .map = try a.dupe(cbor.Entry, &.{
             .{ .key = "status", .value = .{ .uint = 503 } },
@@ -399,17 +394,15 @@ fn submitted(a: Allocator, in: Value, arg: Value) !Value {
         }) };
     }
     if (try wal.settlement(txid)) |rec| {
-        // Rejected (ARC's answer, a status, a double spend): nothing admitted. Only a first submission's
-        // `then` gets here; resubmitting a rejected transaction is answered in the call (200, the empty STEAK).
+        // Rejected (ARC's answer, a status, a double spend): nothing admitted. Only a submission whose
+        // thread this request waited on gets here; resubmitting a rejected transaction is answered at once
+        // (the route's `nothing`: 200, the empty STEAK).
         return failure(a, 400, try std.fmt.allocPrint(a, "Transaction rejected: {s}", .{rec.getText("reason") orelse "rejected"}));
     }
-    const topics_v = arg.getArray("topics") orelse return error.BadInput;
-    const topics = try a.alloc([]const u8, topics_v.len);
-    const entries = try a.alloc([3][]const u64, topics_v.len);
-    for (topics_v, topics, entries) |tv, *t, *e| {
-        t.* = if (tv == .text) tv.text else return error.BadInput;
+    const entries = try a.alloc([3][]const u64, topics.len);
+    for (topics, entries) |t, *e| {
         e.* = .{ &.{}, &.{}, &.{} };
-        const key = try std.mem.concat(a, u8, &.{ try w.overlay.topicPrefix(a, t.*), &txid });
+        const key = try std.mem.concat(a, u8, &.{ try w.overlay.topicPrefix(a, t), &txid });
         const rec_cid = (try wal.map("applied").link(key)) orelse continue;
         const rec = try vm.store().getValue(a, rec_cid);
         e.* = .{
