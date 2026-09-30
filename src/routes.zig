@@ -5,6 +5,8 @@
 //!   POST /submit      fn "submit"   body BEEF, X-Topics (comma list or JSON array),
 //!                                   x-includes-off-chain-values: true → VarInt(len) ‖ BEEF ‖ off-chain values
 //!                                   → the STEAK {topic: {outputsToAdmit, coinsToRetain, coinsRemoved}}
+//!   libp2p:<topic>    fn "submit"   the same submit as a GossipSub message (#57): the message's topic
+//!                                   requested, its body the BEEF → {verdict, admit?} (`gossip` below)
 //!   POST /lookup      fn "lookup"   {service, query} (JSON) → {type: "output-list", outputs: [{beef, outputIndex, context?}]}
 //!                                   X-Aggregation: yes → the compact octet-stream form (count, [txid, index, context], one BEEF)
 //!   GET  /listTopicManagers, /listLookupServiceProviders         fn "listTopicManagers" / "listLookupServiceProviders"
@@ -275,6 +277,7 @@ const Steak = struct {
 };
 
 fn submit(a: Allocator, in: Value, req: Value) !Value {
+    if (eql(u8, req.getText("transport") orelse "", "libp2p")) return gossip(a, in, req);
     const th = header(req, "x-topics") orelse return failure(a, 400, "Missing x-topics header");
     const requested = parseTopics(a, th) catch return failure(a, 400, "Invalid x-topics header: expected a comma-separated list or JSON string array");
     var body = req.getBytes("body") orelse "";
@@ -327,6 +330,41 @@ fn submit(a: Allocator, in: Value, req: Value) !Value {
             .{ .key = "fn", .value = .{ .text = "submitted" } },
             .{ .key = "arg", .value = .{ .bytes = then_arg } },
         }) } },
+    }) };
+}
+
+/// The same submit, arriving as a GossipSub message on a `libp2p:<topic>` route (#57): the message's
+/// topic is the one requested, its body the BEEF (no off-chain values), and the route's half runs
+/// unchanged. The answer is the libp2p handler contract (docs/MESSAGES.md, "libp2p"): accept with the
+/// same submit entry POST /submit returns (the front door forwards it after the message's own `p2p`
+/// entry); ignore — no forward, no penalty — when nothing is new or the BEEF is refused (a refusal may
+/// be this instance's missing headers, not the publisher's fault). No `then`: nothing to answer.
+fn gossip(a: Allocator, in: Value, req: Value) !Value {
+    const t = req.getText("topic") orelse return verdictOf(a, "ignore", "not a topic message");
+    const body = req.getBytes("body") orelse "";
+    if (body.len == 0) return verdictOf(a, "ignore", "Missing or empty BEEF body");
+    const topics = try served(a, &.{t}, try configMap(a, in, "overlayTopics"));
+    if (topics.len == 0) return verdictOf(a, "ignore", "the topic is not served here");
+    var wal = try load(a, in);
+    const routed = switch (try submit_mod.route(a, vm.caller(), &wal, in, body, topics, null)) {
+        .refused => |why| return verdictOf(a, "ignore", why),
+        .nothing => |why| return verdictOf(a, "ignore", why),
+        .unchanged => return verdictOf(a, "ignore", "already judged"),
+        .admit => |x| x,
+    };
+    return .{ .map = try a.dupe(cbor.Entry, &.{
+        .{ .key = "verdict", .value = .{ .text = "accept" } },
+        .{ .key = "admit", .value = .{ .array = try a.dupe(Value, &.{.{ .map = try a.dupe(cbor.Entry, &.{
+            .{ .key = "event", .value = routed.event },
+            .{ .key = "box", .value = .{ .text = "submit" } },
+        }) }}) } },
+    }) };
+}
+
+fn verdictOf(a: Allocator, v: []const u8, reason: []const u8) !Value {
+    return .{ .map = try a.dupe(cbor.Entry, &.{
+        .{ .key = "verdict", .value = .{ .text = v } },
+        .{ .key = "reason", .value = .{ .text = reason } },
     }) };
 }
 

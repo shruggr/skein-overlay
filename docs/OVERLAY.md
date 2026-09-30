@@ -395,6 +395,24 @@ host makes once the entry is processed. `submitted` reads the STEAK from the
 state: each topic's `applied` record for the transaction, empty for a topic
 that was a dupe or admitted nothing.
 
+**The same submit over GossipSub** (#57). A `libp2p:<topic>` route may name
+the same fn: `{"path": "libp2p:tm_demo", "program": "overlay", "fn":
+"submit"}`. The front door verifies the message's signature (docs/MESSAGES.md,
+"libp2p") and calls `submit` with it; the handler sees `transport: "libp2p"`
+and takes the message's topic as the one requested, its body as the BEEF (no
+off-chain values), and runs the same route half. Its answer is the libp2p
+handler contract: **accept** with the same submit entry `POST /submit` returns
+(no `then`: there is no one to answer), which the front door forwards after the
+message's own `p2p` entry, so the step persists exactly what the HTTP path
+does; **ignore** (no forward, no penalty) when the topic is not served, nothing
+is new (a dupe, no topic takes it) or the BEEF is refused — a refusal may be
+this instance's missing headers rather than the publisher's fault. A
+redelivered message writes nothing: its `p2p` entry is refused first, and the
+submit entry with it. equiv/overlay.ts checks it: a second instance fed the
+token transaction by GossipSub holds the same `applied` / `admitted` records
+(but for each step's time), `byTopic` map and lookup storage as the one fed by
+`POST /submit`, and the redelivery leaves its store file byte-identical.
+
 **A lookup writes nothing.** The handler calls the service's program and
 shapes its answer for the wire. Listings and documentation read the program
 records. equiv/overlay.ts checks it: across the lookups, a dupe, the
