@@ -1,10 +1,12 @@
 //! The skein calls as a program sees them (preview1 `skein` imports,
 //! kernel-zig program.zig), and the few helpers every overlay program needs:
 //! the step's (or call's) input, the store as wallet-zig's `Store`,
-//! keep-and-print of a result record, in-VM calls and a call's answer.
+//! keep-and-print of a result record, in-VM calls and a call's answer, and
+//! the broadcast gate's recorded `http`, `await` and `deadline` (#57).
 //! wasm32-wasi only.
 const std = @import("std");
 const w = @import("wallet");
+const submit = @import("submit.zig");
 
 const cbor = w.cbor;
 const Value = cbor.Value;
@@ -22,6 +24,9 @@ pub const sk = struct {
     pub extern "skein" fn take(out: [*]u8, cap: u32) i32;
     pub extern "skein" fn @"error"(out: [*]u8, cap: u32) i32;
     pub extern "skein" fn edges(to: [*]const u8, to_len: u32, rel: [*]const u8, rel_len: u32, out: [*]u8, cap: u32) i32;
+    pub extern "skein" fn http(req: [*]const u8, len: u32, out: [*]u8, cap: u32) i32;
+    pub extern "skein" fn deadline(until: i64) i32;
+    pub extern "skein" fn @"await"(cid: [*]const u8, cid_len: u32) i32;
 };
 
 var last_error: [1024]u8 = undefined;
@@ -110,6 +115,44 @@ fn callerImpl(_: *anyopaque, a: std.mem.Allocator, program: []const u8, func: []
 /// The overlay's calls of topics and lookup services (#50), over the `call` import.
 pub fn caller() w.overlay.Caller {
     return .{ .ctx = &dummy, .callFn = callerImpl };
+}
+
+/// One request over the `http` import (attested: request and answer are
+/// recorded on the step, so a replay never touches the network) → the
+/// answer's status and body. A failed import (the host could not answer at
+/// all; the kernel records no answer) is `HttpFailed`: the step ends
+/// errored, as the wallet's does, rather than record an outcome no answer
+/// supports. An Arcade the host cannot reach is not this: the route answers
+/// it 503, a recorded answer (transient).
+fn httpImpl(_: *anyopaque, a: std.mem.Allocator, method: []const u8, url: []const u8, body: ?[]const u8) anyerror!submit.Http.Reply {
+    var req: std.ArrayList(cbor.Entry) = .empty;
+    try req.appendSlice(a, &.{
+        .{ .key = "method", .value = .{ .text = method } },
+        .{ .key = "url", .value = .{ .text = url } },
+        .{ .key = "headers", .value = .{ .map = if (body != null) &.{
+            .{ .key = "Content-Type", .value = .{ .text = "application/octet-stream" } },
+            .{ .key = "Accept", .value = .{ .text = "application/json" } },
+        } else &.{.{ .key = "Accept", .value = .{ .text = "application/json" } }} } },
+    });
+    if (body) |b| try req.append(a, .{ .key = "body", .value = .{ .bytes = b } });
+    const bytes = try cbor.encode(a, .{ .map = req.items });
+    const res = cbor.decode(a, result(a, sk.http, .{ bytes.ptr, @as(u32, @intCast(bytes.len)) }) catch return error.HttpFailed) catch return error.BadHttpResponse;
+    return .{ .status = res.getUint("status") orelse return error.BadHttpResponse, .body = res.getBytes("body") orelse "" };
+}
+
+/// The broadcast gate's HTTP (#57), over the `http` import.
+pub fn http() submit.Http {
+    return .{ .ctx = &dummy, .callFn = httpImpl };
+}
+
+/// Rest the thread until a status for this record (a transaction's CID) arrives, or the deadline.
+pub fn awaitRecord(cid: []const u8) !void {
+    if (sk.@"await"(cid.ptr, @intCast(cid.len)) < 0) return failed();
+}
+
+/// Wake the thread at `until` (ms) if nothing it awaits arrives first.
+pub fn deadline(until: i64) !void {
+    if (sk.deadline(until) < 0) return failed();
 }
 
 /// The program's Io: one single-threaded WASI process, no concurrency.

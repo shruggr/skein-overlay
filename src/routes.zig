@@ -18,14 +18,19 @@
 //! and calls each requested topic this instance serves and has not judged
 //! the transaction for (fn "identify", on the transaction's CID). Nothing is
 //! written when nothing is new: a bad BEEF answers 400; a valid transaction
-//! no topic took, or a dupe everywhere, answers 200 with the empty STEAK
-//! (BRC-22); the overlay is dropped. Otherwise it returns the entry for the host to admit — the plain
+//! no topic took answers 200 with the empty STEAK (BRC-22); the overlay is
+//! dropped. Otherwise it returns the entry for the host to admit — the plain
 //! event {kind: "submit", txid, txs, nodes, proofs, topics: [judgement],
 //! offChainValues?} in box `submit`, which engine.zig steps on (holding the
-//! records, recording the judgements, calling the lookup services' hooks) —
+//! records, broadcasting it unless mined, and only once ARC takes it
+//! recording the judgements and calling the lookup services' hooks, #57) —
 //! and `then`: a call of fn "submitted" the host makes once that entry is
-//! processed, which reads the STEAK from the state (each topic's `applied`
-//! record; a dupe's is empty).
+//! processed, which reads the answer from the state: the STEAK (each topic's
+//! `applied` record); 503 with Retry-After while ARC has not taken the
+//! transaction; 400 if ARC rejected it. A resubmission (judged before, or
+//! awaiting ARC) appends nothing and gets the same `then`: its answer is
+//! the state's, so a client retrying after a 503 gets the STEAK once
+//! admitted.
 //!
 //! A lookup is a read: the service's program is called (fn "lookup", the
 //! lookup contract, lookup.zig) and its answer shaped for the wire; nothing
@@ -295,42 +300,49 @@ fn submit(a: Allocator, in: Value, req: Value) !Value {
     const topics = try served(a, requested, map);
     var wal = try load(a, in);
     // The BEEF decoded once into records in this call's overlay, verified, judged by the topics (#50).
-    // Refused, or a dupe everywhere: the call answers, no entry, the overlay is dropped — nothing persists.
+    // Refused, or nothing new: the call writes nothing, and the overlay is dropped — nothing persists.
     const routed = switch (try submit_mod.route(a, vm.caller(), &wal, in, body, topics, off)) {
         .refused => |why| return failure(a, 400, why),
-        // Valid but admitted nowhere, or a dupe everywhere: BRC-22's answer is 200 with an empty STEAK.
-        .nothing, .unchanged => {
+        // Valid but admitted nowhere: BRC-22's answer is 200 with an empty STEAK.
+        .nothing => {
             const entries = try a.alloc([3][]const u64, topics.len);
             for (entries) |*e| e.* = .{ &.{}, &.{}, &.{} };
             return respond(a, 200, "application/json", try jsonOf(a, Steak{ .topics = topics, .entries = entries }));
         },
+        // Resubmitted (#57): judged already, or held and awaiting ARC. Nothing new to admit; the answer is
+        // read from the state, as after the first submission's step: the STEAK once admitted, 503 while pending.
+        .unchanged, .pending => |txid| return answeredLater(a, in, txid, topics, null),
         .admit => |x| x,
     };
+    return answeredLater(a, in, routed.txid, topics, routed.event);
+}
+
+/// An answer a step computes: the entry to admit (if any), and `then`, a call of fn "submitted" the host
+/// makes once it is processed, which reads the answer from the state.
+fn answeredLater(a: Allocator, in: Value, txid: [32]u8, topics: []const []const u8, ev: ?Value) !Value {
     const names = try a.alloc(Value, topics.len);
     for (topics, names) |t, *n| n.* = .{ .text = t };
-    const dupes = try a.alloc(Value, routed.dupes.len);
-    for (routed.dupes, dupes) |t, *n| n.* = .{ .text = t };
-    const ev = routed.event;
     const self = (in.get("programs") orelse return error.BadInput).getCid("overlay") orelse return error.NoOverlayProgram;
     const then_arg = try cbor.encode(a, .{ .map = try a.dupe(cbor.Entry, &.{
-        .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &w.header.toHex(routed.txid)) } },
+        .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &w.header.toHex(txid)) } },
         .{ .key = "topics", .value = .{ .array = names } },
-        .{ .key = "dupes", .value = .{ .array = dupes } },
     }) });
-    return .{ .map = try a.dupe(cbor.Entry, &.{
+    var es: std.ArrayList(cbor.Entry) = .empty;
+    try es.appendSlice(a, &.{
         .{ .key = "status", .value = .{ .uint = 202 } },
         .{ .key = "type", .value = .{ .text = "application/json" } },
         .{ .key = "body", .value = .{ .bytes = "{}" } },
-        .{ .key = "admit", .value = .{ .array = try a.dupe(Value, &.{.{ .map = try a.dupe(cbor.Entry, &.{
-            .{ .key = "event", .value = ev },
-            .{ .key = "box", .value = .{ .text = "submit" } },
-        }) }}) } },
         .{ .key = "then", .value = .{ .map = try a.dupe(cbor.Entry, &.{
             .{ .key = "program", .value = .{ .cid = self } },
             .{ .key = "fn", .value = .{ .text = "submitted" } },
             .{ .key = "arg", .value = .{ .bytes = then_arg } },
         }) } },
-    }) };
+    });
+    if (ev) |e| try es.append(a, .{ .key = "admit", .value = .{ .array = try a.dupe(Value, &.{.{ .map = try a.dupe(cbor.Entry, &.{
+        .{ .key = "event", .value = e },
+        .{ .key = "box", .value = .{ .text = "submit" } },
+    }) }}) } });
+    return .{ .map = es.items };
 }
 
 /// The same submit, arriving as a GossipSub message on a `libp2p:<topic>` route (#57): the message's
@@ -350,6 +362,7 @@ fn gossip(a: Allocator, in: Value, req: Value) !Value {
         .refused => |why| return verdictOf(a, "ignore", why),
         .nothing => |why| return verdictOf(a, "ignore", why),
         .unchanged => return verdictOf(a, "ignore", "already judged"),
+        .pending => return verdictOf(a, "ignore", "already submitted: awaiting its broadcast"),
         .admit => |x| x,
     };
     return .{ .map = try a.dupe(cbor.Entry, &.{
@@ -368,21 +381,34 @@ fn verdictOf(a: Allocator, v: []const u8, reason: []const u8) !Value {
     }) };
 }
 
-/// After the submit entry is processed: the STEAK from each topic's `applied` record (a dupe, or a topic that admitted nothing: empty).
+/// After the submit entry is processed (#57): ARC has not taken the transaction yet → 503 with
+/// Retry-After (nothing admitted; the client resubmits); ARC rejected it → 400 {status: "error",
+/// message}; otherwise the STEAK from each topic's `applied` record (this submission's judgement or an
+/// earlier one's: a resubmission answers what was admitted; a topic that took nothing, or admitted
+/// nothing: empty). A STEAK only ever names outputs of a transaction ARC took, or a mined one.
 fn submitted(a: Allocator, in: Value, arg: Value) !Value {
     var wal = try load(a, in);
     const txid = try w.header.fromHex(arg.getText("txid") orelse return error.BadInput);
+    if (try submit_mod.isPending(&wal, txid)) {
+        const retry = (try submit_mod.Gate.of(in)).retryAfter();
+        return .{ .map = try a.dupe(cbor.Entry, &.{
+            .{ .key = "status", .value = .{ .uint = 503 } },
+            .{ .key = "type", .value = .{ .text = "application/json" } },
+            .{ .key = "headers", .value = .{ .map = try a.dupe(cbor.Entry, &.{.{ .key = "retry-after", .value = .{ .text = try std.fmt.allocPrint(a, "{d}", .{retry}) } }}) } },
+            .{ .key = "body", .value = .{ .bytes = try jsonOf(a, .{ .status = "error", .message = "Not yet accepted by the broadcaster: nothing is admitted until it is. Resubmit after Retry-After seconds." }) } },
+        }) };
+    }
+    if (try wal.settlement(txid)) |rec| {
+        // Rejected (ARC's answer, a status, a double spend): nothing admitted. Only a first submission's
+        // `then` gets here; resubmitting a rejected transaction is answered in the call (200, the empty STEAK).
+        return failure(a, 400, try std.fmt.allocPrint(a, "Transaction rejected: {s}", .{rec.getText("reason") orelse "rejected"}));
+    }
     const topics_v = arg.getArray("topics") orelse return error.BadInput;
-    const dupes = arg.getArray("dupes") orelse &.{};
     const topics = try a.alloc([]const u8, topics_v.len);
     const entries = try a.alloc([3][]const u64, topics_v.len);
     for (topics_v, topics, entries) |tv, *t, *e| {
         t.* = if (tv == .text) tv.text else return error.BadInput;
         e.* = .{ &.{}, &.{}, &.{} };
-        const dupe = for (dupes) |d| {
-            if (d == .text and eql(u8, d.text, t.*)) break true;
-        } else false;
-        if (dupe) continue;
         const key = try std.mem.concat(a, u8, &.{ try w.overlay.topicPrefix(a, t.*), &txid });
         const rec_cid = (try wal.map("applied").link(key)) orelse continue;
         const rec = try vm.store().getValue(a, rec_cid);

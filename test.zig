@@ -7,6 +7,13 @@
 //! decoded blocks, the judgement and the service's map; ls_demo answers from
 //! its own map (by topic, by script hash, by outpoint) with BEEF that
 //! verifies; a spend reaches it through `spent`, a rejection through `rejected`.
+//! The broadcast gate (#57), against a fake Arcade behind the step's `http`:
+//! admitted only once ARC takes the transaction (then proven by its awaiting
+//! thread's MINED status); ARC's 400 rejects it, nothing admitted; ARC's 503
+//! leaves it pending (a resubmission adds nothing) until a deadline's re-ask
+//! posts it again and it is admitted; a DOUBLE_SPEND_ATTEMPTED after
+//! admission unwinds it; a pending one never taken is abandoned; a mined one
+//! is admitted with no POST.
 const std = @import("std");
 const w = @import("wallet");
 const topic = @import("src/topic.zig");
@@ -93,6 +100,52 @@ const Overlay = struct {
     }
 };
 
+/// Arcade behind the host's broadcast route (#57, #58), as the step's `http`
+/// sees it: POST /v1/tx (202 RECEIVED, a duplicate's current status; 400 in
+/// mode `reject`; 503 + Retry-After in mode `busy`), GET /v1/tx/<txid> (its
+/// status, or 404 for a transaction it never took).
+const FakeArc = struct {
+    const base = "http://arc.test/arc";
+    mode: enum { ok, reject, busy } = .ok,
+    /// txid (hex) → its txStatus, for the transactions it took.
+    known: std.StringHashMapUnmanaged([]const u8) = .empty,
+    posts: usize = 0,
+    gets: usize = 0,
+    a: Allocator,
+
+    fn reply(a: Allocator, status: u64, v: anytype) !submit.Http.Reply {
+        var out: std.Io.Writer.Allocating = .init(a);
+        try std.json.Stringify.value(v, .{}, &out.writer);
+        return .{ .status = status, .body = out.written() };
+    }
+
+    fn call(ctx: *anyopaque, a: Allocator, method: []const u8, url: []const u8, body: ?[]const u8) anyerror!submit.Http.Reply {
+        const self: *FakeArc = @ptrCast(@alignCast(ctx));
+        if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, url, base ++ "/v1/tx")) {
+            self.posts += 1;
+            // Arcade's own parse of what it receives: not the overlay's (#50 counts the overlay's parses).
+            const parses = beef.parses;
+            defer beef.parses = parses;
+            const txid = hdr.toHex((try beef.parse(a, body.?)).subject().?);
+            switch (self.mode) {
+                .busy => return reply(a, 503, .{ .status = 503, .title = "Service Unavailable", .detail = "backpressure" }),
+                .reject => return reply(a, 400, .{ .status = 400, .txid = &txid, .reason = "rejected by the test" }),
+                .ok => {},
+            }
+            if (self.known.get(&txid)) |st| return reply(a, 202, .{ .txid = &txid, .status = 202, .txStatus = st });
+            try self.known.put(self.a, try self.a.dupe(u8, &txid), "RECEIVED");
+            return reply(a, 202, .{ .txid = &txid, .status = 202, .txStatus = "RECEIVED" });
+        }
+        if (std.mem.eql(u8, method, "GET") and std.mem.startsWith(u8, url, base ++ "/v1/tx/")) {
+            self.gets += 1;
+            const txid = url[base.len + "/v1/tx/".len ..];
+            const st = self.known.get(txid) orelse return reply(a, 404, .{ .status = 404, .title = "Not Found" });
+            return reply(a, 200, .{ .txid = txid, .txStatus = st });
+        }
+        return reply(a, 404, .{ .status = 404, .title = "Not Found" });
+    }
+};
+
 /// An instance, natively: the store, the heads `wallet` and `ls:ls_demo`, the
 /// genesis config, and the programs behind the `call`s.
 const Instance = struct {
@@ -108,6 +161,9 @@ const Instance = struct {
     lookup_prog: []const u8,
     /// Calls made, by fn.
     calls: std.StringHashMapUnmanaged(usize) = .empty,
+    arc: *FakeArc,
+    /// The last submit entry stepped: what its awaiting thread began with.
+    last_event: Value = .null,
 
     fn init(a: Allocator, ms: *w.store.MemStore) !Instance {
         const tp = try a.dupe(u8, &cbor.cidOf("topic-demo"));
@@ -115,6 +171,8 @@ const Instance = struct {
         const in: Value = .{ .map = try a.dupe(cbor.Entry, &.{
             .{ .key = "defaults", .value = .{ .map = try a.dupe(cbor.Entry, &.{
                 .{ .key = "walletNetwork", .value = .{ .text = "regtest" } },
+                .{ .key = "walletArc", .value = .{ .text = FakeArc.base } },
+                .{ .key = "walletAbandonMs", .value = .{ .text = "100000" } },
                 .{ .key = "overlayTopics", .value = .{ .text = "{\"tm_demo\":\"topic-demo\"}" } },
                 .{ .key = "overlayLookups", .value = .{ .text = "{\"ls_demo\":{\"program\":\"lookup-demo\",\"topics\":[\"tm_demo\"]}}" } },
             }) } },
@@ -123,7 +181,13 @@ const Instance = struct {
                 .{ .key = "topic-demo", .value = .{ .cid = tp } },
             }) } },
         }) };
-        return .{ .a = a, .ms = ms, .current = ms.store(), .in = in, .topic_prog = tp, .lookup_prog = lp };
+        const arc = try a.create(FakeArc);
+        arc.* = .{ .a = a };
+        return .{ .a = a, .ms = ms, .current = ms.store(), .in = in, .topic_prog = tp, .lookup_prog = lp, .arc = arc };
+    }
+
+    fn http(self: *Instance) submit.Http {
+        return .{ .ctx = self.arc, .callFn = FakeArc.call };
     }
 
     fn callImpl(ctx: *anyopaque, a: Allocator, program: []const u8, func: []const u8, arg: Value) anyerror!Value {
@@ -166,14 +230,37 @@ const Instance = struct {
         return submit.route(self.a, self.caller(), &wal, self.in, bytes, &.{"tm_demo"}, null);
     }
 
-    /// The engine stepped on the admitted entry.
+    /// The engine stepped on the admitted entry: held, broadcast unless mined, admitted once ARC takes it.
     fn step(self: *Instance, ev: Value) !submit.Stepped {
+        self.current = self.ms.store();
+        self.last_event = ev;
+        var wal = try w.wallet.Wallet.load(self.a, self.ms.store(), self.wallet, .regtest);
+        wal.now = self.now;
+        const done = try submit.step(self.a, self.caller(), self.http(), &wal, self.in, ev);
+        try w.overlay.hookRejected(self.a, self.caller(), self.in, wal.unapplied.items);
+        self.wallet = try wal.save();
+        return done;
+    }
+
+    /// The submission's awaiting thread stepped again: an entry for its transaction, or its deadline.
+    fn wake(self: *Instance, ev: Value, wk: submit.Wake) !submit.Stepped {
         self.current = self.ms.store();
         var wal = try w.wallet.Wallet.load(self.a, self.ms.store(), self.wallet, .regtest);
         wal.now = self.now;
-        const done = try submit.step(self.a, self.caller(), &wal, self.in, ev);
+        const done = try submit.awaited(self.a, self.caller(), self.http(), &wal, self.in, ev, wk);
+        try w.overlay.hookRejected(self.a, self.caller(), self.in, wal.unapplied.items);
         self.wallet = try wal.save();
         return done;
+    }
+
+    /// The `then` call's view: whether the transaction awaits ARC with nothing admitted, and its status.
+    fn pending(self: *Instance, txid: [32]u8) !bool {
+        var wal = try w.wallet.Wallet.load(self.a, self.ms.store(), self.wallet, .regtest);
+        return submit.isPending(&wal, txid);
+    }
+    fn settled(self: *Instance, txid: [32]u8) !w.wallet.Status {
+        var wal = try w.wallet.Wallet.load(self.a, self.ms.store(), self.wallet, .regtest);
+        return wal.status(txid);
     }
 
     /// Route then step, as the host does for an admitted submit.
@@ -411,6 +498,203 @@ test "the submission flow: parse once, persist only on admission, a lookup servi
         try std.testing.expectEqual(@as(usize, 2), inst.count("spent"));
         try std.testing.expectEqual(@as(usize, 0), (try inst.look(&.{.{ .key = "topic", .value = .{ .text = "tm_demo" } }})).len);
         try std.testing.expectEqual(@as(usize, 1), (try inst.look(&.{ .{ .key = "topic", .value = .{ .text = "tm_demo" } }, .{ .key = "includeSpent", .value = .{ .boolean = true } } })).len);
+    }
+}
+
+/// A status entry's record, as the host admits Arcade's (feeds.ts statusOf).
+fn statusEntry(a: Allocator, tx_status: []const u8, path: ?[]const u8) !Value {
+    var es: std.ArrayList(cbor.Entry) = .empty;
+    try es.appendSlice(a, &.{
+        .{ .key = "kind", .value = .{ .text = "status" } },
+        .{ .key = "txStatus", .value = .{ .text = tx_status } },
+    });
+    if (path) |p| try es.append(a, .{ .key = "merklePath", .value = .{ .bytes = p } });
+    return .{ .map = es.items };
+}
+
+test "the broadcast gate (#57): admitted only once ARC takes it; rejected, pending, mined; settled by the awaiting thread" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = w.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var inst = try Instance.init(a, &ms);
+
+    const priv: [32]u8 = .{0x42} ** 32;
+    const pub_key = try w.brc29.identityKey(priv);
+    const pkh = bsvz.crypto.hash.hash160(&pub_key).bytes;
+    const p2pkh = w.brc29.p2pkh(pub_key);
+    const token: [34]u8 = demo.tag.* ++ [_]u8{ 0x76, 0xa9, 0x14 } ++ pkh ++ [_]u8{ 0x88, 0xac };
+
+    // A funding transaction with four outputs, mined alone at height 1.
+    var fund_raw: std.ArrayList(u8) = .empty;
+    try fund_raw.appendSlice(a, &.{ 1, 0, 0, 0, 1 });
+    try fund_raw.appendSlice(a, &(.{0x22} ** 32));
+    try fund_raw.appendSlice(a, &.{ 0, 0, 0, 0, 1, 0x51, 0xff, 0xff, 0xff, 0xff, 4 });
+    for ([_]u64{ 10_000, 10_000, 10_000, 10_000 }) |v| {
+        var sats: [8]u8 = undefined;
+        std.mem.writeInt(u64, &sats, v, .little);
+        try fund_raw.appendSlice(a, &sats);
+        try fund_raw.append(a, p2pkh.len);
+        try fund_raw.appendSlice(a, &p2pkh);
+    }
+    try fund_raw.appendSlice(a, &.{ 0, 0, 0, 0 });
+    const fund_tx = try bsvz.transaction.Transaction.parse(a, fund_raw.items);
+    const fund_txid = beef.txidOf(fund_raw.items);
+    const h1 = mine(hdr.hash(&w.chain.Network.regtest.genesis()), fund_txid, 1_700_000_600);
+    try inst.headers(&.{&h1});
+    const bumps = try a.dupe(bsvz.spv.MerklePath, &.{try bsvz.spv.MerklePath.parse(a, try soloPath(a, 1, fund_txid))});
+    const fund_entry: beef.Entry = .{ .txid = fund_txid, .format = .raw_with_bump, .bump = 0, .raw = fund_raw.items, .tx = fund_tx };
+    const withFund = struct {
+        fn of(al: Allocator, bs: []bsvz.spv.MerklePath, fe: beef.Entry, t: Spent) ![]const u8 {
+            return beef.serialize(al, .{ .version = beef.V2, .bumps = bs, .entries = try al.dupe(beef.Entry, &.{ fe, .{ .txid = t.txid, .format = .raw, .raw = t.raw, .tx = t.tx } }) });
+        }
+    }.of;
+    const look = struct {
+        fn topic(i: *Instance) !usize {
+            return (try i.look(&.{.{ .key = "topic", .value = .{ .text = "tm_demo" } }})).len;
+        }
+    }.topic;
+
+    // ------------------------------------------------ (a) unproven: posted, 202 → admitted; SEEN, then MINED with its path → proven
+    const ta = try spend(a, &fund_tx, 0, &.{.{ 1, &token }}, priv);
+    const h2 = mine(hdr.hash(&h1), ta.txid, 1_700_001_200);
+    {
+        const done = try inst.submitted(try withFund(a, bumps, fund_entry, ta));
+        try std.testing.expectEqual(@as(usize, 1), inst.arc.posts);
+        try std.testing.expectEqual(submit.Gated.accepted, done.gate);
+        try std.testing.expectEqualStrings("RECEIVED", done.arc.?.tx_status);
+        try std.testing.expect(done.admitted);
+        try std.testing.expectEqualSlices(u32, &.{0}, done.applied[0].outputs_to_admit);
+        try std.testing.expectEqual(w.wallet.Wallet.Outcome.pending, done.outcome); // the thread awaits
+        try std.testing.expectEqual(@as(usize, 1), inst.count("admitted"));
+        try std.testing.expectEqual(@as(usize, 1), try look(&inst));
+        try std.testing.expect(!(try inst.pending(ta.txid)));
+        // The broadcast record: the route, ARC's status, since.
+        var wal = try w.wallet.Wallet.load(a, ms.store(), inst.wallet, .regtest);
+        const rec = (try wal.awaitingRecord(ta.txid)).?;
+        try std.testing.expectEqualStrings(FakeArc.base, rec.getText("arc").?);
+        try std.testing.expectEqualStrings("RECEIVED", rec.getText("txStatus").?);
+        try std.testing.expectEqualStrings("admitted", rec.getText("submission").?);
+        try std.testing.expectEqual(@as(u64, 1000), rec.getUint("since").?);
+        // A resubmission is a dupe (nothing new: not pending, applied).
+        try std.testing.expect((try inst.route(try withFund(a, bumps, fund_entry, ta))) == .unchanged);
+
+        const seen = try inst.wake(inst.last_event, .{ .event = try statusEntry(a, "SEEN_ON_NETWORK", null) });
+        try std.testing.expectEqual(w.wallet.Wallet.Outcome.pending, seen.outcome);
+        try std.testing.expect(!seen.admitted);
+        try inst.headers(&.{&h2});
+        const mined = try inst.wake(inst.last_event, .{ .event = try statusEntry(a, "MINED", try soloPath(a, 2, ta.txid)) });
+        try std.testing.expectEqual(w.wallet.Wallet.Outcome.proven, mined.outcome);
+        try std.testing.expectEqual(w.wallet.Status.proven, try inst.settled(ta.txid));
+        wal = try w.wallet.Wallet.load(a, ms.store(), inst.wallet, .regtest);
+        try std.testing.expect((try wal.awaitingRecord(ta.txid)) == null);
+    }
+
+    // ------------------------------------------------ (b) ARC's 400: rejected, nothing admitted, no hook
+    {
+        const tb = try spend(a, &fund_tx, 1, &.{.{ 1, &token }}, priv);
+        inst.arc.mode = .reject;
+        defer inst.arc.mode = .ok;
+        const admitted = inst.count("admitted");
+        const done = try inst.submitted(try withFund(a, bumps, fund_entry, tb));
+        try std.testing.expectEqual(submit.Gated.rejected, done.gate);
+        try std.testing.expectEqual(@as(u64, 400), done.arc.?.http_status);
+        try std.testing.expectEqualStrings("rejected by the test", done.arc.?.extra);
+        try std.testing.expect(!done.admitted);
+        try std.testing.expectEqual(admitted, inst.count("admitted"));
+        try std.testing.expectEqual(w.wallet.Status.rejected, try inst.settled(tb.txid));
+        var wal = try w.wallet.Wallet.load(a, ms.store(), inst.wallet, .regtest);
+        try std.testing.expect(!(try w.overlay.isApplied(&wal, "tm_demo", tb.txid)));
+        try std.testing.expectEqualStrings("REJECTED", (try wal.settlement(tb.txid)).?.getText("reason").?);
+        try std.testing.expectEqual(@as(usize, 1), try look(&inst));
+        // Resubmitted: a known-rejected transaction admits nothing (200, the empty STEAK).
+        try std.testing.expectEqualStrings("TransactionRejected", (try inst.route(try withFund(a, bumps, fund_entry, tb))).nothing);
+    }
+
+    // ------------------------------------------------ (c) ARC's 503: pending, nothing admitted; a resubmission adds nothing;
+    // the deadline re-asks (404: never taken) and posts again: accepted → admitted
+    {
+        const tc = try spend(a, &fund_tx, 2, &.{.{ 1, &token }}, priv);
+        inst.arc.mode = .busy;
+        inst.now = 2000;
+        const admitted = inst.count("admitted");
+        const done = try inst.submitted(try withFund(a, bumps, fund_entry, tc));
+        try std.testing.expectEqual(submit.Gated.pending, done.gate);
+        try std.testing.expectEqual(@as(u64, 503), done.arc.?.http_status);
+        try std.testing.expectEqual(w.wallet.Wallet.Outcome.pending, done.outcome);
+        try std.testing.expect(!done.admitted);
+        try std.testing.expectEqual(admitted, inst.count("admitted"));
+        try std.testing.expect(try inst.pending(tc.txid));
+        const ev = inst.last_event;
+        const r = try inst.route(try withFund(a, bumps, fund_entry, tc));
+        try std.testing.expectEqualSlices(u8, &tc.txid, &r.pending);
+        // Still busy at the first deadline: asked (404), posted again (503): pending still.
+        inst.now = 2000 + 30_000;
+        const posts = inst.arc.posts;
+        const again = try inst.wake(ev, .deadline);
+        try std.testing.expectEqual(submit.Gated.pending, again.gate);
+        try std.testing.expectEqual(posts + 1, inst.arc.posts);
+        try std.testing.expectEqual(@as(usize, 1), inst.arc.gets);
+        // Arcade takes it at the next deadline: admitted then.
+        inst.arc.mode = .ok;
+        inst.now = 2000 + 60_000;
+        const ok = try inst.wake(ev, .deadline);
+        try std.testing.expectEqual(submit.Gated.accepted, ok.gate);
+        try std.testing.expectEqual(@as(u64, 202), ok.arc.?.http_status);
+        try std.testing.expect(ok.admitted);
+        try std.testing.expectEqual(w.wallet.Wallet.Outcome.pending, ok.outcome);
+        try std.testing.expectEqual(admitted + 1, inst.count("admitted"));
+        try std.testing.expect(!(try inst.pending(tc.txid)));
+        try std.testing.expectEqual(@as(usize, 2), try look(&inst));
+        // The broadcast record's clock is the first attempt's.
+        var wal = try w.wallet.Wallet.load(a, ms.store(), inst.wallet, .regtest);
+        try std.testing.expectEqual(@as(u64, 2000), (try wal.awaitingRecord(tc.txid)).?.getUint("since").?);
+
+        // (e) DOUBLE_SPEND_ATTEMPTED after admission: the admittance and the lookup's index unwound.
+        const rejected = inst.count("rejected");
+        const ds = try inst.wake(ev, .{ .event = try statusEntry(a, "DOUBLE_SPEND_ATTEMPTED", null) });
+        try std.testing.expectEqual(w.wallet.Wallet.Outcome.rejected, ds.outcome);
+        try std.testing.expectEqual(rejected + 1, inst.count("rejected"));
+        try std.testing.expectEqual(@as(usize, 1), try look(&inst));
+        wal = try w.wallet.Wallet.load(a, ms.store(), inst.wallet, .regtest);
+        try std.testing.expect(!(try w.overlay.isApplied(&wal, "tm_demo", tc.txid)));
+        try std.testing.expectEqual(@as(usize, 1), (try w.overlay.inTopic(&wal, "tm_demo", true)).len); // ta's token alone
+    }
+
+    // ------------------------------------------------ a pending submission never taken is abandoned at its deadline (walletAbandonMs)
+    {
+        const tp = try spend(a, &fund_tx, 3, &.{.{ 1, &token }}, priv);
+        inst.arc.mode = .busy;
+        defer inst.arc.mode = .ok;
+        inst.now = 200_000;
+        _ = try inst.submitted(try withFund(a, bumps, fund_entry, tp));
+        const ev = inst.last_event;
+        inst.now = 200_000 + 100_000;
+        const gets = inst.arc.gets;
+        const gone = try inst.wake(ev, .deadline);
+        try std.testing.expectEqual(w.wallet.Wallet.Outcome.rejected, gone.outcome);
+        try std.testing.expectEqual(gets, inst.arc.gets); // not asked: given up
+        var wal = try w.wallet.Wallet.load(a, ms.store(), inst.wallet, .regtest);
+        try std.testing.expectEqualStrings("abandoned", (try wal.settlement(tp.txid)).?.getText("reason").?);
+        try std.testing.expect(!(try inst.pending(tp.txid)));
+    }
+
+    // ------------------------------------------------ (d) mined: the BEEF proves the subject; admitted with no POST
+    {
+        // (ta is proven in block 2: its token spent on, in a transaction mined alone at 3.)
+        const td = try spend(a, &ta.tx, 0, &.{.{ 1, &token }}, priv);
+        const h3 = mine(hdr.hash(&h2), td.txid, 1_700_001_800);
+        try inst.headers(&.{&h3});
+        const td_bumps = try a.dupe(bsvz.spv.MerklePath, &.{try bsvz.spv.MerklePath.parse(a, try soloPath(a, 3, td.txid))});
+        const bytes = try beef.serialize(a, .{ .version = beef.V2, .bumps = td_bumps, .entries = try a.dupe(beef.Entry, &.{.{ .txid = td.txid, .format = .raw_with_bump, .bump = 0, .raw = td.raw, .tx = td.tx }}) });
+        const posts = inst.arc.posts;
+        const done = try inst.submitted(bytes);
+        try std.testing.expectEqual(posts, inst.arc.posts);
+        try std.testing.expectEqual(submit.Gated.mined, done.gate);
+        try std.testing.expectEqual(w.wallet.Wallet.Outcome.proven, done.outcome);
+        try std.testing.expect(done.admitted);
+        try std.testing.expectEqualSlices(u32, &.{0}, done.applied[0].coins_to_retain);
     }
 }
 

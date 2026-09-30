@@ -12,11 +12,21 @@
 //!   nothing persists. Otherwise it returns the entry for the host to admit.
 //! - **The step** (`step`, the engine stepped on that entry). It holds the
 //!   decoded records the entry carries (overlay.holdDecoded: kept, so #42's
-//!   edges appear), records each topic's judgement (`applied`, the
-//!   admittances), and calls each listening lookup service's hooks
-//!   (`admitted`, then `spent` for each previous coin consumed) — all in the
-//!   one step. A judgement is taken again, in the step, only if the topic's
-//!   previous coins moved between the call and the step.
+//!   edges appear), then gates on broadcast (#57): a subject the entry
+//!   proves is mined and goes straight on; otherwise it is posted to the
+//!   host's broadcast route (#58) over the recorded `http` import. ARC takes
+//!   it: the broadcast record, then the admission — each topic's judgement
+//!   recorded (`applied`, the admittances) and each listening lookup
+//!   service's hooks called (`admitted`, then `spent` for each previous coin
+//!   consumed). ARC rejects it: the rejection (Wallet.reject), nothing
+//!   admitted. A transient failure: the broadcast record marked `pending`,
+//!   nothing admitted. A judgement is taken again, at admission, only if the
+//!   topic's previous coins moved since the call.
+//! - **The awaiting thread** (`awaited`). While the transaction is pending
+//!   or unproven the engine awaits its CID with a deadline: a `status` /
+//!   `proof` entry for it, or the deadline (ARC asked again), steps the same
+//!   thread, admitting it once ARC has it, then settling it (proven: done;
+//!   rejected: the admittances unwind through `admits`, #37).
 //!
 //! The entry (box `submit`) carries records, not a BEEF:
 //!
@@ -75,10 +85,12 @@ pub const Routed = union(enum) {
     refused: []const u8,
     /// A valid transaction no served topic admitted (BRC-22: 200 with an empty STEAK); the reasons, for the log.
     nothing: []const u8,
-    /// Every served topic judged it before (a dupe): nothing new.
-    unchanged,
-    /// The entry to admit, and the topics that were dupes.
-    admit: struct { event: Value, txid: [32]u8, dupes: []const []const u8 },
+    /// Every served topic judged it before (a dupe): nothing new; the answer is its judgements, from the state.
+    unchanged: [32]u8,
+    /// Held and awaiting ARC, nothing admitted yet (#57): a resubmission adds nothing; the answer is read from the state.
+    pending: [32]u8,
+    /// The entry to admit (the topics that were dupes are answered from their `applied` records).
+    admit: struct { event: Value, txid: [32]u8 },
 };
 
 /// The route's half (a call): decode once, verify, judge. `topics` are the
@@ -90,13 +102,14 @@ pub fn route(a: Allocator, caller: ov.Caller, wal: *Wallet, in: Value, beef: []c
         error.TransactionRejected => return .{ .nothing = @errorName(e) },
         else => return .{ .refused = @errorName(e) },
     };
+    if (try isPending(wal, c.subject.txid)) return .{ .pending = c.subject.txid };
     const served = try ov.configObject(a, in, "overlayTopics");
-    var dupes: std.ArrayList([]const u8) = .empty;
+    var dupes: usize = 0;
     var judged: std.ArrayList(Judged) = .empty;
     var why: std.ArrayList(u8) = .empty;
     for (topics) |t| {
         if (try ov.isApplied(wal, t, c.subject.txid)) {
-            try dupes.append(a, t);
+            dupes += 1;
             continue;
         }
         const previous = try ov.previousCoins(wal, t, c.subject.tx);
@@ -111,9 +124,10 @@ pub fn route(a: Allocator, caller: ov.Caller, wal: *Wallet, in: Value, beef: []c
         };
         if (ov.takes(previous, ins)) try judged.append(a, .{ .topic = t, .previous = previous, .ins = ins });
     }
-    if (dupes.items.len == topics.len) return .unchanged;
+    // Nothing new, but judged before by some topic: that judgement is the answer (from the state).
+    if (dupes == topics.len or (judged.items.len == 0 and dupes > 0)) return .{ .unchanged = c.subject.txid };
     if (judged.items.len == 0) return .{ .nothing = if (why.items.len > 0) why.items else "NotAdmitted: no topic admitted an output or consumed a previous coin" };
-    return .{ .admit = .{ .event = try event(a, c.decoded, judged.items, off), .txid = c.subject.txid, .dupes = dupes.items } };
+    return .{ .admit = .{ .event = try event(a, c.decoded, judged.items, off), .txid = c.subject.txid } };
 }
 
 /// The submit entry's event: the decoded records, the judgements, the off-chain values.
@@ -175,18 +189,253 @@ pub fn hold(wal: *Wallet, ev: Value) !ov.Subject {
     return ov.subjectOf(wal, try w.header.fromHex(ev.getText("txid") orelse return error.BadEvent));
 }
 
-/// What the step came to, per topic in the entry.
-pub const Stepped = struct {
-    subject: ov.Subject,
-    topics: []const []const u8,
-    applied: []const ov.Applied,
-    /// The records the judgements wrote (admittances, applied): the step keeps them.
-    records: []const []const u8,
+// ---------------------------------------------------------------- the step: broadcast, then admit (#57)
+
+/// The recorded `http` import as the gate sees it (vm.zig's, or a test's).
+pub const Http = struct {
+    ctx: *anyopaque,
+    callFn: *const fn (ctx: *anyopaque, a: Allocator, method: []const u8, url: []const u8, body: ?[]const u8) anyerror!Reply,
+
+    pub const Reply = struct { status: u64, body: []const u8 };
+
+    pub fn call(self: Http, a: Allocator, method: []const u8, url: []const u8, body: ?[]const u8) !Reply {
+        return self.callFn(self.ctx, a, method, url, body);
+    }
 };
 
-/// The step's half: hold the records, record each judgement, call the lookup services' hooks.
-pub fn step(a: Allocator, caller: ov.Caller, wal: *Wallet, in: Value, ev: Value) !Stepped {
+/// The broadcaster a submission goes through, from genesis `defaults`: the
+/// host's broadcast route (`walletArc`, #58: the router's /arc, which proxies
+/// to its Arcade — the route the chain core's wallet uses), how often a
+/// submission awaiting ARC is asked about again (`overlayRecheckMs`, default
+/// 30 000: a client told 503 retries on that scale), and when an unmined one
+/// is given up (`walletAbandonMs`, default 86 400 000: the chain core's rule).
+pub const Gate = struct {
+    arc: ?[]const u8,
+    recheck_ms: i64 = 30_000,
+    abandon_ms: i64 = 86_400_000,
+
+    pub fn of(in: Value) !Gate {
+        const d = in.get("defaults") orelse return .{ .arc = null };
+        return .{
+            .arc = d.getText("walletArc"),
+            .recheck_ms = std.fmt.parseInt(i64, d.getText("overlayRecheckMs") orelse "30000", 10) catch return error.BadConfig,
+            .abandon_ms = std.fmt.parseInt(i64, d.getText("walletAbandonMs") orelse "86400000", 10) catch return error.BadConfig,
+        };
+    }
+
+    /// The Retry-After a pending submission is answered with: the re-ask interval, in whole seconds (at least 1).
+    pub fn retryAfter(g: Gate) u64 {
+        return @intCast(@max(1, @divFloor(g.recheck_ms + 999, 1000)));
+    }
+};
+
+/// ARC's answer (the route passes Arcade's own): the HTTP status, its
+/// txStatus, a merkle path if mined, and its reason.
+pub const ArcAnswer = struct {
+    http_status: u64,
+    tx_status: []const u8 = "",
+    merkle_path: ?[]const u8 = null,
+    extra: []const u8 = "",
+
+    pub fn value(self: ArcAnswer, a: Allocator) !Value {
+        var es: std.ArrayList(cbor.Entry) = .empty;
+        try es.appendSlice(a, &.{
+            .{ .key = "status", .value = .{ .uint = self.http_status } },
+            .{ .key = "txStatus", .value = .{ .text = self.tx_status } },
+            .{ .key = "extraInfo", .value = .{ .text = self.extra } },
+        });
+        if (self.merkle_path) |p| try es.append(a, .{ .key = "merklePath", .value = .{ .bytes = p } });
+        return .{ .map = es.items };
+    }
+};
+
+/// Read ARC's JSON answer as the wallet program does: txStatus, merklePath
+/// (hex), and extraInfo (else Arcade's reason / detail / title).
+pub fn arcAnswer(a: Allocator, reply: Http.Reply) !ArcAnswer {
+    var ans = ArcAnswer{ .http_status = reply.status };
+    const j = std.json.parseFromSliceLeaky(std.json.Value, a, reply.body, .{}) catch return ans;
+    if (j != .object) return ans;
+    if (j.object.get("txStatus")) |t| if (t == .string) {
+        ans.tx_status = t.string;
+    };
+    for ([_][]const u8{ "extraInfo", "reason", "detail", "title" }) |k| if (j.object.get(k)) |t| if (t == .string and t.string.len > 0) {
+        ans.extra = t.string;
+        break;
+    };
+    if (j.object.get("merklePath")) |t| if (t == .string and t.string.len > 0) {
+        const p = try a.alloc(u8, t.string.len / 2);
+        _ = std.fmt.hexToBytes(p, t.string) catch return error.BadHttpResponse;
+        ans.merkle_path = p;
+    };
+    return ans;
+}
+
+/// What ARC's answer says about a submission: **accepted** (a 2xx whose
+/// txStatus is not a rejection — RECEIVED, a duplicate's SEEN or MINED);
+/// **rejected** (a 4xx, or REJECTED / DOUBLE_SPEND_ATTEMPTED / INVALID /
+/// MALFORMED); **transient** (anything else: a 503 for backpressure, or the
+/// route's 503 for an Arcade it cannot reach).
+pub const Verdict = enum { accepted, rejected, transient };
+
+pub fn verdictOf(ans: ArcAnswer) Verdict {
+    if (Wallet.isRejection(ans.tx_status)) return .rejected;
+    if (ans.http_status >= 200 and ans.http_status < 300) return .accepted;
+    if (ans.http_status >= 400 and ans.http_status < 500) return .rejected;
+    return .transient;
+}
+
+/// How the broadcast gate went: `mined` (the entry carried the subject's
+/// proof: no broadcast), `accepted`, `rejected`, `pending` (ARC has not
+/// taken it yet: nothing admitted, the thread awaits and asks again).
+pub const Gated = enum { mined, accepted, rejected, pending };
+
+/// What a submit step (or a step of its awaiting thread) came to.
+pub const Stepped = struct {
+    subject: ov.Subject,
+    /// The entry's topics, and each one's judgement as recorded: set when this step admitted it.
+    topics: []const []const u8 = &.{},
+    applied: []const ov.Applied = &.{},
+    /// Whether this step admitted the submission (recorded its judgements, called the hooks).
+    admitted: bool = false,
+    gate: Gated,
+    /// ARC's answer, when this step asked.
+    arc: ?ArcAnswer = null,
+    /// The transaction's settlement now: its thread awaits it while pending.
+    outcome: Wallet.Outcome,
+    /// The records the judgements wrote (admittances, applied): the step keeps them.
+    records: []const []const u8 = &.{},
+};
+
+/// The step's half, on the `submit` entry (#57): hold the records; unless
+/// the subject is mined, broadcast it through the host's route and admit it
+/// only once ARC takes it. The engine then awaits the transaction's CID
+/// with a deadline while the outcome is pending.
+pub fn step(a: Allocator, caller: ov.Caller, http: Http, wal: *Wallet, in: Value, ev: Value) !Stepped {
     const sub = try hold(wal, ev);
+    var out = Stepped{ .subject = sub, .gate = .mined, .outcome = .pending };
+    switch (try wal.status(sub.txid)) {
+        // Mined: the entry carried its proof; nothing to broadcast.
+        .proven => {
+            out.outcome = .proven;
+            try admit(a, caller, wal, in, ev, &out);
+            return out;
+        },
+        // Rejected between the call and the step (a status, a competing proof): nothing admitted.
+        .rejected => {
+            out.gate = .rejected;
+            out.outcome = .rejected;
+            return out;
+        },
+        .unproven => {},
+    }
+    const arc = (try Gate.of(in)).arc orelse return error.NoBroadcaster;
+    const beef = (try wal.beefOf(sub.txid)) orelse return error.UnknownTransaction;
+    const ans = try arcAnswer(a, try http.call(a, "POST", try std.fmt.allocPrint(a, "{s}/v1/tx", .{arc}), beef));
+    try gated(a, caller, wal, in, ev, arc, ans, &out);
+    return out;
+}
+
+/// ARC's word on a submission not yet admitted (its answer to the POST or to
+/// a re-ask, or a status entry): accepted → the broadcast record, the status
+/// applied, the judgements admitted; rejected → the rejection (#37's walk:
+/// the transaction and whatever depends on it), nothing admitted; transient
+/// → the broadcast record with `submission: "pending"`, nothing admitted.
+fn gated(a: Allocator, caller: ov.Caller, wal: *Wallet, in: Value, ev: Value, arc: []const u8, ans: ArcAnswer, out: *Stepped) !void {
+    const txid = out.subject.txid;
+    out.arc = ans;
+    switch (verdictOf(ans)) {
+        .accepted => {
+            out.gate = .accepted;
+            try wal.noteSubmission(txid, arc, ans.tx_status, "admitted");
+            out.outcome = try wal.applyStatus(txid, ans.tx_status, ans.merkle_path);
+            if (out.outcome != .rejected) try admit(a, caller, wal, in, ev, out);
+        },
+        .rejected => {
+            out.gate = .rejected;
+            _ = try wal.reject(txid, if (ans.tx_status.len > 0) ans.tx_status else "REJECTED");
+            out.outcome = .rejected;
+        },
+        .transient => {
+            out.gate = .pending;
+            try wal.noteSubmission(txid, arc, ans.tx_status, "pending");
+            out.outcome = .pending;
+        },
+    }
+}
+
+/// Whether a submission is held and awaiting ARC with nothing admitted yet: its broadcast record says `pending`.
+pub fn isPending(wal: *Wallet, txid: [32]u8) !bool {
+    const r = (try wal.awaitingRecord(txid)) orelse return false;
+    return std.mem.eql(u8, r.getText("submission") orelse "", "pending");
+}
+
+/// What steps a submission's awaiting thread: a `status` / `proof` entry for its transaction, or its deadline.
+pub const Wake = union(enum) { event: Value, deadline };
+
+/// A step of the submission's awaiting thread (as the wallet's
+/// awaiting-callback thread, docs/WALLET.md); `ev` is the submit entry the
+/// thread began with. **Not yet admitted:** a status entry is ARC's word on
+/// it (a rejection rejects; anything else means ARC has it, and it is
+/// admitted); at the deadline it is abandoned if due, else ARC is asked
+/// again (a 404 — ARC never took it — posts it again). **Admitted:** the
+/// status is applied (a merkle path proves it; a rejection unwinds the
+/// admittances through `admits`); at the deadline ARC is asked again.
+pub fn awaited(a: Allocator, caller: ov.Caller, http: Http, wal: *Wallet, in: Value, ev: Value, wake: Wake) !Stepped {
+    const sub = try ov.subjectOf(wal, try w.header.fromHex(ev.getText("txid") orelse return error.BadEvent));
+    const txid = sub.txid;
+    const pending = try isPending(wal, txid);
+    var out = Stepped{ .subject = sub, .gate = if (pending) .pending else .accepted, .outcome = .pending };
+    switch (wake) {
+        .event => |e| {
+            const kind = e.getText("kind") orelse return error.BadEvent;
+            const ans: ArcAnswer = if (std.mem.eql(u8, kind, "proof"))
+                .{ .http_status = 200, .tx_status = "MINED", .merkle_path = e.getBytes("path") orelse return error.BadEvent }
+            else if (std.mem.eql(u8, kind, "status"))
+                .{ .http_status = 200, .tx_status = e.getText("txStatus") orelse "", .merkle_path = e.getBytes("merklePath") }
+            else
+                return error.BadEvent;
+            if (pending) {
+                const arc = ((try wal.awaitingRecord(txid)) orelse return error.BadRecord).getText("arc") orelse return error.BadRecord;
+                try gated(a, caller, wal, in, ev, arc, ans, &out);
+                out.arc = null; // an entry, not an answer to this step's call
+            } else out.outcome = try wal.applyStatus(txid, ans.tx_status, ans.merkle_path);
+        },
+        .deadline => {
+            const r = (try wal.awaitingRecord(txid)) orelse {
+                // Settled by another step (a proof on the chain feed, a rejection's walk): nothing to ask.
+                out.outcome = switch (try wal.status(txid)) {
+                    .proven => .proven,
+                    .rejected => .rejected,
+                    .unproven => .pending,
+                };
+                return out;
+            };
+            if (try wal.abandonIfDue(txid, (try Gate.of(in)).abandon_ms)) {
+                out.outcome = .rejected;
+                return out;
+            }
+            const arc = r.getText("arc") orelse return error.BadRecord;
+            var ans = try arcAnswer(a, try http.call(a, "GET", try std.fmt.allocPrint(a, "{s}/v1/tx/{s}", .{ arc, w.header.toHex(txid) }), null));
+            // 404: ARC never took it (the broadcast failed transiently, or it lost its history): post it again.
+            if (ans.http_status == 404) ans = try arcAnswer(a, try http.call(a, "POST", try std.fmt.allocPrint(a, "{s}/v1/tx", .{arc}), (try wal.beefOf(txid)) orelse return error.UnknownTransaction));
+            if (pending) {
+                try gated(a, caller, wal, in, ev, arc, ans, &out);
+            } else {
+                out.arc = ans;
+                out.outcome = try wal.applyStatus(txid, if (verdictOf(ans) == .rejected and ans.tx_status.len == 0) "REJECTED" else ans.tx_status, ans.merkle_path);
+            }
+        },
+    }
+    return out;
+}
+
+/// The admission: each topic's judgement the entry carries recorded
+/// (`applied`, the admittances), and the listening lookup services' hooks
+/// called (`admitted`, then `spent` for each previous coin consumed) — once
+/// ARC took the transaction, or it is mined. A judgement is taken again only
+/// if the topic's previous coins moved since the call.
+fn admit(a: Allocator, caller: ov.Caller, wal: *Wallet, in: Value, ev: Value, out: *Stepped) !void {
+    const sub = out.subject;
     const served = try ov.configObject(a, in, "overlayTopics");
     const js = ev.getArray("topics") orelse return error.BadEvent;
     const topics = try a.alloc([]const u8, js.len);
@@ -211,5 +460,8 @@ pub fn step(a: Allocator, caller: ov.Caller, wal: *Wallet, in: Value, ev: Value)
         try records.appendSlice(a, ap.records);
         try ov.hookAdmitted(a, caller, in, t.*, sub, previous, ap.*);
     }
-    return .{ .subject = sub, .topics = topics, .applied = applied, .records = records.items };
+    out.topics = topics;
+    out.applied = applied;
+    out.records = records.items;
+    out.admitted = true;
 }
