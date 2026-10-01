@@ -11,7 +11,7 @@
 //!                                                                                       to its key), the same
 //!
 //! The state is the instance's chain+settlement core: the record the head
-//! `wallet` names (wallet-zig: headers, transactions, proofs, settlement, and
+//! `wallet` names (the SDK's wallet library: headers, transactions, proofs, settlement, and
 //! the overlay's maps, overlay.zig), shared with a wallet in the same
 //! instance. Each lookup service keeps its own state under its own head
 //! (`ls:<service>`, lookup.zig). The topics and lookup services are genesis

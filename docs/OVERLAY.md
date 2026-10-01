@@ -27,27 +27,32 @@ storage are not ported.
 
 | where | what |
 |---|---|
-| `wallet-zig/src/overlay.zig` | The overlay's state in the chain and settlement core, and the submission's records: `decode` (the one BEEF parse), `verifyDecoded` (SPV over the records), `holdDecoded`, the previous coins, recording a topic's judgement (`apply`), the derived map, the hooks' dispatch (`Caller`, `listeners`, `hookAdmitted`, `hookRejected`), each output's BEEF for a lookup answer. |
-| `programs/overlay/src/engine.zig` → `overlay.wasm` | The engine: called, the front door's route handlers (`routes.zig`); stepped, the handler for the `submit` and `chain` entries. |
-| `programs/overlay/src/submit.zig` | A submission from the wire to the state: the route's half (decode, verify, judge — in the front door's step on the request), the step's half (hold, broadcast — an event, #65 — then record and call the hooks once the gate lets it through: the first of a status or the proof, #73), and the steps while it is pending (#57). |
-| `programs/overlay/src/routes.zig` | The route handlers (#40): the overlay-express wire contract, and the gossip's inbound routes (`peerAdmit`, `peerProof`, #74). |
-| `programs/overlay/src/gossip.zig` | The three gossip topics (#74): message shapes, what an admission and a proof publish, a peer's proof checked, the peer-admit records. |
-| `programs/overlay/src/topic.zig` | The topic contract (a library). |
-| `programs/overlay/src/lookup.zig` | The lookup contract (a library): hooks, own storage, answers. |
-| `programs/overlay/src/topic_demo.zig` → `topic-demo.wasm` | `tm_demo`, an example topic. |
-| `programs/overlay/src/lookup_demo.zig` → `lookup-demo.wasm` | `ls_demo`, an example lookup service with its own index. |
-| `kernel-zig/equiv/overlay.ts` | End to end, with the stock `@bsv/sdk` clients. It is part of `equiv/run.sh`. |
+| the SDK's `wallet/src/overlay.zig` (shruggr/skein-sdk) | The overlay's state in the chain and settlement core, and the submission's records: `decode` (the one BEEF parse), `verifyDecoded` (SPV over the records), `holdDecoded`, the previous coins, recording a topic's judgement (`apply`), the derived map, the hooks' dispatch (`Caller`, `listeners`, `hookAdmitted`, `hookRejected`), each output's BEEF for a lookup answer. |
+| `src/engine.zig` → `overlay.wasm` | The engine: called, the front door's route handlers (`routes.zig`); stepped, the handler for the `submit` and `chain` entries. |
+| `src/submit.zig` | A submission from the wire to the state: the route's half (decode, verify, judge — in the front door's step on the request), the step's half (hold, broadcast — an event, #65 — then record and call the hooks once the gate lets it through: the first of a status or the proof, #73), and the steps while it is pending (#57). |
+| `src/routes.zig` | The route handlers (#40): the overlay-express wire contract, and the gossip's inbound routes (`peerAdmit`, `peerProof`, #74). |
+| `src/gossip.zig` | The three gossip topics (#74): message shapes, what an admission and a proof publish, a peer's proof checked, the peer-admit records. |
+| `src/topic.zig` | The topic contract (a library). |
+| `src/lookup.zig` | The lookup contract (a library): hooks, own storage, answers. |
+| `src/topic_demo.zig` → `topic-demo.wasm` | `tm_demo`, an example topic. |
+| `src/lookup_demo.zig` → `lookup-demo.wasm` | `ls_demo`, an example lookup service with its own index. |
+| skein's `kernel-zig/equiv/overlay.ts` | End to end, with the stock `@bsv/sdk` clients, over this repo's `bin/` (cloned at a pinned commit, or `$SKEIN_OVERLAY_DIR`). It is part of skein's `equiv/run.sh`. |
 
-Build and test the programs from `programs/overlay`:
+Build and test the programs from this repo (Zig 0.16.0, `mise.toml`):
 
 ```
 zig build        # zig-out/bin/{overlay,topic-demo,lookup-demo}.wasm
+zig build bin    # the same, into bin/ (committed)
 zig build test   # the submission flow and the contracts, natively
 ```
 
-wallet-zig is a path dependency. Its library module is exported as `wallet`,
-and bsvz comes through it. The programs are not pinned. An instance takes
-them from its system tree's `bin/`.
+The SDK (shruggr/skein-sdk) is a URL+hash dependency in `build.zig.zon`. Its
+wallet library module is `wallet`, and bsvz comes through it. The programs
+are not pinned in skein. An instance takes them from its system tree's `bin/`
+(this repo's `bin/*.wasm`, committed).
+
+Paths below that are not this repo's (`docs/*.md`, `programs/frontdoor`,
+`src/host/*`, `wasm/`, `equiv/*.ts`) are shruggr/skein's.
 
 ## A submission, from the wire to the state (#50)
 
@@ -73,8 +78,8 @@ managers read typed records through `get`, which reads through the cache:
 - a subject already rejected is refused (`TransactionRejected`), and so is
   one spending an output a proven transaction spends (`DoubleSpend`).
 
-In a test build `wallet-zig/src/beef.zig` counts its parses
-(`beef.parses`); programs/overlay's test asserts one parse per submit,
+In a test build the SDK's `wallet/src/beef.zig` counts its parses
+(`beef.parses`); this repo's test.zig asserts one parse per submit,
 across the route, the topic, the step and the hooks.
 
 **Judge in the step.** For each requested topic this instance serves and has
@@ -193,7 +198,7 @@ relations and the settlement (`rejected`). Who spends what is the kernel's
 `spends` edges (#42: every held transaction is a kept bitcoin-tx block, each
 input an edge). These are the wallet's records and maps, unchanged. The
 overlay's maps are added to the same record (wallet.zig `map_names`), and
-wallet-zig's `Wallet` is the core both programs load:
+The SDK wallet's `Wallet` is the core both programs load:
 
 - **The wallet program** writes actions, outputs, drafts and broadcasts.
 - **The overlay engine** writes the transactions a topic took (held like any
@@ -350,6 +355,13 @@ There is no `lookup` box: a lookup is a read: its request is recorded, and it mo
   transaction neither taken nor mined that long after its first broadcast
   is abandoned (rejected), one rule for the chain core.
 
+The app's manifest (`etc/app.json`, skein docs/APPS.md §6) carries the same
+settings as `config.overlay`: `topics` is `overlayTopics`, `lookups` is
+`overlayLookups`, `gossip` is `overlayGossip`, and `status` names the status
+provider whose messages the `status` box takes. The engine still reads the
+genesis defaults. Reading `config.overlay` from the manifest at its head's
+root is skein #72 (build 3).
+
 One instance may serve several topics and services.
 
 **Result.** Each step keeps a result record and prints its CID:
@@ -421,7 +433,7 @@ they receive CIDs, never bytes, and read the transactions through `get`:
 | `lookup` | `{kind: "lookup-call", service, query}` | `POST /lookup`: a read |
 
 A hook may be a no-op. **Own storage:** a service keeps named maps (the
-shared MST module, wallet-zig `store.zig`) under its own head `ls:<service>`,
+shared MST module, the SDK wallet's `store.zig`) under its own head `ls:<service>`,
 a record `{kind: "lookup-state", service, maps: {name: root | null}}`. The
 maps are written only through the hooks: a hook that changes them puts the
 new nodes and state record and advances the head, which is the step's head
@@ -562,7 +574,7 @@ submits, with its facilitator pointed at the instance's origin, since the
 ## Gossip: the three topics (#74)
 
 For each overlay topic `<topic>` it runs, an overlay speaks three GossipSub
-topics, three meanings (`programs/overlay/src/gossip.zig`). Bodies are
+topics, three meanings (`src/gossip.zig`). Bodies are
 dag-cbor unless said; a txid and a block hash are hex in display order.
 
 | topic | body | published | received (route → fn) |
@@ -674,8 +686,9 @@ etc/routes.json          [{"path": "/submit", "program": "overlay", "fn": "submi
                           {"path": "libp2p:tm_demo-proof", "program": "overlay", "fn": "peerProof"}]
 ```
 
-The front door must be in `bin/` (a tree's programs are its own):
-equiv/overlay.ts copies the kernel's `wasm/frontdoor.wasm`. These routes
+The three overlay modules are this repo's `bin/*.wasm`. The front door must
+be in `bin/` (a tree's programs are its own): equiv/overlay.ts copies the
+kernel's `wasm/frontdoor.wasm`. These routes
 replace the stock ones, so this node has no messagebox (add the stock
 routes to keep one). The config names no broadcaster (#65: a broadcast is an
 event); a host with an Arcade seeds its status provider in the address book,

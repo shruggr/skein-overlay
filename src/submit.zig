@@ -2,7 +2,7 @@
 //!
 //! - **The route** (`route`, the front door's `/submit` handler: an in-VM
 //!   call, writing nothing). The BEEF is decoded once, into records
-//!   (wallet-zig overlay.decode: `bitcoin-tx` blocks and merkle nodes, put
+//!   (the SDK wallet's overlay.decode: `bitcoin-tx` blocks and merkle nodes, put
 //!   into the call's in-memory overlay), checked over them
 //!   (overlay.verifyDecoded: SPV read through `get`), and judged: each
 //!   requested topic this instance serves and has not judged it before is

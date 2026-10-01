@@ -1,0 +1,34 @@
+{
+  "kind": "app",
+  "name": "overlay",
+  "version": "0.1.0",
+  "programs": {
+    "overlay": "bin/overlay.wasm",
+    "topic-demo": "bin/topic-demo.wasm",
+    "lookup-demo": "bin/lookup-demo.wasm"
+  },
+  "handler": "overlay",
+  "config": {
+    "overlay": {
+      "topics": {"tm_demo": "topic-demo"},
+      "lookups": {"ls_demo": {"program": "lookup-demo", "topics": ["tm_demo"]}},
+      "status": "$status",
+      "gossip": {"tm_demo": true}
+    }
+  },
+  "requires": [],
+  "boxes": [
+    {"box": "submit", "senders": ["*"]},
+    "chain",
+    {"box": "status", "senders": ["$status"]}
+  ],
+  "routes": [
+    {"path": "/submit", "program": "overlay", "fn": "submit", "auth": "none"},
+    {"path": "/lookup", "program": "overlay", "fn": "lookup", "auth": "none"},
+    {"path": "libp2p:tm_demo", "program": "overlay", "fn": "submit"},
+    {"path": "libp2p:tm_demo-admit", "program": "overlay", "fn": "peerAdmit"},
+    {"path": "libp2p:tm_demo-proof", "program": "overlay", "fn": "peerProof"}
+  ],
+  "heads": ["overlay", "overlay:gossip", "ls:*"],
+  "description": "Overlay services (BRC-22 submit, BRC-24 lookup; docs/OVERLAY.md): the engine handles the submit entries, the chain feed and the status provider's messages, and serves submit and lookup as route handlers; tm_demo and ls_demo are its example topic manager and lookup service. Gossip on <topic>, <topic>-admit, <topic>-proof (#74)."
+}

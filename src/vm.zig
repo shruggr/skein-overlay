@@ -1,6 +1,6 @@
 //! The skein calls as a program sees them (preview1 `skein` imports,
 //! kernel-zig program.zig), and the few helpers every overlay program needs:
-//! the step's (or call's) input, the store as wallet-zig's `Store`,
+//! the step's (or call's) input, the store as the SDK wallet's `Store`,
 //! keep-and-print of a result record, in-VM calls and a call's answer, and
 //! the broadcast gate's wiring — the broadcast event (`emit`, #65) — `await`
 //! and `deadline` (#57).

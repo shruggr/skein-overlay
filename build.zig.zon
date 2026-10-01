@@ -14,5 +14,9 @@
         "build.zig.zon",
         "src",
         "test.zig",
+        "bin",
+        "etc",
+        "docs",
+        "README.md",
     },
 }

@@ -1,7 +1,7 @@
 //! The lookup contract (BRC-24 LookupService, issues #36, #50): a lookup
 //! service is a program, pluggable in the submission flow as topic managers
 //! are. It keeps its own storage — named maps (the shared MST module,
-//! wallet-zig store.zig) under its own head `ls:<service>`, a record
+//! the SDK wallet's store.zig) under its own head `ls:<service>`, a record
 //!
 //!   {kind: "lookup-state", service, maps: {name: root | null}}
 //!
