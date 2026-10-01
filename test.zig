@@ -24,6 +24,7 @@ const lookup = @import("src/lookup.zig");
 const demo = @import("src/topic_demo.zig");
 const ls = @import("src/lookup_demo.zig");
 const submit = @import("src/submit.zig");
+const gossip = @import("src/gossip.zig");
 
 const bsvz = w.bsvz;
 const beef = w.beef;
@@ -197,12 +198,17 @@ const Instance = struct {
 
     /// POST /submit's handler: a call over an overlay of its own, dropped afterwards.
     fn route(self: *Instance, bytes: []const u8) !submit.Routed {
+        return self.routeFrom(bytes, null);
+    }
+
+    /// The same, the submission's `source` given (#74: where it came from, carried on its entry).
+    fn routeFrom(self: *Instance, bytes: []const u8, source: ?Value) !submit.Routed {
         var ovl = Overlay{ .inner = self.ms.store(), .arena = self.a };
         self.current = ovl.store();
         defer self.current = self.ms.store();
         var wal = try w.wallet.Wallet.load(self.a, ovl.store(), self.wallet, .regtest);
         wal.now = self.now;
-        return submit.route(self.a, self.caller(), &wal, self.in, bytes, &.{"tm_demo"}, null);
+        return submit.route(self.a, self.caller(), &wal, self.in, bytes, &.{"tm_demo"}, null, source);
     }
 
     /// The engine stepped on the admitted entry: held, broadcast unless
@@ -743,4 +749,269 @@ test "the topic contract: identify on a CID, reading records" {
         .{ .key = "tx", .value = .{ .cid = try a.dupe(u8, &w.store.hashCid(.tx, .{0x5a} ** 32)) } },
     }) };
     try std.testing.expectError(error.UnknownTransaction, topic.judge(a, s, demo.identify, missing));
+}
+
+/// The gossip out (#74) as the engine sees it: the publishes, recorded (topic, body).
+const FakeOut = struct {
+    a: Allocator,
+    sent: std.ArrayList(Sent) = .empty,
+
+    const Sent = struct { topic: []const u8, body: []const u8 };
+
+    fn publish(ctx: *anyopaque, _: Allocator, t: []const u8, body: []const u8) anyerror!void {
+        const self: *FakeOut = @ptrCast(@alignCast(ctx));
+        try self.sent.append(self.a, .{ .topic = try self.a.dupe(u8, t), .body = try self.a.dupe(u8, body) });
+    }
+    fn out(self: *FakeOut) gossip.Out {
+        return .{ .ctx = self, .publishFn = publish };
+    }
+};
+
+/// The instance's genesis input with `defaults.<key>` set to `value`.
+fn withDefault(a: Allocator, in: Value, key: []const u8, value: []const u8) !Value {
+    const es = try a.dupe(cbor.Entry, in.map);
+    for (es) |*e| if (std.mem.eql(u8, e.key, "defaults")) {
+        e.value = .{ .map = try std.mem.concat(a, cbor.Entry, &.{ e.value.map, &.{.{ .key = key, .value = .{ .text = value } }} }) };
+    };
+    return .{ .map = es };
+}
+
+test "gossip (#74): the three topics' shapes; what an admission and a proof publish; a peer's proof checked; a late duplicate judged once" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = w.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var inst = try Instance.init(a, &ms);
+    var fo = FakeOut{ .a = a };
+
+    const priv: [32]u8 = .{0x42} ** 32;
+    const pub_key = try w.brc29.identityKey(priv);
+    const pkh = bsvz.crypto.hash.hash160(&pub_key).bytes;
+    const p2pkh = w.brc29.p2pkh(pub_key);
+    const token: [34]u8 = demo.tag.* ++ [_]u8{ 0x76, 0xa9, 0x14 } ++ pkh ++ [_]u8{ 0x88, 0xac };
+    var fund_raw: std.ArrayList(u8) = .empty;
+    try fund_raw.appendSlice(a, &.{ 1, 0, 0, 0, 1 });
+    try fund_raw.appendSlice(a, &(.{0x33} ** 32));
+    try fund_raw.appendSlice(a, &.{ 0, 0, 0, 0, 1, 0x51, 0xff, 0xff, 0xff, 0xff, 2 });
+    for ([_]u64{ 10_000, 10_000 }) |v| {
+        var sats: [8]u8 = undefined;
+        std.mem.writeInt(u64, &sats, v, .little);
+        try fund_raw.appendSlice(a, &sats);
+        try fund_raw.append(a, p2pkh.len);
+        try fund_raw.appendSlice(a, &p2pkh);
+    }
+    try fund_raw.appendSlice(a, &.{ 0, 0, 0, 0 });
+    const fund_tx = try bsvz.transaction.Transaction.parse(a, fund_raw.items);
+    const fund_txid = beef.txidOf(fund_raw.items);
+    const h1 = mine(hdr.hash(&w.chain.Network.regtest.genesis()), fund_txid, 1_700_000_600);
+    try inst.headers(&.{&h1});
+    const bumps = try a.dupe(bsvz.spv.MerklePath, &.{try bsvz.spv.MerklePath.parse(a, try soloPath(a, 1, fund_txid))});
+    const fund_entry: beef.Entry = .{ .txid = fund_txid, .format = .raw_with_bump, .bump = 0, .raw = fund_raw.items, .tx = fund_tx };
+    const withFund = struct {
+        fn of(al: Allocator, bs: []bsvz.spv.MerklePath, fe: beef.Entry, t: Spent) ![]const u8 {
+            return beef.serialize(al, .{ .version = beef.V2, .bumps = bs, .entries = try al.dupe(beef.Entry, &.{ fe, .{ .txid = t.txid, .format = .raw, .raw = t.raw, .tx = t.tx } }) });
+        }
+    }.of;
+    const wallet = struct {
+        fn of(i: *Instance) !w.wallet.Wallet {
+            var wal = try w.wallet.Wallet.load(i.a, i.ms.store(), i.wallet, .regtest);
+            wal.now = i.now;
+            return wal;
+        }
+    }.of;
+
+    // ------------------------------------------------ the shapes (dag-cbor), exactly
+    {
+        const txid: [32]u8 = .{0xab} ** 32;
+        const ad = try cbor.decode(a, try gossip.admitBody(a, txid, "tm_demo", &.{ 0, 2 }, &.{1}));
+        try std.testing.expectEqual(@as(usize, 2), ad.map.len);
+        try std.testing.expectEqualStrings(&hdr.toHex(txid), ad.getText("txid").?);
+        const e = ad.get("topics").?.get("tm_demo").?;
+        try std.testing.expectEqual(@as(usize, 2), e.map.len);
+        try std.testing.expectEqual(@as(usize, 2), e.getArray("outputsToAdmit").?.len);
+        try std.testing.expectEqual(@as(u64, 1), e.getArray("coinsToRetain").?[0].uint);
+        const back = try gossip.parseAdmit(a, try gossip.admitBody(a, txid, "tm_demo", &.{ 0, 2 }, &.{1}), "tm_demo");
+        try std.testing.expectEqualSlices(u32, &.{ 0, 2 }, back.outputs_to_admit);
+        try std.testing.expectError(error.NotThisTopic, gossip.parseAdmit(a, try gossip.admitBody(a, txid, "tm_demo", &.{}, &.{}), "tm_other"));
+        try std.testing.expectError(error.BadMessage, gossip.parseAdmit(a, "not cbor", "tm_demo"));
+
+        const pr = try cbor.decode(a, try gossip.proofBody(a, txid, .{0xcd} ** 32, 7, "BUMP"));
+        try std.testing.expectEqual(@as(usize, 4), pr.map.len);
+        try std.testing.expectEqualStrings(&hdr.toHex(.{0xcd} ** 32), pr.getText("blockHash").?);
+        try std.testing.expectEqual(@as(u64, 7), pr.getUint("blockHeight").?);
+        try std.testing.expectEqualStrings("BUMP", pr.getBytes("bump").?);
+        const pp = try gossip.parseProof(a, try gossip.proofBody(a, txid, .{0xcd} ** 32, 7, "BUMP"));
+        try std.testing.expectEqualSlices(u8, &txid, &pp.txid);
+        try std.testing.expectEqual(@as(u32, 7), pp.height);
+
+        try std.testing.expectEqualStrings("tm_demo", gossip.baseOf("tm_demo-proof", gossip.proof_suffix).?);
+        try std.testing.expect(gossip.baseOf("-proof", gossip.proof_suffix) == null);
+        try std.testing.expect(gossip.baseOf("tm_demo-admit", gossip.proof_suffix) == null);
+    }
+
+    // ------------------------------------------------ an HTTP submission (off-chain values framed): admitted on a status →
+    // the BEEF as received on `tm_demo`, then the verdict on `tm_demo-admit`; its proof later → `tm_demo-proof`
+    const ta = try spend(a, &fund_tx, 0, &.{.{ 1, &token }}, priv);
+    const ta_beef = try withFund(a, bumps, fund_entry, ta);
+    const h2 = mine(hdr.hash(&h1), ta.txid, 1_700_001_200);
+    {
+        var framed: std.ArrayList(u8) = .empty;
+        try framed.appendSlice(a, &.{ 0xfd, @truncate(ta_beef.len), @truncate(ta_beef.len >> 8) });
+        try framed.appendSlice(a, ta_beef);
+        try framed.appendSlice(a, "off-chain");
+        const req = try ms.store().putValue(a, .{ .map = try a.dupe(cbor.Entry, &.{
+            .{ .key = "kind", .value = .{ .text = "http" } },
+            .{ .key = "headers", .value = .{ .map = try a.dupe(cbor.Entry, &.{.{ .key = "x-includes-off-chain-values", .value = .{ .text = "true" } }}) } },
+            .{ .key = "body", .value = .{ .bytes = framed.items } },
+        }) });
+        const source: Value = .{ .map = try a.dupe(cbor.Entry, &.{
+            .{ .key = "transport", .value = .{ .text = "http" } },
+            .{ .key = "request", .value = .{ .cid = req } },
+        }) };
+        const r = try inst.routeFrom(ta_beef, source);
+        _ = try inst.step(try cbor.decode(a, try cbor.encode(a, r.admit.event)));
+        const ev = inst.last_event;
+        const ok = try inst.wake(ev, .{ .status = try statusBody(a, ta.txid, "RECEIVED") });
+        try std.testing.expect(ok.admitted);
+        var wal = try wallet(&inst);
+        try std.testing.expectEqual(@as(usize, 2), try gossip.admitted(a, fo.out(), ms.store(), &wal, inst.in, ev, ta.txid, ok.topics, ok.applied));
+        try std.testing.expectEqualStrings("tm_demo", fo.sent.items[0].topic);
+        try std.testing.expectEqualSlices(u8, ta_beef, fo.sent.items[0].body);
+        try std.testing.expectEqualStrings("tm_demo-admit", fo.sent.items[1].topic);
+        try std.testing.expectEqualSlices(u8, try gossip.admitBody(a, ta.txid, "tm_demo", &.{0}, &.{}), fo.sent.items[1].body);
+        // Admitted on a status, unproven: no proof to publish.
+        try std.testing.expectEqual(@as(usize, 0), try gossip.proven(a, fo.out(), &wal, inst.in, ta.txid, null, false));
+
+        // The proof (the chain feed's event, nobody awaiting: the engine's `event` step): `tm_demo-proof`,
+        // this txid's BUMP rebuilt from the nodes — here the very path that came.
+        try inst.headers(&.{&h2});
+        wal = try wallet(&inst);
+        const before = try wal.proofBlock(ta.txid);
+        _ = try wal.applyStatus(ta.txid, "MINED", try soloPath(a, 2, ta.txid));
+        try std.testing.expectEqual(@as(usize, 1), try gossip.proven(a, fo.out(), &wal, inst.in, ta.txid, before, false));
+        try std.testing.expectEqualStrings("tm_demo-proof", fo.sent.items[2].topic);
+        const p = try gossip.parseProof(a, fo.sent.items[2].body);
+        try std.testing.expectEqualSlices(u8, &ta.txid, &p.txid);
+        try std.testing.expectEqualSlices(u8, &hdr.hash(&h2), &p.block_hash);
+        try std.testing.expectEqual(@as(u32, 2), p.height);
+        try std.testing.expectEqualSlices(u8, try soloPath(a, 2, ta.txid), p.bump);
+        // The same proof again (the same block): nothing; one that came by gossip on `-proof`: never re-published.
+        try std.testing.expectEqual(@as(usize, 0), try gossip.proven(a, fo.out(), &wal, inst.in, ta.txid, hdr.hash(&h2), false));
+        try std.testing.expectEqual(@as(usize, 0), try gossip.proven(a, fo.out(), &wal, inst.in, ta.txid, null, true));
+        inst.wallet = try wal.save();
+        // A peer's copy of that proof, here: already proven in that block — ignore.
+        wal = try wallet(&inst);
+        try std.testing.expectEqualStrings("already proven in that block", (try gossip.checkProof(a, &wal, p, "libp2p:tm_demo-proof")).ignore);
+        // With gossip off for the topic (defaults.overlayGossip): nothing published.
+        const off_in = try withDefault(a, inst.in, "overlayGossip", "{\"tm_demo\":false}");
+        try std.testing.expect(!(try gossip.enabled(a, off_in, "tm_demo")));
+        try std.testing.expect(try gossip.enabled(a, inst.in, "tm_demo"));
+        try std.testing.expectError(error.BadConfig, gossip.enabled(a, try withDefault(a, inst.in, "overlayGossip", "{\"tm_demo\":\"no\"}"), "tm_demo"));
+        try std.testing.expectEqual(@as(usize, 0), try gossip.admitted(a, fo.out(), ms.store(), &wal, off_in, ev, ta.txid, ok.topics, ok.applied));
+        try std.testing.expectEqual(@as(usize, 0), try gossip.proven(a, fo.out(), &wal, off_in, ta.txid, null, false));
+    }
+
+    // ------------------------------------------------ a submission that came by gossip on `tm_demo`: only the verdict
+    // is published (GossipSub forwarded the message itself); its proof from a peer is checked against our chain
+    const tb = try spend(a, &fund_tx, 1, &.{.{ 1, &token }}, priv);
+    const tb_beef = try withFund(a, bumps, fund_entry, tb);
+    const h3 = mine(hdr.hash(&h2), tb.txid, 1_700_001_800);
+    {
+        const source: Value = .{ .map = try a.dupe(cbor.Entry, &.{
+            .{ .key = "transport", .value = .{ .text = "libp2p" } },
+            .{ .key = "topic", .value = .{ .text = "tm_demo" } },
+        }) };
+        const r = try inst.routeFrom(tb_beef, source);
+        _ = try inst.step(try cbor.decode(a, try cbor.encode(a, r.admit.event)));
+        const ev = inst.last_event;
+        // Pending its gate: a peer's proof for it is checked, here before we hold its header — ignore.
+        var wal = try wallet(&inst);
+        const proof = gossip.Proof{ .txid = tb.txid, .block_hash = hdr.hash(&h3), .height = 3, .bump = try soloPath(a, 3, tb.txid) };
+        try std.testing.expectEqualStrings("no header held at blockHeight", (try gossip.checkProof(a, &wal, proof, "libp2p:tm_demo-proof")).ignore);
+        try inst.headers(&.{&h3});
+        wal = try wallet(&inst);
+        // Bad ones: not ours, not parsing, the wrong height, the wrong block hash, the wrong root.
+        try std.testing.expectEqualStrings("the transaction is not held here", (try gossip.checkProof(a, &wal, .{ .txid = .{0x77} ** 32, .block_hash = hdr.hash(&h3), .height = 3, .bump = proof.bump }, "x")).ignore);
+        try std.testing.expectEqualStrings("the bump does not parse", (try gossip.checkProof(a, &wal, .{ .txid = tb.txid, .block_hash = hdr.hash(&h3), .height = 3, .bump = "junk" }, "x")).ignore);
+        try std.testing.expectEqualStrings("the bump is not at blockHeight", (try gossip.checkProof(a, &wal, .{ .txid = tb.txid, .block_hash = hdr.hash(&h3), .height = 2, .bump = proof.bump }, "x")).ignore);
+        try std.testing.expectEqualStrings("blockHash is not our header at blockHeight", (try gossip.checkProof(a, &wal, .{ .txid = tb.txid, .block_hash = hdr.hash(&h2), .height = 3, .bump = proof.bump }, "x")).ignore);
+        const other = gossip.Proof{ .txid = tb.txid, .block_hash = hdr.hash(&h2), .height = 2, .bump = try soloPath(a, 2, tb.txid) };
+        try std.testing.expectEqualStrings("the bump's root is not our header's merkle root", (try gossip.checkProof(a, &wal, other, "x")).ignore);
+        // The good one: the `chain` proof event, as the host's feed admits it, with `via`.
+        const good = (try gossip.checkProof(a, &wal, proof, "libp2p:tm_demo-proof")).event;
+        try std.testing.expectEqualStrings("proof", good.getText("kind").?);
+        try std.testing.expectEqualSlices(u8, &w.store.hashCid(.tx, tb.txid), good.getCid("subject").?);
+        try std.testing.expectEqualSlices(u8, proof.bump, good.getBytes("path").?);
+        try std.testing.expectEqualStrings("libp2p:tm_demo-proof", good.getText("via").?);
+        // It steps the pending submission (the awaiting thread): admitted at the proof (#73).
+        const n = fo.sent.items.len;
+        wal = try wallet(&inst);
+        const before = try wal.proofBlock(tb.txid);
+        const ok = try inst.wake(ev, .{ .event = good });
+        try std.testing.expect(ok.admitted);
+        try std.testing.expectEqual(submit.Gated.mined, ok.gate);
+        wal = try wallet(&inst);
+        // Only `tm_demo-admit`: the submission came by gossip on `tm_demo`, the proof by gossip on `-proof`.
+        try std.testing.expectEqual(@as(usize, 1), try gossip.admitted(a, fo.out(), ms.store(), &wal, inst.in, ev, tb.txid, ok.topics, ok.applied));
+        try std.testing.expectEqual(@as(usize, 0), try gossip.proven(a, fo.out(), &wal, inst.in, tb.txid, before, good.get("via") != null));
+        try std.testing.expectEqual(n + 1, fo.sent.items.len);
+        try std.testing.expectEqualStrings("tm_demo-admit", fo.sent.items[n].topic);
+
+        // A reorg: a heavier branch from 2 mines tb second in a new block 3'. tb is unproven again; its re-proof
+        // (the chain feed's) names a new block: published again; a peer holding the new headers takes it.
+        const filler: [32]u8 = .{0xf3} ** 32;
+        const pair: [64]u8 = filler ++ tb.txid;
+        const root3b = w.store.dblSha256(&pair);
+        const h3b = mine(hdr.hash(&h2), root3b, 1_700_001_900);
+        const h4b = mine(hdr.hash(&h3b), .{0x44} ** 32, 1_700_002_500);
+        try inst.headers(&.{ &h3b, &h4b });
+        wal = try wallet(&inst);
+        try std.testing.expectEqual(w.wallet.Status.unproven, try wal.status(tb.txid));
+        var path3b: std.ArrayList(u8) = .empty;
+        try path3b.appendSlice(a, &.{ 3, 0x01, 0x02, 0x00, 0x00 });
+        try path3b.appendSlice(a, &filler);
+        try path3b.appendSlice(a, &.{ 0x01, 0x02 });
+        try path3b.appendSlice(a, &tb.txid);
+        const re = gossip.Proof{ .txid = tb.txid, .block_hash = hdr.hash(&h3b), .height = 3, .bump = path3b.items };
+        try std.testing.expect((try gossip.checkProof(a, &wal, re, "libp2p:tm_demo-proof")) == .event);
+        const old = try wal.proofBlock(tb.txid);
+        try std.testing.expectEqualSlices(u8, &hdr.hash(&h3), &old.?);
+        _ = try wal.applyStatus(tb.txid, "MINED", path3b.items);
+        try std.testing.expectEqual(w.wallet.Status.proven, try wal.status(tb.txid));
+        try std.testing.expectEqual(@as(usize, 1), try gossip.proven(a, fo.out(), &wal, inst.in, tb.txid, old, false));
+        const p3b = try gossip.parseProof(a, fo.sent.items[fo.sent.items.len - 1].body);
+        try std.testing.expectEqualSlices(u8, &hdr.hash(&h3b), &p3b.block_hash);
+        try std.testing.expectEqualSlices(u8, path3b.items, p3b.bump);
+        try std.testing.expectEqualSlices(u8, &hdr.hash(&h3b), &(try wal.proofBlock(tb.txid)).?);
+        inst.wallet = try wal.save();
+
+        // A late duplicate on `tm_demo` (past GossipSub's seen-cache, or from another publisher): one decode,
+        // the index lookup, "already judged" (`unchanged`) — no topic manager runs.
+        const identifies = inst.count("identify");
+        const parses = beef.parses;
+        try std.testing.expect((try inst.routeFrom(tb_beef, source)) == .unchanged);
+        try std.testing.expectEqual(identifies, inst.count("identify"));
+        try std.testing.expectEqual(parses + 1, beef.parses);
+    }
+
+    // ------------------------------------------------ peers' admits, recorded under `overlay:gossip` (key topic ‖ txid ‖ from)
+    {
+        var st = try gossip.State.load(a, ms.store(), null);
+        const m = try gossip.parseAdmit(a, try gossip.admitBody(a, ta.txid, "tm_demo", &.{0}, &.{}), "tm_demo");
+        const pa: [33]u8 = .{0x02} ++ .{0xaa} ** 32;
+        const pb: [33]u8 = .{0x03} ++ .{0xbb} ** 32;
+        _ = try st.record(try gossip.peerAdmitRecord(a, "tm_demo", m, &pa));
+        _ = try st.record(try gossip.peerAdmitRecord(a, "tm_demo", m, &pb));
+        _ = try st.record(try gossip.peerAdmitRecord(a, "tm_demo", m, &pa)); // the same peer again: the same key
+        const saved = try st.save();
+        var again = try gossip.State.load(a, ms.store(), saved);
+        const admits = try again.admitsOf("tm_demo", ta.txid);
+        try std.testing.expectEqual(@as(usize, 2), admits.len);
+        const rec = try ms.store().getValue(a, admits[0]);
+        try std.testing.expectEqualStrings("peer-admit", rec.getText("kind").?);
+        try std.testing.expectEqualStrings(&hdr.toHex(ta.txid), rec.getText("txid").?);
+        try std.testing.expectEqualSlices(u8, &pa, rec.getBytes("from").?);
+        try std.testing.expectEqual(@as(usize, 0), (try again.admitsOf("tm_demo", tb.txid)).len);
+    }
 }

@@ -7,6 +7,10 @@
 //!                                   → the STEAK {topic: {outputsToAdmit, coinsToRetain, coinsRemoved}}
 //!   libp2p:<topic>    fn "submit"   the same submit as a GossipSub message (#57): the message's topic
 //!                                   requested, its body the BEEF → {verdict, admit?} (`gossip` below)
+//!   libp2p:<topic>-admit   fn "peerAdmit"   a peer's verdict (#74, gossip.zig): recorded as a
+//!                                           `peer-admit` record, never admitting → {verdict, admit?}
+//!   libp2p:<topic>-proof   fn "peerProof"   a peer's proof (#74): checked against our chain, admitted
+//!                                           as the `chain` proof event (#65) → {verdict, admit?}
 //!   POST /lookup      fn "lookup"   {service, query} (JSON) → {type: "output-list", outputs: [{beef, outputIndex, context?}]}
 //!                                   X-Aggregation: yes → the compact octet-stream form (count, [txid, index, context], one BEEF)
 //!   GET  /listTopicManagers, /listLookupServiceProviders         fn "listTopicManagers" / "listLookupServiceProviders"
@@ -40,6 +44,7 @@ const std = @import("std");
 const w = @import("wallet");
 const vm = @import("vm.zig");
 const submit_mod = @import("submit.zig");
+const gossip_mod = @import("gossip.zig");
 
 const cbor = w.cbor;
 const Value = cbor.Value;
@@ -233,6 +238,10 @@ pub fn call(a: Allocator, in: Value) !void {
     const arg = try vm.callArg(a, in);
     const out = if (eql(u8, func, "submit"))
         try submit(a, in, arg)
+    else if (eql(u8, func, "peerAdmit"))
+        try peerAdmit(a, in, arg)
+    else if (eql(u8, func, "peerProof"))
+        try peerProof(a, in, arg)
     else if (eql(u8, func, "lookup"))
         try lookup(a, in, arg)
     else if (eql(u8, func, "listTopicManagers"))
@@ -303,7 +312,7 @@ fn submit(a: Allocator, in: Value, req: Value) !Value {
         return submitted(a, in, &wal, b.subject() orelse return failure(a, 400, "Invalid BEEF"), topics);
     }
     // The BEEF decoded once into records in the step's write cache, verified, judged by the topics (#50).
-    const routed = switch (try submit_mod.route(a, vm.caller(), &wal, in, body, topics, off)) {
+    const routed = switch (try submit_mod.route(a, vm.caller(), &wal, in, body, topics, off, try sourceOf(a, req, null))) {
         .refused => |why| return failure(a, 400, why),
         // Valid but admitted nowhere: BRC-22's answer is 200 with an empty STEAK.
         .nothing => {
@@ -355,18 +364,69 @@ fn gossip(a: Allocator, in: Value, req: Value) !Value {
     const topics = try served(a, &.{t}, try configMap(a, in, "overlayTopics"));
     if (topics.len == 0) return verdictOf(a, "ignore", "the topic is not served here");
     var wal = try load(a, in);
-    const routed = switch (try submit_mod.route(a, vm.caller(), &wal, in, body, topics, null)) {
+    const routed = switch (try submit_mod.route(a, vm.caller(), &wal, in, body, topics, null, try sourceOf(a, req, t))) {
         .refused => |why| return verdictOf(a, "ignore", why),
         .nothing => |why| return verdictOf(a, "ignore", why),
         .unchanged => return verdictOf(a, "ignore", "already judged"),
         .pending => return verdictOf(a, "ignore", "already submitted: awaiting its broadcast"),
         .admit => |x| x,
     };
+    return accepting(a, routed.event, "submit");
+}
+
+/// Where a submission came from, carried on its entry (#74: an admission re-publishes it on `<topic>`
+/// unless it arrived by gossip on that topic): {transport, topic? (the libp2p topic), request}.
+fn sourceOf(a: Allocator, req: Value, topic: ?[]const u8) !Value {
+    var es: std.ArrayList(cbor.Entry) = .empty;
+    try es.append(a, .{ .key = "transport", .value = .{ .text = req.getText("transport") orelse "http" } });
+    if (topic) |t| try es.append(a, .{ .key = "topic", .value = .{ .text = t } });
+    if (req.getCid("request")) |rc| try es.append(a, .{ .key = "request", .value = .{ .cid = rc } });
+    return .{ .map = es.items };
+}
+
+/// A peer's verdict on `libp2p:<topic>-admit` (#74): {txid, topics: {<topic>: {outputsToAdmit,
+/// coinsToRetain}}}. Never admits anything: accept admits a `peer-admit` event (box `submit`) the
+/// engine records under the head `overlay:gossip` (gossip.zig), a read for a lookup or a UI. Ignore
+/// when the topic is not served here or the body is not that shape.
+fn peerAdmit(a: Allocator, in: Value, req: Value) !Value {
+    if (!eql(u8, req.getText("transport") orelse "", "libp2p")) return failure(a, 400, "peerAdmit takes libp2p topic messages");
+    const gt = req.getText("topic") orelse return verdictOf(a, "ignore", "not a topic message");
+    const t = gossip_mod.baseOf(gt, gossip_mod.admit_suffix) orelse return verdictOf(a, "ignore", "not an -admit topic");
+    if (!(try configMap(a, in, "overlayTopics")).contains(t)) return verdictOf(a, "ignore", "the topic is not served here");
+    const from = req.getBytes("key") orelse return verdictOf(a, "ignore", "no publisher key");
+    const m = gossip_mod.parseAdmit(a, req.getBytes("body") orelse "", t) catch |e| return verdictOf(a, "ignore", @errorName(e));
+    return accepting(a, try gossip_mod.peerAdmitRecord(a, t, m, from), "submit");
+}
+
+/// A peer's proof on `libp2p:<topic>-proof` (#74): {txid, blockHash, blockHeight, bump}. The proof-in
+/// wiring of #65 for the topics this overlay runs: checked against this instance's own chain (the
+/// transaction held, the BUMP's root our header's at blockHeight, that header's hash blockHash) and
+/// admitted as the `chain` proof event the host's feed admits — it steps the transaction's awaiting
+/// submission (admitted at the proof, #73), else the `chain` subscription records it (a reorg's re-proof
+/// replaces the old one). Anything else is ignore, never reject: a proof we cannot check may be our
+/// missing headers.
+fn peerProof(a: Allocator, in: Value, req: Value) !Value {
+    if (!eql(u8, req.getText("transport") orelse "", "libp2p")) return failure(a, 400, "peerProof takes libp2p topic messages");
+    const gt = req.getText("topic") orelse return verdictOf(a, "ignore", "not a topic message");
+    const t = gossip_mod.baseOf(gt, gossip_mod.proof_suffix) orelse return verdictOf(a, "ignore", "not a -proof topic");
+    if (!(try configMap(a, in, "overlayTopics")).contains(t)) return verdictOf(a, "ignore", "the topic is not served here");
+    const p = gossip_mod.parseProof(a, req.getBytes("body") orelse "") catch |e| return verdictOf(a, "ignore", @errorName(e));
+    var wal = try load(a, in);
+    // Only for a transaction this overlay admitted under the topic, or holds pending its gate.
+    if (!(try w.overlay.isApplied(&wal, t, p.txid)) and !(try submit_mod.isPending(&wal, p.txid))) return verdictOf(a, "ignore", "not admitted under this topic, nor pending here");
+    return switch (try gossip_mod.checkProof(a, &wal, p, try std.fmt.allocPrint(a, "libp2p:{s}", .{gt}))) {
+        .ignore => |why| verdictOf(a, "ignore", why),
+        .event => |ev| accepting(a, ev, "chain"),
+    };
+}
+
+/// Accept, admitting one event into `box` (after the message's own `p2p` event, which the front door admits first).
+fn accepting(a: Allocator, ev: Value, box: []const u8) !Value {
     return .{ .map = try a.dupe(cbor.Entry, &.{
         .{ .key = "verdict", .value = .{ .text = "accept" } },
         .{ .key = "admit", .value = .{ .array = try a.dupe(Value, &.{.{ .map = try a.dupe(cbor.Entry, &.{
-            .{ .key = "event", .value = routed.event },
-            .{ .key = "box", .value = .{ .text = "submit" } },
+            .{ .key = "event", .value = ev },
+            .{ .key = "box", .value = .{ .text = box } },
         }) }}) } },
     }) };
 }

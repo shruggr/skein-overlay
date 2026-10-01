@@ -37,7 +37,12 @@
 //! The entry (box `submit`) carries records, not a BEEF:
 //!
 //!   {kind: "submit", txid (hex), txs: [bytes], nodes: [bytes], proofs: [{txid: bytes, height}],
-//!    topics: [{topic, previousCoins, outputsToAdmit, coinsToRetain}], offChainValues?: bytes}
+//!    topics: [{topic, previousCoins, outputsToAdmit, coinsToRetain}], offChainValues?: bytes,
+//!    source?: {transport, topic?, request: <the request record>}}
+//!
+//! `source` (#74) says where the submission came from: at admission it is
+//! re-published on each topic that admitted it (the BEEF as received: the
+//! request's body), unless it arrived by gossip on that topic (gossip.zig).
 //!
 //! Only the host admits plain entries (the front door's answer, the feeds),
 //! so the judgements it carries are the route's.
@@ -101,8 +106,8 @@ pub const Routed = union(enum) {
 
 /// The route's half (a call): decode once, verify, judge. `topics` are the
 /// requested ones this instance serves; `in` is the call's input (genesis
-/// `defaults`, `programs`).
-pub fn route(a: Allocator, caller: ov.Caller, wal: *Wallet, in: Value, beef: []const u8, topics: []const []const u8, off: ?[]const u8) !Routed {
+/// `defaults`, `programs`); `source` is carried on the entry (#74).
+pub fn route(a: Allocator, caller: ov.Caller, wal: *Wallet, in: Value, beef: []const u8, topics: []const []const u8, off: ?[]const u8, source: ?Value) !Routed {
     const c = decodeAndVerify(wal, beef) catch |e| switch (e) {
         // A known-rejected transaction is a valid request that admits nothing (200, empty STEAK).
         error.TransactionRejected => return .{ .nothing = @errorName(e) },
@@ -133,11 +138,11 @@ pub fn route(a: Allocator, caller: ov.Caller, wal: *Wallet, in: Value, beef: []c
     // Nothing new, but judged before by some topic: that judgement is the answer (from the state).
     if (dupes == topics.len or (judged.items.len == 0 and dupes > 0)) return .{ .unchanged = c.subject.txid };
     if (judged.items.len == 0) return .{ .nothing = if (why.items.len > 0) why.items else "NotAdmitted: no topic admitted an output or consumed a previous coin" };
-    return .{ .admit = .{ .event = try event(a, c.decoded, judged.items, off), .txid = c.subject.txid } };
+    return .{ .admit = .{ .event = try event(a, c.decoded, judged.items, off, source), .txid = c.subject.txid } };
 }
 
-/// The submit entry's event: the decoded records, the judgements, the off-chain values.
-pub fn event(a: Allocator, d: ov.Decoded, judged: []const Judged, off: ?[]const u8) !Value {
+/// The submit entry's event: the decoded records, the judgements, the off-chain values, the source.
+pub fn event(a: Allocator, d: ov.Decoded, judged: []const Judged, off: ?[]const u8, source: ?Value) !Value {
     const txs = try a.alloc(Value, d.txs.len);
     for (d.txs, txs) |t, *o| o.* = .{ .bytes = t.raw };
     const nodes = try a.alloc(Value, d.nodes.len);
@@ -166,6 +171,7 @@ pub fn event(a: Allocator, d: ov.Decoded, judged: []const Judged, off: ?[]const 
         .{ .key = "topics", .value = .{ .array = topics } },
     });
     if (off) |o| try es.append(a, .{ .key = "offChainValues", .value = .{ .bytes = o } });
+    if (source) |src| try es.append(a, .{ .key = "source", .value = src });
     return .{ .map = es.items };
 }
 
