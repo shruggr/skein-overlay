@@ -18,13 +18,14 @@
 //!
 //! A submit step, after the route decoded and judged it in its call
 //! (submit.zig): hold the records the entry carries; unless the entry proves
-//! the transaction mined, broadcast it through the host's route
-//! (defaults.walletArc, #58) over the recorded `http` import (#57); once ARC
-//! takes it, record each topic's judgement (overlay.apply) and call the
+//! the transaction mined, post it to the broadcaster (#70, #67: a message to
+//! the address book's `broadcast` provider, the host's Arcade, #58); once
+//! ARC takes it, record each topic's judgement (overlay.apply) and call the
 //! listening lookup services' hooks (`admitted`, `spent`); save. While ARC
-//! has not taken it the thread awaits its CID with a deadline
-//! (defaults.overlayRecheckMs): a `status` / `proof` entry for it, or the
-//! deadline (ARC asked again), steps the same thread — admitting it once
+//! has not taken it the thread awaits what it asked the broadcaster and the
+//! transaction's CID, with a deadline (defaults.overlayRecheckMs): the
+//! broadcaster's answer, a `status` / `proof` entry for it, or the deadline
+//! (the broadcaster asked again) steps the same thread — admitting it once
 //! ARC has it, or rejecting it. Once admitted or rejected the thread
 //! finishes (#66): the request that launched it (POST /submit), and any
 //! resubmission awaiting it, answer from the state — the STEAK from the
@@ -34,7 +35,7 @@
 //! `rejected` for each judgement it removed.
 //! Every step keeps its result record and prints its CID:
 //!
-//!   {kind: "overlay-result", op: "submit" | "callback", txid, gate, outcome, arc?, steak?, awaiting?, event? | woke?, refs, state}
+//!   {kind: "overlay-result", op: "submit" | "callback", txid, gate, outcome, arc?, steak?, awaiting?, asked?, event? | answer? | woke?, refs, state}
 //!   {kind: "overlay-result", op: "event", event, …, state}      the chain feed
 //!   {kind: "overlay-result", op, error}                         refused
 const std = @import("std");
@@ -67,6 +68,17 @@ fn resultRecord(a: std.mem.Allocator, op: []const u8, fields: []const cbor.Entry
     return .{ .map = es.items };
 }
 
+/// The questions to the broadcaster the thread's last result left open (its `asked`).
+fn openQuestions(a: std.mem.Allocator, s: w.store.Store, step: Value) ![]const []const u8 {
+    const tip = try s.getValue(a, step.getCid("tip") orelse return &.{});
+    const kept = tip.getArray("kept") orelse return &.{};
+    if (kept.len == 0 or kept[kept.len - 1] != .cid) return &.{};
+    const res = try s.getValue(a, kept[kept.len - 1].cid);
+    var out: std.ArrayList([]const u8) = .empty;
+    for (res.getArray("asked") orelse return &.{}) |x| if (x == .cid) try out.append(a, x.cid);
+    return out.items;
+}
+
 fn refused(a: std.mem.Allocator, op: []const u8, e: anyerror) !void {
     _ = try vm.finish(a, vm.store(), try resultRecord(a, op, &.{.{ .key = "error", .value = .{ .text = @errorName(e) } }}));
 }
@@ -83,23 +95,25 @@ fn run(a: std.mem.Allocator) anyerror!void {
     var wal = try Wallet.load(a, s, state, try vm.network(step));
     wal.now = @intCast(step.getUint("at") orelse return error.BadInput);
     var fields: std.ArrayList(cbor.Entry) = .empty;
-    // A submission's awaiting thread (#57) steps again on an entry for its transaction, or at its deadline.
+    // A submission's awaiting thread (#57) steps again on an entry for its transaction, the
+    // broadcaster's answer to what it asked (#70: a reply), or at its deadline.
+    const reply: ?Value = if (step.get("reply")) |r| (if (r == .map) r else null) else null;
     const wake: ?submit.Wake = if (step.get("event")) |e|
         .{ .event = try s.getValue(a, e.getCid("event") orelse return error.BadInput) }
-    else if (step.getBool("woke") orelse false) .deadline else null;
+    else if (reply) |r| blk: {
+        const body = try s.getValue(a, r.getCid("body") orelse return error.BadInput);
+        if (body.getText("error")) |e| std.log.err("the broadcaster: {s}", .{e});
+        break :blk .{ .answer = .{ .box = r.getText("box") orelse "", .reply = .{ .status = body.getUint("status") orelse 0, .body = body.getBytes("body") orelse "" } } };
+    } else if (step.getBool("woke") orelse false) .deadline else null;
     var op: []const u8 = "event";
 
     if (std.mem.eql(u8, kind, "submit")) {
         // Hold the records; broadcast unless mined; admit once ARC takes it (submit.zig).
         op = if (wake == null) "submit" else "callback";
         const done = (if (wake) |wk|
-            submit.awaited(a, vm.caller(), vm.http(), &wal, step, ev, wk)
+            submit.awaited(a, vm.caller(), vm.broadcaster(), &wal, step, ev, wk)
         else
-            submit.step(a, vm.caller(), vm.http(), &wal, step, ev)) catch |e| {
-            // No answer to record: the step errors (vm.http).
-            if (e == error.HttpFailed) return e;
-            return refused(a, op, e);
-        };
+            submit.step(a, vm.caller(), vm.broadcaster(), &wal, step, ev)) catch |e| return refused(a, op, e);
         for (done.records) |c| try vm.keep(c);
         try fields.appendSlice(a, &.{
             .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &w.header.toHex(done.subject.txid)) } },
@@ -112,6 +126,7 @@ fn run(a: std.mem.Allocator) anyerror!void {
         });
         if (wake) |wk| switch (wk) {
             .event => |e| try fields.append(a, .{ .key = "event", .value = .{ .text = e.getText("kind") orelse "" } }),
+            .answer => |x| try fields.append(a, .{ .key = "answer", .value = .{ .text = x.box } }),
             .deadline => try fields.append(a, .{ .key = "woke", .value = .{ .boolean = true } }),
         };
         if (done.arc) |ans| try fields.append(a, .{ .key = "arc", .value = try ans.value(a) });
@@ -132,6 +147,16 @@ fn run(a: std.mem.Allocator) anyerror!void {
             try vm.awaitRecord(done.subject.cid);
             try vm.deadline(wal.now + (try submit.Gate.of(step)).recheck_ms);
             try fields.append(a, .{ .key = "awaiting", .value = .{ .boolean = true } });
+            // What it asked the broadcaster and has no answer to yet (#70): this step's questions and
+            // the earlier ones still open (but the one answered now), awaited, kept on the result.
+            var asked: std.ArrayList(Value) = .empty;
+            for (done.asked) |c| try asked.append(a, .{ .cid = c });
+            for (try openQuestions(a, s, step)) |c| {
+                if (reply) |r| if (std.mem.eql(u8, r.getCid("replyTo") orelse "", c)) continue;
+                try asked.append(a, .{ .cid = c });
+            }
+            for (asked.items) |c| try vm.awaitRecord(c.cid);
+            if (asked.items.len > 0) try fields.append(a, .{ .key = "asked", .value = .{ .array = asked.items } });
         }
     } else if (wake != null) {
         return error.BadInput; // only a submission's thread awaits

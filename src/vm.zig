@@ -2,7 +2,7 @@
 //! kernel-zig program.zig), and the few helpers every overlay program needs:
 //! the step's (or call's) input, the store as wallet-zig's `Store`,
 //! keep-and-print of a result record, in-VM calls and a call's answer, and
-//! the broadcast gate's recorded `http`, `await` and `deadline` (#57).
+//! the broadcast gate's `emit` to the broadcaster, `await` and `deadline` (#57, #70).
 //! wasm32-wasi only.
 const std = @import("std");
 const w = @import("wallet");
@@ -24,7 +24,7 @@ pub const sk = struct {
     pub extern "skein" fn take(out: [*]u8, cap: u32) i32;
     pub extern "skein" fn @"error"(out: [*]u8, cap: u32) i32;
     pub extern "skein" fn edges(to: [*]const u8, to_len: u32, rel: [*]const u8, rel_len: u32, out: [*]u8, cap: u32) i32;
-    pub extern "skein" fn http(req: [*]const u8, len: u32, out: [*]u8, cap: u32) i32;
+    pub extern "skein" fn emit(msg: [*]const u8, len: u32, out: [*]u8, cap: u32) i32;
     pub extern "skein" fn deadline(until: i64) i32;
     pub extern "skein" fn @"await"(cid: [*]const u8, cid_len: u32) i32;
 };
@@ -117,32 +117,37 @@ pub fn caller() w.overlay.Caller {
     return .{ .ctx = &dummy, .callFn = callerImpl };
 }
 
-/// One request over the `http` import (attested: request and answer are
-/// recorded on the step, so a replay never touches the network) → the
-/// answer's status and body. A failed import (the host could not answer at
-/// all; the kernel records no answer) is `HttpFailed`: the step ends
-/// errored, as the wallet's does, rather than record an outcome no answer
-/// supports. An Arcade the host cannot reach is not this: the route answers
-/// it 503, a recorded answer (transient).
-fn httpImpl(_: *anyopaque, a: std.mem.Allocator, method: []const u8, url: []const u8, body: ?[]const u8) anyerror!submit.Http.Reply {
-    var req: std.ArrayList(cbor.Entry) = .empty;
-    try req.appendSlice(a, &.{
-        .{ .key = "method", .value = .{ .text = method } },
-        .{ .key = "url", .value = .{ .text = url } },
-        .{ .key = "headers", .value = .{ .map = if (body != null) &.{
-            .{ .key = "Content-Type", .value = .{ .text = "application/octet-stream" } },
-            .{ .key = "Accept", .value = .{ .text = "application/json" } },
-        } else &.{.{ .key = "Accept", .value = .{ .text = "application/json" } }} } },
-    });
-    if (body) |b| try req.append(a, .{ .key = "body", .value = .{ .bytes = b } });
-    const bytes = try cbor.encode(a, .{ .map = req.items });
-    const res = cbor.decode(a, result(a, sk.http, .{ bytes.ptr, @as(u32, @intCast(bytes.len)) }) catch return error.HttpFailed) catch return error.BadHttpResponse;
-    return .{ .status = res.getUint("status") orelse return error.BadHttpResponse, .body = res.getBytes("body") orelse "" };
+/// The address book's `broadcast` provider's key (#70: the entry with role
+/// "broadcast" under the head `peers`), or null.
+fn broadcasterKey(a: std.mem.Allocator) !?[]const u8 {
+    const s = store();
+    const root = (try head(a, "peers")) orelse return null;
+    const book = try s.getValue(a, root);
+    for (book.getArray("peers") orelse return null) |e| {
+        const p = try s.getValue(a, e.getCid("peer") orelse continue);
+        if (std.mem.eql(u8, p.getText("role") orelse "", "broadcast")) return p.getBytes("key");
+    }
+    return null;
 }
 
-/// The broadcast gate's HTTP (#57), over the `http` import.
-pub fn http() submit.Http {
-    return .{ .ctx = &dummy, .callFn = httpImpl };
+/// A message to the broadcaster about a transaction (#70): emitted, its
+/// `subject` the transaction's CID; the message's CID. The step that emits it
+/// awaits it (engine.zig), and the broadcaster's answer steps the thread.
+fn emitImpl(_: *anyopaque, a: std.mem.Allocator, box: []const u8, txid: [32]u8, body: Value) anyerror![]const u8 {
+    const to = (try broadcasterKey(a)) orelse return error.NoBroadcaster;
+    const subject = w.store.hashCid(.tx, txid);
+    const msg = try cbor.encode(a, .{ .map = try a.dupe(cbor.Entry, &.{
+        .{ .key = "to", .value = .{ .bytes = to } },
+        .{ .key = "box", .value = .{ .text = box } },
+        .{ .key = "body", .value = .{ .bytes = try cbor.encode(a, body) } },
+        .{ .key = "subject", .value = .{ .cid = try a.dupe(u8, &subject) } },
+    }) });
+    return result(a, sk.emit, .{ msg.ptr, @as(u32, @intCast(msg.len)) });
+}
+
+/// The broadcast gate's broadcaster (#57, #70), over the `emit` import.
+pub fn broadcaster() submit.Broadcaster {
+    return .{ .ctx = &dummy, .emitFn = emitImpl };
 }
 
 /// Rest the thread until a status for this record (a transaction's CID) arrives, or the deadline.

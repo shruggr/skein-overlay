@@ -8,7 +8,7 @@
 //! decoded blocks, the judgement and the service's map; ls_demo answers from
 //! its own map (by topic, by script hash, by outpoint) with BEEF that
 //! verifies; a spend reaches it through `spent`, a rejection through `rejected`.
-//! The broadcast gate (#57), against a fake Arcade behind the step's `http`:
+//! The broadcast gate (#57), against a fake Arcade behind the broadcaster (#70: the step emits, the answers step the thread):
 //! admitted only once ARC takes the transaction (then proven by its awaiting
 //! thread's MINED status); ARC's 400 rejects it, nothing admitted; ARC's 503
 //! leaves it pending (a resubmission adds nothing) until a deadline's re-ask
@@ -101,33 +101,38 @@ const Overlay = struct {
     }
 };
 
-/// Arcade behind the host's broadcast route (#57, #58), as the step's `http`
-/// sees it: POST /v1/tx (202 RECEIVED, a duplicate's current status; 400 in
-/// mode `reject`; 503 + Retry-After in mode `busy`), GET /v1/tx/<txid> (its
-/// status, or 404 for a transaction it never took).
+/// Arcade behind the host's broadcaster provider (#57, #58, #70), as the
+/// step's emits reach it: box "broadcast" {tx} is its POST /tx (202 RECEIVED,
+/// a duplicate's current status; 400 in mode `reject`; 503 + Retry-After in
+/// mode `busy`), box "status" {txid} its GET /tx/<txid> (its status, or 404
+/// for a transaction it never took). Each question is answered later, as the
+/// provider's message is: queued, and fed to the thread as its next step
+/// (Instance.answered).
 const FakeArc = struct {
-    const base = "http://arc.test/arc";
     mode: enum { ok, reject, busy } = .ok,
     /// txid (hex) → its txStatus, for the transactions it took.
     known: std.StringHashMapUnmanaged([]const u8) = .empty,
     posts: usize = 0,
     gets: usize = 0,
+    /// The answers not yet delivered, in order: the box asked in, and Arcade's reply.
+    queue: std.ArrayList(Answer) = .empty,
     a: Allocator,
 
-    fn reply(a: Allocator, status: u64, v: anytype) !submit.Http.Reply {
+    const Answer = struct { box: []const u8, reply: submit.Reply };
+
+    fn reply(a: Allocator, status: u64, v: anytype) !submit.Reply {
         var out: std.Io.Writer.Allocating = .init(a);
         try std.json.Stringify.value(v, .{}, &out.writer);
         return .{ .status = status, .body = out.written() };
     }
 
-    fn call(ctx: *anyopaque, a: Allocator, method: []const u8, url: []const u8, body: ?[]const u8) anyerror!submit.Http.Reply {
-        const self: *FakeArc = @ptrCast(@alignCast(ctx));
-        if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, url, base ++ "/v1/tx")) {
+    fn arcade(self: *FakeArc, a: Allocator, box: []const u8, body: Value) !submit.Reply {
+        if (std.mem.eql(u8, box, "broadcast")) {
             self.posts += 1;
             // Arcade's own parse of what it receives: not the overlay's (#50 counts the overlay's parses).
             const parses = beef.parses;
             defer beef.parses = parses;
-            const txid = hdr.toHex((try beef.parse(a, body.?)).subject().?);
+            const txid = hdr.toHex((try beef.parse(a, body.getBytes("tx").?)).subject().?);
             switch (self.mode) {
                 .busy => return reply(a, 503, .{ .status = 503, .title = "Service Unavailable", .detail = "backpressure" }),
                 .reject => return reply(a, 400, .{ .status = 400, .txid = &txid, .reason = "rejected by the test" }),
@@ -137,13 +142,20 @@ const FakeArc = struct {
             try self.known.put(self.a, try self.a.dupe(u8, &txid), "RECEIVED");
             return reply(a, 202, .{ .txid = &txid, .status = 202, .txStatus = "RECEIVED" });
         }
-        if (std.mem.eql(u8, method, "GET") and std.mem.startsWith(u8, url, base ++ "/v1/tx/")) {
+        if (std.mem.eql(u8, box, "status")) {
             self.gets += 1;
-            const txid = url[base.len + "/v1/tx/".len ..];
+            const txid = body.getText("txid").?;
             const st = self.known.get(txid) orelse return reply(a, 404, .{ .status = 404, .title = "Not Found" });
             return reply(a, 200, .{ .txid = txid, .txStatus = st });
         }
         return reply(a, 404, .{ .status = 404, .title = "Not Found" });
+    }
+
+    fn emit(ctx: *anyopaque, a: Allocator, box: []const u8, _: [32]u8, body: Value) anyerror![]const u8 {
+        const self: *FakeArc = @ptrCast(@alignCast(ctx));
+        try self.queue.append(self.a, .{ .box = box, .reply = try self.arcade(a, box, body) });
+        // The question's id: a CID of its own, as the kernel's emit returns.
+        return try a.dupe(u8, &cbor.cidOf(try std.fmt.allocPrint(a, "question {d}", .{self.posts + self.gets})));
     }
 };
 
@@ -165,6 +177,8 @@ const Instance = struct {
     arc: *FakeArc,
     /// The last submit entry stepped: what its awaiting thread began with.
     last_event: Value = .null,
+    /// Every wallet state a submission's steps saved (#70: the post and its answer are two steps, each saves).
+    states: std.ArrayList([]const u8) = .empty,
 
     fn init(a: Allocator, ms: *w.store.MemStore) !Instance {
         const tp = try a.dupe(u8, &cbor.cidOf("topic-demo"));
@@ -172,7 +186,6 @@ const Instance = struct {
         const in: Value = .{ .map = try a.dupe(cbor.Entry, &.{
             .{ .key = "defaults", .value = .{ .map = try a.dupe(cbor.Entry, &.{
                 .{ .key = "walletNetwork", .value = .{ .text = "regtest" } },
-                .{ .key = "walletArc", .value = .{ .text = FakeArc.base } },
                 .{ .key = "walletAbandonMs", .value = .{ .text = "100000" } },
                 .{ .key = "overlayTopics", .value = .{ .text = "{\"tm_demo\":\"topic-demo\"}" } },
                 .{ .key = "overlayLookups", .value = .{ .text = "{\"ls_demo\":{\"program\":\"lookup-demo\",\"topics\":[\"tm_demo\"]}}" } },
@@ -187,8 +200,8 @@ const Instance = struct {
         return .{ .a = a, .ms = ms, .current = ms.store(), .in = in, .topic_prog = tp, .lookup_prog = lp, .arc = arc };
     }
 
-    fn http(self: *Instance) submit.Http {
-        return .{ .ctx = self.arc, .callFn = FakeArc.call };
+    fn broadcaster(self: *Instance) submit.Broadcaster {
+        return .{ .ctx = self.arc, .emitFn = FakeArc.emit };
     }
 
     fn callImpl(ctx: *anyopaque, a: Allocator, program: []const u8, func: []const u8, arg: Value) anyerror!Value {
@@ -231,26 +244,45 @@ const Instance = struct {
         return submit.route(self.a, self.caller(), &wal, self.in, bytes, &.{"tm_demo"}, null);
     }
 
-    /// The engine stepped on the admitted entry: held, broadcast unless mined, admitted once ARC takes it.
+    /// The engine stepped on the admitted entry: held, posted to the
+    /// broadcaster unless mined; then the thread stepped on each answer
+    /// (Arcade's) as it comes: admitted once ARC takes it. The last step's.
     fn step(self: *Instance, ev: Value) !submit.Stepped {
         self.current = self.ms.store();
         self.last_event = ev;
         var wal = try w.wallet.Wallet.load(self.a, self.ms.store(), self.wallet, .regtest);
         wal.now = self.now;
-        const done = try submit.step(self.a, self.caller(), self.http(), &wal, self.in, ev);
+        const done = try submit.step(self.a, self.caller(), self.broadcaster(), &wal, self.in, ev);
         try w.overlay.hookRejected(self.a, self.caller(), self.in, wal.unapplied.items);
         self.wallet = try wal.save();
-        return done;
+        try self.states.append(self.a, self.wallet.?);
+        return self.answered(ev, done);
     }
 
-    /// The submission's awaiting thread stepped again: an entry for its transaction, or its deadline.
+    /// The submission's awaiting thread stepped again — an entry for its
+    /// transaction, or its deadline — and then on each answer to what it asked.
     fn wake(self: *Instance, ev: Value, wk: submit.Wake) !submit.Stepped {
+        return self.answered(ev, try self.wakeOnce(ev, wk));
+    }
+
+    fn wakeOnce(self: *Instance, ev: Value, wk: submit.Wake) !submit.Stepped {
         self.current = self.ms.store();
         var wal = try w.wallet.Wallet.load(self.a, self.ms.store(), self.wallet, .regtest);
         wal.now = self.now;
-        const done = try submit.awaited(self.a, self.caller(), self.http(), &wal, self.in, ev, wk);
+        const done = try submit.awaited(self.a, self.caller(), self.broadcaster(), &wal, self.in, ev, wk);
         try w.overlay.hookRejected(self.a, self.caller(), self.in, wal.unapplied.items);
         self.wallet = try wal.save();
+        try self.states.append(self.a, self.wallet.?);
+        return done;
+    }
+
+    /// The broadcaster's answers, each the thread's next step (#70), until none is left: the last step's.
+    fn answered(self: *Instance, ev: Value, first: submit.Stepped) !submit.Stepped {
+        var done = first;
+        while (self.arc.queue.items.len > 0) {
+            const x = self.arc.queue.orderedRemove(0);
+            done = try self.wakeOnce(ev, .{ .answer = .{ .box = x.box, .reply = x.reply } });
+        }
         return done;
     }
 
@@ -404,11 +436,15 @@ test "the submission flow: parse once, persist only on admission, a lookup servi
         try std.testing.expectEqualSlices(u32, &.{0}, done.applied[0].outputs_to_admit);
         try std.testing.expectEqual(@as(usize, 1), inst.count("admitted"));
         try std.testing.expectEqual(@as(usize, 0), inst.count("spent"));
-        // What the step persisted: the decoded blocks (the transactions; this BUMP reveals no node:
+        // What the steps persisted: the decoded blocks (the transactions; this BUMP reveals no node:
         // a one-transaction block), the judgement and admittance (reachable from the new wallet
         // state), the service's map (from its new state) — and nothing else.
         const decoded = [_][37]u8{ w.store.hashCid(.tx, fund_txid), w.store.hashCid(.tx, t1.txid) };
-        const kept = try reachable(a, ms.store(), &.{ inst.wallet.?, inst.ls_state.? });
+        // The wallet states the steps saved: the post's (pending) and the answer's (admitted, #70).
+        var roots: std.ArrayList([]const u8) = .empty;
+        try roots.appendSlice(a, inst.states.items);
+        try roots.append(a, inst.ls_state.?);
+        const kept = try reachable(a, ms.store(), roots.items);
         var fresh: usize = 0;
         var it = ms.blocks.iterator();
         while (it.next()) |e| {
@@ -571,10 +607,10 @@ test "the broadcast gate (#57): admitted only once ARC takes it; rejected, pendi
         try std.testing.expectEqual(@as(usize, 1), inst.count("admitted"));
         try std.testing.expectEqual(@as(usize, 1), try look(&inst));
         try std.testing.expect(!(try inst.pending(ta.txid)));
-        // The broadcast record: the route, ARC's status, since.
+        // The broadcast record: the broadcaster, ARC's status, since.
         var wal = try w.wallet.Wallet.load(a, ms.store(), inst.wallet, .regtest);
         const rec = (try wal.awaitingRecord(ta.txid)).?;
-        try std.testing.expectEqualStrings(FakeArc.base, rec.getText("arc").?);
+        try std.testing.expectEqualStrings("broadcast", rec.getText("arc").?);
         try std.testing.expectEqualStrings("RECEIVED", rec.getText("txStatus").?);
         try std.testing.expectEqualStrings("admitted", rec.getText("submission").?);
         try std.testing.expectEqual(@as(u64, 1000), rec.getUint("since").?);
