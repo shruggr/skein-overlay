@@ -8,13 +8,15 @@
 //! decoded blocks, the judgement and the service's map; ls_demo answers from
 //! its own map (by topic, by script hash, by outpoint) with BEEF that
 //! verifies; a spend reaches it through `spent`, a rejection through `rejected`.
-//! The broadcast gate (#57, #65), the broadcast an event the wiring records:
-//! with a status provider, admitted on its accepted status (then proven by
-//! its proof event), rejected by its REJECTED, abandoned when nothing comes;
-//! under overlayAdmitOn "proof", a status is only noted and the proof admits
-//! it (a path whose header is not held yet leaves it pending); with no status
-//! provider, admitted on validation and unwound by a later rejection; a mined
-//! one is admitted with no broadcast.
+//! The broadcast gate (#57, #65, #73), the broadcast an event the wiring
+//! records: there is no setting — admitted on the first of a status
+//! provider's accepted status or a validated proof. With a status provider,
+//! admitted on its accepted status, then the later proof just proves it (no
+//! second admission); rejected by its REJECTED; abandoned when nothing comes.
+//! The proof first instead: admitted on it (a path whose header is not held
+//! yet leaves it pending), a later status just noted (no second admission).
+//! With no status provider subscribed, no status ever arrives: nothing is
+//! admitted before the proof. A mined one is admitted with no broadcast.
 const std = @import("std");
 const w = @import("wallet");
 const topic = @import("src/topic.zig");
@@ -101,10 +103,8 @@ const Overlay = struct {
     }
 };
 
-/// The broadcast wiring (#65) as the gate sees it: the broadcast events the
-/// step emits, recorded; whether a status provider is in the address book.
+/// The broadcast wiring (#65) as the gate sees it: the broadcast events the step emits, recorded.
 const FakeWire = struct {
-    status_provider: bool = false,
     /// The transactions broadcast, in order.
     broadcasts: std.ArrayList([32]u8) = .empty,
     a: Allocator,
@@ -117,10 +117,6 @@ const FakeWire = struct {
         const sub = (try beef.parse(self.a, bytes)).subject().?;
         if (!std.mem.eql(u8, &sub, &txid)) return error.NotItsBeef;
         try self.broadcasts.append(self.a, txid);
-    }
-    fn hasStatus(ctx: *anyopaque, _: Allocator) anyerror!bool {
-        const self: *FakeWire = @ptrCast(@alignCast(ctx));
-        return self.status_provider;
     }
 };
 
@@ -166,18 +162,7 @@ const Instance = struct {
     }
 
     fn wire(self: *Instance) submit.Wire {
-        return .{ .ctx = self.wire_, .broadcastFn = FakeWire.broadcast, .statusFn = FakeWire.hasStatus };
-    }
-
-    /// Set genesis `defaults.overlayAdmitOn` ("status" | "proof").
-    fn admitOn(self: *Instance, mode: []const u8) !void {
-        const d = self.in.get("defaults").?;
-        var es: std.ArrayList(cbor.Entry) = .empty;
-        for (d.map) |e| if (!std.mem.eql(u8, e.key, "overlayAdmitOn")) try es.append(self.a, e);
-        try es.append(self.a, .{ .key = "overlayAdmitOn", .value = .{ .text = mode } });
-        var top: std.ArrayList(cbor.Entry) = .empty;
-        for (self.in.map) |e| try top.append(self.a, if (std.mem.eql(u8, e.key, "defaults")) .{ .key = "defaults", .value = .{ .map = es.items } } else e);
-        self.in = .{ .map = top.items };
+        return .{ .ctx = self.wire_, .broadcastFn = FakeWire.broadcast };
     }
 
     fn callImpl(ctx: *anyopaque, a: Allocator, program: []const u8, func: []const u8, arg: Value) anyerror!Value {
@@ -221,7 +206,8 @@ const Instance = struct {
     }
 
     /// The engine stepped on the admitted entry: held, broadcast unless
-    /// mined (an event), admitted per overlayAdmitOn or left pending.
+    /// mined (an event), else left pending (#73: admitted later, on the
+    /// first of a status or the proof).
     fn step(self: *Instance, ev: Value) !submit.Stepped {
         self.current = self.ms.store();
         self.last_event = ev;
@@ -272,6 +258,15 @@ const Instance = struct {
         }
         // The entry as the host puts it: a dag-cbor record, read back.
         return self.step(try cbor.decode(self.a, try cbor.encode(self.a, r.admit.event)));
+    }
+
+    /// Submitted, then admitted on a status (RECEIVED) — the gate itself is
+    /// #73's own test below; this test is about decode-once/persist, so it
+    /// just needs the submission off `pending` once, the same way a status
+    /// provider's first word would take it there.
+    fn admitted(self: *Instance, bytes: []const u8, txid: [32]u8) !submit.Stepped {
+        _ = try self.submitted(bytes);
+        return self.wake(self.last_event, .{ .status = try statusBody(self.a, txid, "RECEIVED") });
     }
 
     /// A `status` entry: the chain feed's rejection, the removed judgements' services told.
@@ -397,8 +392,9 @@ test "the submission flow: parse once, persist only on admission, a lookup servi
         const before = try inst.snapshot();
         const wallet_before = inst.wallet.?;
         const parses = beef.parses;
-        const done = try inst.submitted(t1_beef);
-        // Parsed once: the route decoded it; the topic, the step and the hooks read records.
+        const done = try inst.admitted(t1_beef, t1.txid);
+        // Parsed once: the route decoded it; the topic, the step and the hooks read records (the
+        // admitting status wake decodes nothing new).
         try std.testing.expectEqual(parses + 1, beef.parses);
         try std.testing.expectEqualSlices(u32, &.{0}, done.applied[0].outputs_to_admit);
         try std.testing.expectEqual(@as(usize, 1), inst.count("admitted"));
@@ -407,7 +403,8 @@ test "the submission flow: parse once, persist only on admission, a lookup servi
         // a one-transaction block), the judgement and admittance (reachable from the new wallet
         // state), the service's map (from its new state) — and nothing else.
         const decoded = [_][37]u8{ w.store.hashCid(.tx, fund_txid), w.store.hashCid(.tx, t1.txid) };
-        // The wallet states the steps saved (no status provider here: admitted on validation, in one step).
+        // The wallet states both steps saved (#73: the submit step broadcasts and goes pending; the
+        // status wake admits it).
         var roots: std.ArrayList([]const u8) = .empty;
         try roots.appendSlice(a, inst.states.items);
         try roots.append(a, inst.ls_state.?);
@@ -467,7 +464,7 @@ test "the submission flow: parse once, persist only on admission, a lookup servi
     const t2 = try spend(a, &t1.tx, 0, &.{.{ 1, &token }}, priv);
     {
         inst.now = 2000;
-        const done = try inst.submitted(try atomic(a, t2));
+        const done = try inst.admitted(try atomic(a, t2), t2.txid);
         try std.testing.expectEqualSlices(u32, &.{0}, done.applied[0].coins_to_retain);
         try std.testing.expectEqual(@as(usize, 1), inst.count("spent"));
         const live = try inst.look(&.{.{ .key = "topic", .value = .{ .text = "tm_demo" } }});
@@ -496,7 +493,7 @@ test "the submission flow: parse once, persist only on admission, a lookup servi
     {
         inst.now = 4000;
         const t3 = try spend(a, &t1.tx, 0, &.{.{ 1, &p2pkh }}, priv);
-        const done = try inst.submitted(try atomic(a, t3));
+        const done = try inst.admitted(try atomic(a, t3), t3.txid);
         try std.testing.expectEqual(@as(usize, 0), done.applied[0].outputs_to_admit.len);
         try std.testing.expectEqualSlices(u32, &.{0}, done.applied[0].coins_removed);
         try std.testing.expectEqual(@as(usize, 2), inst.count("spent"));
@@ -524,14 +521,13 @@ fn proofEvent(a: Allocator, txid: [32]u8, path: []const u8) !Value {
     }) };
 }
 
-test "the broadcast gate (#57, #65): a status provider's word, the proof, or validation; rejected, abandoned, mined" {
+test "the broadcast gate (#57, #65, #73): admitted on the first of a status or the proof; rejected, abandoned, mined" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
     var ms = w.store.MemStore.init(std.testing.allocator);
     defer ms.deinit();
     var inst = try Instance.init(a, &ms);
-    inst.wire_.status_provider = true;
 
     const priv: [32]u8 = .{0x42} ** 32;
     const pub_key = try w.brc29.identityKey(priv);
@@ -633,21 +629,17 @@ test "the broadcast gate (#57, #65): a status provider's word, the proof, or val
         try std.testing.expectEqualStrings("TransactionRejected", (try inst.route(try withFund(a, bumps, fund_entry, tb))).nothing);
     }
 
-    // ------------------------------------------------ (c) overlayAdmitOn "proof": a status is noted, it stays pending; a path
-    // whose header is not held leaves it pending; the proof admits it
+    // ------------------------------------------------ (c) its proof first (no status at all): admits it (a path whose
+    // header is not held leaves it pending); a later status that is not a rejection just notes it — no second
+    // admission (#73: the gate is the first of the two signals)
     const tc = try spend(a, &fund_tx, 2, &.{.{ 1, &token }}, priv);
     const h3 = mine(hdr.hash(&h2), tc.txid, 1_700_001_800);
     {
-        try inst.admitOn("proof");
-        defer inst.admitOn("status") catch unreachable;
         inst.now = 2000;
         const admitted = inst.count("admitted");
         const done = try inst.submitted(try withFund(a, bumps, fund_entry, tc));
         try std.testing.expectEqual(submit.Gated.pending, done.gate);
         const ev = inst.last_event;
-        const seen = try inst.wake(ev, .{ .status = try statusBody(a, tc.txid, "SEEN_ON_NETWORK") });
-        try std.testing.expectEqual(submit.Gated.pending, seen.gate);
-        try std.testing.expect(!seen.admitted);
         try std.testing.expect(try inst.pending(tc.txid));
         try std.testing.expectEqualSlices(u8, &tc.txid, &(try inst.route(try withFund(a, bumps, fund_entry, tc))).pending);
         // Its proof before its header: still pending.
@@ -664,6 +656,13 @@ test "the broadcast gate (#57, #65): a status provider's word, the proof, or val
         try std.testing.expect(ok.admitted);
         try std.testing.expectEqual(w.wallet.Wallet.Outcome.proven, ok.outcome);
         try std.testing.expectEqual(admitted + 1, inst.count("admitted"));
+        try std.testing.expectEqual(@as(usize, 2), try look(&inst));
+        try std.testing.expect(!(try inst.pending(tc.txid)));
+        // A later status (not a rejection), the proof having admitted it first: only noted, no second admission.
+        const noted = try inst.wake(ev, .{ .status = try statusBody(a, tc.txid, "SEEN_ON_NETWORK") });
+        try std.testing.expect(!noted.admitted);
+        try std.testing.expectEqual(admitted + 1, inst.count("admitted"));
+        try std.testing.expectEqual(w.wallet.Wallet.Outcome.proven, noted.outcome);
         try std.testing.expectEqual(@as(usize, 2), try look(&inst));
     }
 
@@ -683,36 +682,42 @@ test "the broadcast gate (#57, #65): a status provider's word, the proof, or val
         try std.testing.expect(!(try inst.pending(tp.txid)));
     }
 
-    // ------------------------------------------------ (e) no status provider: admitted on validation; a later
-    // DOUBLE_SPEND_ATTEMPTED (the chain feed's) unwinds the admittance and the lookup's index
+    // ------------------------------------------------ (e) no status ever arrives (no provider subscribed, in
+    // production: a status message only ever reaches `awaited` through one, #73): nothing admitted before the
+    // proof — the same gate as (c), just with no status racing it
+    const te = try spend(a, &fund_tx, 4, &.{.{ 1, &token }}, priv);
+    const h4 = mine(hdr.hash(&h3), te.txid, 1_700_002_000);
     {
-        inst.wire_.status_provider = false;
-        defer inst.wire_.status_provider = true;
-        const tv = try spend(a, &fund_tx, 4, &.{.{ 1, &token }}, priv);
         inst.now = 400_000;
         const admitted = inst.count("admitted");
-        const done = try inst.submitted(try withFund(a, bumps, fund_entry, tv));
-        try std.testing.expectEqual(submit.Gated.validated, done.gate);
-        try std.testing.expect(done.admitted);
-        try std.testing.expectEqual(w.wallet.Wallet.Outcome.pending, done.outcome);
+        const done = try inst.submitted(try withFund(a, bumps, fund_entry, te));
+        try std.testing.expectEqual(submit.Gated.pending, done.gate);
+        try std.testing.expect(!done.admitted);
+        try std.testing.expectEqual(admitted, inst.count("admitted"));
+        try std.testing.expect(try inst.pending(te.txid));
+        const ev = inst.last_event;
+        // Its proof before its header: still pending.
+        const early = try inst.wake(ev, .{ .event = try proofEvent(a, te.txid, try soloPath(a, 4, te.txid)) });
+        try std.testing.expectEqual(submit.Gated.pending, early.gate);
+        try std.testing.expect(try inst.pending(te.txid));
+        try std.testing.expectEqual(admitted, inst.count("admitted"));
+        try inst.headers(&.{&h4});
+        const ok = try inst.wake(ev, .{ .event = try proofEvent(a, te.txid, try soloPath(a, 4, te.txid)) });
+        try std.testing.expectEqual(submit.Gated.mined, ok.gate);
+        try std.testing.expect(ok.admitted);
+        try std.testing.expectEqual(w.wallet.Wallet.Outcome.proven, ok.outcome);
         try std.testing.expectEqual(admitted + 1, inst.count("admitted"));
-        try std.testing.expect(!(try inst.pending(tv.txid)));
+        try std.testing.expect(!(try inst.pending(te.txid)));
         try std.testing.expectEqual(@as(usize, 3), try look(&inst));
-        const rejected = inst.count("rejected");
-        try inst.status(tv.txid, "DOUBLE_SPEND_ATTEMPTED");
-        try std.testing.expectEqual(rejected + 1, inst.count("rejected"));
-        try std.testing.expectEqual(@as(usize, 2), try look(&inst));
-        var wl = try w.wallet.Wallet.load(a, ms.store(), inst.wallet, .regtest);
-        try std.testing.expect(!(try w.overlay.isApplied(&wl, "tm_demo", tv.txid)));
     }
 
     // ------------------------------------------------ (d) mined: the BEEF proves the subject; admitted with no broadcast
     {
-        // (ta is proven in block 2: its token spent on, in a transaction mined alone at 4.)
+        // (ta is proven in block 2: its token spent on, in a transaction mined alone at 5.)
         const td = try spend(a, &ta.tx, 0, &.{.{ 1, &token }}, priv);
-        const h4 = mine(hdr.hash(&h3), td.txid, 1_700_002_400);
-        try inst.headers(&.{&h4});
-        const td_bumps = try a.dupe(bsvz.spv.MerklePath, &.{try bsvz.spv.MerklePath.parse(a, try soloPath(a, 4, td.txid))});
+        const h5 = mine(hdr.hash(&h4), td.txid, 1_700_002_400);
+        try inst.headers(&.{&h5});
+        const td_bumps = try a.dupe(bsvz.spv.MerklePath, &.{try bsvz.spv.MerklePath.parse(a, try soloPath(a, 5, td.txid))});
         const bytes = try beef.serialize(a, .{ .version = beef.V2, .bumps = td_bumps, .entries = try a.dupe(beef.Entry, &.{.{ .txid = td.txid, .format = .raw_with_bump, .bump = 0, .raw = td.raw, .tx = td.tx }}) });
         const n = inst.wire_.broadcasts.items.len;
         const done = try inst.submitted(bytes);

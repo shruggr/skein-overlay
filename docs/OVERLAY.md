@@ -28,7 +28,7 @@ storage are not ported.
 |---|---|
 | `wallet-zig/src/overlay.zig` | The overlay's state in the chain and settlement core, and the submission's records: `decode` (the one BEEF parse), `verifyDecoded` (SPV over the records), `holdDecoded`, the previous coins, recording a topic's judgement (`apply`), the derived map, the hooks' dispatch (`Caller`, `listeners`, `hookAdmitted`, `hookRejected`), each output's BEEF for a lookup answer. |
 | `programs/overlay/src/engine.zig` → `overlay.wasm` | The engine: called, the front door's route handlers (`routes.zig`); stepped, the handler for the `submit` and `chain` entries. |
-| `programs/overlay/src/submit.zig` | A submission from the wire to the state: the route's half (decode, verify, judge — in the front door's step on the request), the step's half (hold, broadcast — an event, #65 — then record and call the hooks once the gate lets it through, `overlayAdmitOn`), and the steps while it is pending (#57). |
+| `programs/overlay/src/submit.zig` | A submission from the wire to the state: the route's half (decode, verify, judge — in the front door's step on the request), the step's half (hold, broadcast — an event, #65 — then record and call the hooks once the gate lets it through: the first of a status or the proof, #73), and the steps while it is pending (#57). |
 | `programs/overlay/src/routes.zig` | The route handlers (#40): the overlay-express wire contract. |
 | `programs/overlay/src/topic.zig` | The topic contract (a library). |
 | `programs/overlay/src/lookup.zig` | The lookup contract (a library): hooks, own storage, answers. |
@@ -108,25 +108,24 @@ once.)
 ```
 
 The record puts the transaction in the graph. No output is admitted until
-the broadcast gate lets it through (`defaults.overlayAdmitOn`, #65, below).
-The engine, stepped on it:
+the broadcast gate lets it through (#65, #73, below). The engine, stepped on it:
 
 1. **Holds the records** (`holdDecoded`): each transaction's block is kept and
    put in `txs` (so #42's `spends` edges appear), the merkle nodes are kept
    (no edges: a proof reads down from the root), and each proven transaction's proof is recorded from the
    header its nodes reach (`Wallet.putProofAt`).
-2. **Gates on broadcast** (#57, #65). A subject the entry proves (its BUMP
-   reaches a header we hold) is mined: no broadcast, straight to 3.
+2. **Gates on broadcast** (#57, #65, #73). A subject the entry proves (its
+   BUMP reaches a header we hold) is mined: no broadcast, straight to 3.
    Otherwise the step broadcasts it — an event, `{event: "broadcast", tx,
    beef}` (its Atomic BEEF built from the held records, `Wallet.beefOf`),
    addressed to no one; the host's wiring carries it (the reference host:
    its broadcaster's durable queue and Arcade session, docs/WALLET.md) —
-   and gates per `defaults.overlayAdmitOn`:
-
-   | `overlayAdmitOn` | with a status provider (address book role `status`) | without one |
-   |---|---|---|
-   | `"status"` (default) | pending until its first status that is not a rejection (the reference host's: Arcade's RECEIVED) | **admitted at once** (gate `validated`): the BEEF verified; its proof settles it, a competing proof, a rejection or abandonment unwinds it through `admits` |
-   | `"proof"` | pending until its proof (statuses are noted; a rejection rejects it) | pending until its proof |
+   and leaves it pending: there is no setting. It is admitted on the first
+   of a status provider's word that the network has it (with none
+   subscribed, address book role `status`, nothing ever says so) or its
+   proof, whichever arrives first; the other, after, only settles or notes
+   it. Admission on validation alone is not a mode: an instance with no
+   status feed admits at the proof.
 
    Pending: the `broadcast` record says `submission: "pending"`, nothing is
    admitted, and the thread awaits (4).
@@ -143,11 +142,13 @@ The engine, stepped on it:
    - a **status message** from the status provider it subscribes to (input
      `message`, routed by its subject): a rejection (`REJECTED`,
      `DOUBLE_SPEND_ATTEMPTED`, `INVALID`, `MALFORMED`) rejects it (#37's
-     walk); any other status admits it (3) under `"status"`, and is only
-     noted under `"proof"`;
+     walk); any other status admits it (3) — the first of the two signals;
    - its **proof event** (box `chain`, input `event`): proven — admitted (3,
      gate `mined`); a path whose header we do not hold yet leaves it pending;
    - the **deadline**: abandoned if still pending (rejected, `abandoned`).
+
+   Once admitted, the other signal — arriving after — only settles it (the
+   proof) or is noted (a status): no second admission.
 
    Admitted or rejected, the submission's thread **finishes** (#66): the
    requests waiting on it answer. What follows for an admitted, unproven
@@ -318,7 +319,7 @@ into it, through sender-less subscriptions:
 
 | box | entry | does |
 |---|---|---|
-| `submit` | the submit event above (what `POST /submit` admits) | Holds the records; unless mined, broadcasts the transaction (an event, #65); once the gate admits it (`overlayAdmitOn`), records each topic's judgement and calls the lookup services' `admitted` / `spent` hooks; saves and advances `wallet`; awaits the transaction while pending or unproven (#57). |
+| `submit` | the submit event above (what `POST /submit` admits) | Holds the records; unless mined, broadcasts the transaction (an event, #65); once the gate admits it (the first of a status or the proof, #73), records each topic's judgement and calls the lookup services' `admitted` / `spent` hooks; saves and advances `wallet`; awaits the transaction while pending or unproven (#57). |
 | `chain` | `header` / `proof` / `status` | Handled as the wallet handles them, then `rejected` for each judgement a rejection removed. This is for an instance without a wallet program. A `status` / `proof` for a transaction whose submission thread awaits it steps that thread instead. |
 
 There is no `lookup` box: a lookup is a read: its request is recorded, and it moves nothing.
@@ -332,10 +333,10 @@ There is no `lookup` box: a lookup is a read: its request is recorded, and it mo
   listens to (its hooks are called for those). The short form
   `'{"ls_demo":"lookup-demo"}'` listens to every topic in `overlayTopics`.
 - `walletNetwork` is the chain's network.
-- `overlayAdmitOn` (`"status"` | `"proof"`, default `"status"`, #65): when
-  an unproven submission is admitted — on a status provider's word (with
-  none in the address book: at once, on validation) or on its proof (the
-  table above).
+- There is no admission setting (#73): an unproven submission is admitted on
+  the first of a status provider's word that the network has it, or its
+  proof — with no status provider in the address book, nothing ever says
+  so, so it is admitted at the proof.
 - The broadcaster is not config: a broadcast is an event the host carries
   (#65). A status provider is the address book's role `status` plus the
   subscription `{"sender": "$status", "box": "status", "handler":
@@ -574,8 +575,8 @@ equiv/overlay.ts copies the kernel's `wasm/frontdoor.wasm`. These routes
 replace the stock ones, so this node has no messagebox (add the stock
 routes to keep one). The config names no broadcaster (#65: a broadcast is an
 event); a host with an Arcade seeds its status provider in the address book,
-and `$status` names it here (left out on a host with none);
-`overlayAdmitOn` may be set here.
+and `$status` names it here (left out on a host with none); there is no
+admission setting (#73).
 
 **The loader change.** For a tree, the boot loader now asks the kernel only
 for the `shell` record. `serve`'s `programs` frame takes a list of names.
