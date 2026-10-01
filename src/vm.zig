@@ -2,7 +2,8 @@
 //! kernel-zig program.zig), and the few helpers every overlay program needs:
 //! the step's (or call's) input, the store as wallet-zig's `Store`,
 //! keep-and-print of a result record, in-VM calls and a call's answer, and
-//! the broadcast gate's `emit` to the broadcaster, `await` and `deadline` (#57, #70).
+//! the broadcast gate's wiring — the broadcast event (`emit`, #65), whether a
+//! status provider is in the address book — `await` and `deadline` (#57).
 //! wasm32-wasi only.
 const std = @import("std");
 const w = @import("wallet");
@@ -117,37 +118,39 @@ pub fn caller() w.overlay.Caller {
     return .{ .ctx = &dummy, .callFn = callerImpl };
 }
 
-/// The address book's `broadcast` provider's key (#70: the entry with role
-/// "broadcast" under the head `peers`), or null.
-fn broadcasterKey(a: std.mem.Allocator) !?[]const u8 {
+/// Whether the address book names a provider with `role` (the head `peers`).
+fn hasRole(a: std.mem.Allocator, role: []const u8) !bool {
     const s = store();
-    const root = (try head(a, "peers")) orelse return null;
+    const root = (try head(a, "peers")) orelse return false;
     const book = try s.getValue(a, root);
-    for (book.getArray("peers") orelse return null) |e| {
+    for (book.getArray("peers") orelse return false) |e| {
         const p = try s.getValue(a, e.getCid("peer") orelse continue);
-        if (std.mem.eql(u8, p.getText("role") orelse "", "broadcast")) return p.getBytes("key");
+        if (std.mem.eql(u8, p.getText("role") orelse "", role)) return true;
     }
-    return null;
+    return false;
 }
 
-/// A message to the broadcaster about a transaction (#70): emitted, its
-/// `subject` the transaction's CID; the message's CID. The step that emits it
-/// awaits it (engine.zig), and the broadcaster's answer steps the thread.
-fn emitImpl(_: *anyopaque, a: std.mem.Allocator, box: []const u8, txid: [32]u8, body: Value) anyerror![]const u8 {
-    const to = (try broadcasterKey(a)) orelse return error.NoBroadcaster;
-    const subject = w.store.hashCid(.tx, txid);
-    const msg = try cbor.encode(a, .{ .map = try a.dupe(cbor.Entry, &.{
-        .{ .key = "to", .value = .{ .bytes = to } },
-        .{ .key = "box", .value = .{ .text = box } },
-        .{ .key = "body", .value = .{ .bytes = try cbor.encode(a, body) } },
-        .{ .key = "subject", .value = .{ .cid = try a.dupe(u8, &subject) } },
+/// Broadcast a transaction (#65): the event {event: "broadcast", tx: <its
+/// CID>, beef: <its Atomic BEEF>}, addressed to no one — the host's wiring
+/// carries it. The step then awaits the transaction (engine.zig).
+fn broadcastImpl(_: *anyopaque, a: std.mem.Allocator, txid: [32]u8, beef: []const u8) anyerror!void {
+    const tx = w.store.hashCid(.tx, txid);
+    const ev = try cbor.encode(a, .{ .map = try a.dupe(cbor.Entry, &.{
+        .{ .key = "event", .value = .{ .text = "broadcast" } },
+        .{ .key = "tx", .value = .{ .cid = try a.dupe(u8, &tx) } },
+        .{ .key = "beef", .value = .{ .bytes = beef } },
     }) });
-    return result(a, sk.emit, .{ msg.ptr, @as(u32, @intCast(msg.len)) });
+    _ = try result(a, sk.emit, .{ ev.ptr, @as(u32, @intCast(ev.len)) });
 }
 
-/// The broadcast gate's broadcaster (#57, #70), over the `emit` import.
-pub fn broadcaster() submit.Broadcaster {
-    return .{ .ctx = &dummy, .emitFn = emitImpl };
+/// A status provider is in the address book (role "status", #65).
+fn statusImpl(_: *anyopaque, a: std.mem.Allocator) anyerror!bool {
+    return hasRole(a, "status");
+}
+
+/// The broadcast gate's wiring (#57, #65), over the `emit` and `head` imports.
+pub fn wire() submit.Wire {
+    return .{ .ctx = &dummy, .broadcastFn = broadcastImpl, .statusFn = statusImpl };
 }
 
 /// Rest the thread until a status for this record (a transaction's CID) arrives, or the deadline.

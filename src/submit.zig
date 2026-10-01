@@ -12,22 +12,26 @@
 //!   nothing persists. Otherwise it returns the entry for the host to admit.
 //! - **The step** (`step`, the engine stepped on that entry). It holds the
 //!   decoded records the entry carries (overlay.holdDecoded: kept, so #42's
-//!   edges appear), then gates on broadcast (#57): a subject the entry
-//!   proves is mined and goes straight on; otherwise it is posted to the
-//!   broadcaster (#70, #67: a message to the address book's `broadcast`
-//!   provider, the host's Arcade, #58) and the broadcast record marked
-//!   `pending`, nothing admitted yet.
+//!   edges appear), then gates on broadcast (#57, #65): a subject the entry
+//!   proves is mined and goes straight on; otherwise it is broadcast (an
+//!   event: {event: "broadcast", tx, beef}, the host's wiring carries it)
+//!   and admitted per `defaults.overlayAdmitOn` (`Gate`):
+//!     "status" (the default) — with a status provider in the address book
+//!       (role `status`), once it says the network has it; without one, at
+//!       once (admitted on validation, settled by the proof: a competing
+//!       proof or a rejection unwinds it through `admits`);
+//!     "proof" — once its proof arrives (a merkle path our headers hold).
+//!   Until then the broadcast record says `pending`, nothing admitted.
 //! - **The awaiting thread** (`awaited`). While the transaction is pending
-//!   the engine awaits what it asked the broadcaster, and the transaction's
-//!   CID, with a deadline: the broadcaster's answer (ARC's), a `status` /
-//!   `proof` entry for it, or the deadline (the broadcaster asked again)
-//!   steps the same thread. ARC takes it: the broadcast record, then the
-//!   admission — each topic's judgement recorded (`applied`, the
-//!   admittances) and each listening lookup service's hooks called
-//!   (`admitted`, then `spent` for each previous coin consumed). ARC rejects
-//!   it: the rejection (Wallet.reject), nothing admitted. A transient
-//!   failure: still `pending`. A judgement is taken again, at admission,
-//!   only if the topic's previous coins moved since the call.
+//!   the engine awaits its CID, with a deadline at its abandonment: a proof
+//!   event, a status provider's message, or the deadline steps the same
+//!   thread. Admitted: the broadcast record, then each topic's judgement
+//!   recorded (`applied`, the admittances) and each listening lookup
+//!   service's hooks called (`admitted`, then `spent` for each previous coin
+//!   consumed). Rejected (the provider's REJECTED, DOUBLE_SPEND_ATTEMPTED, …;
+//!   a competing proof; abandonment): the rejection (Wallet.reject), nothing
+//!   admitted. A judgement is taken again, at admission, only if the topic's
+//!   previous coins moved since the call.
 //!
 //! The entry (box `submit`) carries records, not a BEEF:
 //!
@@ -192,115 +196,69 @@ pub fn hold(wal: *Wallet, ev: Value) !ov.Subject {
 
 // ---------------------------------------------------------------- the step: broadcast, then admit (#57)
 
-/// An answer of the broadcaster (#70: the provider's signed message, its
-/// body {replyTo, status, body}): Arcade's HTTP status and JSON, as the
-/// host's broadcaster (#58) had them — status 0 when no answer came ({error}).
-pub const Reply = struct { status: u64, body: []const u8 };
-
-/// The broadcaster as the gate sees it (#70, #67): the address book's
-/// `broadcast` provider, reached by emitting to it (vm.zig's), or a test's.
-/// Each question is a message about the transaction; its answer is an entry
-/// that steps the submission's thread again (`Wake.answer`).
-pub const Broadcaster = struct {
+/// The broadcast wiring as the gate sees it (#65): broadcasting is an
+/// event, addressed to no one (vm.zig's emits it; a test's records it); and
+/// whether a status provider speaks to this instance (the address book
+/// names one, role `status`).
+pub const Wire = struct {
     ctx: *anyopaque,
-    /// Emit to the broadcaster in `box` about `txid` with `body`: the
-    /// message's CID (the thread awaits it). No broadcaster: error.NoBroadcaster.
-    emitFn: *const fn (ctx: *anyopaque, a: Allocator, box: []const u8, txid: [32]u8, body: Value) anyerror![]const u8,
+    /// Broadcast the transaction: the event {event: "broadcast", tx: <its CID>, beef}.
+    broadcastFn: *const fn (ctx: *anyopaque, a: Allocator, txid: [32]u8, beef: []const u8) anyerror!void,
+    /// Whether a status provider is in the address book.
+    statusFn: *const fn (ctx: *anyopaque, a: Allocator) anyerror!bool,
 
-    /// Post the transaction (box "broadcast", {tx: <the Atomic BEEF>}).
-    pub fn broadcast(self: Broadcaster, a: Allocator, txid: [32]u8, beef: []const u8) ![]const u8 {
-        return self.emitFn(self.ctx, a, "broadcast", txid, .{ .map = try a.dupe(cbor.Entry, &.{.{ .key = "tx", .value = .{ .bytes = beef } }}) });
+    pub fn broadcast(self: Wire, a: Allocator, txid: [32]u8, beef: []const u8) !void {
+        return self.broadcastFn(self.ctx, a, txid, beef);
     }
-
-    /// Ask after it (box "status", {txid}).
-    pub fn ask(self: Broadcaster, a: Allocator, txid: [32]u8) ![]const u8 {
-        return self.emitFn(self.ctx, a, "status", txid, .{ .map = try a.dupe(cbor.Entry, &.{.{ .key = "txid", .value = .{ .text = try a.dupe(u8, &w.header.toHex(txid)) } }}) });
+    pub fn hasStatus(self: Wire, a: Allocator) !bool {
+        return self.statusFn(self.ctx, a);
     }
 };
 
-/// The broadcast gate's settings, from genesis `defaults`: how often a
-/// submission awaiting the broadcaster is asked about again
-/// (`overlayRecheckMs`, default 30 000: a client told 503 retries on that
-/// scale), and when an unmined one is given up (`walletAbandonMs`, default
-/// 86 400 000: the chain core's rule). The broadcaster itself is the address
-/// book's (#70).
+/// When a submission is admitted (genesis `defaults.overlayAdmitOn`, #65):
+/// on a status provider's word that the network has it (`status`, the
+/// default; with no status provider, on validation), or on its proof (`proof`).
+pub const AdmitOn = enum { status, proof };
+
+/// The broadcast gate's settings, from genesis `defaults`: `overlayAdmitOn`
+/// ("status" | "proof", default "status"), and when an unmined submission is
+/// given up (`walletAbandonMs`, default 86 400 000; 0: never — the chain
+/// core's rule).
 pub const Gate = struct {
-    recheck_ms: i64 = 30_000,
+    admit_on: AdmitOn = .status,
     abandon_ms: i64 = 86_400_000,
 
     pub fn of(in: Value) !Gate {
         const d = in.get("defaults") orelse return .{};
         return .{
-            .recheck_ms = std.fmt.parseInt(i64, d.getText("overlayRecheckMs") orelse "30000", 10) catch return error.BadConfig,
+            .admit_on = std.meta.stringToEnum(AdmitOn, d.getText("overlayAdmitOn") orelse "status") orelse return error.BadConfig,
             .abandon_ms = std.fmt.parseInt(i64, d.getText("walletAbandonMs") orelse "86400000", 10) catch return error.BadConfig,
         };
     }
 
-    /// The Retry-After a pending submission is answered with: the re-ask interval, in whole seconds (at least 1).
-    pub fn retryAfter(g: Gate) u64 {
-        return @intCast(@max(1, @divFloor(g.recheck_ms + 999, 1000)));
+    /// The Retry-After a submission still pending is answered with (whole
+    /// seconds): a client told 503 resubmits on this scale, and is answered
+    /// from the state (the same thread) until it is admitted or rejected.
+    pub fn retryAfter(_: Gate) u64 {
+        return 30;
+    }
+
+    /// When a pending submission's thread wakes to abandon it: its first
+    /// broadcast + `abandon_ms`; null: never (0), or nothing awaits it.
+    pub fn deadline(g: Gate, wal: *Wallet, txid: [32]u8) !?i64 {
+        if (g.abandon_ms <= 0) return null;
+        const r = (try wal.awaitingRecord(txid)) orelse return null;
+        const since: i64 = @intCast(r.getUint("since") orelse return null);
+        return @max(since + g.abandon_ms, wal.now + 1);
     }
 };
-
-/// ARC's answer (the broadcaster passes Arcade's own): the HTTP status, its
-/// txStatus, a merkle path if mined, and its reason.
-pub const ArcAnswer = struct {
-    http_status: u64,
-    tx_status: []const u8 = "",
-    merkle_path: ?[]const u8 = null,
-    extra: []const u8 = "",
-
-    pub fn value(self: ArcAnswer, a: Allocator) !Value {
-        var es: std.ArrayList(cbor.Entry) = .empty;
-        try es.appendSlice(a, &.{
-            .{ .key = "status", .value = .{ .uint = self.http_status } },
-            .{ .key = "txStatus", .value = .{ .text = self.tx_status } },
-            .{ .key = "extraInfo", .value = .{ .text = self.extra } },
-        });
-        if (self.merkle_path) |p| try es.append(a, .{ .key = "merklePath", .value = .{ .bytes = p } });
-        return .{ .map = es.items };
-    }
-};
-
-/// Read ARC's JSON answer as the wallet program does: txStatus, merklePath
-/// (hex), and extraInfo (else Arcade's reason / detail / title).
-pub fn arcAnswer(a: Allocator, reply: Reply) !ArcAnswer {
-    var ans = ArcAnswer{ .http_status = reply.status };
-    const j = std.json.parseFromSliceLeaky(std.json.Value, a, reply.body, .{}) catch return ans;
-    if (j != .object) return ans;
-    if (j.object.get("txStatus")) |t| if (t == .string) {
-        ans.tx_status = t.string;
-    };
-    for ([_][]const u8{ "extraInfo", "reason", "detail", "title" }) |k| if (j.object.get(k)) |t| if (t == .string and t.string.len > 0) {
-        ans.extra = t.string;
-        break;
-    };
-    if (j.object.get("merklePath")) |t| if (t == .string and t.string.len > 0) {
-        const p = try a.alloc(u8, t.string.len / 2);
-        _ = std.fmt.hexToBytes(p, t.string) catch return error.BadHttpResponse;
-        ans.merkle_path = p;
-    };
-    return ans;
-}
-
-/// What ARC's answer says about a submission: **accepted** (a 2xx whose
-/// txStatus is not a rejection — RECEIVED, a duplicate's SEEN or MINED);
-/// **rejected** (a 4xx, or REJECTED / DOUBLE_SPEND_ATTEMPTED / INVALID /
-/// MALFORMED); **transient** (anything else: a 503 for backpressure, the
-/// broadcaster's 503 for an Arcade it cannot reach, no answer at all).
-pub const Verdict = enum { accepted, rejected, transient };
-
-pub fn verdictOf(ans: ArcAnswer) Verdict {
-    if (Wallet.isRejection(ans.tx_status)) return .rejected;
-    if (ans.http_status >= 200 and ans.http_status < 300) return .accepted;
-    if (ans.http_status >= 400 and ans.http_status < 500) return .rejected;
-    return .transient;
-}
 
 /// How the broadcast gate went: `mined` (the entry carried the subject's
-/// proof: no broadcast), `accepted`, `rejected`, `pending` (ARC has not
-/// taken it yet: nothing admitted, the thread awaits and asks again).
-pub const Gated = enum { mined, accepted, rejected, pending };
+/// proof, or its proof came: admitted), `accepted` (a status provider said
+/// the network has it: admitted), `validated` (no status provider and
+/// `overlayAdmitOn: "status"`: admitted on validation, settled by its
+/// proof), `rejected`, `pending` (nothing admitted yet: the thread awaits).
+pub const Gated = enum { mined, accepted, validated, rejected, pending };
 
 /// What a submit step (or a step of its awaiting thread) came to.
 pub const Stepped = struct {
@@ -311,22 +269,20 @@ pub const Stepped = struct {
     /// Whether this step admitted the submission (recorded its judgements, called the hooks).
     admitted: bool = false,
     gate: Gated,
-    /// ARC's answer, when this step had one (the broadcaster's).
-    arc: ?ArcAnswer = null,
-    /// What this step asked the broadcaster (#70): the messages, whose answers the thread awaits.
-    asked: []const []const u8 = &.{},
+    /// The status this step heard of the transaction (a status provider's), if any.
+    tx_status: []const u8 = "",
     /// The transaction's settlement now: its thread awaits it while pending.
     outcome: Wallet.Outcome,
     /// The records the judgements wrote (admittances, applied): the step keeps them.
     records: []const []const u8 = &.{},
 };
 
-/// The step's half, on the `submit` entry (#57): hold the records; unless
-/// the subject is mined, post it to the broadcaster (#70: a message) and
-/// leave it pending, nothing admitted: the thread awaits the broadcaster's
-/// answer (and the transaction's CID, with a deadline), which admits it once
-/// ARC takes it.
-pub fn step(a: Allocator, caller: ov.Caller, bc: Broadcaster, wal: *Wallet, in: Value, ev: Value) !Stepped {
+/// The step's half, on the `submit` entry (#57, #65): hold the records;
+/// unless the subject is mined, broadcast it (an event) and admit it per
+/// `overlayAdmitOn` — at once when there is no status provider to wait for
+/// ("status"), else leave it pending, nothing admitted: the thread awaits
+/// the transaction's CID (a status, its proof) with a deadline.
+pub fn step(a: Allocator, caller: ov.Caller, wire: Wire, wal: *Wallet, in: Value, ev: Value) !Stepped {
     const sub = try hold(wal, ev);
     var out = Stepped{ .subject = sub, .gate = .mined, .outcome = .pending };
     switch (try wal.status(sub.txid)) {
@@ -345,40 +301,18 @@ pub fn step(a: Allocator, caller: ov.Caller, bc: Broadcaster, wal: *Wallet, in: 
         .unproven => {},
     }
     const beef = (try wal.beefOf(sub.txid)) orelse return error.UnknownTransaction;
-    const asked = try bc.broadcast(a, sub.txid, beef);
-    try wal.noteSubmission(sub.txid, "broadcast", "", "pending", in.getCid("thread"));
-    out.gate = .pending;
-    out.asked = try a.dupe([]const u8, &.{asked});
-    return out;
-}
-
-/// ARC's word on a submission not yet admitted (its answer to the post or to
-/// a question, or a status entry): accepted → the broadcast record, the
-/// status applied, the judgements admitted; rejected → the rejection (#37's
-/// walk: the transaction and whatever depends on it), nothing admitted;
-/// transient → the broadcast record with `submission: "pending"`, nothing
-/// admitted.
-fn gated(a: Allocator, caller: ov.Caller, wal: *Wallet, in: Value, ev: Value, ans: ArcAnswer, out: *Stepped) !void {
-    const txid = out.subject.txid;
-    out.arc = ans;
-    switch (verdictOf(ans)) {
-        .accepted => {
-            out.gate = .accepted;
-            try wal.noteSubmission(txid, "broadcast", ans.tx_status, "admitted", in.getCid("thread"));
-            out.outcome = try wal.applyStatus(txid, ans.tx_status, ans.merkle_path);
-            if (out.outcome != .rejected) try admit(a, caller, wal, in, ev, out);
-        },
-        .rejected => {
-            out.gate = .rejected;
-            _ = try wal.reject(txid, if (ans.tx_status.len > 0) ans.tx_status else "REJECTED");
-            out.outcome = .rejected;
-        },
-        .transient => {
-            out.gate = .pending;
-            try wal.noteSubmission(txid, "broadcast", ans.tx_status, "pending", in.getCid("thread"));
-            out.outcome = .pending;
-        },
+    try wire.broadcast(a, sub.txid, beef);
+    const gate = try Gate.of(in);
+    if (gate.admit_on == .status and !(try wire.hasStatus(a))) {
+        // No status provider to wait for: admitted on validation; its proof settles it.
+        try wal.noteSubmission(sub.txid, "", "admitted", in.getCid("thread"));
+        out.gate = .validated;
+        try admit(a, caller, wal, in, ev, &out);
+        return out;
     }
+    try wal.noteSubmission(sub.txid, "", "pending", in.getCid("thread"));
+    out.gate = .pending;
+    return out;
 }
 
 /// Whether a submission is held and awaiting ARC with nothing admitted yet: its broadcast record says `pending`.
@@ -387,72 +321,80 @@ pub fn isPending(wal: *Wallet, txid: [32]u8) !bool {
     return std.mem.eql(u8, r.getText("submission") orelse "", "pending");
 }
 
-/// What steps a submission's awaiting thread: a `status` / `proof` entry for
-/// its transaction, the broadcaster's answer to what it asked (#70: in the
-/// box it asked in, "broadcast" or "status"), or its deadline.
-pub const Wake = union(enum) { event: Value, answer: struct { box: []const u8, reply: Reply }, deadline };
+/// What steps a submission's awaiting thread (#65): an event about its
+/// transaction (its proof, from the host's wiring), a status provider's
+/// message about it (the body: {kind: "status", txid, txStatus, …}), or its
+/// deadline (abandonment).
+pub const Wake = union(enum) { event: Value, status: Value, deadline };
 
 /// A step of the submission's awaiting thread (as the wallet's
 /// awaiting-callback thread, docs/WALLET.md); `ev` is the submit entry the
-/// thread began with. **Not yet admitted:** the broadcaster's answer, or a
-/// status entry, is ARC's word on it (a rejection rejects; anything else
-/// means ARC has it, and it is admitted); a 404 to a question (ARC never
-/// took it) posts it again; at the deadline it is abandoned if due, else the
-/// broadcaster is asked again. **Admitted:** the status is applied (a merkle
-/// path proves it; a rejection unwinds the admittances through `admits`).
-pub fn awaited(a: Allocator, caller: ov.Caller, bc: Broadcaster, wal: *Wallet, in: Value, ev: Value, wake: Wake) !Stepped {
+/// thread began with. **Not yet admitted:** its proof proves it and admits
+/// it (a path whose header we do not hold yet leaves it pending); a status
+/// provider's rejection rejects it, any other status admits it under
+/// `overlayAdmitOn: "status"` (under "proof" it is only noted); at the
+/// deadline it is abandoned if due. **Admitted:** the status or proof is
+/// applied (a merkle path proves it; a rejection unwinds the admittances
+/// through `admits`).
+pub fn awaited(a: Allocator, caller: ov.Caller, wal: *Wallet, in: Value, ev: Value, wake: Wake) !Stepped {
     const sub = try ov.subjectOf(wal, try w.header.fromHex(ev.getText("txid") orelse return error.BadEvent));
     const txid = sub.txid;
     const pending = try isPending(wal, txid);
+    const gate = try Gate.of(in);
     var out = Stepped{ .subject = sub, .gate = if (pending) .pending else .accepted, .outcome = .pending };
     switch (wake) {
         .event => |e| {
             const kind = e.getText("kind") orelse return error.BadEvent;
-            const ans: ArcAnswer = if (std.mem.eql(u8, kind, "proof"))
-                .{ .http_status = 200, .tx_status = "MINED", .merkle_path = e.getBytes("path") orelse return error.BadEvent }
-            else if (std.mem.eql(u8, kind, "status"))
-                .{ .http_status = 200, .tx_status = e.getText("txStatus") orelse "", .merkle_path = e.getBytes("merklePath") }
-            else
-                return error.BadEvent;
-            if (pending) {
-                try gated(a, caller, wal, in, ev, ans, &out);
-                out.arc = null; // an entry, not the broadcaster's answer
-            } else out.outcome = try wal.applyStatus(txid, ans.tx_status, ans.merkle_path);
+            if (!std.mem.eql(u8, kind, "proof")) return error.BadEvent;
+            const path = e.getBytes("path") orelse return error.BadEvent;
+            out.tx_status = "MINED";
+            out.outcome = try wal.applyStatus(txid, "MINED", path);
+            if (pending) switch (out.outcome) {
+                .proven => {
+                    out.gate = .mined;
+                    try admit(a, caller, wal, in, ev, &out);
+                },
+                .rejected => out.gate = .rejected,
+                // A path whose header we do not hold yet: still pending (and still marked so).
+                .pending => try wal.noteSubmission(txid, "MINED", "pending", in.getCid("thread")),
+            };
         },
-        .answer => |x| {
-            const ans = try arcAnswer(a, x.reply);
-            if (std.mem.eql(u8, x.box, "status") and ans.http_status == 404) {
-                // 404: ARC never took it (the post failed transiently, or it lost its history): post it again.
-                out.arc = ans;
-                out.asked = try a.dupe([]const u8, &.{try bc.broadcast(a, txid, (try wal.beefOf(txid)) orelse return error.UnknownTransaction)});
-                out.outcome = switch (try wal.status(txid)) {
-                    .proven => .proven,
-                    .rejected => .rejected,
-                    .unproven => .pending,
-                };
-            } else if (pending) {
-                try gated(a, caller, wal, in, ev, ans, &out);
+        .status => |b| {
+            const st = b.getText("txStatus") orelse return error.BadEvent;
+            out.tx_status = st;
+            if (!pending) {
+                out.outcome = try wal.applyStatus(txid, st, null);
+            } else if (Wallet.isRejection(st)) {
+                _ = try wal.reject(txid, st);
+                out.gate = .rejected;
+                out.outcome = .rejected;
+            } else if (gate.admit_on == .status) {
+                // The network has it, says the status provider: admitted (its proof settles it later).
+                try wal.noteSubmission(txid, st, "admitted", in.getCid("thread"));
+                out.gate = .accepted;
+                out.outcome = try wal.applyStatus(txid, st, null);
+                if (out.outcome != .rejected) try admit(a, caller, wal, in, ev, &out);
             } else {
-                out.arc = ans;
-                out.outcome = try wal.applyStatus(txid, if (verdictOf(ans) == .rejected and ans.tx_status.len == 0) "REJECTED" else ans.tx_status, ans.merkle_path);
+                // Admitted on its proof only: the status is noted, it stays pending.
+                try wal.noteSubmission(txid, st, "pending", in.getCid("thread"));
             }
         },
         .deadline => {
             if ((try wal.awaitingRecord(txid)) == null) {
-                // Settled by another step (a proof on the chain feed, a rejection's walk): nothing to ask.
+                // Settled by another step (a proof on the chain feed, a rejection's walk).
                 out.outcome = switch (try wal.status(txid)) {
                     .proven => .proven,
                     .rejected => .rejected,
                     .unproven => .pending,
                 };
+                if (out.outcome == .rejected) out.gate = .rejected;
                 return out;
             }
-            if (try wal.abandonIfDue(txid, (try Gate.of(in)).abandon_ms)) {
+            if (try wal.abandonIfDue(txid, gate.abandon_ms)) {
+                out.gate = .rejected;
                 out.outcome = .rejected;
                 return out;
             }
-            // Ask the broadcaster again: its answer steps the thread.
-            out.asked = try a.dupe([]const u8, &.{try bc.ask(a, txid)});
         },
     }
     return out;
@@ -461,7 +403,8 @@ pub fn awaited(a: Allocator, caller: ov.Caller, bc: Broadcaster, wal: *Wallet, i
 /// The admission: each topic's judgement the entry carries recorded
 /// (`applied`, the admittances), and the listening lookup services' hooks
 /// called (`admitted`, then `spent` for each previous coin consumed) — once
-/// ARC took the transaction, or it is mined. A judgement is taken again only
+/// the gate lets it through (#65: its proof, a status provider's word, or
+/// at once with no status provider to wait for). A judgement is taken again only
 /// if the topic's previous coins moved since the call.
 fn admit(a: Allocator, caller: ov.Caller, wal: *Wallet, in: Value, ev: Value, out: *Stepped) !void {
     const sub = out.subject;
