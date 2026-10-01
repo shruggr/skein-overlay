@@ -1,15 +1,15 @@
-// The overlay programs (issue #36): Zig 0.16.0, wasm32-wasi, over wallet-zig
-// (the chain+settlement core and the overlay's maps, a path dependency).
+// The overlay programs (issue #36): Zig 0.16.0, wasm32-wasi, over the SDK's wallet library
+// (skein-sdk `wallet`: the chain+settlement core and the overlay's maps; a path dependency).
 //
 //   zig build         → zig-out/bin/overlay.wasm (the engine), topic-demo.wasm (tm_demo), lookup-demo.wasm (ls_demo)
 //   zig build test    the topic and lookup contracts, natively
 //
-// bsvz comes through wallet-zig (../../.build/bsvz: scripts/fetch-bsvz.sh).
+// bsvz comes through the SDK (its lazy URL dependency).
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const wasi = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .wasi });
-    const wallet = b.dependency("wallet", .{ .target = wasi, .optimize = .ReleaseSafe }).module("wallet");
+    const wallet = b.dependency("skein_sdk", .{ .target = wasi, .optimize = .ReleaseSafe }).module("wallet");
     for ([_][2][]const u8{ .{ "overlay", "src/engine.zig" }, .{ "topic-demo", "src/topic_demo.zig" }, .{ "lookup-demo", "src/lookup_demo.zig" } }) |p| {
         const exe = b.addExecutable(.{
             .name = p[0],
@@ -25,7 +25,7 @@ pub fn build(b: *std.Build) void {
     }
 
     const target = b.standardTargetOptions(.{});
-    const native = b.dependency("wallet", .{ .target = target, .optimize = .Debug }).module("wallet");
+    const native = b.dependency("skein_sdk", .{ .target = target, .optimize = .Debug }).module("wallet");
     const tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("test.zig"),
         .target = target,

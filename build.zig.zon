@@ -4,7 +4,7 @@
     .minimum_zig_version = "0.16.0",
     .fingerprint = 0x61cfd392818dcb20,
     .dependencies = .{
-        .wallet = .{ .path = "../../wallet-zig" },
+        .skein_sdk = .{ .path = "../../sdk" },
     },
     .paths = .{
         "build.zig",
