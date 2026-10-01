@@ -17,6 +17,11 @@
 //! yet leaves it pending), a later status just noted (no second admission).
 //! With no status provider subscribed, no status ever arrives: nothing is
 //! admitted before the proof. A mined one is admitted with no broadcast.
+//! The configuration (skein #72, config.zig): an installed engine reads its
+//! topics, lookup services and gossip switches from its app record's
+//! `config.overlay` (found through its program record's `app`, from a step's
+//! thread or a call's matched route), the roles as its programs; the genesis
+//! defaults only without one; a new app record is read at the next call.
 const std = @import("std");
 const w = @import("wallet");
 const topic = @import("src/topic.zig");
@@ -25,6 +30,7 @@ const demo = @import("src/topic_demo.zig");
 const ls = @import("src/lookup_demo.zig");
 const submit = @import("src/submit.zig");
 const gossip = @import("src/gossip.zig");
+const config = @import("src/config.zig");
 
 const bsvz = w.bsvz;
 const beef = w.beef;
@@ -1014,4 +1020,156 @@ test "gossip (#74): the three topics' shapes; what an admission and a proof publ
         try std.testing.expectEqualSlices(u8, &pa, rec.getBytes("from").?);
         try std.testing.expectEqual(@as(usize, 0), (try again.admitsOf("tm_demo", tb.txid)).len);
     }
+}
+
+/// Heads by name, for config.zig.
+const HeadMap = struct {
+    m: std.StringHashMapUnmanaged([]const u8) = .empty,
+    fn head(ctx: *anyopaque, _: Allocator, name: []const u8) anyerror!?[]const u8 {
+        const self: *HeadMap = @ptrCast(@alignCast(ctx));
+        return self.m.get(name);
+    }
+    fn heads(self: *HeadMap) config.Heads {
+        return .{ .ctx = self, .headFn = head };
+    }
+};
+
+fn mapOf(a: Allocator, es: []const cbor.Entry) !Value {
+    return .{ .map = try a.dupe(cbor.Entry, es) };
+}
+
+/// An app record (the head `overlay`'s root, as an install writes it): the roles and config.overlay.
+fn appRecordOf(a: Allocator, s: Store, engine: []const u8, tp: []const u8, lp: []const u8, topics: []const cbor.Entry, gossip_: []const cbor.Entry) ![]const u8 {
+    return s.putValue(a, try mapOf(a, &.{
+        .{ .key = "kind", .value = .{ .text = "app" } },
+        .{ .key = "name", .value = .{ .text = "overlay" } },
+        .{ .key = "programs", .value = try mapOf(a, &.{
+            .{ .key = "overlay", .value = .{ .cid = engine } },
+            .{ .key = "topic-demo", .value = .{ .cid = tp } },
+            .{ .key = "lookup-demo", .value = .{ .cid = lp } },
+        }) },
+        .{ .key = "config", .value = try mapOf(a, &.{.{ .key = "overlay", .value = try mapOf(a, &.{
+            .{ .key = "topics", .value = try mapOf(a, topics) },
+            .{ .key = "lookups", .value = try mapOf(a, &.{.{ .key = "ls_demo", .value = try mapOf(a, &.{
+                .{ .key = "program", .value = .{ .text = "lookup-demo" } },
+                .{ .key = "topics", .value = .{ .array = try a.dupe(Value, &.{.{ .text = "tm_demo" }}) } },
+            }) }}) },
+            .{ .key = "status", .value = .{ .text = "$status" } },
+            .{ .key = "gossip", .value = try mapOf(a, gossip_) },
+        }) }}) },
+    }));
+}
+
+/// `in` stepped on a thread whose origin runs `program`.
+fn withThread(a: Allocator, s: Store, in: Value, program: []const u8) !Value {
+    const t = try s.putValue(a, try mapOf(a, &.{
+        .{ .key = "kind", .value = .{ .text = "thread" } },
+        .{ .key = "program", .value = .{ .cid = program } },
+    }));
+    return .{ .map = try std.mem.concat(a, cbor.Entry, &.{ in.map, &.{.{ .key = "thread", .value = .{ .cid = t } }} }) };
+}
+
+test "the configuration (skein #72): an installed engine's config.overlay from its app record, read at every step and call; the genesis defaults only without one" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = w.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var inst = try Instance.init(a, &ms);
+    const s = ms.store();
+    var hm = HeadMap{};
+
+    // The install's records: the engine's program record names its app; the app record has the roles
+    // and config.overlay — two topics, ls_demo on tm_demo, tm_two's gossip off.
+    const engine = try s.putValue(a, try mapOf(a, &.{
+        .{ .key = "kind", .value = .{ .text = "program" } },
+        .{ .key = "name", .value = .{ .text = "overlay" } },
+        .{ .key = "app", .value = .{ .text = "overlay" } },
+    }));
+    const genesis_engine = try s.putValue(a, try mapOf(a, &.{
+        .{ .key = "kind", .value = .{ .text = "program" } },
+        .{ .key = "name", .value = .{ .text = "overlay" } },
+    }));
+    const two = [_]cbor.Entry{ .{ .key = "tm_demo", .value = .{ .text = "topic-demo" } }, .{ .key = "tm_two", .value = .{ .text = "topic-demo" } } };
+    try hm.m.put(a, "overlay", try appRecordOf(a, s, engine, inst.topic_prog, inst.lookup_prog, &two, &.{.{ .key = "tm_two", .value = .{ .boolean = false } }}));
+
+    // The genesis this instance runs: no overlay of its own (a topic it does not serve here), other defaults.
+    const genesis_in = try mapOf(a, &.{
+        .{ .key = "defaults", .value = try mapOf(a, &.{
+            .{ .key = "walletNetwork", .value = .{ .text = "regtest" } },
+            .{ .key = "walletAbandonMs", .value = .{ .text = "100000" } },
+            .{ .key = "overlayTopics", .value = .{ .text = "{\"tm_genesis\":\"topic-demo\"}" } },
+        }) },
+        .{ .key = "programs", .value = try mapOf(a, &.{.{ .key = "overlay", .value = .{ .cid = genesis_engine } }}) },
+    });
+
+    // A step (its thread's program is the installed engine): the app's config, the roles as programs.
+    const step = try config.resolve(a, s, hm.heads(), try withThread(a, s, genesis_in, engine), null);
+    const topics = try w.overlay.configObject(a, step, "overlayTopics");
+    try std.testing.expectEqual(@as(usize, 2), topics.count());
+    try std.testing.expect(topics.contains("tm_demo") and topics.contains("tm_two") and !topics.contains("tm_genesis"));
+    try std.testing.expectEqualStrings("regtest", step.get("defaults").?.getText("walletNetwork").?);
+    try std.testing.expectEqualSlices(u8, inst.topic_prog, (try w.overlay.programNamed(step, "topic-demo")).?);
+    const ls_ = try w.overlay.listeners(a, step, "tm_demo");
+    try std.testing.expectEqual(@as(usize, 1), ls_.len);
+    try std.testing.expectEqualStrings("ls_demo", ls_[0].service);
+    try std.testing.expectEqualSlices(u8, inst.lookup_prog, ls_[0].program);
+    try std.testing.expectEqual(@as(usize, 0), (try w.overlay.listeners(a, step, "tm_two")).len);
+    try std.testing.expect(try gossip.enabled(a, step, "tm_demo"));
+    try std.testing.expect(!try gossip.enabled(a, step, "tm_two"));
+    try std.testing.expectEqualSlices(u8, engine, step.getCid("engine").?);
+
+    // A route's call (no thread; the matched routes-table entry names the engine): the same.
+    const arg = try mapOf(a, &.{.{ .key = "match", .value = try mapOf(a, &.{
+        .{ .key = "path", .value = .{ .text = "libp2p:tm_demo" } },
+        .{ .key = "program", .value = .{ .cid = engine } },
+        .{ .key = "fn", .value = .{ .text = "submit" } },
+        .{ .key = "app", .value = .{ .text = "overlay" } },
+    }) }});
+    const called = try config.resolve(a, s, hm.heads(), genesis_in, arg);
+    try std.testing.expectEqual(@as(usize, 2), (try w.overlay.configObject(a, called, "overlayTopics")).count());
+
+    // A genesis-wired engine (its record names no app), or a host's call: the genesis defaults, as given.
+    const wired = try config.resolve(a, s, hm.heads(), try withThread(a, s, genesis_in, genesis_engine), null);
+    try std.testing.expect((try w.overlay.configObject(a, wired, "overlayTopics")).contains("tm_genesis"));
+    try std.testing.expect(wired.get("engine") == null);
+    try std.testing.expect((try w.overlay.configObject(a, try config.resolve(a, s, hm.heads(), genesis_in, null), "overlayTopics")).contains("tm_genesis"));
+
+    // A submission judged with the app's config: tm_demo is served (the genesis's defaults name no such topic).
+    inst.in = called;
+    const priv: [32]u8 = .{0x5a} ** 32;
+    const pub_key = try w.brc29.identityKey(priv);
+    const pkh = bsvz.crypto.hash.hash160(&pub_key).bytes;
+    const p2pkh = w.brc29.p2pkh(pub_key);
+    const token: [34]u8 = demo.tag.* ++ [_]u8{ 0x76, 0xa9, 0x14 } ++ pkh ++ [_]u8{ 0x88, 0xac };
+    var fund_raw: std.ArrayList(u8) = .empty;
+    try fund_raw.appendSlice(a, &.{ 1, 0, 0, 0, 1 });
+    try fund_raw.appendSlice(a, &(.{0x72} ** 32));
+    try fund_raw.appendSlice(a, &.{ 0, 0, 0, 0, 1, 0x51, 0xff, 0xff, 0xff, 0xff, 1 });
+    var sats: [8]u8 = undefined;
+    std.mem.writeInt(u64, &sats, 10_000, .little);
+    try fund_raw.appendSlice(a, &sats);
+    try fund_raw.append(a, p2pkh.len);
+    try fund_raw.appendSlice(a, &p2pkh);
+    try fund_raw.appendSlice(a, &.{ 0, 0, 0, 0 });
+    const fund_tx = try bsvz.transaction.Transaction.parse(a, fund_raw.items);
+    const fund_txid = beef.txidOf(fund_raw.items);
+    const h1 = mine(hdr.hash(&w.chain.Network.regtest.genesis()), fund_txid, 1_700_000_600);
+    try inst.headers(&.{&h1});
+    const bumps = try a.dupe(bsvz.spv.MerklePath, &.{try bsvz.spv.MerklePath.parse(a, try soloPath(a, 1, fund_txid))});
+    const tok = try spend(a, &fund_tx, 0, &.{ .{ 1, &token }, .{ 9_000, &p2pkh } }, priv);
+    const bytes = try beef.serialize(a, .{ .version = beef.V2, .bumps = bumps, .entries = try a.dupe(beef.Entry, &.{
+        .{ .txid = fund_txid, .format = .raw_with_bump, .bump = 0, .raw = fund_raw.items, .tx = fund_tx },
+        .{ .txid = tok.txid, .format = .raw, .raw = tok.raw, .tx = tok.tx },
+    }) });
+    const r = try inst.route(bytes);
+    try std.testing.expect(r == .admit);
+    try std.testing.expectEqual(@as(usize, 1), inst.count("identify"));
+
+    // A reinstall (a new app record under the head, tm_demo gone): read at the next call.
+    try hm.m.put(a, "overlay", try appRecordOf(a, s, engine, inst.topic_prog, inst.lookup_prog, two[1..], &.{}));
+    const after = try config.resolve(a, s, hm.heads(), genesis_in, arg);
+    const now_topics = try w.overlay.configObject(a, after, "overlayTopics");
+    try std.testing.expect(!now_topics.contains("tm_demo") and now_topics.contains("tm_two"));
+    try std.testing.expect(try gossip.enabled(a, after, "tm_two"));
 }

@@ -332,14 +332,40 @@ into it, through sender-less subscriptions:
 
 There is no `lookup` box: a lookup is a read: its request is recorded, and it moves nothing.
 
-**Config.** The config is the genesis `defaults`, from `etc/config.json`:
+**Config.** An installed engine reads its configuration from its app
+record (skein #72; `src/config.zig`), at every step and call: the head's
+root `{kind: "app", programs: {<role>: <program record>}, config: {overlay:
+{topics, lookups, status?, gossip?}}, …}` that `skein-host install` wrote.
+It finds that head through its own program record, which the install gives
+`app: <name>`: in a step, the thread's `program`; in a route's call, the
+matched routes-table entry's `program` (`match`). A reinstall with a
+changed `config.overlay` (a new app record, the head advanced) is read at
+the next step or call; nothing restarts.
 
-- `overlayTopics = '{"tm_demo":"topic-demo"}'` maps each topic to a `bin/`
-  program name.
-- `overlayLookups = '{"ls_demo":{"program":"lookup-demo","topics":["tm_demo"]}}'`
-  maps each lookup service to a `bin/` program name and the topics it
-  listens to (its hooks are called for those). The short form
-  `'{"ls_demo":"lookup-demo"}'` listens to every topic in `overlayTopics`.
+- `config.overlay.topics = {"tm_demo": "topic-demo"}` maps each topic to a
+  role in `programs`.
+- `config.overlay.lookups = {"ls_demo": {"program": "lookup-demo",
+  "topics": ["tm_demo"]}}` maps each lookup service to a role and the
+  topics it listens to (its hooks are called for those). The short form
+  `{"ls_demo": "lookup-demo"}` listens to every topic the overlay serves.
+- `config.overlay.gossip = {"tm_demo": false}` turns a topic's gossip
+  publishing off (#74; default on, "Gossip" below).
+- `config.overlay.status` names the status provider (`"$status"`, or a
+  remote provider's key) whose messages the `status` box takes; the engine
+  does not read it — it is the install's wiring (below).
+
+**The fallback: a genesis-wired engine.** An engine whose program record
+names no app (a system tree's `bin/overlay.wasm`, booted with the
+instance), or a host's call with no route, reads the genesis `defaults`
+(from `etc/config.json`) instead, the same mappings as JSON in strings, the
+program names the genesis's: `overlayTopics = '{"tm_demo":"topic-demo"}'`,
+`overlayLookups =
+'{"ls_demo":{"program":"lookup-demo","topics":["tm_demo"]}}'`,
+`overlayGossip = '{"tm_demo": false}'`. With an app record, these defaults
+are not read at all.
+
+The other settings are the genesis `defaults` either way:
+
 - `walletNetwork` is the chain's network.
 - There is no admission setting (#73): an unproven submission is admitted on
   the first of a status provider's word that the network has it, or its
@@ -349,18 +375,21 @@ There is no `lookup` box: a lookup is a read: its request is recorded, and it mo
   (#65). A status provider is the address book's role `status` plus the
   subscription `{"sender": "$status", "box": "status", "handler":
   "overlay"}` in etc/subscriptions.json.
-- `overlayGossip = '{"tm_demo": false}'` turns a topic's gossip publishing
-  off (#74; default on, "Gossip" below).
 - `walletAbandonMs` (default 86400000) is shared with the wallet: a pending
   transaction neither taken nor mined that long after its first broadcast
   is abandoned (rejected), one rule for the chain core.
 
-The app's manifest (`etc/app.json`, skein docs/APPS.md §6) carries the same
-settings as `config.overlay`: `topics` is `overlayTopics`, `lookups` is
-`overlayLookups`, `gossip` is `overlayGossip`, and `status` names the status
-provider whose messages the `status` box takes. The engine still reads the
-genesis defaults. Reading `config.overlay` from the manifest at its head's
-root is skein #72 (build 3).
+**The wiring is derived from `config.overlay`** (skein docs/APPS.md §6):
+`skein-host install` adds, for each topic, the routes `libp2p:<topic>` →
+`submit`, `libp2p:<topic>-admit` → `peerAdmit`, `libp2p:<topic>-proof` →
+`peerProof`, plus `/submit` and `/lookup` (open, under `/<app>/`); the
+boxes `submit` and `chain` from anyone (the front door's and the host
+feeds' entries carry no sender) and `status` from the provider
+`config.overlay.status` names; a head `ls:<service>` per lookup service —
+all to the role `overlay`. The host's libp2p node subscribes the installed
+`libp2p:` routes' topics as they are installed and unsubscribes them at
+uninstall. A manifest entry of its own (the same box, the same route path)
+wins over the derived one.
 
 One instance may serve several topics and services.
 
@@ -646,12 +675,14 @@ and answered `ignore` "already judged" (or "already submitted: awaiting its
 broadcast" while pending): no topic manager runs (test.zig counts the
 calls). A submission no topic took leaves no record, so it is judged again.
 
-**Config.** `defaults.overlayGossip`, a JSON object in a string: `{"<topic>":
-false}` turns a topic's publishing off; a topic not named publishes (the
-default is on). It maps 1:1 onto the manifest's `config.overlay.gossip`
-(docs/APPS.md §6). Receiving is the routes and the subscribed topics:
-`libp2p:<topic>`, `libp2p:<topic>-admit`, `libp2p:<topic>-proof` in
-etc/routes.json, and the topics in etc/config.json `libp2p.topics`.
+**Config.** `config.overlay.gossip` (genesis-wired: `defaults.overlayGossip`,
+a JSON object in a string): `{"<topic>": false}` turns a topic's publishing
+off; a topic not named publishes (the default is on). Receiving is the
+routes and the subscribed topics: `libp2p:<topic>`, `libp2p:<topic>-admit`,
+`libp2p:<topic>-proof` — derived by the install from `config.overlay` and
+subscribed by the host's node as installed (skein #72); a genesis-wired
+node names them in etc/routes.json and the topics in etc/config.json
+`libp2p.topics`.
 
 **Not built:** catch-up (asking a peer for its admitted set, or proofs by
 block — the pull half of #44–#48).
@@ -666,6 +697,12 @@ reorg's re-proof reaches B and replaces the old proof; a bad BUMP is
 ignored; the late duplicates are as above. Every store replays exactly.
 
 ## A system tree for an overlay node
+
+Installed as an app (`skein-host install https://github.com/shruggr/skein-overlay
+--instance <h>`, skein docs/BOOTSTRAP.md "Installing an app"), the overlay
+needs none of this: its manifest is the config and its wiring is derived.
+A system tree wires the engine into an instance's genesis instead (the
+fallback above):
 
 ```
 bin/frontdoor.wasm, bin/overlay.wasm, bin/topic-demo.wasm, bin/lookup-demo.wasm   (+ .json: description)

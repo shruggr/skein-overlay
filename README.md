@@ -21,7 +21,7 @@ bin/overlay.wasm       the engine (wasm32-wasi, committed; `zig build bin` rewri
 bin/topic-demo.wasm    tm_demo, the example topic manager
 bin/lookup-demo.wasm   ls_demo, the example lookup service (its own index under ls:ls_demo)
 etc/app.json           the manifest (skein docs/APPS.md §2, §6)
-src/                   the engine (engine.zig, submit.zig, routes.zig, gossip.zig, vm.zig),
+src/                   the engine (engine.zig, submit.zig, routes.zig, gossip.zig, config.zig, vm.zig),
                        the contracts (topic.zig, lookup.zig) and the two examples
 test.zig               the submission flow and the contracts, natively
 docs/OVERLAY.md        the overlay, in full
@@ -36,19 +36,29 @@ tree, and names them in `config.overlay`.
 `etc/app.json` runs `tm_demo` and `ls_demo`. Its `config.overlay` is
 `topics`, `lookups`, `status` (`"$status"`: the status provider whose
 messages the `status` box takes; none means admit at the proof) and `gossip`
-(per topic, `false` turns its publishing off). It asks for the boxes
-`submit` (from anyone), `chain` (the owner) and `status` (from `$status`);
-the routes `/submit` and `/lookup` (served at `/overlay/submit`,
-`/overlay/lookup`) and `libp2p:tm_demo`, `libp2p:tm_demo-admit`,
-`libp2p:tm_demo-proof`; and the heads `overlay`, `overlay:gossip` and
-`ls:*`.
+(per topic, `false` turns its publishing off).
 
-**The engine does not read `config.overlay` yet.** It reads the genesis
-defaults (`etc/config.json`): `overlayTopics`, `overlayLookups` and
-`overlayGossip`, the same mappings as JSON in strings. Reading
-`config.overlay` from the manifest at its head's root is skein #72 (build
-3). Until then a tree that runs this app carries both (docs/OVERLAY.md, "A
-system tree for an overlay node"). Install by message is skein #72.
+**The engine reads `config.overlay` from its app record** (skein #72,
+`src/config.zig`): the head's root that `skein-host install` writes, found
+through the engine's own program record (`app: <name>`), at every step and
+call. A reinstall with a changed `config.overlay` takes effect at the next
+step, with no restart. The genesis defaults (`overlayTopics`,
+`overlayLookups`, `overlayGossip`) are read only by an engine with no app
+record: one wired into an instance's genesis by a system tree
+(docs/OVERLAY.md, "A system tree for an overlay node").
+
+**The wiring is derived** from `config.overlay` by the install (skein
+docs/APPS.md §6), so the manifest does not list it: the boxes `submit` and
+`chain` (from anyone) and `status` (from `$status`); the routes `/submit`
+and `/lookup` (served at `/overlay/submit`, `/overlay/lookup`) and
+`libp2p:tm_demo`, `libp2p:tm_demo-admit`, `libp2p:tm_demo-proof` (the
+host's libp2p node subscribes them as they are installed); the head
+`ls:ls_demo`. The manifest adds the listing and documentation routes and
+the heads `overlay`, `wallet`, `overlay:gossip` and `ls:*`.
+
+```
+skein-host install https://github.com/shruggr/skein-overlay --instance <handle>
+```
 
 ## Build and test
 

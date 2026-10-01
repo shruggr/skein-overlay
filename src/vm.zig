@@ -9,6 +9,7 @@ const std = @import("std");
 const w = @import("wallet");
 const submit = @import("submit.zig");
 const gossip = @import("gossip.zig");
+const config = @import("config.zig");
 
 const cbor = w.cbor;
 const Value = cbor.Value;
@@ -89,6 +90,21 @@ pub fn input(a: std.mem.Allocator) !Value {
 pub fn head(a: std.mem.Allocator, name: []const u8) !?[]const u8 {
     const c = try result(a, sk.head, .{ name.ptr, @as(u32, @intCast(name.len)) });
     return if (c.len > 0) c else null;
+}
+
+fn headImpl(_: *anyopaque, a: std.mem.Allocator, name: []const u8) anyerror!?[]const u8 {
+    return head(a, name);
+}
+
+/// The heads through the `head` import (config.zig reads the engine's app record).
+pub fn heads() config.Heads {
+    return .{ .ctx = &dummy, .headFn = headImpl };
+}
+
+/// The input as the engine reads its configuration (#72, config.zig): from the app record it was
+/// installed as (a call's `arg` names its route), else the genesis's.
+pub fn configured(a: std.mem.Allocator, in: Value, arg: ?Value) !Value {
+    return config.resolve(a, store(), heads(), in, arg);
 }
 
 pub fn advance(name: []const u8, cid: []const u8) !void {

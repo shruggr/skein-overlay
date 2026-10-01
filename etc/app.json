@@ -1,7 +1,7 @@
 {
   "kind": "app",
   "name": "overlay",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "programs": {
     "overlay": "bin/overlay.wasm",
     "topic-demo": "bin/topic-demo.wasm",
@@ -28,49 +28,7 @@
     }
   },
   "requires": [],
-  "boxes": [
-    {
-      "box": "submit",
-      "senders": [
-        "*"
-      ]
-    },
-    "chain",
-    {
-      "box": "status",
-      "senders": [
-        "$status"
-      ]
-    }
-  ],
   "routes": [
-    {
-      "path": "/submit",
-      "program": "overlay",
-      "fn": "submit",
-      "auth": "none"
-    },
-    {
-      "path": "/lookup",
-      "program": "overlay",
-      "fn": "lookup",
-      "auth": "none"
-    },
-    {
-      "path": "libp2p:tm_demo",
-      "program": "overlay",
-      "fn": "submit"
-    },
-    {
-      "path": "libp2p:tm_demo-admit",
-      "program": "overlay",
-      "fn": "peerAdmit"
-    },
-    {
-      "path": "libp2p:tm_demo-proof",
-      "program": "overlay",
-      "fn": "peerProof"
-    },
     {
       "path": "/listTopicManagers",
       "program": "overlay",
@@ -102,5 +60,5 @@
     "overlay:gossip",
     "ls:*"
   ],
-  "description": "Overlay services (BRC-22 submit, BRC-24 lookup; docs/OVERLAY.md): the engine handles the submit entries, the chain feed and the status provider's messages, and serves submit and lookup as route handlers; tm_demo and ls_demo are its example topic manager and lookup service. Gossip on <topic>, <topic>-admit, <topic>-proof (#74)."
+  "description": "Overlay services (BRC-22 submit, BRC-24 lookup; docs/OVERLAY.md): the engine handles the submit entries, the chain feed and the status provider's messages, and serves submit and lookup as route handlers; tm_demo and ls_demo are its example topic manager and lookup service. Its configuration is config.overlay, read from the app record at every step; the install derives its wiring from it (boxes submit, chain, status; routes /submit, /lookup, libp2p:<topic>, -admit, -proof; heads ls:<service>). Gossip on <topic>, <topic>-admit, <topic>-proof (#74)."
 }

@@ -14,10 +14,15 @@
 //! `wallet` names (the SDK's wallet library: headers, transactions, proofs, settlement, and
 //! the overlay's maps, overlay.zig), shared with a wallet in the same
 //! instance. Each lookup service keeps its own state under its own head
-//! (`ls:<service>`, lookup.zig). The topics and lookup services are genesis
-//! config: defaults.overlayTopics = JSON {"tm_x": "<bin/ program name>", …},
-//! defaults.overlayLookups = JSON {"ls_x": {"program": "<bin/ program name>",
-//! "topics": ["tm_x", …]}, …} (or "ls_x": "<name>": every served topic).
+//! (`ls:<service>`, lookup.zig). The topics and lookup services are the
+//! app's (#72, config.zig): `config.overlay` of the app record the engine
+//! was installed as, read at every step and call — {topics: {"tm_x":
+//! "<role>"}, lookups: {"ls_x": {"program": "<role>", "topics": ["tm_x",
+//! …]}} (or "ls_x": "<role>": every served topic), gossip?} — the roles its
+//! `programs`. A genesis-wired engine (no app record) reads the genesis
+//! config instead: defaults.overlayTopics, defaults.overlayLookups,
+//! defaults.overlayGossip (JSON in a string, the same shapes; program names
+//! the genesis's).
 //!
 //! A submit step, after the route decoded and judged it in its call
 //! (submit.zig): hold the records the entry carries; unless the entry proves
@@ -104,8 +109,10 @@ fn peerAdmitted(a: std.mem.Allocator, ev: Value) !void {
 
 fn run(a: std.mem.Allocator) anyerror!void {
     const s = vm.store();
-    const step = try vm.input(a);
-    if (std.mem.eql(u8, step.getText("kind") orelse "", "call")) return routes.call(a, step);
+    const in = try vm.input(a);
+    if (std.mem.eql(u8, in.getText("kind") orelse "", "call")) return routes.call(a, in);
+    // The topics, lookup services and programs: the app record's (#72, config.zig), else the genesis's.
+    const step = try vm.configured(a, in, null);
     const args = step.get("args") orelse return error.BadInput;
     // A plain entry (args.event), or a status provider's message by subscription (#65: args.body in box `status`).
     const ev_cid = args.getCid("event") orelse if (std.mem.eql(u8, args.getText("box") orelse "", "status")) args.getCid("body") orelse return error.BadInput else return error.BadInput;

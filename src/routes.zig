@@ -209,10 +209,11 @@ fn writeVarInt(a: Allocator, out: *std.ArrayList(u8), v: u64) !void {
 
 // ---------------------------------------------------------------- config
 
-/// A name → program map from genesis defaults (a JSON object in a string).
+/// A name → program map from the config (defaults.<key>, a JSON object in a string: the app record's
+/// `config.overlay` or the genesis's, config.zig).
 pub const configMap = w.overlay.configObject;
 
-/// The program record a served name runs: genesis `programs` by the configured name.
+/// The program record a served name runs: `programs` (the app's roles, or the genesis's) by the configured name.
 pub const programFor = w.overlay.configuredProgram;
 
 /// The `bin/` program name a configured name runs (a string, or `{program, …}`).
@@ -233,9 +234,12 @@ fn load(a: Allocator, in: Value) !Wallet {
 // ---------------------------------------------------------------- the handlers
 
 /// A call of the engine (input kind "call"): the route handlers above.
-pub fn call(a: Allocator, in: Value) !void {
-    const func = in.getText("fn") orelse return error.BadInput;
-    const arg = try vm.callArg(a, in);
+pub fn call(a: Allocator, call_in: Value) !void {
+    const func = call_in.getText("fn") orelse return error.BadInput;
+    const arg = try vm.callArg(a, call_in);
+    // The topics, lookup services and programs: the app record's (#72, config.zig; the route names the
+    // engine's program record), else the genesis's.
+    const in = try vm.configured(a, call_in, arg);
     const out = if (eql(u8, func, "submit"))
         try submit(a, in, arg)
     else if (eql(u8, func, "peerAdmit"))
@@ -334,7 +338,7 @@ fn submit(a: Allocator, in: Value, req: Value) !Value {
     };
     // The submission's thread (engine.zig, stepped on the submit record as a `submit` event would be):
     // launched by this request's step, which waits on it; its answer, when it comes to rest, is the state's.
-    const self = (in.get("programs") orelse return error.BadInput).getCid("overlay") orelse return error.NoOverlayProgram;
+    const self = in.getCid("engine") orelse (in.get("programs") orelse return error.BadInput).getCid("overlay") orelse return error.NoOverlayProgram;
     const ev = try vm.store().putValue(a, routed.event);
     const args = try vm.store().putValue(a, .{ .map = try a.dupe(cbor.Entry, &.{
         .{ .key = "event", .value = .{ .cid = ev } },
