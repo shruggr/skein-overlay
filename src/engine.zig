@@ -22,12 +22,11 @@
 //! A submit step, after the route decoded and judged it in its call
 //! (submit.zig): hold the records the entry carries; unless the entry proves
 //! the transaction mined, broadcast it (#65: an event, the host's wiring
-//! carries it) and admit it per `defaults.overlayAdmitOn` — on a status
-//! provider's word ("status"; with no status provider in the address book, at
-//! once) or on its proof ("proof"): record each topic's judgement
-//! (overlay.apply) and call the listening lookup services' hooks
-//! (`admitted`, `spent`); save. Until then the thread awaits the
-//! transaction's CID, with a deadline at its abandonment
+//! carries it) and leave it pending. There is no setting (#73): admission is
+//! the first of a status provider's word that the network has it, or its
+//! proof — either records each topic's judgement (overlay.apply) and calls
+//! the listening lookup services' hooks (`admitted`, `spent`); save. Until
+//! then the thread awaits the transaction's CID, with a deadline at its abandonment
 //! (defaults.walletAbandonMs): its proof, a status provider's message, or
 //! the deadline steps the same thread — admitting it, or rejecting it. Once
 //! admitted or rejected the thread finishes (#66): the request that launched
@@ -98,7 +97,7 @@ fn run(a: std.mem.Allocator) anyerror!void {
     var op: []const u8 = "event";
 
     if (std.mem.eql(u8, kind, "submit")) {
-        // Hold the records; broadcast unless mined; admit per overlayAdmitOn (submit.zig).
+        // Hold the records; broadcast unless mined; admit on the first of a status or the proof (submit.zig).
         op = if (wake == null) "submit" else "callback";
         const done = (if (wake) |wk|
             submit.awaited(a, vm.caller(), &wal, step, ev, wk)

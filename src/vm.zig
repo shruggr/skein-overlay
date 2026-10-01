@@ -2,8 +2,8 @@
 //! kernel-zig program.zig), and the few helpers every overlay program needs:
 //! the step's (or call's) input, the store as wallet-zig's `Store`,
 //! keep-and-print of a result record, in-VM calls and a call's answer, and
-//! the broadcast gate's wiring — the broadcast event (`emit`, #65), whether a
-//! status provider is in the address book — `await` and `deadline` (#57).
+//! the broadcast gate's wiring — the broadcast event (`emit`, #65) — `await`
+//! and `deadline` (#57).
 //! wasm32-wasi only.
 const std = @import("std");
 const w = @import("wallet");
@@ -118,18 +118,6 @@ pub fn caller() w.overlay.Caller {
     return .{ .ctx = &dummy, .callFn = callerImpl };
 }
 
-/// Whether the address book names a provider with `role` (the head `peers`).
-fn hasRole(a: std.mem.Allocator, role: []const u8) !bool {
-    const s = store();
-    const root = (try head(a, "peers")) orelse return false;
-    const book = try s.getValue(a, root);
-    for (book.getArray("peers") orelse return false) |e| {
-        const p = try s.getValue(a, e.getCid("peer") orelse continue);
-        if (std.mem.eql(u8, p.getText("role") orelse "", role)) return true;
-    }
-    return false;
-}
-
 /// Broadcast a transaction (#65): the event {event: "broadcast", tx: <its
 /// CID>, beef: <its Atomic BEEF>}, addressed to no one — the host's wiring
 /// carries it. The step then awaits the transaction (engine.zig).
@@ -143,14 +131,9 @@ fn broadcastImpl(_: *anyopaque, a: std.mem.Allocator, txid: [32]u8, beef: []cons
     _ = try result(a, sk.emit, .{ ev.ptr, @as(u32, @intCast(ev.len)) });
 }
 
-/// A status provider is in the address book (role "status", #65).
-fn statusImpl(_: *anyopaque, a: std.mem.Allocator) anyerror!bool {
-    return hasRole(a, "status");
-}
-
-/// The broadcast gate's wiring (#57, #65), over the `emit` and `head` imports.
+/// The broadcast gate's wiring (#57, #65), over the `emit` import.
 pub fn wire() submit.Wire {
-    return .{ .ctx = &dummy, .broadcastFn = broadcastImpl, .statusFn = statusImpl };
+    return .{ .ctx = &dummy, .broadcastFn = broadcastImpl };
 }
 
 /// Rest the thread until a status for this record (a transaction's CID) arrives, or the deadline.

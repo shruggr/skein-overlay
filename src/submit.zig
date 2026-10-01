@@ -12,26 +12,27 @@
 //!   nothing persists. Otherwise it returns the entry for the host to admit.
 //! - **The step** (`step`, the engine stepped on that entry). It holds the
 //!   decoded records the entry carries (overlay.holdDecoded: kept, so #42's
-//!   edges appear), then gates on broadcast (#57, #65): a subject the entry
-//!   proves is mined and goes straight on; otherwise it is broadcast (an
-//!   event: {event: "broadcast", tx, beef}, the host's wiring carries it)
-//!   and admitted per `defaults.overlayAdmitOn` (`Gate`):
-//!     "status" (the default) — with a status provider in the address book
-//!       (role `status`), once it says the network has it; without one, at
-//!       once (admitted on validation, settled by the proof: a competing
-//!       proof or a rejection unwinds it through `admits`);
-//!     "proof" — once its proof arrives (a merkle path our headers hold).
-//!   Until then the broadcast record says `pending`, nothing admitted.
+//!   edges appear), then gates on broadcast (#57, #65, #73): a subject the
+//!   entry proves is mined and goes straight on; otherwise it is broadcast
+//!   (an event: {event: "broadcast", tx, beef}, the host's wiring carries it)
+//!   and left pending — nothing admitted — until either signal arrives.
+//!   There is no setting: the gate is **the first of** a status provider's
+//!   acceptance or the transaction's proof (#73). Admission on validation
+//!   alone is not a mode; an instance with no status feed subscribed simply
+//!   never hears one, so it admits at the proof.
 //! - **The awaiting thread** (`awaited`). While the transaction is pending
 //!   the engine awaits its CID, with a deadline at its abandonment: a proof
 //!   event, a status provider's message, or the deadline steps the same
-//!   thread. Admitted: the broadcast record, then each topic's judgement
-//!   recorded (`applied`, the admittances) and each listening lookup
-//!   service's hooks called (`admitted`, then `spent` for each previous coin
-//!   consumed). Rejected (the provider's REJECTED, DOUBLE_SPEND_ATTEMPTED, …;
-//!   a competing proof; abandonment): the rejection (Wallet.reject), nothing
-//!   admitted. A judgement is taken again, at admission, only if the topic's
-//!   previous coins moved since the call.
+//!   thread. **Admits on the first of them**: a status that is not a
+//!   rejection, or a validated proof — whichever arrives first; the other,
+//!   arriving after, only settles or notes it (no double admission). Each
+//!   admission records the broadcast record, then each topic's judgement
+//!   (`applied`, the admittances) and each listening lookup service's hooks
+//!   (`admitted`, then `spent` for each previous coin consumed). Rejected
+//!   (the provider's REJECTED, DOUBLE_SPEND_ATTEMPTED, …; a competing proof;
+//!   abandonment): the rejection (Wallet.reject), nothing admitted. A
+//!   judgement is taken again, at admission, only if the topic's previous
+//!   coins moved since the call.
 //!
 //! The entry (box `submit`) carries records, not a BEEF:
 //!
@@ -197,41 +198,27 @@ pub fn hold(wal: *Wallet, ev: Value) !ov.Subject {
 // ---------------------------------------------------------------- the step: broadcast, then admit (#57)
 
 /// The broadcast wiring as the gate sees it (#65): broadcasting is an
-/// event, addressed to no one (vm.zig's emits it; a test's records it); and
-/// whether a status provider speaks to this instance (the address book
-/// names one, role `status`).
+/// event, addressed to no one (vm.zig's emits it; a test's records it).
 pub const Wire = struct {
     ctx: *anyopaque,
     /// Broadcast the transaction: the event {event: "broadcast", tx: <its CID>, beef}.
     broadcastFn: *const fn (ctx: *anyopaque, a: Allocator, txid: [32]u8, beef: []const u8) anyerror!void,
-    /// Whether a status provider is in the address book.
-    statusFn: *const fn (ctx: *anyopaque, a: Allocator) anyerror!bool,
 
     pub fn broadcast(self: Wire, a: Allocator, txid: [32]u8, beef: []const u8) !void {
         return self.broadcastFn(self.ctx, a, txid, beef);
     }
-    pub fn hasStatus(self: Wire, a: Allocator) !bool {
-        return self.statusFn(self.ctx, a);
-    }
 };
 
-/// When a submission is admitted (genesis `defaults.overlayAdmitOn`, #65):
-/// on a status provider's word that the network has it (`status`, the
-/// default; with no status provider, on validation), or on its proof (`proof`).
-pub const AdmitOn = enum { status, proof };
-
-/// The broadcast gate's settings, from genesis `defaults`: `overlayAdmitOn`
-/// ("status" | "proof", default "status"), and when an unmined submission is
-/// given up (`walletAbandonMs`, default 86 400 000; 0: never — the chain
-/// core's rule).
+/// The broadcast gate's settings, from genesis `defaults`: when an unmined
+/// submission is given up (`walletAbandonMs`, default 86 400 000; 0: never —
+/// the chain core's rule). There is no admission setting (#73): the gate is
+/// always the first of a status provider's acceptance or the proof.
 pub const Gate = struct {
-    admit_on: AdmitOn = .status,
     abandon_ms: i64 = 86_400_000,
 
     pub fn of(in: Value) !Gate {
         const d = in.get("defaults") orelse return .{};
         return .{
-            .admit_on = std.meta.stringToEnum(AdmitOn, d.getText("overlayAdmitOn") orelse "status") orelse return error.BadConfig,
             .abandon_ms = std.fmt.parseInt(i64, d.getText("walletAbandonMs") orelse "86400000", 10) catch return error.BadConfig,
         };
     }
@@ -255,10 +242,9 @@ pub const Gate = struct {
 
 /// How the broadcast gate went: `mined` (the entry carried the subject's
 /// proof, or its proof came: admitted), `accepted` (a status provider said
-/// the network has it: admitted), `validated` (no status provider and
-/// `overlayAdmitOn: "status"`: admitted on validation, settled by its
-/// proof), `rejected`, `pending` (nothing admitted yet: the thread awaits).
-pub const Gated = enum { mined, accepted, validated, rejected, pending };
+/// the network has it: admitted), `rejected`, `pending` (nothing admitted
+/// yet: the thread awaits — either its proof, or a status provider's word).
+pub const Gated = enum { mined, accepted, rejected, pending };
 
 /// What a submit step (or a step of its awaiting thread) came to.
 pub const Stepped = struct {
@@ -277,11 +263,11 @@ pub const Stepped = struct {
     records: []const []const u8 = &.{},
 };
 
-/// The step's half, on the `submit` entry (#57, #65): hold the records;
-/// unless the subject is mined, broadcast it (an event) and admit it per
-/// `overlayAdmitOn` — at once when there is no status provider to wait for
-/// ("status"), else leave it pending, nothing admitted: the thread awaits
-/// the transaction's CID (a status, its proof) with a deadline.
+/// The step's half, on the `submit` entry (#57, #65, #73): hold the records;
+/// unless the subject is mined, broadcast it (an event) and leave it
+/// pending, nothing admitted: the thread awaits the transaction's CID (a
+/// status provider's word, its proof) with a deadline — admitted on the
+/// first of them (`awaited`).
 pub fn step(a: Allocator, caller: ov.Caller, wire: Wire, wal: *Wallet, in: Value, ev: Value) !Stepped {
     const sub = try hold(wal, ev);
     var out = Stepped{ .subject = sub, .gate = .mined, .outcome = .pending };
@@ -302,14 +288,6 @@ pub fn step(a: Allocator, caller: ov.Caller, wire: Wire, wal: *Wallet, in: Value
     }
     const beef = (try wal.beefOf(sub.txid)) orelse return error.UnknownTransaction;
     try wire.broadcast(a, sub.txid, beef);
-    const gate = try Gate.of(in);
-    if (gate.admit_on == .status and !(try wire.hasStatus(a))) {
-        // No status provider to wait for: admitted on validation; its proof settles it.
-        try wal.noteSubmission(sub.txid, "", "admitted", in.getCid("thread"));
-        out.gate = .validated;
-        try admit(a, caller, wal, in, ev, &out);
-        return out;
-    }
     try wal.noteSubmission(sub.txid, "", "pending", in.getCid("thread"));
     out.gate = .pending;
     return out;
@@ -329,18 +307,19 @@ pub const Wake = union(enum) { event: Value, status: Value, deadline };
 
 /// A step of the submission's awaiting thread (as the wallet's
 /// awaiting-callback thread, docs/WALLET.md); `ev` is the submit entry the
-/// thread began with. **Not yet admitted:** its proof proves it and admits
-/// it (a path whose header we do not hold yet leaves it pending); a status
-/// provider's rejection rejects it, any other status admits it under
-/// `overlayAdmitOn: "status"` (under "proof" it is only noted); at the
-/// deadline it is abandoned if due. **Admitted:** the status or proof is
-/// applied (a merkle path proves it; a rejection unwinds the admittances
-/// through `admits`).
+/// thread began with. **Not yet admitted, the gate (#73): the first of**
+/// a status that is not a rejection (admits), or a validated proof (admits;
+/// a path whose header we do not hold yet leaves it pending); a rejection
+/// status rejects it; at the deadline it is abandoned if due. A status
+/// message only ever arrives here through a subscribed provider, so an
+/// instance with none simply never hears one and admits at the proof.
+/// **Already admitted:** the status or proof is only applied (a merkle path
+/// proves it; a rejection unwinds the admittances through `admits`) — no
+/// second admission.
 pub fn awaited(a: Allocator, caller: ov.Caller, wal: *Wallet, in: Value, ev: Value, wake: Wake) !Stepped {
     const sub = try ov.subjectOf(wal, try w.header.fromHex(ev.getText("txid") orelse return error.BadEvent));
     const txid = sub.txid;
     const pending = try isPending(wal, txid);
-    const gate = try Gate.of(in);
     var out = Stepped{ .subject = sub, .gate = if (pending) .pending else .accepted, .outcome = .pending };
     switch (wake) {
         .event => |e| {
@@ -368,15 +347,13 @@ pub fn awaited(a: Allocator, caller: ov.Caller, wal: *Wallet, in: Value, ev: Val
                 _ = try wal.reject(txid, st);
                 out.gate = .rejected;
                 out.outcome = .rejected;
-            } else if (gate.admit_on == .status) {
-                // The network has it, says the status provider: admitted (its proof settles it later).
+            } else {
+                // The network has it, says the status provider: admitted — the first of the two
+                // signals (#73); its proof, arriving after, only settles it (the `!pending` branch above).
                 try wal.noteSubmission(txid, st, "admitted", in.getCid("thread"));
                 out.gate = .accepted;
                 out.outcome = try wal.applyStatus(txid, st, null);
                 if (out.outcome != .rejected) try admit(a, caller, wal, in, ev, &out);
-            } else {
-                // Admitted on its proof only: the status is noted, it stays pending.
-                try wal.noteSubmission(txid, st, "pending", in.getCid("thread"));
             }
         },
         .deadline => {
@@ -390,7 +367,7 @@ pub fn awaited(a: Allocator, caller: ov.Caller, wal: *Wallet, in: Value, ev: Val
                 if (out.outcome == .rejected) out.gate = .rejected;
                 return out;
             }
-            if (try wal.abandonIfDue(txid, gate.abandon_ms)) {
+            if (try wal.abandonIfDue(txid, (try Gate.of(in)).abandon_ms)) {
                 out.gate = .rejected;
                 out.outcome = .rejected;
                 return out;
@@ -403,9 +380,9 @@ pub fn awaited(a: Allocator, caller: ov.Caller, wal: *Wallet, in: Value, ev: Val
 /// The admission: each topic's judgement the entry carries recorded
 /// (`applied`, the admittances), and the listening lookup services' hooks
 /// called (`admitted`, then `spent` for each previous coin consumed) — once
-/// the gate lets it through (#65: its proof, a status provider's word, or
-/// at once with no status provider to wait for). A judgement is taken again only
-/// if the topic's previous coins moved since the call.
+/// the gate lets it through (#65, #73: mined, or the first of a status
+/// provider's word and the proof). A judgement is taken again only if the
+/// topic's previous coins moved since the call.
 fn admit(a: Allocator, caller: ov.Caller, wal: *Wallet, in: Value, ev: Value, out: *Stepped) !void {
     const sub = out.subject;
     const served = try ov.configObject(a, in, "overlayTopics");
