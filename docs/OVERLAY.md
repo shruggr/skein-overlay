@@ -18,7 +18,8 @@ storage are not ported.
 
 - BRC-88 SHIP/SLAP advertisement. Clients reach an instance through the
   `hostOverrides` / `facilitator` options of the stock clients.
-- Sync between overlay nodes (GASP).
+- Sync between overlay nodes (GASP); catch-up from a peer. The push half —
+  submissions, admits and proofs as they happen — is the gossip (#74, below).
 - The `historical-tx` modes.
 - BRC-64 history queries beyond "spent too" (`includeSpent`).
 
@@ -29,7 +30,8 @@ storage are not ported.
 | `wallet-zig/src/overlay.zig` | The overlay's state in the chain and settlement core, and the submission's records: `decode` (the one BEEF parse), `verifyDecoded` (SPV over the records), `holdDecoded`, the previous coins, recording a topic's judgement (`apply`), the derived map, the hooks' dispatch (`Caller`, `listeners`, `hookAdmitted`, `hookRejected`), each output's BEEF for a lookup answer. |
 | `programs/overlay/src/engine.zig` → `overlay.wasm` | The engine: called, the front door's route handlers (`routes.zig`); stepped, the handler for the `submit` and `chain` entries. |
 | `programs/overlay/src/submit.zig` | A submission from the wire to the state: the route's half (decode, verify, judge — in the front door's step on the request), the step's half (hold, broadcast — an event, #65 — then record and call the hooks once the gate lets it through: the first of a status or the proof, #73), and the steps while it is pending (#57). |
-| `programs/overlay/src/routes.zig` | The route handlers (#40): the overlay-express wire contract. |
+| `programs/overlay/src/routes.zig` | The route handlers (#40): the overlay-express wire contract, and the gossip's inbound routes (`peerAdmit`, `peerProof`, #74). |
+| `programs/overlay/src/gossip.zig` | The three gossip topics (#74): message shapes, what an admission and a proof publish, a peer's proof checked, the peer-admit records. |
 | `programs/overlay/src/topic.zig` | The topic contract (a library). |
 | `programs/overlay/src/lookup.zig` | The lookup contract (a library): hooks, own storage, answers. |
 | `programs/overlay/src/topic_demo.zig` → `topic-demo.wasm` | `tm_demo`, an example topic. |
@@ -320,7 +322,8 @@ into it, through sender-less subscriptions:
 | box | entry | does |
 |---|---|---|
 | `submit` | the submit event above (what `POST /submit` admits) | Holds the records; unless mined, broadcasts the transaction (an event, #65); once the gate admits it (the first of a status or the proof, #73), records each topic's judgement and calls the lookup services' `admitted` / `spent` hooks; saves and advances `wallet`; awaits the transaction while pending or unproven (#57). |
-| `chain` | `header` / `proof` / `status` | Handled as the wallet handles them, then `rejected` for each judgement a rejection removed. This is for an instance without a wallet program. A `status` / `proof` for a transaction whose submission thread awaits it steps that thread instead. |
+| `submit` | `peer-admit` (what the `-admit` route admits, #74) | Recorded under the head `overlay:gossip` ("Gossip", below); nothing admitted. |
+| `chain` | `header` (`raw`, or a run `raws`, parents first: a reorg's heavier branch in one event) / `proof` / `status` | Handled as the wallet handles them, then `rejected` for each judgement a rejection removed. This is for an instance without a wallet program. A `status` / `proof` for a transaction whose submission thread awaits it steps that thread instead. A proof recorded for an admitted transaction is published on `<topic>-proof` (#74). |
 
 There is no `lookup` box: a lookup is a read: its request is recorded, and it moves nothing.
 
@@ -341,6 +344,8 @@ There is no `lookup` box: a lookup is a read: its request is recorded, and it mo
   (#65). A status provider is the address book's role `status` plus the
   subscription `{"sender": "$status", "box": "status", "handler":
   "overlay"}` in etc/subscriptions.json.
+- `overlayGossip = '{"tm_demo": false}'` turns a topic's gossip publishing
+  off (#74; default on, "Gossip" below).
 - `walletAbandonMs` (default 86400000) is shared with the wallet: a pending
   transaction neither taken nor mined that long after its first broadcast
   is abandoned (rejected), one rule for the chain core.
@@ -554,12 +559,108 @@ submits, with its facilitator pointed at the instance's origin, since the
 (`hostOverrides`, `local` preset) queries, and its BEEF verifies with
 `Transaction.verify` against the fed headers.
 
+## Gossip: the three topics (#74)
+
+For each overlay topic `<topic>` it runs, an overlay speaks three GossipSub
+topics, three meanings (`programs/overlay/src/gossip.zig`). Bodies are
+dag-cbor unless said; a txid and a block hash are hex in display order.
+
+| topic | body | published | received (route → fn) |
+|---|---|---|---|
+| `<topic>` | the raw submission: the BEEF as received (bytes, not dag-cbor) | after this overlay **admits** a submission that did not arrive by gossip on `<topic>` (HTTP, a stream), whichever gate admitted it (#73) | `libp2p:<topic>` → `submit`: judged as any submission (#57) |
+| `<topic>-admit` | `{txid, topics: {<topic>: {outputsToAdmit: [vout], coinsToRetain: [input index]}}}` — the STEAK and the txid, **no BEEF** | on admission, every time (also for a submission that arrived by gossip) | `libp2p:<topic>-admit` → `peerAdmit`: recorded, never admits |
+| `<topic>-proof` | `{txid, blockHash, blockHeight, bump: bytes}` — `bump` the BRC-74 path of this txid alone | on recording a merkle proof for a transaction a topic admitted: its first proof, and again when a reorg re-proves it in another block | `libp2p:<topic>-proof` → `peerProof`: checked, then the proof-in path |
+
+**Publishing.** A message to the libp2p provider, box `publish`, body
+`{topic, body}` (docs/MESSAGES.md, "The providers"), emitted from the step
+that admits or records the proof and not awaited: the provider's answer is
+an entry that runs nothing. With no libp2p provider in the address book (a
+host without libp2p) nothing is published. The raw submission is the
+request's own body (an HTTP submit's off-chain values framing taken off;
+the off-chain values do not travel): the submit entry carries `source:
+{transport, topic?, request}` for this. A submission that arrived by gossip
+on `<topic>` is not re-published there (GossipSub already forwarded it); a
+proof that arrived on `<topic>-proof` is not re-published (the same). A
+proof is published only when the step changed the block the transaction's
+proof names (the same proof twice publishes once). **Statuses never
+propagate**: a status is one node's view of its own broadcast.
+
+**One message per txid, no compound BUMP.** Each proof arrives as its own
+event and is recorded in its own step, so `-proof` carries one txid's path,
+rebuilt from the held merkle nodes (`Wallet.proofFor`), not a compound BUMP
+of the block. Peers that hold several transactions of a block get one
+message each; the nodes they share are stored once.
+
+**Receiving `-admit`** (`peerAdmit`): the topic must be one this overlay
+serves and the body that shape, else `ignore`. Accept admits a `peer-admit`
+event into box `submit`; the engine records it under the head
+`overlay:gossip`:
+
+```
+{kind: "overlay-gossip", maps: {peerAdmits: <MST root> | null}}
+peerAdmits: tp ‖ txid (internal order) ‖ from → {kind: "peer-admit", topic, txid (hex), from: bytes(33) (the publisher's peer key),
+                                                 outputsToAdmit, coinsToRetain}
+```
+
+A later admit from the same peer for the same transaction replaces the
+record. It is a read — for a submitter counting admits, a lookup, a UI —
+and **never admits anything**: nothing is admitted from gossip without this
+node's own judgement and gate.
+
+**Receiving `-proof`** (`peerProof`): the proof-in wiring of #65 for the
+topics this overlay runs — specific wiring, not an open box. In the call
+(read only), against this instance's own state: the topic is served; the
+transaction is admitted under it, or held pending its gate; it is not
+already proven in that block; the BUMP parses, is at `blockHeight` and
+flags the txid; our header at `blockHeight` has the hash `blockHash`, and
+its merkle root is the BUMP's root. Then accept, admitting the same event
+the host's chain feed admits, plus `via`:
+
+```
+event (box "chain")  {kind: "proof", subject: <tx CID>, txid, path: <the bump>, blockHash, blockHeight, via: "libp2p:<topic>-proof"}
+```
+
+It steps the transaction's pending submission (admitted at the proof, #73),
+else the `chain` subscription records it (a reorg's re-proof replaces the
+old proof). Anything else is **`ignore`, never `reject`**: a proof we cannot
+check may be our missing headers, not the publisher's fault. Only its
+request entry is written.
+
+**Late duplicates.** A `<topic>` message GossipSub's seen-cache has
+forgotten is the same record as before: the front door finds it in the
+`unique` map and answers `ignore` ("already admitted") with nothing run. The
+same BEEF in a new message (another publisher) is decoded once, looked up,
+and answered `ignore` "already judged" (or "already submitted: awaiting its
+broadcast" while pending): no topic manager runs (test.zig counts the
+calls). A submission no topic took leaves no record, so it is judged again.
+
+**Config.** `defaults.overlayGossip`, a JSON object in a string: `{"<topic>":
+false}` turns a topic's publishing off; a topic not named publishes (the
+default is on). It maps 1:1 onto the manifest's `config.overlay.gossip`
+(docs/APPS.md §6). Receiving is the routes and the subscribed topics:
+`libp2p:<topic>`, `libp2p:<topic>-admit`, `libp2p:<topic>-proof` in
+etc/routes.json, and the topics in etc/config.json `libp2p.topics`.
+
+**Not built:** catch-up (asking a peer for its admitted set, or proofs by
+block — the pull half of #44–#48).
+
+equiv/overlay.ts checks it end to end on three routers with libp2p: A
+(with an Arcade) admits an HTTP submission and publishes `tm_demo` and
+`tm_demo-admit`; B (no status provider) judges the gossiped submission and
+waits at its gate; A's proof goes out on `tm_demo-proof`, B checks it
+against its own headers and admits at it, then publishes its own admit; C
+(on `tm_demo-admit` only) records A's and B's admits and admits nothing; a
+reorg's re-proof reaches B and replaces the old proof; a bad BUMP is
+ignored; the late duplicates are as above. Every store replays exactly.
+
 ## A system tree for an overlay node
 
 ```
 bin/frontdoor.wasm, bin/overlay.wasm, bin/topic-demo.wasm, bin/lookup-demo.wasm   (+ .json: description)
 etc/config.json          {"defaults": {"walletNetwork": "regtest", "overlayTopics": "{\"tm_demo\":\"topic-demo\"}",
                           "overlayLookups": "{\"ls_demo\":{\"program\":\"lookup-demo\",\"topics\":[\"tm_demo\"]}}"}}
+                          (+ "libp2p": {"topics": ["tm_demo", "tm_demo-proof"]} to take part in the gossip, #74;
+                           "overlayGossip": "{\"tm_demo\":false}" in defaults to publish nothing for a topic)
 etc/subscriptions.json   [{"box": "submit", "handler": "overlay"}, {"box": "chain", "handler": "overlay"},
                           {"sender": "$status", "box": "status", "handler": "overlay"}]
 etc/routes.json          [{"path": "/submit", "program": "overlay", "fn": "submit", "auth": "none"},
@@ -567,7 +668,10 @@ etc/routes.json          [{"path": "/submit", "program": "overlay", "fn": "submi
                           {"path": "/listTopicManagers", "program": "overlay", "fn": "listTopicManagers", "auth": "none"},
                           {"path": "/listLookupServiceProviders", "program": "overlay", "fn": "listLookupServiceProviders", "auth": "none"},
                           {"path": "/getDocumentationForTopicManager", "program": "overlay", "fn": "topicDocumentation", "auth": "none"},
-                          {"path": "/getDocumentationForLookupServiceProvider", "program": "overlay", "fn": "lookupDocumentation", "auth": "none"}]
+                          {"path": "/getDocumentationForLookupServiceProvider", "program": "overlay", "fn": "lookupDocumentation", "auth": "none"},
+                          {"path": "libp2p:tm_demo", "program": "overlay", "fn": "submit"},
+                          {"path": "libp2p:tm_demo-admit", "program": "overlay", "fn": "peerAdmit"},
+                          {"path": "libp2p:tm_demo-proof", "program": "overlay", "fn": "peerProof"}]
 ```
 
 The front door must be in `bin/` (a tree's programs are its own):
