@@ -28,7 +28,7 @@ storage are not ported.
 |---|---|
 | `wallet-zig/src/overlay.zig` | The overlay's state in the chain and settlement core, and the submission's records: `decode` (the one BEEF parse), `verifyDecoded` (SPV over the records), `holdDecoded`, the previous coins, recording a topic's judgement (`apply`), the derived map, the hooks' dispatch (`Caller`, `listeners`, `hookAdmitted`, `hookRejected`), each output's BEEF for a lookup answer. |
 | `programs/overlay/src/engine.zig` → `overlay.wasm` | The engine: called, the front door's route handlers (`routes.zig`); stepped, the handler for the `submit` and `chain` entries. |
-| `programs/overlay/src/submit.zig` | A submission from the wire to the state: the route's half (decode, verify, judge — in the front door's step on the request), the step's half (hold, broadcast, then record and call the hooks once ARC takes it), and the steps while ARC has not taken it (#57). |
+| `programs/overlay/src/submit.zig` | A submission from the wire to the state: the route's half (decode, verify, judge — in the front door's step on the request), the step's half (hold, broadcast — an event, #65 — then record and call the hooks once the gate lets it through, `overlayAdmitOn`), and the steps while it is pending (#57). |
 | `programs/overlay/src/routes.zig` | The route handlers (#40): the overlay-express wire contract. |
 | `programs/overlay/src/topic.zig` | The topic contract (a library). |
 | `programs/overlay/src/lookup.zig` | The lookup contract (a library): hooks, own storage, answers. |
@@ -90,7 +90,7 @@ for the log) and starts nothing: the request is recorded, and no head moves
 a BEEF that does not decode or verify answers 400 `{status: "error",
 message}`. A resubmission of a transaction every served topic judged before
 (a dupe) is answered from the state at once (the STEAK of what was
-admitted); one of a transaction held and awaiting ARC (below) waits on the
+admitted); one of a transaction held and pending (below) waits on the
 first submission's thread ("The answer", below).
 
 **Admitted into the graph, then broadcast (#57).** Otherwise the handler
@@ -107,36 +107,29 @@ once.)
  topics: [{topic, previousCoins, outputsToAdmit, coinsToRetain}], offChainValues?: bytes}
 ```
 
-The record puts the transaction in the graph. No output is admitted yet: a
-topic's outputs are admitted only once ARC takes the transaction (or it is
-mined), so a STEAK only ever names outputs of a transaction the network
-has. The engine, stepped on it:
+The record puts the transaction in the graph. No output is admitted until
+the broadcast gate lets it through (`defaults.overlayAdmitOn`, #65, below).
+The engine, stepped on it:
 
 1. **Holds the records** (`holdDecoded`): each transaction's block is kept and
    put in `txs` (so #42's `spends` edges appear), the merkle nodes are kept
    (no edges: a proof reads down from the root), and each proven transaction's proof is recorded from the
    header its nodes reach (`Wallet.putProofAt`).
-2. **Gates on broadcast.** A subject the entry proves (its BUMP reaches a
-   header we hold) is mined: no broadcast, straight to 3. Otherwise the step
-   emits its Atomic BEEF (built from the held records, `Wallet.beefOf`) to
-   the address book's `broadcast` provider (#70, #67: a message, box
-   `broadcast`, `{tx}`, its `subject` the transaction's CID) — the host's
-   broadcaster (#58, docs/WALLET.md), which sends Arcade the Extended Format
-   — marks the `broadcast` record `submission: "pending"`, and awaits (4).
-   Nothing is admitted in this step. The broadcaster's answer, a signed
-   message `{replyTo, status, body}` carrying Arcade's HTTP status and JSON,
-   steps the thread again, and decides (the wallet's reading of it):
-   - **accepted** — a 2xx whose `txStatus` is not a rejection (RECEIVED, or a
-     duplicate's SEEN / MINED): the `broadcast` record (below), the status
-     applied (a MINED answer with a merkle path proves it), then 3.
-   - **rejected** — a 4xx, or `REJECTED` / `DOUBLE_SPEND_ATTEMPTED` /
-     `INVALID` / `MALFORMED`: the transaction is rejected (`Wallet.reject`,
-     #37's walk: a held transaction spending it falls with it). Nothing
-     admitted; the step ends.
-   - **transient** — anything else (Arcade's 503 for backpressure, the
-     broadcaster's 503 for an Arcade it cannot reach, no answer at all): the
-     `broadcast` record stays `submission: "pending"`. Nothing admitted; the
-     thread awaits (4).
+2. **Gates on broadcast** (#57, #65). A subject the entry proves (its BUMP
+   reaches a header we hold) is mined: no broadcast, straight to 3.
+   Otherwise the step broadcasts it — an event, `{event: "broadcast", tx,
+   beef}` (its Atomic BEEF built from the held records, `Wallet.beefOf`),
+   addressed to no one; the host's wiring carries it (the reference host:
+   its broadcaster's durable queue and Arcade session, docs/WALLET.md) —
+   and gates per `defaults.overlayAdmitOn`:
+
+   | `overlayAdmitOn` | with a status provider (address book role `status`) | without one |
+   |---|---|---|
+   | `"status"` (default) | pending until its first status that is not a rejection (the reference host's: Arcade's RECEIVED) | **admitted at once** (gate `validated`): the BEEF verified; its proof settles it, a competing proof, a rejection or abandonment unwinds it through `admits` |
+   | `"proof"` | pending until its proof (statuses are noted; a rejection rejects it) | pending until its proof |
+
+   Pending: the `broadcast` record says `submission: "pending"`, nothing is
+   admitted, and the thread awaits (4).
 3. **Admits.** Each judgement recorded (`apply`): the admittances and the
    `applied` record. The previous coins are taken again; if they moved since
    the call (another submission in between), the topic is asked again, over
@@ -144,25 +137,23 @@ has. The engine, stepped on it:
    something: `admitted`, then `spent` for each previous coin the
    transaction consumed. The services' map updates are that step's head
    moves.
-4. **Awaits while pending.** While ARC has not taken the transaction, the
-   step `await`s what it asked the broadcaster (the messages still
-   unanswered, kept on its result as `asked`) and the transaction's CID, and
-   sets a `deadline` (`overlayRecheckMs`). What steps it again:
-   - the broadcaster's answer — read as in 2; a 404 to a question (ARC
-     never took it) posts it again;
-   - a `status` / `proof` entry for its CID — Arcade's statuses, which the
-     host's broadcaster routes to every instance holding the transaction
-     (#58): a rejection rejects it, anything else means ARC has it, and it
-     is admitted (3);
-   - the deadline — abandoned if still pending for `walletAbandonMs` since
-     the first broadcast; else the broadcaster is asked again (box `status`,
-     `{txid}`), its answer the next step's.
+4. **Awaits while pending.** The step `await`s the transaction's CID and
+   sets a `deadline` at its abandonment (`walletAbandonMs` after its first
+   broadcast). What steps it again:
+   - a **status message** from the status provider it subscribes to (input
+     `message`, routed by its subject): a rejection (`REJECTED`,
+     `DOUBLE_SPEND_ATTEMPTED`, `INVALID`, `MALFORMED`) rejects it (#37's
+     walk); any other status admits it (3) under `"status"`, and is only
+     noted under `"proof"`;
+   - its **proof event** (box `chain`, input `event`): proven — admitted (3,
+     gate `mined`); a path whose header we do not hold yet leaves it pending;
+   - the **deadline**: abandoned if still pending (rejected, `abandoned`).
 
    Admitted or rejected, the submission's thread **finishes** (#66): the
    requests waiting on it answer. What follows for an admitted, unproven
    transaction — its statuses, its proof, a double spend — comes through
-   the chain feed (box `chain`, the engine's `chain` handling, or the
-   wallet's), nobody waiting: a merkle path proves it, a rejection
+   the chain feed (box `chain`) and the status subscription (box `status`),
+   to the engine or the wallet, nobody waiting: a merkle path proves it, a rejection
    (`DOUBLE_SPEND_ATTEMPTED`, …) unwinds its admittances and lookup entries
    through `admits` (#37, below); a reorg that unproves it is re-proven the
    same way.
@@ -180,10 +171,10 @@ answer from the state:
 | state of the transaction | answer |
 |---|---|
 | admitted (or judged before) | 200, the STEAK from each topic's `applied` record (empty for a topic that took nothing) |
-| still pending (the thread errored before ARC took it) | **503** `{status: "error", message}` with `Retry-After` (`overlayRecheckMs`, whole seconds): nothing admitted; resubmit |
-| rejected by ARC | **400** `{status: "error", message: "Transaction rejected: <reason>"}` (overlay-express's error form; the stock `TopicBroadcaster` counts it a failure) |
+| still pending (the thread errored before it was admitted) | **503** `{status: "error", message}` with `Retry-After: 30`: nothing admitted; resubmit |
+| rejected (a status provider's rejection, a competing proof, abandonment) | **400** `{status: "error", message: "Transaction rejected: <reason>"}` (overlay-express's error form; the stock `TopicBroadcaster` counts it a failure) |
 
-While the thread waits on ARC the client waits too, up to the host's bound
+While the thread waits on the gate the client waits too, up to the host's bound
 (`answerWaitMs`): then 503 + `Retry-After` from the host, and the thread
 goes on. A resubmission while pending waits on the same thread (the
 `broadcast` record names it) and gets the same answer; after admission it
@@ -225,7 +216,7 @@ overlay-only instance routes `chain` to the engine.
 | `admitted` | tp ‖ outpoint → admittance record | an output a topic admitted |
 | `applied` | tp ‖ txid → applied record | the topic's judgement of this transaction: a later submission is a dupe; which previous coins it retained |
 | `byTopic` | tp ‖ 0 (unspent) \| 1 (spent) ‖ outpoint → null | derived: `admitted` joined to the spends edge |
-| `awaiting` (the wallet's, shared) | txid → broadcast record | a submission posted to ARC and not yet proven or rejected (#57): `submission: "pending"` until ARC takes it |
+| `awaiting` (the wallet's, shared) | txid → broadcast record | a submission broadcast and not yet proven or rejected (#57): `submission: "pending"` until the gate admits it |
 
 Indexes for answering queries are not here: each lookup service keeps its
 own (below). The shared `byScript` map was only the demo lookup's, so it
@@ -264,10 +255,10 @@ from a stored consumed table.
   coinsToRetain, coinsRemoved, at, tx, refs}`.
 - **Broadcast** (#57, the wallet's record, in the shared `awaiting` map:
   txid → record while the transaction awaits its status): `{kind:
-  "broadcast", txid, subject: <tx CID>, arc, txStatus, since, submission}`.
-  `arc` is the route it was posted to, `txStatus` ARC's last word, `since`
-  the first attempt's time (the abandonment clock), and `submission` the
-  overlay's: `"pending"` while ARC has not taken it (nothing admitted),
+  "broadcast", txid, subject: <tx CID>, txStatus, since, submission, thread}`.
+  `txStatus` is the status provider's last word, `since` the first
+  broadcast's time (the abandonment clock), and `submission` the overlay's:
+  `"pending"` while the gate has not admitted it (nothing admitted),
   `"admitted"` once it has (`Wallet.noteSubmission`). A later status re-notes
   the record through `noteBroadcast`, which drops the field; only `pending`
   is read. Proven or rejected, the transaction leaves `awaiting`.
@@ -307,11 +298,12 @@ them:
 Rejections come from the same sources as the wallet's (docs/WALLET.md,
 "Settlement"):
 
-- ARC's refusal of the submission's broadcast (#57: before anything is
-  admitted), or the submission abandoned, never taken or never mined within
-  `walletAbandonMs`;
-- a `status` entry (for example ARC's `DOUBLE_SPEND_ATTEMPTED`), which steps
-  the submission's awaiting thread;
+- a status provider's rejection (#65: Arcade's 400 or its `REJECTED`,
+  `DOUBLE_SPEND_ATTEMPTED`, …), which steps the submission's awaiting thread
+  while it is pending, or reaches the engine by the status subscription
+  after;
+- the submission abandoned, never mined within `walletAbandonMs` (while
+  pending);
 - a competing spend that gets proven;
 - a submission that spends an output a proven transaction already spends,
   which is refused (`DoubleSpend`);
@@ -326,7 +318,7 @@ into it, through sender-less subscriptions:
 
 | box | entry | does |
 |---|---|---|
-| `submit` | the submit event above (what `POST /submit` admits) | Holds the records; unless mined, emits the transaction to the broadcaster (#70); once ARC takes it (the broadcaster's answer), records each topic's judgement and calls the lookup services' `admitted` / `spent` hooks; saves and advances `wallet`; awaits the transaction while pending or unproven (#57). |
+| `submit` | the submit event above (what `POST /submit` admits) | Holds the records; unless mined, broadcasts the transaction (an event, #65); once the gate admits it (`overlayAdmitOn`), records each topic's judgement and calls the lookup services' `admitted` / `spent` hooks; saves and advances `wallet`; awaits the transaction while pending or unproven (#57). |
 | `chain` | `header` / `proof` / `status` | Handled as the wallet handles them, then `rejected` for each judgement a rejection removed. This is for an instance without a wallet program. A `status` / `proof` for a transaction whose submission thread awaits it steps that thread instead. |
 
 There is no `lookup` box: a lookup is a read: its request is recorded, and it moves nothing.
@@ -340,17 +332,17 @@ There is no `lookup` box: a lookup is a read: its request is recorded, and it mo
   listens to (its hooks are called for those). The short form
   `'{"ls_demo":"lookup-demo"}'` listens to every topic in `overlayTopics`.
 - `walletNetwork` is the chain's network.
-- The broadcaster is not config: it is the address book's `broadcast`
-  provider (#70), which a host with an Arcade seeds in every new genesis.
-  Without one an unproven submission is refused in its step
-  (`NoBroadcaster`: nothing admitted).
-- `overlayRecheckMs` (default 30000) is how long a submission's thread rests
-  before asking ARC again, and the `Retry-After` of a pending answer. It is
-  the overlay's own: the wallet's `walletRecheckMs` (default ten minutes)
-  suits a payment, not a client waiting on a 503.
-- `walletAbandonMs` (default 86400000) is shared with the wallet: a
-  transaction neither taken nor mined that long after its first broadcast is
-  abandoned (rejected), one rule for the chain core.
+- `overlayAdmitOn` (`"status"` | `"proof"`, default `"status"`, #65): when
+  an unproven submission is admitted — on a status provider's word (with
+  none in the address book: at once, on validation) or on its proof (the
+  table above).
+- The broadcaster is not config: a broadcast is an event the host carries
+  (#65). A status provider is the address book's role `status` plus the
+  subscription `{"sender": "$status", "box": "status", "handler":
+  "overlay"}` in etc/subscriptions.json.
+- `walletAbandonMs` (default 86400000) is shared with the wallet: a pending
+  transaction neither taken nor mined that long after its first broadcast
+  is abandoned (rejected), one rule for the chain core.
 
 One instance may serve several topics and services.
 
@@ -487,7 +479,7 @@ overlay-express is.
 
 | route | fn | | answer |
 |---|---|---|---|
-| `POST /submit` | `submit` | body BEEF (`application/octet-stream`); `X-Topics` a comma list (the SDK's form) or a JSON array; `x-includes-off-chain-values: true` → VarInt(len) ‖ BEEF ‖ values | the STEAK `{topic: {outputsToAdmit, coinsToRetain, coinsRemoved}}` over the requested topics this instance serves (unserved topics left out); 400 `{status: "error", message}` if refused or ARC rejected it; 503 with `Retry-After` while ARC has not taken it (#57) |
+| `POST /submit` | `submit` | body BEEF (`application/octet-stream`); `X-Topics` a comma list (the SDK's form) or a JSON array; `x-includes-off-chain-values: true` → VarInt(len) ‖ BEEF ‖ values | the STEAK `{topic: {outputsToAdmit, coinsToRetain, coinsRemoved}}` over the requested topics this instance serves (unserved topics left out); 400 `{status: "error", message}` if refused or rejected; 503 with `Retry-After` while it is pending (#57) |
 | `POST /lookup` | `lookup` | `{service, query}` JSON; `X-Aggregation: yes` | `{type: "output-list", outputs: [{beef: [bytes], outputIndex, context?}]}`, or the compact octet-stream (count, per output txid ‖ index ‖ context, then one BEEF of them all, `Wallet.beefOfMany`); a freeform answer as `{type, result}` |
 | `GET /listTopicManagers`, `/listLookupServiceProviders` | `listTopicManagers`, `listLookupServiceProviders` | | `{name: {name, shortDescription}}` |
 | `GET /getDocumentationForTopicManager?manager=`, `/getDocumentationForLookupServiceProvider?lookupService=` | `topicDocumentation`, `lookupDocumentation` | | `text/markdown` |
@@ -498,7 +490,7 @@ overlay-express is.
 host makes once the entry is processed. `submitted` reads the answer from the
 state ("The answer", above): the STEAK from each topic's `applied` record for
 the transaction (empty for a topic that admitted nothing), 503 with
-`Retry-After` while ARC has not taken it, 400 if ARC rejected it. A
+`Retry-After` while it is pending, 400 if it was rejected. A
 resubmission returns only `then` (no entry). The `then` call's answer is
 `{status, type?, headers?, body}`; the router passes its headers through
 (`src/host/router.ts`, `forward`), which is how the 503 carries
@@ -527,24 +519,25 @@ token transaction by GossipSub holds the same `applied` / `admitted` records
 **A lookup writes nothing.** The handler calls the service's program and
 shapes its answer for the wire. Listings and documentation read the program
 records. equiv/overlay.ts checks it: across the lookups, a dupe, the
-refusals and the listings, only the submits and the status entry are
-entries, and a refused submit leaves the store file byte-identical.
+refusals and the listings, only the requests and the status provider's
+messages are entries, and a refused submit leaves the store file byte-identical.
 
-**The broadcast gate end to end** (#57, equiv/overlay.ts): the router runs
-the host's broadcaster (#58, the `broadcast` provider, #70) in front of a
-fake Arcade (`src/host/fake-arcade.ts`). Each unproven submission is emitted
-to it, which posts it (Extended Format), and admitted on its answer, the
-GossipSub one too (admitted on Arcade's
-duplicate answer); the three tokens' `SEEN_ON_NETWORK` and `MINED` statuses
-(with their merkle paths) come back over Arcade's SSE stream to their
-awaiting threads and prove them; a `DOUBLE_SPEND_ATTEMPTED` after admission
-unwinds the spend's admittance and lookup entries; a resubmission answers
-the STEAK from the state; a mined submission is admitted with no POST;
-Arcade's 400 answers the client 400 with nothing admitted. On an instance
-re-asking every 1.5 s, Arcade's 503 answers the client 503 with
-`Retry-After: 2`, a resubmission appends nothing and gets 503 again, and the
-deadline's re-ask (404) posts it again: admitted, and the retrying client
-gets the STEAK. Each store replays to itself exactly.
+**The broadcast gate end to end** (#57, #65, equiv/overlay.ts): the router
+runs the host's broadcaster (#58) in front of a fake Arcade
+(`src/host/fake-arcade.ts`); the instances subscribe to its status provider.
+Each unproven submission is broadcast as an event, which the host queues and
+posts (Extended Format), and admitted on Arcade's RECEIVED (a status
+message), the GossipSub one too (Arcade's duplicate answer reaches its
+broadcaster); the three tokens' `SEEN_ON_NETWORK` statuses (messages) and
+`MINED` proofs (events, with their merkle paths) come back over Arcade's SSE
+stream and prove them; a `DOUBLE_SPEND_ATTEMPTED` after admission unwinds the
+spend's admittance and lookup entries; a resubmission answers the STEAK from
+the state; a mined submission is admitted with no POST; Arcade's 400 (a
+REJECTED status) answers the client 400 with nothing admitted. With Arcade
+busy (503), the host keeps the transaction queued: the client waits until the
+router's bound (503 + Retry-After), a resubmission appends nothing and gets
+503 again, and once Arcade takes the queue's next post it is admitted and the
+waiting clients get the STEAK. Each store replays to itself exactly.
 
 **The STEAK.** It carries exactly the three fields the stock client accepts.
 The stock `validateSTEAK` refuses any other field, so the `ancillaryTxids`
@@ -566,7 +559,8 @@ submits, with its facilitator pointed at the instance's origin, since the
 bin/frontdoor.wasm, bin/overlay.wasm, bin/topic-demo.wasm, bin/lookup-demo.wasm   (+ .json: description)
 etc/config.json          {"defaults": {"walletNetwork": "regtest", "overlayTopics": "{\"tm_demo\":\"topic-demo\"}",
                           "overlayLookups": "{\"ls_demo\":{\"program\":\"lookup-demo\",\"topics\":[\"tm_demo\"]}}"}}
-etc/subscriptions.json   [{"box": "submit", "handler": "overlay"}, {"box": "chain", "handler": "overlay"}]
+etc/subscriptions.json   [{"box": "submit", "handler": "overlay"}, {"box": "chain", "handler": "overlay"},
+                          {"sender": "$status", "box": "status", "handler": "overlay"}]
 etc/routes.json          [{"path": "/submit", "program": "overlay", "fn": "submit", "auth": "none"},
                           {"path": "/lookup", "program": "overlay", "fn": "lookup", "auth": "none"},
                           {"path": "/listTopicManagers", "program": "overlay", "fn": "listTopicManagers", "auth": "none"},
@@ -578,9 +572,10 @@ etc/routes.json          [{"path": "/submit", "program": "overlay", "fn": "submi
 The front door must be in `bin/` (a tree's programs are its own):
 equiv/overlay.ts copies the kernel's `wasm/frontdoor.wasm`. These routes
 replace the stock ones, so this node has no messagebox (add the stock
-routes to keep one). The config names no broadcaster: a host with an Arcade
-seeds its `broadcast` provider in the address book (#58, #70);
-`overlayRecheckMs` may be set here.
+routes to keep one). The config names no broadcaster (#65: a broadcast is an
+event); a host with an Arcade seeds its status provider in the address book,
+and `$status` names it here (left out on a host with none);
+`overlayAdmitOn` may be set here.
 
 **The loader change.** For a tree, the boot loader now asks the kernel only
 for the `shell` record. `serve`'s `programs` frame takes a list of names.
