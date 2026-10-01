@@ -189,7 +189,13 @@ fn run(a: std.mem.Allocator) anyerror!void {
         // with a wallet routes `chain` and `status` to the wallet instead).
         try fields.append(a, .{ .key = "event", .value = .{ .text = kind } });
         if (std.mem.eql(u8, kind, "header")) {
-            const res = try wal.addHeaders(&.{ev.getBytes("raw") orelse return error.BadEvent});
+            // One header (`raw`), or a run of them, parents first (`raws`): a reorg's heavier branch
+            // arrives as one run, since its first header alone is no heavier than ours.
+            var raws: std.ArrayList([]const u8) = .empty;
+            if (ev.getArray("raws")) |rs| {
+                for (rs) |r| try raws.append(a, if (r == .bytes) r.bytes else return error.BadEvent);
+            } else try raws.append(a, ev.getBytes("raw") orelse return error.BadEvent);
+            const res = try wal.addHeaders(raws.items);
             try fields.appendSlice(a, &.{
                 .{ .key = "added", .value = .{ .uint = res.added } },
                 .{ .key = "tip", .value = .{ .uint = res.tip } },
