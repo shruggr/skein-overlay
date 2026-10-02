@@ -1,4 +1,4 @@
-# Overlay services in the VM (issues #36, #50, #57; re-split by #79)
+# Overlay services in the VM (0.3.0)
 
 An overlay is an app (skein docs/APPS.md §6). It judges transactions with
 its topic managers and indexes them with its lookup services; it does not
@@ -32,7 +32,7 @@ storage are not ported.
 **Not built:**
 
 - BRC-88 SHIP/SLAP advertisement. Clients reach an instance through the
-  `hostOverrides` / `facilitator` options of the stock clients.
+  `hostOverrides` / `facilitator` options of the @bsv/sdk clients.
 - Sync between overlay nodes (GASP); catch-up from a peer. The push half —
   submissions, admits and proofs as they happen — is the gossip (#74, below).
 - The `historical-tx` modes.
@@ -55,7 +55,7 @@ storage are not ported.
 | `src/vm.zig` | The `skein` imports as an overlay program sees them — the module `sk`. |
 | `src/topic_demo.zig` → `topic-demo.wasm` | `tm_demo`, an example topic. |
 | `src/lookup_demo.zig` → `lookup-demo.wasm` | `ls_demo`, an example lookup service with its own index. |
-| skein's `kernel-zig/equiv/overlay.ts`, `install-overlay.ts` | End to end, with the stock `@bsv/sdk` clients, over this repo's `bin/` (cloned at a pinned commit, or `$SKEIN_OVERLAY_DIR`). Part of skein's `equiv/run.sh`. |
+| skein's `kernel-zig/equiv/overlay.ts`, `install-overlay.ts` | End to end, with the `@bsv/sdk` clients (against a system-tree instance served at its origin root), over this repo's `bin/` (cloned at a pinned commit, or `$SKEIN_OVERLAY_DIR`). Part of skein's `equiv/run.sh`. |
 
 Build and test (Zig 0.16.0, `mise.toml`):
 
@@ -76,7 +76,8 @@ and `sk`. An overlay app of its own — its topic managers and lookup
 services — depends on skein-overlay by URL+hash, as on the SDK:
 
 ```zig
-// build.zig.zon: .skein_overlay = .{ .url = "https://github.com/shruggr/skein-overlay/archive/refs/tags/v0.3.0.tar.gz", .hash = "…" }
+// build.zig.zon: .skein_overlay = .{ .url = "https://github.com/shruggr/skein-overlay/archive/refs/tags/v0.3.0.tar.gz",
+//                                    .hash = "skein_overlay-0.3.0-IMuNgUtjEwCMjfeG0MOYcGW1uD8gssDxdSEn8Ixx1Eta" }
 const ov = b.dependency("skein_overlay", .{ .target = wasi, .optimize = .ReleaseSafe });
 exe.root_module.addImport("topic", ov.module("topic"));   // pub fn main() u8 { return topic.main(identify); }
 exe.root_module.addImport("lookup", ov.module("lookup")); // pub fn main() u8 { return lookup.main(spec); }
@@ -192,6 +193,17 @@ judgement of the transaction removed (`State.unapply`: its `applied`
 record and its admittances) and each listening lookup service told
 (`rejected`); then it finishes. No deadline: abandonment is the chain app's,
 and reaches the watch as a `rejected` answer.
+
+**Next (not built).** skein-overlay#1: submit walks the whole BEEF
+oldest-first and judges every transaction of the topic before the subject
+(known ones skip, unknown valid ones are admitted on the way, each ingested
+through the chain app); a submission whose parent is neither in the BEEF nor
+held pauses until something changes, and fetching it is a separate monitor
+tool's. With it comes the decided direction of shruggr/skein#31 ("Decided
+2026-10-02 (night)"): the one-shot watch becomes a registration for the life
+of the transaction, there is no unwind as an action (whether an admission
+counts is a read of the chain state), and a judgement is re-run when the
+chain state it depended on changes.
 
 **The answer** (#66). When the submission's thread comes to rest, the
 request waiting on it calls the handler again (`resolved`), which reads the
@@ -449,8 +461,11 @@ The overlay is served by the instance itself: its front door
 (`programs/frontdoor`) matches the request against the dispatch table's
 http rows and calls the engine's handler with it. The rows are open (sender
 `*`), as overlay-express is, and under the app's prefix: the app's BRC-23
-base URL is `https://<host>/<handle>/<app>`, and the stock clients call
-`${baseUrl}/submit`.
+base URL is `https://<host>/<handle>/<app>`, and a client calls
+`${baseUrl}/submit`. The @bsv/sdk `TopicBroadcaster` and `LookupResolver`
+reject a base URL with a path, so they work only against an overlay served
+at an origin's root (a system tree, below); skein does not use them for
+overlay apps.
 
 | route | fn | | answer |
 |---|---|---|---|
@@ -478,7 +493,7 @@ instance's missing headers rather than the publisher's fault.
 shapes its answer for the wire. Listings and documentation read the program
 records.
 
-**The STEAK.** It carries exactly the three fields the stock client accepts
+**The STEAK.** It carries exactly the three fields the @bsv/sdk client accepts
 (`validateSTEAK` refuses any other field).
 
 ## Gossip: the three topics (#74)
