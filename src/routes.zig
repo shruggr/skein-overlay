@@ -1,6 +1,7 @@
 //! The overlay's front-door routes (#40): the overlay-express wire contract,
 //! as route handlers the front door calls (an in-VM call with the request;
-//! routes.json names them, all `auth: "none"`, as overlay-express is open).
+//! the app's dispatch rows name them, open (sender `*`), as overlay-express is).
+//! The addresses are the app's own (`/<app>/submit`, …: its BRC-23 base URL).
 //!
 //!   POST /submit      fn "submit"   body BEEF, X-Topics (comma list or JSON array),
 //!                                   x-includes-off-chain-values: true → VarInt(len) ‖ BEEF ‖ off-chain values
@@ -9,8 +10,8 @@
 //!                                   requested, its body the BEEF → {verdict, admit?} (`gossip` below)
 //!   libp2p:<topic>-admit   fn "peerAdmit"   a peer's verdict (#74, gossip.zig): recorded as a
 //!                                           `peer-admit` record, never admitting → {verdict, admit?}
-//!   libp2p:<topic>-proof   fn "peerProof"   a peer's proof (#74): checked against our chain, admitted
-//!                                           as the `chain` proof event (#65) → {verdict, admit?}
+//!   libp2p:<topic>-proof   fn "peerProof"   a peer's proof (#74): checked against the chain state,
+//!                                           admitted as the `proof` event in box `chain` → {verdict, admit?}
 //!   POST /lookup      fn "lookup"   {service, query} (JSON) → {type: "output-list", outputs: [{beef, outputIndex, context?}]}
 //!                                   X-Aggregation: yes → the compact octet-stream form (count, [txid, index, context], one BEEF)
 //!   GET  /listTopicManagers, /listLookupServiceProviders         fn "listTopicManagers" / "listLookupServiceProviders"
@@ -19,38 +20,41 @@
 //!
 //! Every request is appended, and the front door's step calls these (#68).
 //! A submit (#50, submit.zig): the handler decodes the BEEF once into
-//! records in the step's write cache, checks SPV over them, and calls each
-//! requested topic this instance serves and has not judged the transaction
-//! for (fn "identify", on the transaction's CID). A bad BEEF answers 400; a
-//! valid transaction no topic took answers 200 with the empty STEAK
+//! records in the step's write cache, checks SPV over them against the chain
+//! app's headers, and calls each requested topic this overlay serves and
+//! has not judged the transaction for (fn "identify"). A bad BEEF answers
+//! 400; a valid transaction no topic took answers 200 with the empty STEAK
 //! (BRC-22); nothing is admitted. Otherwise it launches the submission's
-//! thread — engine.zig stepped on the submit record {kind: "submit", txid,
-//! txs, nodes, proofs, topics: [judgement], offChainValues?} (holding the
-//! records, broadcasting it unless mined, and only once ARC takes it
-//! recording the judgements and calling the lookup services' hooks, #57) —
+//! thread (engine.zig: the BEEF to the chain app, admitted on its answer)
 //! and answers {wait: true}: the request's thread waits on it (#66), and
 //! when it comes to rest the handler is called again (`resolved`) and
 //! answers from the state: the STEAK (each topic's `applied` record); 400
-//! if ARC rejected it; 503 with Retry-After if it ended still pending. A
-//! resubmission judged before answers the STEAK at once; one while the
-//! first awaits ARC awaits that same thread (the broadcast record names
-//! it) and gets the same answer.
+//! if the chain app rejected it; 503 with Retry-After if it ended with
+//! nothing decided. A resubmission judged before answers the STEAK at once;
+//! one while the first is pending awaits that same thread (the pending
+//! record names it) and gets the same answer.
 //!
 //! A lookup is a read: the service's program is called (fn "lookup", the
 //! lookup contract, lookup.zig) and its answer shaped for the wire; it
 //! writes nothing but the request's own record. Listings and documentation
 //! are the program records' `description`.
 const std = @import("std");
-const w = @import("wallet");
-const vm = @import("vm.zig");
+const c = @import("chain");
+const vm = @import("sk");
+const ev_ = @import("engine_vm.zig");
 const submit_mod = @import("submit.zig");
 const gossip_mod = @import("gossip.zig");
+const calls = @import("calls.zig");
+const state = @import("state.zig");
 
-const cbor = w.cbor;
+const cbor = c.cbor;
 const Value = cbor.Value;
-const Wallet = w.wallet.Wallet;
+const State = state.State;
 const Allocator = std.mem.Allocator;
 const eql = std.mem.eql;
+
+/// The Retry-After a submission still undecided is answered with (whole seconds).
+pub const retry_after = 30;
 
 // ---------------------------------------------------------------- answers
 
@@ -87,10 +91,10 @@ fn writeJson(a: Allocator, jw: *std.json.Stringify, v: Value) !void {
             for (b) |x| try jw.write(x);
             try jw.endArray();
         },
-        .cid => |c| {
+        .cid => |cv| {
             try jw.beginObject();
             try jw.objectField("/");
-            try jw.write(try vm.hexAlloc(a, c));
+            try jw.write(try vm.hexAlloc(a, cv));
             try jw.endObject();
         },
         .array => |xs| {
@@ -153,8 +157,8 @@ fn param(a: Allocator, req: Value, name: []const u8) !?[]const u8 {
         const i = std.mem.indexOfScalar(u8, kv, '=') orelse continue;
         if (!eql(u8, kv[0..i], name)) continue;
         const v = try a.dupe(u8, kv[i + 1 ..]);
-        for (v) |*c| if (c.* == '+') {
-            c.* = ' ';
+        for (v) |*ch| if (ch.* == '+') {
+            ch.* = ' ';
         };
         return std.Uri.percentDecodeInPlace(v);
     }
@@ -211,10 +215,10 @@ fn writeVarInt(a: Allocator, out: *std.ArrayList(u8), v: u64) !void {
 
 /// A name → program map from the config (defaults.<key>, a JSON object in a string: the app record's
 /// `config.overlay` or the genesis's, config.zig).
-pub const configMap = w.overlay.configObject;
+pub const configMap = calls.configObject;
 
 /// The program record a served name runs: `programs` (the app's roles, or the genesis's) by the configured name.
-pub const programFor = w.overlay.configuredProgram;
+pub const programFor = calls.configuredProgram;
 
 /// The `bin/` program name a configured name runs (a string, or `{program, …}`).
 fn programName(v: std.json.Value) ![]const u8 {
@@ -225,10 +229,11 @@ fn programName(v: std.json.Value) ![]const u8 {
     };
 }
 
-fn load(a: Allocator, in: Value) !Wallet {
-    var wal = try Wallet.load(a, vm.store(), try vm.head(a, vm.state_head), try vm.network(in));
-    wal.now = @intCast(in.getUint("now") orelse 0);
-    return wal;
+/// The overlay's state over the chain state, through the call's store (its write cache).
+fn load(a: Allocator, in: Value) !State {
+    var l = try ev_.load(a, in);
+    l.st.now = @intCast(in.getUint("now") orelse 0);
+    return l.st;
 }
 
 // ---------------------------------------------------------------- the handlers
@@ -239,7 +244,7 @@ pub fn call(a: Allocator, call_in: Value) !void {
     const arg = try vm.callArg(a, call_in);
     // The topics, lookup services and programs: the app record's (#72, config.zig; the route names the
     // engine's program record), else the genesis's.
-    const in = try vm.configured(a, call_in, arg);
+    const in = try ev_.configured(a, call_in, arg);
     const out = if (eql(u8, func, "submit"))
         try submit(a, in, arg)
     else if (eql(u8, func, "peerAdmit"))
@@ -309,14 +314,14 @@ fn submit(a: Allocator, in: Value, req: Value) !Value {
     }
     const map = try configMap(a, in, "overlayTopics");
     const topics = try served(a, requested, map);
-    var wal = try load(a, in);
+    var st = try load(a, in);
     // Called again (#66): the submission's thread this request waited on has come to rest — the answer is the state's.
     if (req.get("resolved") != null) {
-        const b = w.beef.parse(a, body) catch return failure(a, 400, "Invalid BEEF");
-        return submitted(a, in, &wal, b.subject() orelse return failure(a, 400, "Invalid BEEF"), topics);
+        const b = c.beef.parse(a, body) catch return failure(a, 400, "Invalid BEEF");
+        return submitted(a, &st, b.subject() orelse return failure(a, 400, "Invalid BEEF"), topics);
     }
     // The BEEF decoded once into records in the step's write cache, verified, judged by the topics (#50).
-    const routed = switch (try submit_mod.route(a, vm.caller(), &wal, in, body, topics, off, try sourceOf(a, req, null))) {
+    const routed = switch (try submit_mod.route(a, ev_.caller(), &st, in, body, topics, off, try sourceOf(a, req, null))) {
         .refused => |why| return failure(a, 400, why),
         // Valid but admitted nowhere: BRC-22's answer is 200 with an empty STEAK.
         .nothing => {
@@ -325,13 +330,13 @@ fn submit(a: Allocator, in: Value, req: Value) !Value {
             return respond(a, 200, "application/json", try jsonOf(a, Steak{ .topics = topics, .entries = entries }));
         },
         // Resubmitted, judged already (#57): the answer is the state's, now.
-        .unchanged => |txid| return submitted(a, in, &wal, txid, topics),
-        // Resubmitted while the first submission's thread awaits ARC (#66): this request waits on that
-        // same thread and gets the same answer, from the state, once it comes to rest.
+        .unchanged => |txid| return submitted(a, &st, txid, topics),
+        // Resubmitted while the first submission's thread awaits the chain app (#66): this request waits
+        // on that same thread and gets the same answer, from the state, once it comes to rest.
         .pending => |txid| {
-            const rec = (try wal.awaitingRecord(txid)) orelse return submitted(a, in, &wal, txid, topics);
-            const thread = rec.getCid("thread") orelse return submitted(a, in, &wal, txid, topics);
-            vm.awaitRecord(thread) catch return submitted(a, in, &wal, txid, topics); // at rest already: the state answers
+            const rec = (try st.pendingRecord(txid)) orelse return submitted(a, &st, txid, topics);
+            const thread = rec.getCid("thread") orelse return submitted(a, &st, txid, topics);
+            vm.awaitRecord(thread) catch return submitted(a, &st, txid, topics); // at rest already: the state answers
             return waiting(a);
         },
         .admit => |x| x,
@@ -355,9 +360,9 @@ fn waiting(a: Allocator) !Value {
 
 /// The same submit, arriving as a GossipSub message on a `libp2p:<topic>` route (#57): the message's
 /// topic is the one requested, its body the BEEF (no off-chain values), and the route's half runs
-/// unchanged. The answer is the libp2p handler contract (docs/MESSAGES.md, "libp2p"): accept, admitting
-/// the submit record as an event in box `submit` (routed after the message's own `p2p` event: the
-/// `submit` subscription launches the same engine thread POST /submit launches), so the verdict goes
+/// unchanged. The answer is the libp2p handler contract (skein docs/MESSAGES.md, "libp2p"): accept,
+/// admitting the submit event in box `<app>` (routed after the message's own `p2p` event: the app's
+/// row from `event` launches the same engine thread POST /submit launches), so the verdict goes
 /// back at once — GossipSub's validator waits on nothing further; ignore — no forward, no penalty —
 /// when nothing is new or the BEEF is refused (a refusal may be this instance's missing headers, not
 /// the publisher's fault).
@@ -367,15 +372,15 @@ fn gossip(a: Allocator, in: Value, req: Value) !Value {
     if (body.len == 0) return verdictOf(a, "ignore", "Missing or empty BEEF body");
     const topics = try served(a, &.{t}, try configMap(a, in, "overlayTopics"));
     if (topics.len == 0) return verdictOf(a, "ignore", "the topic is not served here");
-    var wal = try load(a, in);
-    const routed = switch (try submit_mod.route(a, vm.caller(), &wal, in, body, topics, null, try sourceOf(a, req, t))) {
+    var st = try load(a, in);
+    const routed = switch (try submit_mod.route(a, ev_.caller(), &st, in, body, topics, null, try sourceOf(a, req, t))) {
         .refused => |why| return verdictOf(a, "ignore", why),
         .nothing => |why| return verdictOf(a, "ignore", why),
         .unchanged => return verdictOf(a, "ignore", "already judged"),
-        .pending => return verdictOf(a, "ignore", "already submitted: awaiting its broadcast"),
+        .pending => return verdictOf(a, "ignore", "already submitted: awaiting the chain app"),
         .admit => |x| x,
     };
-    return accepting(a, routed.event, "submit");
+    return accepting(a, routed.event, calls.appOf(in));
 }
 
 /// Where a submission came from, carried on its entry (#74: an admission re-publishes it on `<topic>`
@@ -389,8 +394,8 @@ fn sourceOf(a: Allocator, req: Value, topic: ?[]const u8) !Value {
 }
 
 /// A peer's verdict on `libp2p:<topic>-admit` (#74): {txid, topics: {<topic>: {outputsToAdmit,
-/// coinsToRetain}}}. Never admits anything: accept admits a `peer-admit` event (box `submit`) the
-/// engine records under the head `overlay:gossip` (gossip.zig), a read for a lookup or a UI. Ignore
+/// coinsToRetain}}}. Never admits anything: accept admits a `peer-admit` event (box `<app>`) the
+/// engine records under the head `<app>/gossip` (gossip.zig), a read for a lookup or a UI. Ignore
 /// when the topic is not served here or the body is not that shape.
 fn peerAdmit(a: Allocator, in: Value, req: Value) !Value {
     if (!eql(u8, req.getText("transport") orelse "", "libp2p")) return failure(a, 400, "peerAdmit takes libp2p topic messages");
@@ -399,15 +404,15 @@ fn peerAdmit(a: Allocator, in: Value, req: Value) !Value {
     if (!(try configMap(a, in, "overlayTopics")).contains(t)) return verdictOf(a, "ignore", "the topic is not served here");
     const from = req.getBytes("key") orelse return verdictOf(a, "ignore", "no publisher key");
     const m = gossip_mod.parseAdmit(a, req.getBytes("body") orelse "", t) catch |e| return verdictOf(a, "ignore", @errorName(e));
-    return accepting(a, try gossip_mod.peerAdmitRecord(a, t, m, from), "submit");
+    return accepting(a, try gossip_mod.peerAdmitRecord(a, t, m, from), calls.appOf(in));
 }
 
 /// A peer's proof on `libp2p:<topic>-proof` (#74): {txid, blockHash, blockHeight, bump}. The proof-in
-/// wiring of #65 for the topics this overlay runs: checked against this instance's own chain (the
-/// transaction held, the BUMP's root our header's at blockHeight, that header's hash blockHash) and
-/// admitted as the `chain` proof event the host's feed admits — it steps the transaction's awaiting
-/// submission (admitted at the proof, #73), else the `chain` subscription records it (a reorg's re-proof
-/// replaces the old one). Anything else is ignore, never reject: a proof we cannot check may be our
+/// wiring of #65 for the topics this overlay runs: checked against the chain app's state (the
+/// transaction held there, the BUMP's root our header's at blockHeight, that header's hash blockHash)
+/// and admitted as the `proof` event in box `chain` — the chain app's event row, as the host's
+/// broadcaster admits one; the chain app records it, and its answer (`proven`, with `via`) admits a
+/// pending submission (#73). Anything else is ignore, never reject: a proof we cannot check may be our
 /// missing headers.
 fn peerProof(a: Allocator, in: Value, req: Value) !Value {
     if (!eql(u8, req.getText("transport") orelse "", "libp2p")) return failure(a, 400, "peerProof takes libp2p topic messages");
@@ -415,10 +420,10 @@ fn peerProof(a: Allocator, in: Value, req: Value) !Value {
     const t = gossip_mod.baseOf(gt, gossip_mod.proof_suffix) orelse return verdictOf(a, "ignore", "not a -proof topic");
     if (!(try configMap(a, in, "overlayTopics")).contains(t)) return verdictOf(a, "ignore", "the topic is not served here");
     const p = gossip_mod.parseProof(a, req.getBytes("body") orelse "") catch |e| return verdictOf(a, "ignore", @errorName(e));
-    var wal = try load(a, in);
-    // Only for a transaction this overlay admitted under the topic, or holds pending its gate.
-    if (!(try w.overlay.isApplied(&wal, t, p.txid)) and !(try submit_mod.isPending(&wal, p.txid))) return verdictOf(a, "ignore", "not admitted under this topic, nor pending here");
-    return switch (try gossip_mod.checkProof(a, &wal, p, try std.fmt.allocPrint(a, "libp2p:{s}", .{gt}))) {
+    var st = try load(a, in);
+    // Only for a transaction this overlay admitted under the topic, or holds pending.
+    if (!(try st.isApplied(t, p.txid)) and !(try st.isPending(p.txid))) return verdictOf(a, "ignore", "not admitted under this topic, nor pending here");
+    return switch (try gossip_mod.checkProof(a, st.ch, p, try std.fmt.allocPrint(a, "libp2p:{s}", .{gt}))) {
         .ignore => |why| verdictOf(a, "ignore", why),
         .event => |ev| accepting(a, ev, "chain"),
     };
@@ -442,39 +447,41 @@ fn verdictOf(a: Allocator, v: []const u8, reason: []const u8) !Value {
     }) };
 }
 
-/// After the submit entry is processed (#57): ARC has not taken the transaction yet → 503 with
-/// Retry-After (nothing admitted; the client resubmits); ARC rejected it → 400 {status: "error",
-/// message}; otherwise the STEAK from each topic's `applied` record (this submission's judgement or an
-/// earlier one's: a resubmission answers what was admitted; a topic that took nothing, or admitted
-/// nothing: empty). A STEAK only ever names outputs of a transaction ARC took, or a mined one.
-fn submitted(a: Allocator, in: Value, wal: *Wallet, txid: [32]u8, topics: []const []const u8) !Value {
-    if (try submit_mod.isPending(wal, txid)) {
-        const retry = (try submit_mod.Gate.of(in)).retryAfter();
-        return .{ .map = try a.dupe(cbor.Entry, &.{
-            .{ .key = "status", .value = .{ .uint = 503 } },
-            .{ .key = "type", .value = .{ .text = "application/json" } },
-            .{ .key = "headers", .value = .{ .map = try a.dupe(cbor.Entry, &.{.{ .key = "retry-after", .value = .{ .text = try std.fmt.allocPrint(a, "{d}", .{retry}) } }}) } },
-            .{ .key = "body", .value = .{ .bytes = try jsonOf(a, .{ .status = "error", .message = "Not yet accepted by the broadcaster: nothing is admitted until it is. Resubmit after Retry-After seconds." }) } },
-        }) };
-    }
-    if (try wal.settlement(txid)) |rec| {
-        // Rejected (ARC's answer, a status, a double spend): nothing admitted. Only a submission whose
-        // thread this request waited on gets here; resubmitting a rejected transaction is answered at once
-        // (the route's `nothing`: 200, the empty STEAK).
+/// After the submission's thread came to rest (#57, #66): still pending (the chain app has not
+/// answered: a 503 with Retry-After — nothing admitted; the client resubmits); the chain app
+/// rejected it → 400 {status: "error", message}; any topic's `applied` record → the STEAK (this
+/// submission's judgement or an earlier one's; a topic that took nothing: empty); the chain holds it
+/// with nothing applied → the empty STEAK; else (an error answer) 503. A STEAK only ever names
+/// outputs of a transaction the chain app accepted, or a mined one.
+fn submitted(a: Allocator, st: *State, txid: [32]u8, topics: []const []const u8) !Value {
+    const undecided = struct {
+        fn f(al: Allocator) !Value {
+            return .{ .map = try al.dupe(cbor.Entry, &.{
+                .{ .key = "status", .value = .{ .uint = 503 } },
+                .{ .key = "type", .value = .{ .text = "application/json" } },
+                .{ .key = "headers", .value = .{ .map = try al.dupe(cbor.Entry, &.{.{ .key = "retry-after", .value = .{ .text = try std.fmt.allocPrint(al, "{d}", .{retry_after}) } }}) } },
+                .{ .key = "body", .value = .{ .bytes = try jsonOf(al, .{ .status = "error", .message = "Not yet accepted by the network: nothing is admitted until it is. Resubmit after Retry-After seconds." }) } },
+            }) };
+        }
+    }.f;
+    if (try st.isPending(txid)) return undecided(a);
+    if (try st.ch.settlementCid(txid)) |sc| {
+        const rec = try st.store.getValue(a, sc);
         return failure(a, 400, try std.fmt.allocPrint(a, "Transaction rejected: {s}", .{rec.getText("reason") orelse "rejected"}));
     }
     const entries = try a.alloc([3][]const u64, topics.len);
+    var any = false;
     for (topics, entries) |t, *e| {
         e.* = .{ &.{}, &.{}, &.{} };
-        const key = try std.mem.concat(a, u8, &.{ try w.overlay.topicPrefix(a, t), &txid });
-        const rec_cid = (try wal.map("applied").link(key)) orelse continue;
-        const rec = try vm.store().getValue(a, rec_cid);
+        const rec = (try st.appliedRecord(t, txid)) orelse continue;
+        any = true;
         e.* = .{
             try uintsJson(a, rec.getArray("outputsToAdmit") orelse &.{}),
             try uintsJson(a, rec.getArray("coinsToRetain") orelse &.{}),
             try uintsJson(a, rec.getArray("coinsRemoved") orelse &.{}),
         };
     }
+    if (!any and !(try st.ch.holds(txid))) return undecided(a);
     return respond(a, 200, "application/json", try jsonOf(a, Steak{ .topics = topics, .entries = entries }));
 }
 
@@ -487,11 +494,7 @@ fn lookup(a: Allocator, in: Value, req: Value) !Value {
     const prog = (try programFor(in, try configMap(a, in, "overlayLookups"), name)) orelse
         return failure(a, 400, try std.fmt.allocPrint(a, "Lookup service not supported: {s}", .{name}));
     const query = fromJson(a, q.?) catch return failure(a, 400, "the query has a non-integral number");
-    const ans = vm.call(a, prog, "lookup", .{ .map = try a.dupe(cbor.Entry, &.{
-        .{ .key = "kind", .value = .{ .text = "lookup-call" } },
-        .{ .key = "service", .value = .{ .text = name } },
-        .{ .key = "query", .value = query },
-    }) }) catch |e| return failure(a, 400, if (e == error.ImportFailed) vm.lastError() else @errorName(e));
+    const ans = vm.call(a, prog, "lookup", try calls.lookupArg(a, in, name, query)) catch |e| return failure(a, 400, if (e == error.ImportFailed) vm.lastError() else @errorName(e));
     const typ = ans.getText("type") orelse return error.BadAnswer;
     if (!eql(u8, typ, "output-list")) {
         return respond(a, 200, "application/json", try toJson(a, .{ .map = try a.dupe(cbor.Entry, &.{
@@ -507,12 +510,12 @@ fn lookup(a: Allocator, in: Value, req: Value) !Value {
         }) }));
     }
     // The compact form (overlay-express): count, each [txid, index, context], then one BEEF of them all.
-    var wal = try load(a, in);
+    const st = try load(a, in);
     var out: std.ArrayList(u8) = .empty;
     var txids: std.ArrayList([32]u8) = .empty;
     try writeVarInt(a, &out, outs.len);
     for (outs) |o| {
-        const b = try w.beef.parse(a, o.getBytes("beef") orelse return error.BadAnswer);
+        const b = try c.beef.parse(a, o.getBytes("beef") orelse return error.BadAnswer);
         const txid = b.subject() orelse return error.BadAnswer;
         var display = txid;
         std.mem.reverse(u8, &display);
@@ -525,7 +528,7 @@ fn lookup(a: Allocator, in: Value, req: Value) !Value {
             if (eql(u8, &t, &txid)) break;
         } else try txids.append(a, txid);
     }
-    try out.appendSlice(a, try wal.beefOfMany(txids.items));
+    try out.appendSlice(a, try state.beefOfMany(st.ch, txids.items));
     return respond(a, 200, "application/octet-stream", out.items);
 }
 

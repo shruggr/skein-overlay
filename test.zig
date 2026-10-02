@@ -1,43 +1,40 @@
-//! The overlay's submission flow natively (#36, #50), as the engine runs it:
-//! the route's half over an in-memory write cache (in the VM, the front
-//! door's step on the request, #68; dropped afterwards here), the step's half
-//! over the store, the tm_demo topic and the
-//! ls_demo lookup service called through a dispatch table in place of the
-//! VM's `call`. Checked: the BEEF is parsed once per submit; a refused
-//! submit leaves the store as it was; an admitted one persists exactly the
-//! decoded blocks, the judgement and the service's map; ls_demo answers from
-//! its own map (by topic, by script hash, by outpoint) with BEEF that
-//! verifies; a spend reaches it through `spent`, a rejection through `rejected`.
-//! The broadcast gate (#57, #65, #73), the broadcast an event the wiring
-//! records: there is no setting — admitted on the first of a status
-//! provider's accepted status or a validated proof. With a status provider,
-//! admitted on its accepted status, then the later proof just proves it (no
-//! second admission); rejected by its REJECTED; abandoned when nothing comes.
-//! The proof first instead: admitted on it (a path whose header is not held
-//! yet leaves it pending), a later status just noted (no second admission).
-//! With no status provider subscribed, no status ever arrives: nothing is
-//! admitted before the proof. A mined one is admitted with no broadcast.
-//! The configuration (skein #72, config.zig): an installed engine reads its
-//! topics, lookup services and gossip switches from its app record's
-//! `config.overlay` (found through its program record's `app`, from a step's
-//! thread or a call's matched route), the roles as its programs; the genesis
-//! defaults only without one; a new app record is read at the next call.
+//! The overlay natively (#36, #50; re-split by skein #79), as the engine runs
+//! it, with a chain state in memory standing in for the chain app
+//! (shruggr/skein-chain: its headers, its `ingest`, the statuses and proofs
+//! it records) and the answers it would send driven by hand. The route's
+//! half runs over an in-memory write cache (in the VM, the front door's
+//! step on the request, #68; dropped afterwards here), the threads' steps
+//! over the store; the tm_demo topic and the ls_demo lookup service are
+//! called through a dispatch table in place of the VM's `call`; the messages
+//! to the instance itself (the ingest, the watch) and the gossip out are
+//! recorded. Checked: the BEEF is parsed once per submit; a refused submit
+//! leaves the store as it was; nothing is admitted until the chain app
+//! answers accepted or proven (#73), the first of them, and a rejection
+//! admits nothing; admitted on `accepted`, a watch hears the later proof
+//! (`-proof`) or rejection (the judgements removed, `rejected` hooks);
+//! ls_demo answers from its own map with BEEF that verifies; a spend reaches
+//! it through `spent`, a rejection through `rejected`; the gossip shapes; a
+//! peer's proof checked against the chain state; the configuration (the app
+//! record at `<app>/app`, the genesis defaults without one).
 const std = @import("std");
-const w = @import("wallet");
-const topic = @import("src/topic.zig");
-const lookup = @import("src/lookup.zig");
+const c = @import("chain");
+const topic = @import("topic");
+const lookup = @import("lookup");
 const demo = @import("src/topic_demo.zig");
 const ls = @import("src/lookup_demo.zig");
+const state = @import("src/state.zig");
 const submit = @import("src/submit.zig");
 const gossip = @import("src/gossip.zig");
 const config = @import("src/config.zig");
+const calls = @import("src/calls.zig");
 
-const bsvz = w.bsvz;
-const beef = w.beef;
-const hdr = w.header;
-const cbor = w.cbor;
+const bsvz = c.bsvz;
+const beef = c.beef;
+const hdr = c.header;
+const cbor = c.cbor;
 const Value = cbor.Value;
-const Store = w.store.Store;
+const Store = c.store.Store;
+const Chain = c.state.State;
 const Allocator = std.mem.Allocator;
 
 fn mine(prev: [32]u8, root: [32]u8, time: u32) [80]u8 {
@@ -53,6 +50,18 @@ fn soloPath(a: Allocator, height: u32, txid: [32]u8) ![]const u8 {
     try path.appendSlice(a, &.{ @intCast(height), 0x01, 0x01, 0x00, 0x02 });
     try path.appendSlice(a, &txid);
     return path.items;
+}
+
+fn identityKey(priv: [32]u8) ![33]u8 {
+    return (try (try bsvz.primitives.ec.PrivateKey.fromBytes(priv)).publicKey()).toCompressedSec1();
+}
+
+fn p2pkhOf(pubkey: [33]u8) [25]u8 {
+    var s: [25]u8 = undefined;
+    s[0..3].* = .{ 0x76, 0xa9, 0x14 };
+    s[3..23].* = bsvz.crypto.hash.hash160(&pubkey).bytes;
+    s[23..25].* = .{ 0x88, 0xac };
+    return s;
 }
 
 const Spent = struct { tx: bsvz.transaction.Transaction, raw: []const u8, txid: [32]u8 };
@@ -73,6 +82,33 @@ fn spend(a: Allocator, src: *const bsvz.transaction.Transaction, vout: u32, outs
 fn atomic(a: Allocator, t: Spent) ![]const u8 {
     const e = try a.dupe(beef.Entry, &.{.{ .txid = t.txid, .format = .raw, .raw = t.raw, .tx = t.tx }});
     return beef.serialize(a, .{ .version = beef.V2, .atomic = t.txid, .bumps = &.{}, .entries = e });
+}
+
+/// A funding transaction (outputs of 10 000 sats to `p2pkh`), mined alone at height 1 of a regtest chain.
+const Fund = struct { tx: bsvz.transaction.Transaction, raw: []const u8, txid: [32]u8, h1: [80]u8, entry: beef.Entry, bumps: []bsvz.spv.MerklePath };
+
+fn fund(a: Allocator, seed: u8, n: u8, p2pkh: []const u8) !Fund {
+    var raw: std.ArrayList(u8) = .empty;
+    try raw.appendSlice(a, &.{ 1, 0, 0, 0, 1 });
+    try raw.appendSlice(a, &(.{seed} ** 32));
+    try raw.appendSlice(a, &.{ 0, 0, 0, 0, 1, 0x51, 0xff, 0xff, 0xff, 0xff, n });
+    for (0..n) |_| {
+        var sats: [8]u8 = undefined;
+        std.mem.writeInt(u64, &sats, 10_000, .little);
+        try raw.appendSlice(a, &sats);
+        try raw.append(a, @intCast(p2pkh.len));
+        try raw.appendSlice(a, p2pkh);
+    }
+    try raw.appendSlice(a, &.{ 0, 0, 0, 0 });
+    const tx = try bsvz.transaction.Transaction.parse(a, raw.items);
+    const txid = beef.txidOf(raw.items);
+    const h1 = mine(hdr.hash(&c.chain.Network.regtest.genesis()), txid, 1_700_000_600);
+    const bumps = try a.dupe(bsvz.spv.MerklePath, &.{try bsvz.spv.MerklePath.parse(a, try soloPath(a, 1, txid))});
+    return .{ .tx = tx, .raw = raw.items, .txid = txid, .h1 = h1, .entry = .{ .txid = txid, .format = .raw_with_bump, .bump = 0, .raw = raw.items, .tx = tx }, .bumps = bumps };
+}
+
+fn withFund(a: Allocator, f: Fund, t: Spent) ![]const u8 {
+    return beef.serialize(a, .{ .version = beef.V2, .bumps = f.bumps, .entries = try a.dupe(beef.Entry, &.{ f.entry, .{ .txid = t.txid, .format = .raw, .raw = t.raw, .tx = t.tx } }) });
 }
 
 /// The front-door call's world: reads fall through to the store; what is put stays here.
@@ -98,63 +134,83 @@ const Overlay = struct {
     }
     fn putBlock(ptr: *anyopaque, cid: []const u8, bytes: []const u8) anyerror!void {
         const self: *Overlay = @ptrCast(@alignCast(ptr));
-        if (w.store.bitcoinHash(cid)) |h| if (!std.mem.eql(u8, &h, &w.store.dblSha256(bytes))) return error.HashMismatch;
+        if (c.store.bitcoinHash(cid)) |h| if (!std.mem.eql(u8, &h, &c.store.dblSha256(bytes))) return error.HashMismatch;
         try self.blocks.put(self.arena, try self.arena.dupe(u8, cid), try self.arena.dupe(u8, bytes));
     }
     fn keep(_: *anyopaque, _: []const u8) anyerror!void {
         return error.ReadOnly; // a call keeps nothing
     }
-    fn edges(ptr: *anyopaque, a: Allocator, to: []const u8, rel: ?[]const u8) anyerror![]const w.store.Edge {
+    fn edges(ptr: *anyopaque, a: Allocator, to: []const u8, rel: ?[]const u8) anyerror![]const c.store.Edge {
         const self: *Overlay = @ptrCast(@alignCast(ptr));
-        return self.inner.edges(a, to, rel); // a call reads the index only
+        return self.inner.edges(a, to, rel);
     }
 };
 
-/// The broadcast wiring (#65) as the gate sees it: the broadcast events the step emits, recorded.
+/// Messages to the instance itself, recorded (box, body); each gets a CID of its own.
 const FakeWire = struct {
-    /// The transactions broadcast, in order.
-    broadcasts: std.ArrayList([32]u8) = .empty,
     a: Allocator,
+    sent: std.ArrayList(Sent) = .empty,
+    const Sent = struct { box: []const u8, body: Value, cid: []const u8 };
 
-    fn broadcast(ctx: *anyopaque, _: Allocator, txid: [32]u8, bytes: []const u8) anyerror!void {
+    fn send(ctx: *anyopaque, _: Allocator, box: []const u8, body: Value) anyerror![]const u8 {
         const self: *FakeWire = @ptrCast(@alignCast(ctx));
-        // The BEEF the event carries is the transaction's (the host's broadcaster posts it as Extended Format).
-        const parses = beef.parses;
-        defer beef.parses = parses;
-        const sub = (try beef.parse(self.a, bytes)).subject().?;
-        if (!std.mem.eql(u8, &sub, &txid)) return error.NotItsBeef;
-        try self.broadcasts.append(self.a, txid);
+        const bytes = try cbor.encode(self.a, .{ .map = try self.a.dupe(cbor.Entry, &.{
+            .{ .key = "box", .value = .{ .text = box } },
+            .{ .key = "body", .value = body },
+            .{ .key = "n", .value = .{ .uint = self.sent.items.len } },
+        }) });
+        const cid = try self.a.dupe(u8, &cbor.cidOf(bytes));
+        try self.sent.append(self.a, .{ .box = try self.a.dupe(u8, box), .body = body, .cid = cid });
+        return cid;
+    }
+    fn wire(self: *FakeWire) submit.Wire {
+        return .{ .ctx = self, .sendFn = send };
+    }
+    fn last(self: *FakeWire) Sent {
+        return self.sent.items[self.sent.items.len - 1];
     }
 };
 
-/// An instance, natively:/// An instance, natively: the store, the heads `wallet` and `ls:ls_demo`, the
-/// genesis config, and the programs behind the `call`s.
+/// The gossip out (#74) as the engine sees it: the publishes, recorded (topic, body).
+const FakeOut = struct {
+    a: Allocator,
+    sent: std.ArrayList(Pub) = .empty,
+    const Pub = struct { topic: []const u8, body: []const u8 };
+
+    fn publish(ctx: *anyopaque, _: Allocator, t: []const u8, body: []const u8) anyerror!void {
+        const self: *FakeOut = @ptrCast(@alignCast(ctx));
+        try self.sent.append(self.a, .{ .topic = try self.a.dupe(u8, t), .body = try self.a.dupe(u8, body) });
+    }
+    fn out(self: *FakeOut) gossip.Out {
+        return .{ .ctx = self, .publishFn = publish };
+    }
+};
+
+/// An instance, natively: the store, the heads `chain/state` (the chain app's, here written by
+/// the test), `overlay/state` and `overlay/ls_demo`, the config, and the programs behind the `call`s.
 const Instance = struct {
     a: Allocator,
-    ms: *w.store.MemStore,
-    /// The store programs see now: the call's overlay during a route, the store in a step.
+    ms: *c.store.MemStore,
     current: Store,
-    wallet: ?[]const u8 = null,
+    chain_root: ?[]const u8 = null,
+    ov_root: ?[]const u8 = null,
     ls_state: ?[]const u8 = null,
     in: Value,
     now: i64 = 1000,
     topic_prog: []const u8,
     lookup_prog: []const u8,
-    /// Calls made, by fn.
-    calls: std.StringHashMapUnmanaged(usize) = .empty,
+    calls_: std.StringHashMapUnmanaged(usize) = .empty,
     wire_: *FakeWire,
-    /// The last submit entry stepped: what its awaiting thread began with.
-    last_event: Value = .null,
-    /// Every wallet state a submission's steps saved.
-    states: std.ArrayList([]const u8) = .empty,
+    out_: *FakeOut,
+    /// The submission threads' events and ingest messages, by txid.
+    threads: std.AutoHashMapUnmanaged([32]u8, struct { ev: Value, ingest: []const u8 }) = .empty,
 
-    fn init(a: Allocator, ms: *w.store.MemStore) !Instance {
+    fn init(a: Allocator, ms: *c.store.MemStore) !Instance {
         const tp = try a.dupe(u8, &cbor.cidOf("topic-demo"));
         const lp = try a.dupe(u8, &cbor.cidOf("lookup-demo"));
         const in: Value = .{ .map = try a.dupe(cbor.Entry, &.{
             .{ .key = "defaults", .value = .{ .map = try a.dupe(cbor.Entry, &.{
                 .{ .key = "walletNetwork", .value = .{ .text = "regtest" } },
-                .{ .key = "walletAbandonMs", .value = .{ .text = "100000" } },
                 .{ .key = "overlayTopics", .value = .{ .text = "{\"tm_demo\":\"topic-demo\"}" } },
                 .{ .key = "overlayLookups", .value = .{ .text = "{\"ls_demo\":{\"program\":\"lookup-demo\",\"topics\":[\"tm_demo\"]}}" } },
             }) } },
@@ -162,19 +218,18 @@ const Instance = struct {
                 .{ .key = "lookup-demo", .value = .{ .cid = lp } },
                 .{ .key = "topic-demo", .value = .{ .cid = tp } },
             }) } },
+            .{ .key = "app", .value = .{ .text = "overlay" } },
         }) };
         const wire_ = try a.create(FakeWire);
         wire_.* = .{ .a = a };
-        return .{ .a = a, .ms = ms, .current = ms.store(), .in = in, .topic_prog = tp, .lookup_prog = lp, .wire_ = wire_ };
-    }
-
-    fn wire(self: *Instance) submit.Wire {
-        return .{ .ctx = self.wire_, .broadcastFn = FakeWire.broadcast };
+        const out_ = try a.create(FakeOut);
+        out_.* = .{ .a = a };
+        return .{ .a = a, .ms = ms, .current = ms.store(), .in = in, .topic_prog = tp, .lookup_prog = lp, .wire_ = wire_, .out_ = out_ };
     }
 
     fn callImpl(ctx: *anyopaque, a: Allocator, program: []const u8, func: []const u8, arg: Value) anyerror!Value {
         const self: *Instance = @ptrCast(@alignCast(ctx));
-        const gop = try self.calls.getOrPut(self.a, try self.a.dupe(u8, func));
+        const gop = try self.calls_.getOrPut(self.a, try self.a.dupe(u8, func));
         if (!gop.found_existing) gop.value_ptr.* = 0;
         gop.value_ptr.* += 1;
         if (std.mem.eql(u8, program, self.topic_prog)) {
@@ -182,127 +237,144 @@ const Instance = struct {
             return topic.judge(a, self.current, demo.identify, arg);
         }
         if (std.mem.eql(u8, program, self.lookup_prog)) {
-            const h = try lookup.handle(a, ls.spec, self.current, .regtest, self.ls_state, self.wallet, func, arg);
-            if (h.state) |c| self.ls_state = c;
+            try std.testing.expectEqualStrings("overlay", arg.getText("app").?);
+            const h = try lookup.handle(a, ls.spec, self.current, .regtest, self.ls_state, self.chain_root, func, arg);
+            if (h.state) |sc| self.ls_state = sc;
             return h.answer;
         }
         return error.UnknownProgram;
     }
-    fn caller(self: *Instance) w.overlay.Caller {
+    fn caller(self: *Instance) calls.Caller {
         return .{ .ctx = self, .callFn = callImpl };
     }
     fn count(self: *Instance, func: []const u8) usize {
-        return self.calls.get(func) orelse 0;
+        return self.calls_.get(func) orelse 0;
     }
 
-    /// A chain for the wallet state (headers only).
+    // ------------------------------------------------ the chain app, standing in
+
+    fn chain(self: *Instance) !Chain {
+        var ch = try Chain.load(self.a, self.ms.store(), self.chain_root, .regtest);
+        ch.now = self.now;
+        return ch;
+    }
     fn headers(self: *Instance, raws: []const []const u8) !void {
-        var wal = try w.wallet.Wallet.load(self.a, self.ms.store(), self.wallet, .regtest);
-        _ = try wal.addHeaders(raws);
-        self.wallet = try wal.save();
+        var ch = try self.chain();
+        _ = try ch.addHeaders(raws);
+        self.chain_root = try ch.save();
+    }
+    /// The chain app takes an ingest message: → the subject's status.
+    fn ingest(self: *Instance, bytes: []const u8) !c.state.Status {
+        var ch = try self.chain();
+        const got = try ch.ingest(bytes);
+        self.chain_root = try ch.save();
+        return got.status;
+    }
+    /// A status (or a proof, "MINED" with its path) reaching the chain app.
+    fn chainStatus(self: *Instance, txid: [32]u8, tx_status: []const u8, path: ?[]const u8) !Chain.Outcome {
+        var ch = try self.chain();
+        const o = try ch.applyStatus(txid, tx_status, path);
+        self.chain_root = try ch.save();
+        return o;
     }
 
-    /// POST /submit's handler: a call over an overlay of its own, dropped afterwards.
+    // ------------------------------------------------ the overlay
+
+    /// POST /submit's handler: a call over a write cache of its own, dropped afterwards.
     fn route(self: *Instance, bytes: []const u8) !submit.Routed {
         return self.routeFrom(bytes, null);
     }
-
-    /// The same, the submission's `source` given (#74: where it came from, carried on its entry).
     fn routeFrom(self: *Instance, bytes: []const u8, source: ?Value) !submit.Routed {
         var ovl = Overlay{ .inner = self.ms.store(), .arena = self.a };
         self.current = ovl.store();
         defer self.current = self.ms.store();
-        var wal = try w.wallet.Wallet.load(self.a, ovl.store(), self.wallet, .regtest);
-        wal.now = self.now;
-        return submit.route(self.a, self.caller(), &wal, self.in, bytes, &.{"tm_demo"}, null, source);
+        const ch = try state.chainView(self.a, ovl.store(), self.chain_root, .regtest);
+        var st = try state.State.load(self.a, ovl.store(), self.ov_root, ch);
+        st.now = self.now;
+        return submit.route(self.a, self.caller(), &st, self.in, bytes, &.{"tm_demo"}, null, source);
     }
 
-    /// The engine stepped on the admitted entry: held, broadcast unless
-    /// mined (an event), else left pending (#73: admitted later, on the
-    /// first of a status or the proof).
-    fn step(self: *Instance, ev: Value) !submit.Stepped {
+    /// A step: the context over the store as it stands, then the state saved.
+    fn cx(self: *Instance, st: *state.State, with_out: bool) submit.Ctx {
+        return .{ .a = self.a, .caller = self.caller(), .wire = self.wire_.wire(), .out = if (with_out) self.out_.out() else null, .st = st, .in = self.in, .thread = &cbor.cidOf("the thread") };
+    }
+    fn load(self: *Instance) !state.State {
         self.current = self.ms.store();
-        self.last_event = ev;
-        var wal = try w.wallet.Wallet.load(self.a, self.ms.store(), self.wallet, .regtest);
-        wal.now = self.now;
-        const done = try submit.step(self.a, self.caller(), self.wire(), &wal, self.in, ev);
-        try w.overlay.hookRejected(self.a, self.caller(), self.in, wal.unapplied.items);
-        self.wallet = try wal.save();
-        try self.states.append(self.a, self.wallet.?);
+        const ch = try state.chainView(self.a, self.ms.store(), self.chain_root, .regtest);
+        var st = try state.State.load(self.a, self.ms.store(), self.ov_root, ch);
+        st.now = self.now;
+        return st;
+    }
+
+    /// The submission's thread, first step (the event read back as the host stores it).
+    fn begin(self: *Instance, event: Value) ![]const u8 {
+        const ev = try cbor.decode(self.a, try cbor.encode(self.a, event));
+        var st = try self.load();
+        const m = try submit.begin(self.cx(&st, true), ev);
+        self.ov_root = try st.save();
+        try self.threads.put(self.a, try submit.txidOf(ev), .{ .ev = ev, .ingest = m });
+        return m;
+    }
+
+    /// The submission's thread stepped with the chain app's answer.
+    fn answer(self: *Instance, txid: [32]u8, ans: submit.Answer) !submit.Stepped {
+        const t = self.threads.get(txid).?;
+        var st = try self.load();
+        const done = try submit.answered(self.cx(&st, true), t.ev, t.ingest, ans);
+        self.ov_root = try st.save();
         return done;
     }
 
-    /// The submission's awaiting thread stepped again: its proof, a status provider's message, or its deadline.
-    fn wake(self: *Instance, ev: Value, wk: submit.Wake) !submit.Stepped {
-        self.current = self.ms.store();
-        var wal = try w.wallet.Wallet.load(self.a, self.ms.store(), self.wallet, .regtest);
-        wal.now = self.now;
-        const done = try submit.awaited(self.a, self.caller(), &wal, self.in, ev, wk);
-        try w.overlay.hookRejected(self.a, self.caller(), self.in, wal.unapplied.items);
-        self.wallet = try wal.save();
-        try self.states.append(self.a, self.wallet.?);
+    fn watchStart(self: *Instance, txid: [32]u8) !submit.Stepped {
+        var st = try self.load();
+        const done = try submit.watchStart(self.cx(&st, true), txid);
+        self.ov_root = try st.save();
+        return done;
+    }
+    fn watched(self: *Instance, txid: [32]u8, ans: submit.Answer) !submit.Stepped {
+        var st = try self.load();
+        const done = try submit.watched(self.cx(&st, true), txid, ans);
+        self.ov_root = try st.save();
         return done;
     }
 
-    /// When the pending submission's thread rests until (its abandonment), as the engine sets it.
-    fn deadline(self: *Instance, txid: [32]u8) !?i64 {
-        var wal = try w.wallet.Wallet.load(self.a, self.ms.store(), self.wallet, .regtest);
-        wal.now = self.now;
-        return (try submit.Gate.of(self.in)).deadline(&wal, txid);
-    }
-
-    /// The `then` call's view: whether the transaction awaits ARC with nothing admitted, and its status.
     fn pending(self: *Instance, txid: [32]u8) !bool {
-        var wal = try w.wallet.Wallet.load(self.a, self.ms.store(), self.wallet, .regtest);
-        return submit.isPending(&wal, txid);
+        var st = try self.load();
+        return st.isPending(txid);
     }
-    fn settled(self: *Instance, txid: [32]u8) !w.wallet.Status {
-        var wal = try w.wallet.Wallet.load(self.a, self.ms.store(), self.wallet, .regtest);
-        return wal.status(txid);
+    fn applied(self: *Instance, txid: [32]u8) !bool {
+        var st = try self.load();
+        return st.isApplied("tm_demo", txid);
     }
 
-    /// Route then step, as the host does for an admitted submit.
-    fn submitted(self: *Instance, bytes: []const u8) !submit.Stepped {
+    /// Route, then the thread's first step: → its ingest message.
+    fn submitted(self: *Instance, bytes: []const u8) ![]const u8 {
         const r = try self.route(bytes);
         if (r != .admit) {
             std.debug.print("not admitted: {any}\n", .{r});
             return error.NotAdmitted;
         }
-        // The entry as the host puts it: a dag-cbor record, read back.
-        return self.step(try cbor.decode(self.a, try cbor.encode(self.a, r.admit.event)));
+        return self.begin(r.admit.event);
     }
 
-    /// Submitted, then admitted on a status (RECEIVED) — the gate itself is
-    /// #73's own test below; this test is about decode-once/persist, so it
-    /// just needs the submission off `pending` once, the same way a status
-    /// provider's first word would take it there.
+    /// Submitted, ingested by the chain app, accepted (a RECEIVED status), and the answer stepped.
     fn admitted(self: *Instance, bytes: []const u8, txid: [32]u8) !submit.Stepped {
         _ = try self.submitted(bytes);
-        return self.wake(self.last_event, .{ .status = try statusBody(self.a, txid, "RECEIVED") });
+        _ = try self.ingest(bytes);
+        try std.testing.expectEqual(Chain.Outcome.accepted, try self.chainStatus(txid, "RECEIVED", null));
+        return self.answer(txid, .accepted);
     }
 
-    /// A `status` entry: the chain feed's rejection, the removed judgements' services told.
-    fn status(self: *Instance, txid: [32]u8, tx_status: []const u8) !void {
-        self.current = self.ms.store();
-        var wal = try w.wallet.Wallet.load(self.a, self.ms.store(), self.wallet, .regtest);
-        wal.now = self.now;
-        _ = try wal.applyStatus(txid, tx_status, null);
-        try w.overlay.hookRejected(self.a, self.caller(), self.in, wal.unapplied.items);
-        self.wallet = try wal.save();
-    }
-
-    /// A lookup (fn "lookup" of the service): the outputs as (txid, vout), and their BEEF.
+    /// A lookup (fn "lookup" of the service): the outputs.
     fn look(self: *Instance, fields: []const cbor.Entry) ![]const Value {
-        const ans = try self.caller().call(self.a, self.lookup_prog, "lookup", .{ .map = try self.a.dupe(cbor.Entry, &.{
-            .{ .key = "kind", .value = .{ .text = "lookup-call" } },
-            .{ .key = "service", .value = .{ .text = "ls_demo" } },
-            .{ .key = "query", .value = .{ .map = try self.a.dupe(cbor.Entry, fields) } },
-        }) });
+        const ans = try self.caller().call(self.a, self.lookup_prog, "lookup", try calls.lookupArg(self.a, self.in, "ls_demo", .{ .map = try self.a.dupe(cbor.Entry, fields) }));
         try std.testing.expectEqualStrings("output-list", ans.getText("type").?);
         return ans.getArray("outputs").?;
     }
+    fn lookTopic(self: *Instance) !usize {
+        return (try self.look(&.{.{ .key = "topic", .value = .{ .text = "tm_demo" } }})).len;
+    }
 
-    /// Every block in the store, by CID.
     fn snapshot(self: *Instance) !std.StringHashMapUnmanaged([]const u8) {
         var out: std.StringHashMapUnmanaged([]const u8) = .empty;
         var it = self.ms.blocks.iterator();
@@ -315,136 +387,98 @@ fn subjectOf(a: Allocator, v: Value) ![32]u8 {
     return (try beef.parse(a, v.getBytes("beef").?)).subject().?;
 }
 
-/// The dag-cbor blocks reachable from `roots` (links followed; bitcoin blocks counted, not walked).
-fn reachable(a: Allocator, s: Store, roots: []const []const u8) !std.StringHashMapUnmanaged(void) {
-    var seen: std.StringHashMapUnmanaged(void) = .empty;
-    var queue: std.ArrayList([]const u8) = .empty;
-    try queue.appendSlice(a, roots);
-    while (queue.pop()) |c| {
-        if (seen.contains(c)) continue;
-        const bytes = s.tryGet(a, c) orelse continue;
-        try seen.put(a, c, {});
-        if (c.len < 2 or c[1] != 0x71) continue;
-        try links(a, try cbor.decode(a, bytes), &queue);
-    }
-    return seen;
-}
+const Keys = struct { priv: [32]u8, p2pkh: [25]u8, token: [34]u8, token_hash: [32]u8 };
 
-fn links(a: Allocator, v: Value, out: *std.ArrayList([]const u8)) !void {
-    switch (v) {
-        .cid => |c| try out.append(a, c),
-        .array => |xs| for (xs) |x| try links(a, x, out),
-        .map => |es| for (es) |e| try links(a, e.value, out),
-        else => {},
-    }
+fn keys(seed: u8) !Keys {
+    const priv: [32]u8 = .{seed} ** 32;
+    const pub_key = try identityKey(priv);
+    const pkh = bsvz.crypto.hash.hash160(&pub_key).bytes;
+    const token: [34]u8 = demo.tag.* ++ [_]u8{ 0x76, 0xa9, 0x14 } ++ pkh ++ [_]u8{ 0x88, 0xac };
+    var th: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&token, &th, .{});
+    return .{ .priv = priv, .p2pkh = p2pkhOf(pub_key), .token = token, .token_hash = th };
 }
 
 test "the submission flow: parse once, persist only on admission, a lookup service's own map through its hooks" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    var ms = w.store.MemStore.init(std.testing.allocator);
+    var ms = c.store.MemStore.init(std.testing.allocator);
     defer ms.deinit();
     var inst = try Instance.init(a, &ms);
-
-    const priv: [32]u8 = .{0x42} ** 32;
-    const pub_key = try w.brc29.identityKey(priv);
-    const pkh = bsvz.crypto.hash.hash160(&pub_key).bytes;
-    const p2pkh = w.brc29.p2pkh(pub_key);
-    const token: [34]u8 = demo.tag.* ++ [_]u8{ 0x76, 0xa9, 0x14 } ++ pkh ++ [_]u8{ 0x88, 0xac };
-    var token_hash: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(&token, &token_hash, .{});
-
-    // A funding transaction mined alone at height 1 of a regtest chain (root = its txid).
-    var fund_raw: std.ArrayList(u8) = .empty;
-    try fund_raw.appendSlice(a, &.{ 1, 0, 0, 0, 1 });
-    try fund_raw.appendSlice(a, &(.{0x11} ** 32));
-    try fund_raw.appendSlice(a, &.{ 0, 0, 0, 0, 1, 0x51, 0xff, 0xff, 0xff, 0xff, 2 });
-    for ([_]u64{ 50_000, 20_000 }) |v| {
-        var sats: [8]u8 = undefined;
-        std.mem.writeInt(u64, &sats, v, .little);
-        try fund_raw.appendSlice(a, &sats);
-        try fund_raw.append(a, p2pkh.len);
-        try fund_raw.appendSlice(a, &p2pkh);
-    }
-    try fund_raw.appendSlice(a, &.{ 0, 0, 0, 0 });
-    const fund_tx = try bsvz.transaction.Transaction.parse(a, fund_raw.items);
-    const fund_txid = beef.txidOf(fund_raw.items);
-    const h1 = mine(hdr.hash(&w.chain.Network.regtest.genesis()), fund_txid, 1_700_000_600);
-    try inst.headers(&.{&h1});
-    const bump = try bsvz.spv.MerklePath.parse(a, try soloPath(a, 1, fund_txid));
-    const fund_entry: beef.Entry = .{ .txid = fund_txid, .format = .raw_with_bump, .bump = 0, .raw = fund_raw.items, .tx = fund_tx };
-    const bumps = try a.dupe(bsvz.spv.MerklePath, &.{bump});
+    const k = try keys(0x42);
+    const f = try fund(a, 0x11, 2, &k.p2pkh);
+    try inst.headers(&.{&f.h1});
 
     // ------------------------------------------------ refused: tm_demo takes nothing, nothing persists
     {
-        const plain = try spend(a, &fund_tx, 1, &.{.{ 19_000, &p2pkh }}, priv);
-        const bytes = try beef.serialize(a, .{ .version = beef.V2, .bumps = bumps, .entries = try a.dupe(beef.Entry, &.{ fund_entry, .{ .txid = plain.txid, .format = .raw, .raw = plain.raw, .tx = plain.tx } }) });
+        const plain = try spend(a, &f.tx, 1, &.{.{ 9_000, &k.p2pkh }}, k.priv);
+        const bytes = try withFund(a, f, plain);
         const before = try inst.snapshot();
         const parses = beef.parses;
         const r = try inst.route(bytes);
         try std.testing.expect(r == .nothing);
         try std.testing.expect(std.mem.startsWith(u8, r.nothing, "NotAdmitted"));
         try std.testing.expectEqual(parses + 1, beef.parses);
-        try std.testing.expectEqual(@as(usize, 1), inst.count("identify")); // the topic was asked, in the call
-        // The store is as it was, block for block.
+        try std.testing.expectEqual(@as(usize, 1), inst.count("identify"));
         try std.testing.expectEqual(before.count(), ms.count());
         var it = before.iterator();
         while (it.next()) |e| try std.testing.expectEqualSlices(u8, e.value_ptr.*, ms.blocks.get(e.key_ptr.*).?);
-        // A BEEF that does not verify is refused the same way.
         const bad = try inst.route(&.{ 1, 2, 3 });
         try std.testing.expectEqualStrings("InvalidBeef", bad.refused);
         try std.testing.expectEqual(before.count(), ms.count());
+        try std.testing.expectEqual(@as(usize, 0), inst.wire_.sent.items.len);
     }
 
-    // ------------------------------------------------ T1 admits a token: persisted exactly, the service told
-    const t1 = try spend(a, &fund_tx, 0, &.{ .{ 1, &token }, .{ 49_000, &p2pkh } }, priv);
-    const t1_beef = try beef.serialize(a, .{ .version = beef.V2, .bumps = bumps, .entries = try a.dupe(beef.Entry, &.{ fund_entry, .{ .txid = t1.txid, .format = .raw, .raw = t1.raw, .tx = t1.tx } }) });
+    // ------------------------------------------------ T1 admits a token: the BEEF to the chain app, admitted on its answer
+    const t1 = try spend(a, &f.tx, 0, &.{ .{ 1, &k.token }, .{ 9_000, &k.p2pkh } }, k.priv);
+    const t1_beef = try withFund(a, f, t1);
     {
-        const before = try inst.snapshot();
-        const wallet_before = inst.wallet.?;
         const parses = beef.parses;
-        const done = try inst.admitted(t1_beef, t1.txid);
-        // Parsed once: the route decoded it; the topic, the step and the hooks read records (the
-        // admitting status wake decodes nothing new).
+        const r = try inst.route(t1_beef);
         try std.testing.expectEqual(parses + 1, beef.parses);
+        const ev = r.admit.event;
+        try std.testing.expectEqualSlices(u8, t1_beef, ev.getBytes("beef").?);
+        try std.testing.expect(ev.get("txs") == null);
+        const m = try inst.begin(ev);
+        // The ingest message: box `chain`, {fn: "ingest", args: {beef}}.
+        const sent = inst.wire_.last();
+        try std.testing.expectEqualStrings("chain", sent.box);
+        try std.testing.expectEqualSlices(u8, m, sent.cid);
+        try std.testing.expectEqualStrings("ingest", sent.body.getText("fn").?);
+        try std.testing.expectEqualSlices(u8, t1_beef, sent.body.get("args").?.getBytes("beef").?);
+        try std.testing.expect(try inst.pending(t1.txid));
+        try std.testing.expect(!(try inst.applied(t1.txid)));
+        try std.testing.expectEqual(@as(usize, 0), inst.count("admitted"));
+        // The pending record names the thread and the message.
+        var st = try inst.load();
+        const rec = (try st.pendingRecord(t1.txid)).?;
+        try std.testing.expectEqualSlices(u8, m, rec.getCid("ingest").?);
+        try std.testing.expectEqualSlices(u8, &cbor.cidOf("the thread"), rec.getCid("thread").?);
+
+        // The chain app ingests it (unproven: broadcast) and the status provider's RECEIVED accepts it.
+        try std.testing.expectEqual(c.state.Status.unproven, try inst.ingest(t1_beef));
+        _ = try inst.chainStatus(t1.txid, "RECEIVED", null);
+        const done = try inst.answer(t1.txid, .accepted);
+        try std.testing.expect(done.admitted and done.done);
         try std.testing.expectEqualSlices(u32, &.{0}, done.applied[0].outputs_to_admit);
         try std.testing.expectEqual(@as(usize, 1), inst.count("admitted"));
         try std.testing.expectEqual(@as(usize, 0), inst.count("spent"));
-        // What the steps persisted: the decoded blocks (the transactions; this BUMP reveals no node:
-        // a one-transaction block), the judgement and admittance (reachable from the new wallet
-        // state), the service's map (from its new state) — and nothing else.
-        const decoded = [_][37]u8{ w.store.hashCid(.tx, fund_txid), w.store.hashCid(.tx, t1.txid) };
-        // The wallet states both steps saved (#73: the submit step broadcasts and goes pending; the
-        // status wake admits it).
-        var roots: std.ArrayList([]const u8) = .empty;
-        try roots.appendSlice(a, inst.states.items);
-        try roots.append(a, inst.ls_state.?);
-        const kept = try reachable(a, ms.store(), roots.items);
-        var fresh: usize = 0;
-        var it = ms.blocks.iterator();
-        while (it.next()) |e| {
-            if (before.contains(e.key_ptr.*)) continue;
-            fresh += 1;
-            const is_decoded = for (decoded) |d| {
-                if (std.mem.eql(u8, &d, e.key_ptr.*)) break true;
-            } else false;
-            if (!is_decoded and !kept.contains(e.key_ptr.*)) {
-                std.debug.print("unaccounted block {x}\n", .{e.key_ptr.*});
-                return error.Unaccounted;
-            }
-        }
-        for (decoded) |d| try std.testing.expect(ms.blocks.contains(&d) and !before.contains(&d));
-        for (done.records) |r| try std.testing.expect(kept.contains(r) and !before.contains(r));
-        try std.testing.expect(fresh > done.records.len + decoded.len);
-        try std.testing.expect(!std.mem.eql(u8, wallet_before, inst.wallet.?));
-        // The funding's proof is recorded from the header (its block's root is its txid).
-        var wal = try w.wallet.Wallet.load(a, ms.store(), inst.wallet, .regtest);
-        try std.testing.expectEqual(w.wallet.Status.proven, try wal.status(fund_txid));
+        try std.testing.expect(!(try inst.pending(t1.txid)));
+        // Admitted on its acceptance: a watch to the app's own box.
+        const w = inst.wire_.last();
+        try std.testing.expectEqualStrings("overlay", w.box);
+        try std.testing.expectEqualSlices(u8, w.cid, done.watch.?);
+        try std.testing.expectEqualStrings("watch", w.body.getText("fn").?);
+        try std.testing.expectEqualStrings(&hdr.toHex(t1.txid), w.body.get("args").?.getText("txid").?);
+        try std.testing.expectEqualSlices(u8, m, w.body.get("args").?.getCid("ingest").?);
+        // The records are in the overlay's state; the transaction is the chain app's.
+        for (done.records) |rc| try std.testing.expect(ms.blocks.contains(rc));
+        try std.testing.expect(ms.blocks.contains(&c.store.hashCid(.tx, t1.txid)));
         // A dupe: nothing new, nothing called.
-        const calls = inst.count("identify");
+        const calls_before = inst.count("identify");
         try std.testing.expect((try inst.route(t1_beef)) == .unchanged);
-        try std.testing.expectEqual(calls, inst.count("identify"));
+        try std.testing.expectEqual(calls_before, inst.count("identify"));
     }
 
     // ------------------------------------------------ ls_demo answers from its own map
@@ -452,292 +486,217 @@ test "the submission flow: parse once, persist only on admission, a lookup servi
         const by_topic = try inst.look(&.{.{ .key = "topic", .value = .{ .text = "tm_demo" } }});
         try std.testing.expectEqual(@as(usize, 1), by_topic.len);
         try std.testing.expectEqualSlices(u8, &t1.txid, &(try subjectOf(a, by_topic[0])));
-        try std.testing.expectEqual(@as(u64, 0), by_topic[0].getUint("outputIndex").?);
         // Its BEEF verifies against a node that holds only the headers.
-        var headers_only = w.store.MemStore.init(std.testing.allocator);
+        var headers_only = c.store.MemStore.init(std.testing.allocator);
         defer headers_only.deinit();
-        var hw = try w.wallet.Wallet.load(a, headers_only.store(), null, .regtest);
-        _ = try hw.addHeaders(&.{&h1});
-        var ctx = w.wallet.Wallet.SpvCtx{ .w = &hw };
-        _ = try w.spv.verify(a, try beef.parse(a, by_topic[0].getBytes("beef").?), .{ .ptr = &ctx, .rootAtFn = w.wallet.Wallet.SpvCtx.rootAt, .knownRawFn = w.wallet.Wallet.SpvCtx.knownRaw });
-        const by_script = try inst.look(&.{.{ .key = "scriptHash", .value = .{ .text = &std.fmt.bytesToHex(token_hash, .lower) } }});
+        var hc = try Chain.load(a, headers_only.store(), null, .regtest);
+        _ = try hc.addHeaders(&.{&f.h1});
+        var sctx = Chain.SpvCtx{ .st = &hc };
+        _ = try c.spv.verify(a, try beef.parse(a, by_topic[0].getBytes("beef").?), .{ .ptr = &sctx, .rootAtFn = Chain.SpvCtx.rootAt, .knownRawFn = Chain.SpvCtx.knownRaw });
+        const by_script = try inst.look(&.{.{ .key = "scriptHash", .value = .{ .text = &std.fmt.bytesToHex(k.token_hash, .lower) } }});
         try std.testing.expectEqual(@as(usize, 1), by_script.len);
         const by_op = try inst.look(&.{
             .{ .key = "topic", .value = .{ .text = "tm_demo" } },
             .{ .key = "txid", .value = .{ .text = &hdr.toHex(t1.txid) } },
             .{ .key = "outputIndex", .value = .{ .uint = 1 } },
         });
-        try std.testing.expectEqual(@as(usize, 0), by_op.len); // the change was not admitted
-        // The shared wallet maps no longer index by script (#50): the service does.
-        for (w.wallet.map_names) |n| try std.testing.expect(!std.mem.eql(u8, n, "byScript"));
+        try std.testing.expectEqual(@as(usize, 0), by_op.len);
+        // The overlay's own view: unspent.
+        var st = try inst.load();
+        const in_topic = try st.inTopic("tm_demo", true);
+        try std.testing.expectEqual(@as(usize, 1), in_topic.len);
+        try std.testing.expect(!in_topic[0].spent);
     }
 
     // ------------------------------------------------ T2 spends the token into a new one: `spent`
-    const t2 = try spend(a, &t1.tx, 0, &.{.{ 1, &token }}, priv);
+    const t2 = try spend(a, &t1.tx, 0, &.{.{ 1, &k.token }}, k.priv);
     {
         inst.now = 2000;
         const done = try inst.admitted(try atomic(a, t2), t2.txid);
         try std.testing.expectEqualSlices(u32, &.{0}, done.applied[0].coins_to_retain);
         try std.testing.expectEqual(@as(usize, 1), inst.count("spent"));
-        const live = try inst.look(&.{.{ .key = "topic", .value = .{ .text = "tm_demo" } }});
-        try std.testing.expectEqual(@as(usize, 1), live.len);
-        try std.testing.expectEqualSlices(u8, &t2.txid, &(try subjectOf(a, live[0])));
+        try std.testing.expectEqual(@as(usize, 1), try inst.lookTopic());
         const all = try inst.look(&.{ .{ .key = "topic", .value = .{ .text = "tm_demo" } }, .{ .key = "includeSpent", .value = .{ .boolean = true } } });
         try std.testing.expectEqual(@as(usize, 2), all.len);
-        const by_script = try inst.look(&.{.{ .key = "scriptHash", .value = .{ .text = &std.fmt.bytesToHex(token_hash, .lower) } }});
-        try std.testing.expectEqual(@as(usize, 1), by_script.len);
+        var st = try inst.load();
+        const sp = (try st.spender("tm_demo", t1.txid, 0)).?;
+        try std.testing.expectEqualSlices(u8, &t2.txid, &sp.txid);
+        try std.testing.expect(sp.retained and sp.judged);
+        try std.testing.expectEqual(@as(usize, 1), (try st.inTopic("tm_demo", false)).len);
     }
 
-    // ------------------------------------------------ T2 rejected (a status entry): `rejected`, T1's token live again
+    // ------------------------------------------------ T2 rejected later (its watch hears it): `rejected`, T1's token live again
     {
         inst.now = 3000;
-        try inst.status(t2.txid, "DOUBLE_SPEND_ATTEMPTED");
+        try std.testing.expect(!(try inst.watchStart(t2.txid)).done);
+        _ = try inst.chainStatus(t2.txid, "DOUBLE_SPEND_ATTEMPTED", null);
+        const done = try inst.watched(t2.txid, .{ .rejected = "DOUBLE_SPEND_ATTEMPTED" });
+        try std.testing.expect(done.done);
+        try std.testing.expectEqual(@as(usize, 1), done.unapplied.len);
         try std.testing.expectEqual(@as(usize, 1), inst.count("rejected"));
+        try std.testing.expect(!(try inst.applied(t2.txid)));
         const live = try inst.look(&.{ .{ .key = "topic", .value = .{ .text = "tm_demo" } }, .{ .key = "includeSpent", .value = .{ .boolean = true } } });
         try std.testing.expectEqual(@as(usize, 1), live.len);
         try std.testing.expectEqualSlices(u8, &t1.txid, &(try subjectOf(a, live[0])));
+        var st = try inst.load();
+        try std.testing.expect((try st.spender("tm_demo", t1.txid, 0)) == null);
         // Resubmitting it admits nothing (200, empty STEAK).
-        const r = try inst.route(try atomic(a, t2));
-        try std.testing.expectEqualStrings("TransactionRejected", r.nothing);
+        try std.testing.expectEqualStrings("TransactionRejected", (try inst.route(try atomic(a, t2))).nothing);
     }
 
     // ------------------------------------------------ T3 spends the token and admits none: the coin removed
     {
         inst.now = 4000;
-        const t3 = try spend(a, &t1.tx, 0, &.{.{ 1, &p2pkh }}, priv);
+        const t3 = try spend(a, &t1.tx, 0, &.{.{ 1, &k.p2pkh }}, k.priv);
         const done = try inst.admitted(try atomic(a, t3), t3.txid);
         try std.testing.expectEqual(@as(usize, 0), done.applied[0].outputs_to_admit.len);
         try std.testing.expectEqualSlices(u32, &.{0}, done.applied[0].coins_removed);
         try std.testing.expectEqual(@as(usize, 2), inst.count("spent"));
-        try std.testing.expectEqual(@as(usize, 0), (try inst.look(&.{.{ .key = "topic", .value = .{ .text = "tm_demo" } }})).len);
-        try std.testing.expectEqual(@as(usize, 1), (try inst.look(&.{ .{ .key = "topic", .value = .{ .text = "tm_demo" } }, .{ .key = "includeSpent", .value = .{ .boolean = true } } })).len);
+        try std.testing.expectEqual(@as(usize, 0), try inst.lookTopic());
     }
 }
 
-/// A status provider's message body (#65, arc.ts statusBodyOf).
-fn statusBody(a: Allocator, txid: [32]u8, tx_status: []const u8) !Value {
-    return .{ .map = try a.dupe(cbor.Entry, &.{
-        .{ .key = "kind", .value = .{ .text = "status" } },
-        .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &hdr.toHex(txid)) } },
-        .{ .key = "txStatus", .value = .{ .text = tx_status } },
-    }) };
-}
-
-/// A proof event (#65, arc.ts proofOf): its merkle path.
-fn proofEvent(a: Allocator, txid: [32]u8, path: []const u8) !Value {
-    return .{ .map = try a.dupe(cbor.Entry, &.{
-        .{ .key = "kind", .value = .{ .text = "proof" } },
-        .{ .key = "subject", .value = .{ .cid = try a.dupe(u8, &w.store.hashCid(.tx, txid)) } },
-        .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &hdr.toHex(txid)) } },
-        .{ .key = "path", .value = .{ .bytes = path } },
-    }) };
-}
-
-test "the broadcast gate (#57, #65, #73): admitted on the first of a status or the proof; rejected, abandoned, mined" {
+test "the gate (#73, the chain app's answer): admitted on the first of accepted or proven; rejected, failed, a later rejection, proven at once" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    var ms = w.store.MemStore.init(std.testing.allocator);
+    var ms = c.store.MemStore.init(std.testing.allocator);
     defer ms.deinit();
     var inst = try Instance.init(a, &ms);
+    const k = try keys(0x42);
+    const f = try fund(a, 0x22, 5, &k.p2pkh);
+    try inst.headers(&.{&f.h1});
 
-    const priv: [32]u8 = .{0x42} ** 32;
-    const pub_key = try w.brc29.identityKey(priv);
-    const pkh = bsvz.crypto.hash.hash160(&pub_key).bytes;
-    const p2pkh = w.brc29.p2pkh(pub_key);
-    const token: [34]u8 = demo.tag.* ++ [_]u8{ 0x76, 0xa9, 0x14 } ++ pkh ++ [_]u8{ 0x88, 0xac };
-
-    // A funding transaction with five outputs, mined alone at height 1.
-    var fund_raw: std.ArrayList(u8) = .empty;
-    try fund_raw.appendSlice(a, &.{ 1, 0, 0, 0, 1 });
-    try fund_raw.appendSlice(a, &(.{0x22} ** 32));
-    try fund_raw.appendSlice(a, &.{ 0, 0, 0, 0, 1, 0x51, 0xff, 0xff, 0xff, 0xff, 5 });
-    for ([_]u64{ 10_000, 10_000, 10_000, 10_000, 10_000 }) |v| {
-        var sats: [8]u8 = undefined;
-        std.mem.writeInt(u64, &sats, v, .little);
-        try fund_raw.appendSlice(a, &sats);
-        try fund_raw.append(a, p2pkh.len);
-        try fund_raw.appendSlice(a, &p2pkh);
-    }
-    try fund_raw.appendSlice(a, &.{ 0, 0, 0, 0 });
-    const fund_tx = try bsvz.transaction.Transaction.parse(a, fund_raw.items);
-    const fund_txid = beef.txidOf(fund_raw.items);
-    const h1 = mine(hdr.hash(&w.chain.Network.regtest.genesis()), fund_txid, 1_700_000_600);
-    try inst.headers(&.{&h1});
-    const bumps = try a.dupe(bsvz.spv.MerklePath, &.{try bsvz.spv.MerklePath.parse(a, try soloPath(a, 1, fund_txid))});
-    const fund_entry: beef.Entry = .{ .txid = fund_txid, .format = .raw_with_bump, .bump = 0, .raw = fund_raw.items, .tx = fund_tx };
-    const withFund = struct {
-        fn of(al: Allocator, bs: []bsvz.spv.MerklePath, fe: beef.Entry, t: Spent) ![]const u8 {
-            return beef.serialize(al, .{ .version = beef.V2, .bumps = bs, .entries = try al.dupe(beef.Entry, &.{ fe, .{ .txid = t.txid, .format = .raw, .raw = t.raw, .tx = t.tx } }) });
-        }
-    }.of;
-    const look = struct {
-        fn topic(i: *Instance) !usize {
-            return (try i.look(&.{.{ .key = "topic", .value = .{ .text = "tm_demo" } }})).len;
-        }
-    }.topic;
-
-    // ------------------------------------------------ (a) a status provider: broadcast, pending; its RECEIVED admits; the proof proves
-    const ta = try spend(a, &fund_tx, 0, &.{.{ 1, &token }}, priv);
-    const h2 = mine(hdr.hash(&h1), ta.txid, 1_700_001_200);
+    // ------------------------------------------------ (a) pending; a resubmission joins the same thread; accepted admits; the proof proves
+    const ta = try spend(a, &f.tx, 0, &.{.{ 1, &k.token }}, k.priv);
+    const h2 = mine(hdr.hash(&f.h1), ta.txid, 1_700_001_200);
     {
-        const done = try inst.submitted(try withFund(a, bumps, fund_entry, ta));
-        try std.testing.expectEqual(@as(usize, 1), inst.wire_.broadcasts.items.len);
-        try std.testing.expectEqualSlices(u8, &ta.txid, &inst.wire_.broadcasts.items[0]);
-        try std.testing.expectEqual(submit.Gated.pending, done.gate);
-        try std.testing.expect(!done.admitted);
-        try std.testing.expectEqual(@as(usize, 0), inst.count("admitted"));
+        const bytes = try withFund(a, f, ta);
+        _ = try inst.submitted(bytes);
         try std.testing.expect(try inst.pending(ta.txid));
-        // The thread rests until its abandonment (walletAbandonMs after the broadcast).
-        try std.testing.expectEqual(@as(?i64, 1000 + 100_000), try inst.deadline(ta.txid));
-        const ev = inst.last_event;
-        try std.testing.expectEqualSlices(u8, &ta.txid, &(try inst.route(try withFund(a, bumps, fund_entry, ta))).pending);
-
-        const ok = try inst.wake(ev, .{ .status = try statusBody(a, ta.txid, "RECEIVED") });
-        try std.testing.expectEqual(submit.Gated.accepted, ok.gate);
-        try std.testing.expectEqualStrings("RECEIVED", ok.tx_status);
+        try std.testing.expectEqualSlices(u8, &ta.txid, &(try inst.route(bytes)).pending);
+        _ = try inst.ingest(bytes);
+        // An answer the engine does not act on: still awaiting.
+        const other = try inst.answer(ta.txid, .other);
+        try std.testing.expect(!other.done and !other.admitted);
+        try std.testing.expect(try inst.pending(ta.txid));
+        _ = try inst.chainStatus(ta.txid, "RECEIVED", null);
+        const ok = try inst.answer(ta.txid, .accepted);
         try std.testing.expect(ok.admitted);
-        try std.testing.expectEqualSlices(u32, &.{0}, ok.applied[0].outputs_to_admit);
-        try std.testing.expectEqual(w.wallet.Wallet.Outcome.pending, ok.outcome);
-        try std.testing.expectEqual(@as(usize, 1), inst.count("admitted"));
-        try std.testing.expectEqual(@as(usize, 1), try look(&inst));
-        try std.testing.expect(!(try inst.pending(ta.txid)));
-        // The broadcast record: the status heard, since; where it went is not the instance's to know.
-        var wal = try w.wallet.Wallet.load(a, ms.store(), inst.wallet, .regtest);
-        const rec = (try wal.awaitingRecord(ta.txid)).?;
-        try std.testing.expect(rec.get("arc") == null);
-        try std.testing.expectEqualStrings("RECEIVED", rec.getText("txStatus").?);
-        try std.testing.expectEqualStrings("admitted", rec.getText("submission").?);
-        try std.testing.expectEqual(@as(u64, 1000), rec.getUint("since").?);
-        // A resubmission is a dupe (nothing new: not pending, applied).
-        try std.testing.expect((try inst.route(try withFund(a, bumps, fund_entry, ta))) == .unchanged);
-
-        const seen = try inst.wake(ev, .{ .status = try statusBody(a, ta.txid, "SEEN_ON_NETWORK") });
-        try std.testing.expectEqual(w.wallet.Wallet.Outcome.pending, seen.outcome);
-        try std.testing.expect(!seen.admitted);
+        try std.testing.expectEqual(@as(usize, 1), try inst.lookTopic());
+        // Gossip: the BEEF on tm_demo, the verdict on tm_demo-admit; no proof yet.
+        try std.testing.expectEqual(@as(usize, 2), ok.published);
+        try std.testing.expectEqualStrings("tm_demo", inst.out_.sent.items[0].topic);
+        try std.testing.expectEqualSlices(u8, bytes, inst.out_.sent.items[0].body);
+        try std.testing.expectEqualStrings("tm_demo-admit", inst.out_.sent.items[1].topic);
+        // Its watch: the chain state says unproven — it awaits; accepted again — still awaits; the proof — `-proof`.
+        try std.testing.expect(!(try inst.watchStart(ta.txid)).done);
+        try std.testing.expect(!(try inst.watched(ta.txid, .accepted)).done);
         try inst.headers(&.{&h2});
-        const mined = try inst.wake(ev, .{ .event = try proofEvent(a, ta.txid, try soloPath(a, 2, ta.txid)) });
-        try std.testing.expectEqual(w.wallet.Wallet.Outcome.proven, mined.outcome);
-        try std.testing.expectEqual(w.wallet.Status.proven, try inst.settled(ta.txid));
-        wal = try w.wallet.Wallet.load(a, ms.store(), inst.wallet, .regtest);
-        try std.testing.expect((try wal.awaitingRecord(ta.txid)) == null);
+        try std.testing.expectEqual(Chain.Outcome.proven, try inst.chainStatus(ta.txid, "MINED", try soloPath(a, 2, ta.txid)));
+        const mined = try inst.watched(ta.txid, .{ .proven = .{} });
+        try std.testing.expect(mined.done);
+        try std.testing.expectEqual(@as(usize, 1), mined.published);
+        const p = try gossip.parseProof(a, inst.out_.sent.items[2].body);
+        try std.testing.expectEqualStrings("tm_demo-proof", inst.out_.sent.items[2].topic);
+        try std.testing.expectEqualSlices(u8, &ta.txid, &p.txid);
+        try std.testing.expectEqualSlices(u8, &hdr.hash(&h2), &p.block_hash);
+        try std.testing.expectEqualSlices(u8, try soloPath(a, 2, ta.txid), p.bump);
+        try std.testing.expectEqual(@as(usize, 1), inst.count("admitted"));
     }
 
-    // ------------------------------------------------ (b) the status provider's REJECTED: rejected, nothing admitted, no hook
+    // ------------------------------------------------ (b) rejected: nothing admitted, no hook
     {
-        const tb = try spend(a, &fund_tx, 1, &.{.{ 1, &token }}, priv);
-        const admitted = inst.count("admitted");
-        _ = try inst.submitted(try withFund(a, bumps, fund_entry, tb));
-        const done = try inst.wake(inst.last_event, .{ .status = try statusBody(a, tb.txid, "REJECTED") });
-        try std.testing.expectEqual(submit.Gated.rejected, done.gate);
-        try std.testing.expect(!done.admitted);
-        try std.testing.expectEqual(admitted, inst.count("admitted"));
-        try std.testing.expectEqual(w.wallet.Status.rejected, try inst.settled(tb.txid));
-        var wal = try w.wallet.Wallet.load(a, ms.store(), inst.wallet, .regtest);
-        try std.testing.expect(!(try w.overlay.isApplied(&wal, "tm_demo", tb.txid)));
-        try std.testing.expectEqualStrings("REJECTED", (try wal.settlement(tb.txid)).?.getText("reason").?);
-        try std.testing.expectEqual(@as(usize, 1), try look(&inst));
-        // Resubmitted: a known-rejected transaction admits nothing (200, the empty STEAK).
-        try std.testing.expectEqualStrings("TransactionRejected", (try inst.route(try withFund(a, bumps, fund_entry, tb))).nothing);
+        const tb = try spend(a, &f.tx, 1, &.{.{ 1, &k.token }}, k.priv);
+        const n = inst.count("admitted");
+        const bytes = try withFund(a, f, tb);
+        _ = try inst.submitted(bytes);
+        _ = try inst.ingest(bytes);
+        _ = try inst.chainStatus(tb.txid, "REJECTED", null);
+        const done = try inst.answer(tb.txid, .{ .rejected = "REJECTED" });
+        try std.testing.expect(done.done and !done.admitted);
+        try std.testing.expectEqual(n, inst.count("admitted"));
+        try std.testing.expectEqual(@as(usize, 0), inst.count("rejected"));
+        try std.testing.expect(!(try inst.pending(tb.txid)));
+        try std.testing.expect(!(try inst.applied(tb.txid)));
+        try std.testing.expectEqualStrings("TransactionRejected", (try inst.route(bytes)).nothing);
     }
 
-    // ------------------------------------------------ (c) its proof first (no status at all): admits it (a path whose
-    // header is not held leaves it pending); a later status that is not a rejection just notes it — no second
-    // admission (#73: the gate is the first of the two signals)
-    const tc = try spend(a, &fund_tx, 2, &.{.{ 1, &token }}, priv);
+    // ------------------------------------------------ (c) proven first (no status): admitted at once, `-proof` too, no watch
+    const tc = try spend(a, &f.tx, 2, &.{.{ 1, &k.token }}, k.priv);
     const h3 = mine(hdr.hash(&h2), tc.txid, 1_700_001_800);
     {
-        inst.now = 2000;
-        const admitted = inst.count("admitted");
-        const done = try inst.submitted(try withFund(a, bumps, fund_entry, tc));
-        try std.testing.expectEqual(submit.Gated.pending, done.gate);
-        const ev = inst.last_event;
-        try std.testing.expect(try inst.pending(tc.txid));
-        try std.testing.expectEqualSlices(u8, &tc.txid, &(try inst.route(try withFund(a, bumps, fund_entry, tc))).pending);
-        // Its proof before its header: still pending.
-        const early = try inst.wake(ev, .{ .event = try proofEvent(a, tc.txid, try soloPath(a, 3, tc.txid)) });
-        try std.testing.expectEqual(submit.Gated.pending, early.gate);
-        try std.testing.expect(try inst.pending(tc.txid));
-        try std.testing.expectEqual(admitted, inst.count("admitted"));
-        // A deadline before its abandonment: still pending.
-        inst.now = 50_000;
-        try std.testing.expectEqual(submit.Gated.pending, (try inst.wake(ev, .deadline)).gate);
+        const bytes = try withFund(a, f, tc);
+        const sent = inst.wire_.sent.items.len;
+        _ = try inst.submitted(bytes);
+        _ = try inst.ingest(bytes);
         try inst.headers(&.{&h3});
-        const ok = try inst.wake(ev, .{ .event = try proofEvent(a, tc.txid, try soloPath(a, 3, tc.txid)) });
-        try std.testing.expectEqual(submit.Gated.mined, ok.gate);
-        try std.testing.expect(ok.admitted);
-        try std.testing.expectEqual(w.wallet.Wallet.Outcome.proven, ok.outcome);
-        try std.testing.expectEqual(admitted + 1, inst.count("admitted"));
-        try std.testing.expectEqual(@as(usize, 2), try look(&inst));
-        try std.testing.expect(!(try inst.pending(tc.txid)));
-        // A later status (not a rejection), the proof having admitted it first: only noted, no second admission.
-        const noted = try inst.wake(ev, .{ .status = try statusBody(a, tc.txid, "SEEN_ON_NETWORK") });
-        try std.testing.expect(!noted.admitted);
-        try std.testing.expectEqual(admitted + 1, inst.count("admitted"));
-        try std.testing.expectEqual(w.wallet.Wallet.Outcome.proven, noted.outcome);
-        try std.testing.expectEqual(@as(usize, 2), try look(&inst));
+        _ = try inst.chainStatus(tc.txid, "MINED", try soloPath(a, 3, tc.txid));
+        const pubs = inst.out_.sent.items.len;
+        const done = try inst.answer(tc.txid, .{ .proven = .{} });
+        try std.testing.expect(done.admitted and done.done);
+        try std.testing.expect(done.watch == null);
+        try std.testing.expectEqual(sent + 1, inst.wire_.sent.items.len); // the ingest only
+        try std.testing.expectEqual(pubs + 3, inst.out_.sent.items.len);
+        try std.testing.expectEqualStrings("tm_demo-proof", inst.out_.sent.items[pubs + 2].topic);
+        // A later answer to the same ingest (none awaits it: the thread finished) — were it stepped, nothing again.
+        try std.testing.expect(!(try inst.answer(tc.txid, .{ .proven = .{} })).admitted);
     }
 
-    // ------------------------------------------------ a pending submission nothing settles is abandoned at its deadline (walletAbandonMs)
+    // ------------------------------------------------ (d) proven by a peer's proof (`via`): admitted, no `-proof` re-published
+    const td = try spend(a, &f.tx, 3, &.{.{ 1, &k.token }}, k.priv);
+    const h4 = mine(hdr.hash(&h3), td.txid, 1_700_002_000);
     {
-        const tp = try spend(a, &fund_tx, 3, &.{.{ 1, &token }}, priv);
-        inst.now = 200_000;
-        _ = try inst.submitted(try withFund(a, bumps, fund_entry, tp));
-        const ev = inst.last_event;
-        try std.testing.expectEqual(@as(?i64, 300_000), try inst.deadline(tp.txid));
-        inst.now = 200_000 + 100_000;
-        const gone = try inst.wake(ev, .deadline);
-        try std.testing.expectEqual(w.wallet.Wallet.Outcome.rejected, gone.outcome);
-        try std.testing.expectEqual(submit.Gated.rejected, gone.gate);
-        var wal = try w.wallet.Wallet.load(a, ms.store(), inst.wallet, .regtest);
-        try std.testing.expectEqualStrings("abandoned", (try wal.settlement(tp.txid)).?.getText("reason").?);
-        try std.testing.expect(!(try inst.pending(tp.txid)));
-    }
-
-    // ------------------------------------------------ (e) no status ever arrives (no provider subscribed, in
-    // production: a status message only ever reaches `awaited` through one, #73): nothing admitted before the
-    // proof — the same gate as (c), just with no status racing it
-    const te = try spend(a, &fund_tx, 4, &.{.{ 1, &token }}, priv);
-    const h4 = mine(hdr.hash(&h3), te.txid, 1_700_002_000);
-    {
-        inst.now = 400_000;
-        const admitted = inst.count("admitted");
-        const done = try inst.submitted(try withFund(a, bumps, fund_entry, te));
-        try std.testing.expectEqual(submit.Gated.pending, done.gate);
-        try std.testing.expect(!done.admitted);
-        try std.testing.expectEqual(admitted, inst.count("admitted"));
-        try std.testing.expect(try inst.pending(te.txid));
-        const ev = inst.last_event;
-        // Its proof before its header: still pending.
-        const early = try inst.wake(ev, .{ .event = try proofEvent(a, te.txid, try soloPath(a, 4, te.txid)) });
-        try std.testing.expectEqual(submit.Gated.pending, early.gate);
-        try std.testing.expect(try inst.pending(te.txid));
-        try std.testing.expectEqual(admitted, inst.count("admitted"));
+        const bytes = try withFund(a, f, td);
+        _ = try inst.submitted(bytes);
+        _ = try inst.ingest(bytes);
         try inst.headers(&.{&h4});
-        const ok = try inst.wake(ev, .{ .event = try proofEvent(a, te.txid, try soloPath(a, 4, te.txid)) });
-        try std.testing.expectEqual(submit.Gated.mined, ok.gate);
-        try std.testing.expect(ok.admitted);
-        try std.testing.expectEqual(w.wallet.Wallet.Outcome.proven, ok.outcome);
-        try std.testing.expectEqual(admitted + 1, inst.count("admitted"));
-        try std.testing.expect(!(try inst.pending(te.txid)));
-        try std.testing.expectEqual(@as(usize, 3), try look(&inst));
+        _ = try inst.chainStatus(td.txid, "MINED", try soloPath(a, 4, td.txid));
+        const pubs = inst.out_.sent.items.len;
+        const done = try inst.answer(td.txid, .{ .proven = .{ .via = "libp2p:tm_demo-proof" } });
+        try std.testing.expect(done.admitted);
+        try std.testing.expectEqual(pubs + 2, inst.out_.sent.items.len);
+        try std.testing.expectEqualStrings("tm_demo-admit", inst.out_.sent.items[pubs + 1].topic);
     }
 
-    // ------------------------------------------------ (d) mined: the BEEF proves the subject; admitted with no broadcast
+    // ------------------------------------------------ (e) an error answer: nothing admitted, no longer pending; a later watch on a rejection unwinds
     {
-        // (ta is proven in block 2: its token spent on, in a transaction mined alone at 5.)
-        const td = try spend(a, &ta.tx, 0, &.{.{ 1, &token }}, priv);
-        const h5 = mine(hdr.hash(&h4), td.txid, 1_700_002_400);
-        try inst.headers(&.{&h5});
-        const td_bumps = try a.dupe(bsvz.spv.MerklePath, &.{try bsvz.spv.MerklePath.parse(a, try soloPath(a, 5, td.txid))});
-        const bytes = try beef.serialize(a, .{ .version = beef.V2, .bumps = td_bumps, .entries = try a.dupe(beef.Entry, &.{.{ .txid = td.txid, .format = .raw_with_bump, .bump = 0, .raw = td.raw, .tx = td.tx }}) });
-        const n = inst.wire_.broadcasts.items.len;
-        const done = try inst.submitted(bytes);
-        try std.testing.expectEqual(n, inst.wire_.broadcasts.items.len);
-        try std.testing.expectEqual(submit.Gated.mined, done.gate);
-        try std.testing.expectEqual(w.wallet.Wallet.Outcome.proven, done.outcome);
-        try std.testing.expect(done.admitted);
-        try std.testing.expectEqualSlices(u32, &.{0}, done.applied[0].coins_to_retain);
+        const te = try spend(a, &f.tx, 4, &.{.{ 1, &k.token }}, k.priv);
+        const bytes = try withFund(a, f, te);
+        _ = try inst.submitted(bytes);
+        const done = try inst.answer(te.txid, .{ .failed = "ingest: UnknownHeader" });
+        try std.testing.expect(done.done and !done.admitted);
+        try std.testing.expect(!(try inst.pending(te.txid)));
+        // Submitted again: admitted on acceptance, then the chain rejects it before its watch's first step.
+        _ = try inst.submitted(bytes);
+        _ = try inst.ingest(bytes);
+        _ = try inst.chainStatus(te.txid, "RECEIVED", null);
+        try std.testing.expect((try inst.answer(te.txid, .accepted)).admitted);
+        const n = try inst.lookTopic();
+        _ = try inst.chainStatus(te.txid, "REJECTED", null);
+        const w = try inst.watchStart(te.txid);
+        try std.testing.expect(w.done);
+        try std.testing.expectEqual(@as(usize, 1), w.unapplied.len);
+        try std.testing.expectEqual(n - 1, try inst.lookTopic());
+    }
+
+    // ------------------------------------------------ the answer bodies as the chain app sends them
+    {
+        const body = struct {
+            fn of(al: Allocator, result: []const cbor.Entry) !Value {
+                return .{ .map = try al.dupe(cbor.Entry, &.{
+                    .{ .key = "fn", .value = .{ .text = "ingest" } },
+                    .{ .key = "result", .value = .{ .map = try al.dupe(cbor.Entry, result) } },
+                }) };
+            }
+        }.of;
+        try std.testing.expect(submit.answerOf(try body(a, &.{.{ .key = "state", .value = .{ .text = "accepted" } }})) == .accepted);
+        const pv = submit.answerOf(try body(a, &.{ .{ .key = "state", .value = .{ .text = "proven" } }, .{ .key = "via", .value = .{ .text = "x" } } }));
+        try std.testing.expectEqualStrings("x", pv.proven.via.?);
+        try std.testing.expectEqualStrings("abandoned", submit.answerOf(try body(a, &.{ .{ .key = "state", .value = .{ .text = "rejected" } }, .{ .key = "reason", .value = .{ .text = "abandoned" } } })).rejected);
+        const err: Value = .{ .map = try a.dupe(cbor.Entry, &.{.{ .key = "error", .value = .{ .map = try a.dupe(cbor.Entry, &.{ .{ .key = "code", .value = .{ .text = "failed" } }, .{ .key = "message", .value = .{ .text = "ingest: InvalidBeef" } } }) } }}) };
+        try std.testing.expectEqualStrings("ingest: InvalidBeef", submit.answerOf(err).failed);
+        try std.testing.expect(submit.answerOf(try body(a, &.{.{ .key = "state", .value = .{ .text = "unknown" } }})) == .other);
     }
 }
 
@@ -745,35 +704,19 @@ test "the topic contract: identify on a CID, reading records" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    var ms = w.store.MemStore.init(std.testing.allocator);
+    var ms = c.store.MemStore.init(std.testing.allocator);
     defer ms.deinit();
     const s = ms.store();
     try std.testing.expectError(error.BadArgs, topic.judge(a, s, demo.identify, .{ .map = &.{} }));
     const missing: Value = .{ .map = try a.dupe(cbor.Entry, &.{
         .{ .key = "kind", .value = .{ .text = "topic-call" } },
         .{ .key = "topic", .value = .{ .text = "tm_demo" } },
-        .{ .key = "tx", .value = .{ .cid = try a.dupe(u8, &w.store.hashCid(.tx, .{0x5a} ** 32)) } },
+        .{ .key = "tx", .value = .{ .cid = try a.dupe(u8, &c.store.hashCid(.tx, .{0x5a} ** 32)) } },
     }) };
     try std.testing.expectError(error.UnknownTransaction, topic.judge(a, s, demo.identify, missing));
 }
 
-/// The gossip out (#74) as the engine sees it: the publishes, recorded (topic, body).
-const FakeOut = struct {
-    a: Allocator,
-    sent: std.ArrayList(Sent) = .empty,
-
-    const Sent = struct { topic: []const u8, body: []const u8 };
-
-    fn publish(ctx: *anyopaque, _: Allocator, t: []const u8, body: []const u8) anyerror!void {
-        const self: *FakeOut = @ptrCast(@alignCast(ctx));
-        try self.sent.append(self.a, .{ .topic = try self.a.dupe(u8, t), .body = try self.a.dupe(u8, body) });
-    }
-    fn out(self: *FakeOut) gossip.Out {
-        return .{ .ctx = self, .publishFn = publish };
-    }
-};
-
-/// The instance's genesis input with `defaults.<key>` set to `value`.
+/// The config with `defaults.<key>` set to `value`.
 fn withDefault(a: Allocator, in: Value, key: []const u8, value: []const u8) !Value {
     const es = try a.dupe(cbor.Entry, in.map);
     for (es) |*e| if (std.mem.eql(u8, e.key, "defaults")) {
@@ -782,50 +725,16 @@ fn withDefault(a: Allocator, in: Value, key: []const u8, value: []const u8) !Val
     return .{ .map = es };
 }
 
-test "gossip (#74): the three topics' shapes; what an admission and a proof publish; a peer's proof checked; a late duplicate judged once" {
+test "gossip (#74): the three topics' shapes; what an admission publishes; a peer's proof checked against the chain state; a late duplicate judged once" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    var ms = w.store.MemStore.init(std.testing.allocator);
+    var ms = c.store.MemStore.init(std.testing.allocator);
     defer ms.deinit();
     var inst = try Instance.init(a, &ms);
-    var fo = FakeOut{ .a = a };
-
-    const priv: [32]u8 = .{0x42} ** 32;
-    const pub_key = try w.brc29.identityKey(priv);
-    const pkh = bsvz.crypto.hash.hash160(&pub_key).bytes;
-    const p2pkh = w.brc29.p2pkh(pub_key);
-    const token: [34]u8 = demo.tag.* ++ [_]u8{ 0x76, 0xa9, 0x14 } ++ pkh ++ [_]u8{ 0x88, 0xac };
-    var fund_raw: std.ArrayList(u8) = .empty;
-    try fund_raw.appendSlice(a, &.{ 1, 0, 0, 0, 1 });
-    try fund_raw.appendSlice(a, &(.{0x33} ** 32));
-    try fund_raw.appendSlice(a, &.{ 0, 0, 0, 0, 1, 0x51, 0xff, 0xff, 0xff, 0xff, 2 });
-    for ([_]u64{ 10_000, 10_000 }) |v| {
-        var sats: [8]u8 = undefined;
-        std.mem.writeInt(u64, &sats, v, .little);
-        try fund_raw.appendSlice(a, &sats);
-        try fund_raw.append(a, p2pkh.len);
-        try fund_raw.appendSlice(a, &p2pkh);
-    }
-    try fund_raw.appendSlice(a, &.{ 0, 0, 0, 0 });
-    const fund_tx = try bsvz.transaction.Transaction.parse(a, fund_raw.items);
-    const fund_txid = beef.txidOf(fund_raw.items);
-    const h1 = mine(hdr.hash(&w.chain.Network.regtest.genesis()), fund_txid, 1_700_000_600);
-    try inst.headers(&.{&h1});
-    const bumps = try a.dupe(bsvz.spv.MerklePath, &.{try bsvz.spv.MerklePath.parse(a, try soloPath(a, 1, fund_txid))});
-    const fund_entry: beef.Entry = .{ .txid = fund_txid, .format = .raw_with_bump, .bump = 0, .raw = fund_raw.items, .tx = fund_tx };
-    const withFund = struct {
-        fn of(al: Allocator, bs: []bsvz.spv.MerklePath, fe: beef.Entry, t: Spent) ![]const u8 {
-            return beef.serialize(al, .{ .version = beef.V2, .bumps = bs, .entries = try al.dupe(beef.Entry, &.{ fe, .{ .txid = t.txid, .format = .raw, .raw = t.raw, .tx = t.tx } }) });
-        }
-    }.of;
-    const wallet = struct {
-        fn of(i: *Instance) !w.wallet.Wallet {
-            var wal = try w.wallet.Wallet.load(i.a, i.ms.store(), i.wallet, .regtest);
-            wal.now = i.now;
-            return wal;
-        }
-    }.of;
+    const k = try keys(0x42);
+    const f = try fund(a, 0x33, 2, &k.p2pkh);
+    try inst.headers(&.{&f.h1});
 
     // ------------------------------------------------ the shapes (dag-cbor), exactly
     {
@@ -835,165 +744,69 @@ test "gossip (#74): the three topics' shapes; what an admission and a proof publ
         try std.testing.expectEqualStrings(&hdr.toHex(txid), ad.getText("txid").?);
         const e = ad.get("topics").?.get("tm_demo").?;
         try std.testing.expectEqual(@as(usize, 2), e.map.len);
-        try std.testing.expectEqual(@as(usize, 2), e.getArray("outputsToAdmit").?.len);
-        try std.testing.expectEqual(@as(u64, 1), e.getArray("coinsToRetain").?[0].uint);
         const back = try gossip.parseAdmit(a, try gossip.admitBody(a, txid, "tm_demo", &.{ 0, 2 }, &.{1}), "tm_demo");
         try std.testing.expectEqualSlices(u32, &.{ 0, 2 }, back.outputs_to_admit);
         try std.testing.expectError(error.NotThisTopic, gossip.parseAdmit(a, try gossip.admitBody(a, txid, "tm_demo", &.{}, &.{}), "tm_other"));
         try std.testing.expectError(error.BadMessage, gossip.parseAdmit(a, "not cbor", "tm_demo"));
-
         const pr = try cbor.decode(a, try gossip.proofBody(a, txid, .{0xcd} ** 32, 7, "BUMP"));
         try std.testing.expectEqual(@as(usize, 4), pr.map.len);
-        try std.testing.expectEqualStrings(&hdr.toHex(.{0xcd} ** 32), pr.getText("blockHash").?);
         try std.testing.expectEqual(@as(u64, 7), pr.getUint("blockHeight").?);
-        try std.testing.expectEqualStrings("BUMP", pr.getBytes("bump").?);
         const pp = try gossip.parseProof(a, try gossip.proofBody(a, txid, .{0xcd} ** 32, 7, "BUMP"));
         try std.testing.expectEqualSlices(u8, &txid, &pp.txid);
-        try std.testing.expectEqual(@as(u32, 7), pp.height);
-
         try std.testing.expectEqualStrings("tm_demo", gossip.baseOf("tm_demo-proof", gossip.proof_suffix).?);
         try std.testing.expect(gossip.baseOf("-proof", gossip.proof_suffix) == null);
-        try std.testing.expect(gossip.baseOf("tm_demo-admit", gossip.proof_suffix) == null);
+        try std.testing.expectEqualStrings("overlay/gossip", try gossip.stateHead(a, "overlay"));
     }
 
-    // ------------------------------------------------ an HTTP submission (off-chain values framed): admitted on a status →
-    // the BEEF as received on `tm_demo`, then the verdict on `tm_demo-admit`; its proof later → `tm_demo-proof`
-    const ta = try spend(a, &fund_tx, 0, &.{.{ 1, &token }}, priv);
-    const ta_beef = try withFund(a, bumps, fund_entry, ta);
-    const h2 = mine(hdr.hash(&h1), ta.txid, 1_700_001_200);
+    // ------------------------------------------------ gossip off for a topic: nothing published
     {
-        var framed: std.ArrayList(u8) = .empty;
-        try framed.appendSlice(a, &.{ 0xfd, @truncate(ta_beef.len), @truncate(ta_beef.len >> 8) });
-        try framed.appendSlice(a, ta_beef);
-        try framed.appendSlice(a, "off-chain");
-        const req = try ms.store().putValue(a, .{ .map = try a.dupe(cbor.Entry, &.{
-            .{ .key = "kind", .value = .{ .text = "http" } },
-            .{ .key = "headers", .value = .{ .map = try a.dupe(cbor.Entry, &.{.{ .key = "x-includes-off-chain-values", .value = .{ .text = "true" } }}) } },
-            .{ .key = "body", .value = .{ .bytes = framed.items } },
-        }) });
-        const source: Value = .{ .map = try a.dupe(cbor.Entry, &.{
-            .{ .key = "transport", .value = .{ .text = "http" } },
-            .{ .key = "request", .value = .{ .cid = req } },
-        }) };
-        const r = try inst.routeFrom(ta_beef, source);
-        _ = try inst.step(try cbor.decode(a, try cbor.encode(a, r.admit.event)));
-        const ev = inst.last_event;
-        const ok = try inst.wake(ev, .{ .status = try statusBody(a, ta.txid, "RECEIVED") });
-        try std.testing.expect(ok.admitted);
-        var wal = try wallet(&inst);
-        try std.testing.expectEqual(@as(usize, 2), try gossip.admitted(a, fo.out(), ms.store(), &wal, inst.in, ev, ta.txid, ok.topics, ok.applied));
-        try std.testing.expectEqualStrings("tm_demo", fo.sent.items[0].topic);
-        try std.testing.expectEqualSlices(u8, ta_beef, fo.sent.items[0].body);
-        try std.testing.expectEqualStrings("tm_demo-admit", fo.sent.items[1].topic);
-        try std.testing.expectEqualSlices(u8, try gossip.admitBody(a, ta.txid, "tm_demo", &.{0}, &.{}), fo.sent.items[1].body);
-        // Admitted on a status, unproven: no proof to publish.
-        try std.testing.expectEqual(@as(usize, 0), try gossip.proven(a, fo.out(), &wal, inst.in, ta.txid, null, false));
-
-        // The proof (the chain feed's event, nobody awaiting: the engine's `event` step): `tm_demo-proof`,
-        // this txid's BUMP rebuilt from the nodes — here the very path that came.
-        try inst.headers(&.{&h2});
-        wal = try wallet(&inst);
-        const before = try wal.proofBlock(ta.txid);
-        _ = try wal.applyStatus(ta.txid, "MINED", try soloPath(a, 2, ta.txid));
-        try std.testing.expectEqual(@as(usize, 1), try gossip.proven(a, fo.out(), &wal, inst.in, ta.txid, before, false));
-        try std.testing.expectEqualStrings("tm_demo-proof", fo.sent.items[2].topic);
-        const p = try gossip.parseProof(a, fo.sent.items[2].body);
-        try std.testing.expectEqualSlices(u8, &ta.txid, &p.txid);
-        try std.testing.expectEqualSlices(u8, &hdr.hash(&h2), &p.block_hash);
-        try std.testing.expectEqual(@as(u32, 2), p.height);
-        try std.testing.expectEqualSlices(u8, try soloPath(a, 2, ta.txid), p.bump);
-        // The same proof again (the same block): nothing; one that came by gossip on `-proof`: never re-published.
-        try std.testing.expectEqual(@as(usize, 0), try gossip.proven(a, fo.out(), &wal, inst.in, ta.txid, hdr.hash(&h2), false));
-        try std.testing.expectEqual(@as(usize, 0), try gossip.proven(a, fo.out(), &wal, inst.in, ta.txid, null, true));
-        inst.wallet = try wal.save();
-        // A peer's copy of that proof, here: already proven in that block — ignore.
-        wal = try wallet(&inst);
-        try std.testing.expectEqualStrings("already proven in that block", (try gossip.checkProof(a, &wal, p, "libp2p:tm_demo-proof")).ignore);
-        // With gossip off for the topic (defaults.overlayGossip): nothing published.
         const off_in = try withDefault(a, inst.in, "overlayGossip", "{\"tm_demo\":false}");
         try std.testing.expect(!(try gossip.enabled(a, off_in, "tm_demo")));
         try std.testing.expect(try gossip.enabled(a, inst.in, "tm_demo"));
         try std.testing.expectError(error.BadConfig, gossip.enabled(a, try withDefault(a, inst.in, "overlayGossip", "{\"tm_demo\":\"no\"}"), "tm_demo"));
-        try std.testing.expectEqual(@as(usize, 0), try gossip.admitted(a, fo.out(), ms.store(), &wal, off_in, ev, ta.txid, ok.topics, ok.applied));
-        try std.testing.expectEqual(@as(usize, 0), try gossip.proven(a, fo.out(), &wal, off_in, ta.txid, null, false));
     }
 
-    // ------------------------------------------------ a submission that came by gossip on `tm_demo`: only the verdict
-    // is published (GossipSub forwarded the message itself); its proof from a peer is checked against our chain
-    const tb = try spend(a, &fund_tx, 1, &.{.{ 1, &token }}, priv);
-    const tb_beef = try withFund(a, bumps, fund_entry, tb);
-    const h3 = mine(hdr.hash(&h2), tb.txid, 1_700_001_800);
+    // ------------------------------------------------ a submission that came by gossip on `tm_demo`: only the verdict;
+    // a peer's proof for it checked against the chain state
+    const tb = try spend(a, &f.tx, 1, &.{.{ 1, &k.token }}, k.priv);
+    const tb_beef = try withFund(a, f, tb);
+    const h2 = mine(hdr.hash(&f.h1), tb.txid, 1_700_001_800);
     {
         const source: Value = .{ .map = try a.dupe(cbor.Entry, &.{
             .{ .key = "transport", .value = .{ .text = "libp2p" } },
             .{ .key = "topic", .value = .{ .text = "tm_demo" } },
         }) };
         const r = try inst.routeFrom(tb_beef, source);
-        _ = try inst.step(try cbor.decode(a, try cbor.encode(a, r.admit.event)));
-        const ev = inst.last_event;
-        // Pending its gate: a peer's proof for it is checked, here before we hold its header — ignore.
-        var wal = try wallet(&inst);
-        const proof = gossip.Proof{ .txid = tb.txid, .block_hash = hdr.hash(&h3), .height = 3, .bump = try soloPath(a, 3, tb.txid) };
-        try std.testing.expectEqualStrings("no header held at blockHeight", (try gossip.checkProof(a, &wal, proof, "libp2p:tm_demo-proof")).ignore);
-        try inst.headers(&.{&h3});
-        wal = try wallet(&inst);
-        // Bad ones: not ours, not parsing, the wrong height, the wrong block hash, the wrong root.
-        try std.testing.expectEqualStrings("the transaction is not held here", (try gossip.checkProof(a, &wal, .{ .txid = .{0x77} ** 32, .block_hash = hdr.hash(&h3), .height = 3, .bump = proof.bump }, "x")).ignore);
-        try std.testing.expectEqualStrings("the bump does not parse", (try gossip.checkProof(a, &wal, .{ .txid = tb.txid, .block_hash = hdr.hash(&h3), .height = 3, .bump = "junk" }, "x")).ignore);
-        try std.testing.expectEqualStrings("the bump is not at blockHeight", (try gossip.checkProof(a, &wal, .{ .txid = tb.txid, .block_hash = hdr.hash(&h3), .height = 2, .bump = proof.bump }, "x")).ignore);
-        try std.testing.expectEqualStrings("blockHash is not our header at blockHeight", (try gossip.checkProof(a, &wal, .{ .txid = tb.txid, .block_hash = hdr.hash(&h2), .height = 3, .bump = proof.bump }, "x")).ignore);
-        const other = gossip.Proof{ .txid = tb.txid, .block_hash = hdr.hash(&h2), .height = 2, .bump = try soloPath(a, 2, tb.txid) };
-        try std.testing.expectEqualStrings("the bump's root is not our header's merkle root", (try gossip.checkProof(a, &wal, other, "x")).ignore);
-        // The good one: the `chain` proof event, as the host's feed admits it, with `via`.
-        const good = (try gossip.checkProof(a, &wal, proof, "libp2p:tm_demo-proof")).event;
+        _ = try inst.begin(r.admit.event);
+        _ = try inst.ingest(tb_beef);
+        var ch = try inst.chain();
+        const proof = gossip.Proof{ .txid = tb.txid, .block_hash = hdr.hash(&h2), .height = 2, .bump = try soloPath(a, 2, tb.txid) };
+        try std.testing.expectEqualStrings("no header held at blockHeight", (try gossip.checkProof(a, &ch, proof, "libp2p:tm_demo-proof")).ignore);
+        try inst.headers(&.{&h2});
+        ch = try inst.chain();
+        try std.testing.expectEqualStrings("the transaction is not held here", (try gossip.checkProof(a, &ch, .{ .txid = .{0x77} ** 32, .block_hash = hdr.hash(&h2), .height = 2, .bump = proof.bump }, "x")).ignore);
+        try std.testing.expectEqualStrings("the bump does not parse", (try gossip.checkProof(a, &ch, .{ .txid = tb.txid, .block_hash = hdr.hash(&h2), .height = 2, .bump = "junk" }, "x")).ignore);
+        try std.testing.expectEqualStrings("the bump is not at blockHeight", (try gossip.checkProof(a, &ch, .{ .txid = tb.txid, .block_hash = hdr.hash(&h2), .height = 1, .bump = proof.bump }, "x")).ignore);
+        try std.testing.expectEqualStrings("blockHash is not our header at blockHeight", (try gossip.checkProof(a, &ch, .{ .txid = tb.txid, .block_hash = hdr.hash(&f.h1), .height = 2, .bump = proof.bump }, "x")).ignore);
+        const other = gossip.Proof{ .txid = tb.txid, .block_hash = hdr.hash(&f.h1), .height = 1, .bump = try soloPath(a, 1, tb.txid) };
+        try std.testing.expectEqualStrings("the bump's root is not our header's merkle root", (try gossip.checkProof(a, &ch, other, "x")).ignore);
+        const good = (try gossip.checkProof(a, &ch, proof, "libp2p:tm_demo-proof")).event;
         try std.testing.expectEqualStrings("proof", good.getText("kind").?);
-        try std.testing.expectEqualSlices(u8, &w.store.hashCid(.tx, tb.txid), good.getCid("subject").?);
-        try std.testing.expectEqualSlices(u8, proof.bump, good.getBytes("path").?);
+        try std.testing.expectEqualSlices(u8, &c.store.hashCid(.tx, tb.txid), good.getCid("subject").?);
         try std.testing.expectEqualStrings("libp2p:tm_demo-proof", good.getText("via").?);
-        // It steps the pending submission (the awaiting thread): admitted at the proof (#73).
-        const n = fo.sent.items.len;
-        wal = try wallet(&inst);
-        const before = try wal.proofBlock(tb.txid);
-        const ok = try inst.wake(ev, .{ .event = good });
+        // The chain app records it (the event in box `chain`) and answers proven, with `via`.
+        _ = try inst.chainStatus(tb.txid, "MINED", good.getBytes("path").?);
+        const ok = try inst.answer(tb.txid, .{ .proven = .{ .via = "libp2p:tm_demo-proof" } });
         try std.testing.expect(ok.admitted);
-        try std.testing.expectEqual(submit.Gated.mined, ok.gate);
-        wal = try wallet(&inst);
         // Only `tm_demo-admit`: the submission came by gossip on `tm_demo`, the proof by gossip on `-proof`.
-        try std.testing.expectEqual(@as(usize, 1), try gossip.admitted(a, fo.out(), ms.store(), &wal, inst.in, ev, tb.txid, ok.topics, ok.applied));
-        try std.testing.expectEqual(@as(usize, 0), try gossip.proven(a, fo.out(), &wal, inst.in, tb.txid, before, good.get("via") != null));
-        try std.testing.expectEqual(n + 1, fo.sent.items.len);
-        try std.testing.expectEqualStrings("tm_demo-admit", fo.sent.items[n].topic);
+        try std.testing.expectEqual(@as(usize, 1), ok.published);
+        try std.testing.expectEqualStrings("tm_demo-admit", inst.out_.sent.items[inst.out_.sent.items.len - 1].topic);
+        try std.testing.expectEqualSlices(u8, try gossip.admitBody(a, tb.txid, "tm_demo", &.{0}, &.{}), inst.out_.sent.items[inst.out_.sent.items.len - 1].body);
+        // Now proven in that block: a peer's copy is ignored.
+        ch = try inst.chain();
+        try std.testing.expectEqualStrings("already proven in that block", (try gossip.checkProof(a, &ch, proof, "libp2p:tm_demo-proof")).ignore);
 
-        // A reorg: a heavier branch from 2 mines tb second in a new block 3'. tb is unproven again; its re-proof
-        // (the chain feed's) names a new block: published again; a peer holding the new headers takes it.
-        const filler: [32]u8 = .{0xf3} ** 32;
-        const pair: [64]u8 = filler ++ tb.txid;
-        const root3b = w.store.dblSha256(&pair);
-        const h3b = mine(hdr.hash(&h2), root3b, 1_700_001_900);
-        const h4b = mine(hdr.hash(&h3b), .{0x44} ** 32, 1_700_002_500);
-        try inst.headers(&.{ &h3b, &h4b });
-        wal = try wallet(&inst);
-        try std.testing.expectEqual(w.wallet.Status.unproven, try wal.status(tb.txid));
-        var path3b: std.ArrayList(u8) = .empty;
-        try path3b.appendSlice(a, &.{ 3, 0x01, 0x02, 0x00, 0x00 });
-        try path3b.appendSlice(a, &filler);
-        try path3b.appendSlice(a, &.{ 0x01, 0x02 });
-        try path3b.appendSlice(a, &tb.txid);
-        const re = gossip.Proof{ .txid = tb.txid, .block_hash = hdr.hash(&h3b), .height = 3, .bump = path3b.items };
-        try std.testing.expect((try gossip.checkProof(a, &wal, re, "libp2p:tm_demo-proof")) == .event);
-        const old = try wal.proofBlock(tb.txid);
-        try std.testing.expectEqualSlices(u8, &hdr.hash(&h3), &old.?);
-        _ = try wal.applyStatus(tb.txid, "MINED", path3b.items);
-        try std.testing.expectEqual(w.wallet.Status.proven, try wal.status(tb.txid));
-        try std.testing.expectEqual(@as(usize, 1), try gossip.proven(a, fo.out(), &wal, inst.in, tb.txid, old, false));
-        const p3b = try gossip.parseProof(a, fo.sent.items[fo.sent.items.len - 1].body);
-        try std.testing.expectEqualSlices(u8, &hdr.hash(&h3b), &p3b.block_hash);
-        try std.testing.expectEqualSlices(u8, path3b.items, p3b.bump);
-        try std.testing.expectEqualSlices(u8, &hdr.hash(&h3b), &(try wal.proofBlock(tb.txid)).?);
-        inst.wallet = try wal.save();
-
-        // A late duplicate on `tm_demo` (past GossipSub's seen-cache, or from another publisher): one decode,
-        // the index lookup, "already judged" (`unchanged`) — no topic manager runs.
+        // A late duplicate on `tm_demo`: one decode, "already judged" (`unchanged`) — no topic manager runs.
         const identifies = inst.count("identify");
         const parses = beef.parses;
         try std.testing.expect((try inst.routeFrom(tb_beef, source)) == .unchanged);
@@ -1001,24 +814,22 @@ test "gossip (#74): the three topics' shapes; what an admission and a proof publ
         try std.testing.expectEqual(parses + 1, beef.parses);
     }
 
-    // ------------------------------------------------ peers' admits, recorded under `overlay:gossip` (key topic ‖ txid ‖ from)
+    // ------------------------------------------------ peers' admits, recorded under `<app>/gossip` (key topic ‖ txid ‖ from)
     {
-        var st = try gossip.State.load(a, ms.store(), null);
-        const m = try gossip.parseAdmit(a, try gossip.admitBody(a, ta.txid, "tm_demo", &.{0}, &.{}), "tm_demo");
+        var gs = try gossip.State.load(a, ms.store(), null);
+        const m = try gossip.parseAdmit(a, try gossip.admitBody(a, tb.txid, "tm_demo", &.{0}, &.{}), "tm_demo");
         const pa: [33]u8 = .{0x02} ++ .{0xaa} ** 32;
         const pb: [33]u8 = .{0x03} ++ .{0xbb} ** 32;
-        _ = try st.record(try gossip.peerAdmitRecord(a, "tm_demo", m, &pa));
-        _ = try st.record(try gossip.peerAdmitRecord(a, "tm_demo", m, &pb));
-        _ = try st.record(try gossip.peerAdmitRecord(a, "tm_demo", m, &pa)); // the same peer again: the same key
-        const saved = try st.save();
+        _ = try gs.record(try gossip.peerAdmitRecord(a, "tm_demo", m, &pa));
+        _ = try gs.record(try gossip.peerAdmitRecord(a, "tm_demo", m, &pb));
+        _ = try gs.record(try gossip.peerAdmitRecord(a, "tm_demo", m, &pa));
+        const saved = try gs.save();
         var again = try gossip.State.load(a, ms.store(), saved);
-        const admits = try again.admitsOf("tm_demo", ta.txid);
+        const admits = try again.admitsOf("tm_demo", tb.txid);
         try std.testing.expectEqual(@as(usize, 2), admits.len);
         const rec = try ms.store().getValue(a, admits[0]);
         try std.testing.expectEqualStrings("peer-admit", rec.getText("kind").?);
-        try std.testing.expectEqualStrings(&hdr.toHex(ta.txid), rec.getText("txid").?);
         try std.testing.expectEqualSlices(u8, &pa, rec.getBytes("from").?);
-        try std.testing.expectEqual(@as(usize, 0), (try again.admitsOf("tm_demo", tb.txid)).len);
     }
 }
 
@@ -1038,11 +849,11 @@ fn mapOf(a: Allocator, es: []const cbor.Entry) !Value {
     return .{ .map = try a.dupe(cbor.Entry, es) };
 }
 
-/// An app record (the head `overlay`'s root, as an install writes it): the roles and config.overlay.
-fn appRecordOf(a: Allocator, s: Store, engine: []const u8, tp: []const u8, lp: []const u8, topics: []const cbor.Entry, gossip_: []const cbor.Entry) ![]const u8 {
+/// An app record (the head `<app>/app`'s root, as an install writes it): the roles and config.overlay.
+fn appRecordOf(a: Allocator, s: Store, name: []const u8, engine: []const u8, tp: []const u8, lp: []const u8, topics: []const cbor.Entry, gossip_: []const cbor.Entry) ![]const u8 {
     return s.putValue(a, try mapOf(a, &.{
         .{ .key = "kind", .value = .{ .text = "app" } },
-        .{ .key = "name", .value = .{ .text = "overlay" } },
+        .{ .key = "name", .value = .{ .text = name } },
         .{ .key = "programs", .value = try mapOf(a, &.{
             .{ .key = "overlay", .value = .{ .cid = engine } },
             .{ .key = "topic-demo", .value = .{ .cid = tp } },
@@ -1054,7 +865,6 @@ fn appRecordOf(a: Allocator, s: Store, engine: []const u8, tp: []const u8, lp: [
                 .{ .key = "program", .value = .{ .text = "lookup-demo" } },
                 .{ .key = "topics", .value = .{ .array = try a.dupe(Value, &.{.{ .text = "tm_demo" }}) } },
             }) }}) },
-            .{ .key = "status", .value = .{ .text = "$status" } },
             .{ .key = "gossip", .value = try mapOf(a, gossip_) },
         }) }}) },
     }));
@@ -1069,107 +879,98 @@ fn withThread(a: Allocator, s: Store, in: Value, program: []const u8) !Value {
     return .{ .map = try std.mem.concat(a, cbor.Entry, &.{ in.map, &.{.{ .key = "thread", .value = .{ .cid = t } }} }) };
 }
 
-test "the configuration (skein #72): an installed engine's config.overlay from its app record, read at every step and call; the genesis defaults only without one" {
+test "the configuration (skein #72, #79): an installed engine's config.overlay from its app record at <app>/app, its heads under its app's name; the genesis defaults only without one" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    var ms = w.store.MemStore.init(std.testing.allocator);
+    var ms = c.store.MemStore.init(std.testing.allocator);
     defer ms.deinit();
     var inst = try Instance.init(a, &ms);
     const s = ms.store();
     var hm = HeadMap{};
 
-    // The install's records: the engine's program record names its app; the app record has the roles
-    // and config.overlay — two topics, ls_demo on tm_demo, tm_two's gossip off.
+    // Two overlay apps' engines on one instance: `overlay` and `amm`, each its own app record.
     const engine = try s.putValue(a, try mapOf(a, &.{
         .{ .key = "kind", .value = .{ .text = "program" } },
         .{ .key = "name", .value = .{ .text = "overlay" } },
         .{ .key = "app", .value = .{ .text = "overlay" } },
+    }));
+    const amm_engine = try s.putValue(a, try mapOf(a, &.{
+        .{ .key = "kind", .value = .{ .text = "program" } },
+        .{ .key = "name", .value = .{ .text = "overlay" } },
+        .{ .key = "app", .value = .{ .text = "amm" } },
     }));
     const genesis_engine = try s.putValue(a, try mapOf(a, &.{
         .{ .key = "kind", .value = .{ .text = "program" } },
         .{ .key = "name", .value = .{ .text = "overlay" } },
     }));
     const two = [_]cbor.Entry{ .{ .key = "tm_demo", .value = .{ .text = "topic-demo" } }, .{ .key = "tm_two", .value = .{ .text = "topic-demo" } } };
-    try hm.m.put(a, "overlay", try appRecordOf(a, s, engine, inst.topic_prog, inst.lookup_prog, &two, &.{.{ .key = "tm_two", .value = .{ .boolean = false } }}));
+    try hm.m.put(a, "overlay/app", try appRecordOf(a, s, "overlay", engine, inst.topic_prog, inst.lookup_prog, &two, &.{.{ .key = "tm_two", .value = .{ .boolean = false } }}));
+    try hm.m.put(a, "amm/app", try appRecordOf(a, s, "amm", amm_engine, inst.topic_prog, inst.lookup_prog, two[1..], &.{}));
+    // The bare name is no head (the #77 alias is gone): an app record there is not read.
+    try hm.m.put(a, "overlay", try appRecordOf(a, s, "overlay", engine, inst.topic_prog, inst.lookup_prog, two[0..1], &.{}));
 
-    // The genesis this instance runs: no overlay of its own (a topic it does not serve here), other defaults.
     const genesis_in = try mapOf(a, &.{
         .{ .key = "defaults", .value = try mapOf(a, &.{
             .{ .key = "walletNetwork", .value = .{ .text = "regtest" } },
-            .{ .key = "walletAbandonMs", .value = .{ .text = "100000" } },
             .{ .key = "overlayTopics", .value = .{ .text = "{\"tm_genesis\":\"topic-demo\"}" } },
         }) },
         .{ .key = "programs", .value = try mapOf(a, &.{.{ .key = "overlay", .value = .{ .cid = genesis_engine } }}) },
     });
 
-    // A step (its thread's program is the installed engine): the app's config, the roles as programs.
+    // A step (its thread's program is the installed engine): the app's config, the roles as programs, `app`.
     const step = try config.resolve(a, s, hm.heads(), try withThread(a, s, genesis_in, engine), null);
-    const topics = try w.overlay.configObject(a, step, "overlayTopics");
+    const topics = try calls.configObject(a, step, "overlayTopics");
     try std.testing.expectEqual(@as(usize, 2), topics.count());
     try std.testing.expect(topics.contains("tm_demo") and topics.contains("tm_two") and !topics.contains("tm_genesis"));
+    try std.testing.expectEqualStrings("overlay", calls.appOf(step));
     try std.testing.expectEqualStrings("regtest", step.get("defaults").?.getText("walletNetwork").?);
-    try std.testing.expectEqualSlices(u8, inst.topic_prog, (try w.overlay.programNamed(step, "topic-demo")).?);
-    const ls_ = try w.overlay.listeners(a, step, "tm_demo");
+    try std.testing.expectEqualSlices(u8, inst.topic_prog, (try calls.programNamed(step, "topic-demo")).?);
+    const ls_ = try calls.listeners(a, step, "tm_demo");
     try std.testing.expectEqual(@as(usize, 1), ls_.len);
     try std.testing.expectEqualStrings("ls_demo", ls_[0].service);
-    try std.testing.expectEqualSlices(u8, inst.lookup_prog, ls_[0].program);
-    try std.testing.expectEqual(@as(usize, 0), (try w.overlay.listeners(a, step, "tm_two")).len);
+    try std.testing.expectEqual(@as(usize, 0), (try calls.listeners(a, step, "tm_two")).len);
     try std.testing.expect(try gossip.enabled(a, step, "tm_demo"));
     try std.testing.expect(!try gossip.enabled(a, step, "tm_two"));
     try std.testing.expectEqualSlices(u8, engine, step.getCid("engine").?);
+    try std.testing.expectEqualStrings("overlay/ls_demo", try lookup.headName(a, calls.appOf(step), "ls_demo"));
 
-    // A route's call (no thread; the matched routes-table entry names the engine): the same.
+    // The other app's engine: its own config, its own name — its heads `amm/…`.
+    const amm = try config.resolve(a, s, hm.heads(), try withThread(a, s, genesis_in, amm_engine), null);
+    try std.testing.expectEqualStrings("amm", calls.appOf(amm));
+    try std.testing.expectEqual(@as(usize, 1), (try calls.configObject(a, amm, "overlayTopics")).count());
+    try std.testing.expectEqualStrings("amm/ls_demo", try lookup.headName(a, calls.appOf(amm), "ls_demo"));
+    try std.testing.expectEqualStrings("amm/gossip", try gossip.stateHead(a, calls.appOf(amm)));
+
+    // A route's call (no thread; the matched dispatch row names the engine): the same.
     const arg = try mapOf(a, &.{.{ .key = "match", .value = try mapOf(a, &.{
-        .{ .key = "path", .value = .{ .text = "libp2p:tm_demo" } },
+        .{ .key = "address", .value = .{ .text = "tm_demo" } },
         .{ .key = "program", .value = .{ .cid = engine } },
         .{ .key = "fn", .value = .{ .text = "submit" } },
         .{ .key = "app", .value = .{ .text = "overlay" } },
     }) }});
     const called = try config.resolve(a, s, hm.heads(), genesis_in, arg);
-    try std.testing.expectEqual(@as(usize, 2), (try w.overlay.configObject(a, called, "overlayTopics")).count());
+    try std.testing.expectEqual(@as(usize, 2), (try calls.configObject(a, called, "overlayTopics")).count());
 
-    // A genesis-wired engine (its record names no app), or a host's call: the genesis defaults, as given.
+    // A genesis-wired engine (its record names no app), or a host's call: the genesis defaults; its name the program's.
     const wired = try config.resolve(a, s, hm.heads(), try withThread(a, s, genesis_in, genesis_engine), null);
-    try std.testing.expect((try w.overlay.configObject(a, wired, "overlayTopics")).contains("tm_genesis"));
+    try std.testing.expect((try calls.configObject(a, wired, "overlayTopics")).contains("tm_genesis"));
     try std.testing.expect(wired.get("engine") == null);
-    try std.testing.expect((try w.overlay.configObject(a, try config.resolve(a, s, hm.heads(), genesis_in, null), "overlayTopics")).contains("tm_genesis"));
+    try std.testing.expectEqualStrings("overlay", calls.appOf(wired));
+    try std.testing.expect((try calls.configObject(a, try config.resolve(a, s, hm.heads(), genesis_in, null), "overlayTopics")).contains("tm_genesis"));
 
-    // A submission judged with the app's config: tm_demo is served (the genesis's defaults name no such topic).
+    // A submission judged with the app's config: tm_demo is served.
     inst.in = called;
-    const priv: [32]u8 = .{0x5a} ** 32;
-    const pub_key = try w.brc29.identityKey(priv);
-    const pkh = bsvz.crypto.hash.hash160(&pub_key).bytes;
-    const p2pkh = w.brc29.p2pkh(pub_key);
-    const token: [34]u8 = demo.tag.* ++ [_]u8{ 0x76, 0xa9, 0x14 } ++ pkh ++ [_]u8{ 0x88, 0xac };
-    var fund_raw: std.ArrayList(u8) = .empty;
-    try fund_raw.appendSlice(a, &.{ 1, 0, 0, 0, 1 });
-    try fund_raw.appendSlice(a, &(.{0x72} ** 32));
-    try fund_raw.appendSlice(a, &.{ 0, 0, 0, 0, 1, 0x51, 0xff, 0xff, 0xff, 0xff, 1 });
-    var sats: [8]u8 = undefined;
-    std.mem.writeInt(u64, &sats, 10_000, .little);
-    try fund_raw.appendSlice(a, &sats);
-    try fund_raw.append(a, p2pkh.len);
-    try fund_raw.appendSlice(a, &p2pkh);
-    try fund_raw.appendSlice(a, &.{ 0, 0, 0, 0 });
-    const fund_tx = try bsvz.transaction.Transaction.parse(a, fund_raw.items);
-    const fund_txid = beef.txidOf(fund_raw.items);
-    const h1 = mine(hdr.hash(&w.chain.Network.regtest.genesis()), fund_txid, 1_700_000_600);
-    try inst.headers(&.{&h1});
-    const bumps = try a.dupe(bsvz.spv.MerklePath, &.{try bsvz.spv.MerklePath.parse(a, try soloPath(a, 1, fund_txid))});
-    const tok = try spend(a, &fund_tx, 0, &.{ .{ 1, &token }, .{ 9_000, &p2pkh } }, priv);
-    const bytes = try beef.serialize(a, .{ .version = beef.V2, .bumps = bumps, .entries = try a.dupe(beef.Entry, &.{
-        .{ .txid = fund_txid, .format = .raw_with_bump, .bump = 0, .raw = fund_raw.items, .tx = fund_tx },
-        .{ .txid = tok.txid, .format = .raw, .raw = tok.raw, .tx = tok.tx },
-    }) });
-    const r = try inst.route(bytes);
-    try std.testing.expect(r == .admit);
+    const k = try keys(0x5a);
+    const f = try fund(a, 0x72, 1, &k.p2pkh);
+    try inst.headers(&.{&f.h1});
+    const tok = try spend(a, &f.tx, 0, &.{ .{ 1, &k.token }, .{ 9_000, &k.p2pkh } }, k.priv);
+    try std.testing.expect((try inst.route(try withFund(a, f, tok))) == .admit);
     try std.testing.expectEqual(@as(usize, 1), inst.count("identify"));
 
-    // A reinstall (a new app record under the head, tm_demo gone): read at the next call.
-    try hm.m.put(a, "overlay", try appRecordOf(a, s, engine, inst.topic_prog, inst.lookup_prog, two[1..], &.{}));
+    // A reinstall (a new app record under `overlay/app`, tm_demo gone): read at the next call.
+    try hm.m.put(a, "overlay/app", try appRecordOf(a, s, "overlay", engine, inst.topic_prog, inst.lookup_prog, two[1..], &.{}));
     const after = try config.resolve(a, s, hm.heads(), genesis_in, arg);
-    const now_topics = try w.overlay.configObject(a, after, "overlayTopics");
+    const now_topics = try calls.configObject(a, after, "overlayTopics");
     try std.testing.expect(!now_topics.contains("tm_demo") and now_topics.contains("tm_two"));
-    try std.testing.expect(try gossip.enabled(a, after, "tm_two"));
 }

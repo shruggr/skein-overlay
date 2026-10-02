@@ -5,7 +5,7 @@
 //! are retained (the history of a token moving); a spend that admits none
 //! removes them.
 const std = @import("std");
-const topic = @import("topic.zig");
+const topic = @import("topic");
 
 pub const tag = "\x07tm_demo\x75";
 

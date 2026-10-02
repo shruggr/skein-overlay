@@ -4,11 +4,13 @@
 //! effect at the next one (no restart).
 //!
 //! Where the engine finds its app (skein docs/APPS.md §2): the program
-//! records `skein-host install` writes carry `app: <name>`, the app's head.
+//! records `skein-host install` writes carry `app: <name>`; the app's root
+//! head is `<name>/app` (skein #77), and every head the engine writes is
+//! under that name (`<name>/state`, `<name>/gossip`, `<name>/ls_<service>`).
 //! The engine's own record is
 //!
 //!   a step    the thread's `program` (the step's `thread` is the origin record)
-//!   a call    the matched routes-table entry's `program` (`match`, the front door's)
+//!   a call    the matched dispatch row's `program` (`match`, the front door's)
 //!
 //! and the head's root is the app record: {kind: "app", name, programs:
 //! {<role>: <program record>}, config: {overlay: {topics, lookups, status?,
@@ -20,19 +22,21 @@
 //!   config.overlay.gossip    {<topic>: bool}                                     (was defaults.overlayGossip)
 //!
 //! No app record — a program record without `app` (a genesis-wired engine:
-//! its programs and config are the genesis's), a host's call with no route,
-//! a head that is not an app — and the genesis `defaults` are the config, as
-//! before. `resolve` returns the input as the rest of the engine reads it:
+//! its programs and config are the genesis's; its name is its program
+//! record's `name`), a host's call with no route, a head that is not an app
+//! — and the genesis `defaults` are the config, as before. `resolve` returns
+//! the input as the rest of the engine reads it, with `app` (the name its
+//! heads are under: the app's, else the program's, else "overlay"):
 //! `defaults.overlayTopics`/`overlayLookups`/`overlayGossip` (JSON text, the
-//! wallet library's `configObject`), `programs` (the app's roles), and
+//! calls.zig `configObject`), `programs` (the app's roles), and
 //! `engine`: the engine's own program record (what a submission's thread is
 //! launched as).
 const std = @import("std");
-const w = @import("wallet");
+const c = @import("chain");
 
-const cbor = w.cbor;
+const cbor = c.cbor;
 const Value = cbor.Value;
-const Store = w.store.Store;
+const Store = c.store.Store;
 const Allocator = std.mem.Allocator;
 const eql = std.mem.eql;
 
@@ -56,26 +60,46 @@ pub fn selfProgram(a: Allocator, s: Store, in: Value, arg: ?Value) !?[]const u8 
     return null;
 }
 
-/// The app record the engine was installed as (its program record's `app` → that head's root), or null.
+/// The app record the engine was installed as (its program record's `app` → the head `<app>/app`'s root), or null.
 pub fn appRecord(a: Allocator, s: Store, heads: Heads, program: ?[]const u8) !?Value {
     const p = program orelse return null;
     const name = (try s.getValue(a, p)).getText("app") orelse return null;
-    const root = (try heads.head(a, name)) orelse return null;
+    const root = (try heads.head(a, try std.fmt.allocPrint(a, "{s}/app", .{name}))) orelse return null;
     const app = try s.getValue(a, root);
     return if (eql(u8, app.getText("kind") orelse "", "app")) app else null;
 }
 
-/// The input as the engine reads its configuration: from its app record if it has one (`fromApp`), else as it is.
+/// The name the engine's heads are under: its program record's `app`, else its `name` (a
+/// genesis-wired engine), else "overlay".
+pub fn appName(a: Allocator, s: Store, program: ?[]const u8) ![]const u8 {
+    const p = program orelse return "overlay";
+    const rec = try s.getValue(a, p);
+    return rec.getText("app") orelse rec.getText("name") orelse "overlay";
+}
+
+/// The input as the engine reads its configuration: from its app record if it has one (`fromApp`),
+/// else as it is — with `app`, the name its heads are under.
 pub fn resolve(a: Allocator, s: Store, heads: Heads, in: Value, arg: ?Value) !Value {
     const self = try selfProgram(a, s, in, arg);
-    const app = (try appRecord(a, s, heads, self)) orelse return in;
-    return fromApp(a, in, app, self);
+    const name = try appName(a, s, self);
+    const base = if (try appRecord(a, s, heads, self)) |app| try fromApp(a, in, app, self) else in;
+    return withApp(a, base, name);
+}
+
+/// `in` with `app` set.
+pub fn withApp(a: Allocator, in: Value, name: []const u8) !Value {
+    var es: std.ArrayList(cbor.Entry) = .empty;
+    if (in == .map) for (in.map) |e| {
+        if (!eql(u8, e.key, "app")) try es.append(a, e);
+    };
+    try es.append(a, .{ .key = "app", .value = .{ .text = name } });
+    return .{ .map = es.items };
 }
 
 /// `in` with the app record's configuration: `defaults.overlay*` from `config.overlay` (an absent key
 /// is `{}`; the other defaults kept), `programs` = the app's roles, `engine` = `self`.
 pub fn fromApp(a: Allocator, in: Value, app: Value, self: ?[]const u8) !Value {
-    const ov: Value = if (app.get("config")) |c| c.get("overlay") orelse .null else .null;
+    const ov: Value = if (app.get("config")) |cf| cf.get("overlay") orelse .null else .null;
     if (ov != .map and ov != .null) return error.BadConfig;
     var defaults: std.ArrayList(cbor.Entry) = .empty;
     if (in.get("defaults")) |d| if (d == .map) for (d.map) |e| {
@@ -95,7 +119,7 @@ pub fn fromApp(a: Allocator, in: Value, app: Value, self: ?[]const u8) !Value {
         .{ .key = "defaults", .value = .{ .map = defaults.items } },
         .{ .key = "programs", .value = programs },
     });
-    if (self) |c| try es.append(a, .{ .key = "engine", .value = .{ .cid = c } });
+    if (self) |e| try es.append(a, .{ .key = "engine", .value = .{ .cid = e } });
     return .{ .map = es.items };
 }
 

@@ -20,14 +20,25 @@
 //! identifyAdmissibleOutputs. `judge` is the same over any store (tests).
 //! Documentation and metadata are the program record's (bin/<name>.json
 //! `description`): the router serves them without running anything.
+//!
+//! This file is the module `topic` of the skein-overlay package: an overlay
+//! app's own topic manager depends on skein-overlay by URL+hash and does
+//! `const topic = @import("topic");`.
 const std = @import("std");
-const w = @import("wallet");
+const c = @import("chain");
 
-const cbor = w.cbor;
+const cbor = c.cbor;
 const Value = cbor.Value;
-const Store = w.store.Store;
-const Transaction = w.bsvz.transaction.Transaction;
-pub const Instructions = w.overlay.Instructions;
+const Store = c.store.Store;
+const Transaction = c.bsvz.transaction.Transaction;
+
+/// A topic's decision on one transaction (BRC-22 AdmittanceInstructions):
+/// output indices to admit, and input indices whose admitted predecessors
+/// stay queryable for history.
+pub const Instructions = struct {
+    outputs_to_admit: []const u32 = &.{},
+    coins_to_retain: []const u32 = &.{},
+};
 
 /// What a topic judges.
 pub const Call = struct {
@@ -44,12 +55,12 @@ pub const Call = struct {
 
     /// A transaction by txid, read through `get` (in the submit's call, its overlay), or null.
     pub fn transaction(self: Call, txid: [32]u8) ?Transaction {
-        const raw = self.store.tryGet(self.arena, &w.store.hashCid(.tx, txid)) orelse return null;
+        const raw = self.store.tryGet(self.arena, &c.store.hashCid(.tx, txid)) orelse return null;
         return Transaction.parse(self.arena, raw) catch null;
     }
 
     /// The output an input spends, when its source transaction is readable.
-    pub fn sourceOutput(self: Call, input_index: usize) ?w.bsvz.transaction.Output {
+    pub fn sourceOutput(self: Call, input_index: usize) ?c.bsvz.transaction.Output {
         if (input_index >= self.tx.inputs.len) return null;
         const in = self.tx.inputs[input_index];
         const src = self.transaction(in.previous_outpoint.txid.bytes) orelse return null;
@@ -76,14 +87,14 @@ fn uints(a: std.mem.Allocator, xs: []const u32) ![]Value {
 /// The call a topic-call args record describes: its transaction read from the store.
 pub fn callOf(a: std.mem.Allocator, s: Store, args: Value) !Call {
     if (!std.mem.eql(u8, args.getText("kind") orelse "", "topic-call")) return error.BadArgs;
-    const cid = args.getCid("tx") orelse return error.BadArgs;
-    const txid = w.store.bitcoinHash(cid) orelse return error.BadArgs;
-    const raw = s.get(a, cid) catch return error.UnknownTransaction;
+    const tx_cid = args.getCid("tx") orelse return error.BadArgs;
+    const txid = c.store.bitcoinHash(tx_cid) orelse return error.BadArgs;
+    const raw = s.get(a, tx_cid) catch return error.UnknownTransaction;
     return .{
         .arena = a,
         .store = s,
         .topic = args.getText("topic") orelse return error.BadArgs,
-        .tx_cid = cid,
+        .tx_cid = tx_cid,
         .txid = txid,
         .tx = Transaction.parse(a, raw) catch return error.BadTransaction,
         .previous_coins = try uintList(a, args.get("previousCoins")),
@@ -98,7 +109,7 @@ pub fn judge(a: std.mem.Allocator, s: Store, identify: Identify, args: Value) !V
     return .{ .map = try a.dupe(cbor.Entry, &.{
         .{ .key = "kind", .value = .{ .text = "admittance" } },
         .{ .key = "topic", .value = .{ .text = call.topic } },
-        .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &w.header.toHex(call.txid)) } },
+        .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &c.header.toHex(call.txid)) } },
         .{ .key = "outputsToAdmit", .value = .{ .array = try uints(a, ins.outputs_to_admit) } },
         .{ .key = "coinsToRetain", .value = .{ .array = try uints(a, ins.coins_to_retain) } },
     }) };
@@ -112,7 +123,7 @@ pub fn instructionsOf(a: std.mem.Allocator, rec: Value) !Instructions {
 
 /// The program's main: a call of fn "identify"; its answer is the admittance record.
 pub fn main(comptime identify: Identify) u8 {
-    const vm = @import("vm.zig");
+    const vm = @import("sk");
     const S = struct {
         fn run(a: std.mem.Allocator) anyerror!void {
             const in = try vm.input(a);

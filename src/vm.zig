@@ -1,19 +1,17 @@
-//! The skein calls as a program sees them (preview1 `skein` imports,
+//! The skein calls as an overlay program sees them (preview1 `skein` imports,
 //! kernel-zig program.zig), and the few helpers every overlay program needs:
-//! the step's (or call's) input, the store as the SDK wallet's `Store`,
-//! keep-and-print of a result record, in-VM calls and a call's answer, and
-//! the broadcast gate's wiring — the broadcast event (`emit`, #65) — `await`
-//! and `deadline` (#57).
+//! the step's (or call's) input, the store as the SDK chain library's
+//! `Store`, keep-and-print of a result record, in-VM calls and a call's
+//! answer, `emit` (a signed message: `send`), `await` and `deadline`. The
+//! module `sk` of this package: the topic and lookup contracts import it, and
+//! so may an app's own programs. The engine's own wiring (its configuration,
+//! its calls of topics and services, the gossip out) is src/engine_vm.zig.
 //! wasm32-wasi only.
 const std = @import("std");
-const w = @import("wallet");
-const submit = @import("submit.zig");
-const gossip = @import("gossip.zig");
-const config = @import("config.zig");
+const c = @import("chain");
 
-const cbor = w.cbor;
+const cbor = c.cbor;
 const Value = cbor.Value;
-
 pub const sk = struct {
     pub extern "skein" fn input(out: [*]u8, cap: u32) i32;
     pub extern "skein" fn get(cid: [*]const u8, cid_len: u32, out: [*]u8, cap: u32) i32;
@@ -69,15 +67,15 @@ fn putBlockImpl(_: *anyopaque, cid: []const u8, bytes: []const u8) anyerror!void
 fn keepImpl(_: *anyopaque, cid: []const u8) anyerror!void {
     if (sk.keep(cid.ptr, @intCast(cid.len)) < 0) return failed();
 }
-fn edgesImpl(_: *anyopaque, arena: std.mem.Allocator, to: []const u8, rel: ?[]const u8) anyerror![]const w.store.Edge {
+fn edgesImpl(_: *anyopaque, arena: std.mem.Allocator, to: []const u8, rel: ?[]const u8) anyerror![]const c.store.Edge {
     const r = rel orelse "";
-    return w.store.decodeEdges(arena, try result(arena, sk.edges, .{ to.ptr, @as(u32, @intCast(to.len)), r.ptr, @as(u32, @intCast(r.len)) }));
+    return c.store.decodeEdges(arena, try result(arena, sk.edges, .{ to.ptr, @as(u32, @intCast(to.len)), r.ptr, @as(u32, @intCast(r.len)) }));
 }
 var dummy: u8 = 0;
 
 /// The record store through the `skein` get/put/putblock/keep imports: the
 /// bitcoin blocks held are kept, so their links are the kernel's edges (#42).
-pub fn store() w.store.Store {
+pub fn store() c.store.Store {
     return .{ .ptr = &dummy, .getFn = getImpl, .putFn = putImpl, .putBlockFn = putBlockImpl, .keepFn = keepImpl, .edgesFn = edgesImpl };
 }
 
@@ -88,23 +86,8 @@ pub fn input(a: std.mem.Allocator) !Value {
 
 /// The record a head names, or null.
 pub fn head(a: std.mem.Allocator, name: []const u8) !?[]const u8 {
-    const c = try result(a, sk.head, .{ name.ptr, @as(u32, @intCast(name.len)) });
-    return if (c.len > 0) c else null;
-}
-
-fn headImpl(_: *anyopaque, a: std.mem.Allocator, name: []const u8) anyerror!?[]const u8 {
-    return head(a, name);
-}
-
-/// The heads through the `head` import (config.zig reads the engine's app record).
-pub fn heads() config.Heads {
-    return .{ .ctx = &dummy, .headFn = headImpl };
-}
-
-/// The input as the engine reads its configuration (#72, config.zig): from the app record it was
-/// installed as (a call's `arg` names its route), else the genesis's.
-pub fn configured(a: std.mem.Allocator, in: Value, arg: ?Value) !Value {
-    return config.resolve(a, store(), heads(), in, arg);
+    const r = try result(a, sk.head, .{ name.ptr, @as(u32, @intCast(name.len)) });
+    return if (r.len > 0) r else null;
 }
 
 pub fn advance(name: []const u8, cid: []const u8) !void {
@@ -126,70 +109,7 @@ pub fn call(a: std.mem.Allocator, program: []const u8, func: []const u8, arg: Va
     return cbor.decode(a, try result(a, sk.call, .{ program.ptr, @as(u32, @intCast(program.len)), func.ptr, @as(u32, @intCast(func.len)), bytes.ptr, @as(u32, @intCast(bytes.len)) }));
 }
 
-fn callerImpl(_: *anyopaque, a: std.mem.Allocator, program: []const u8, func: []const u8, arg: Value) anyerror!Value {
-    return call(a, program, func, arg);
-}
-
-/// The overlay's calls of topics and lookup services (#50), over the `call` import.
-pub fn caller() w.overlay.Caller {
-    return .{ .ctx = &dummy, .callFn = callerImpl };
-}
-
-/// Broadcast a transaction (#65): the event {event: "broadcast", tx: <its
-/// CID>, beef: <its Atomic BEEF>}, addressed to no one — the host's wiring
-/// carries it. The step then awaits the transaction (engine.zig).
-fn broadcastImpl(_: *anyopaque, a: std.mem.Allocator, txid: [32]u8, beef: []const u8) anyerror!void {
-    const tx = w.store.hashCid(.tx, txid);
-    const ev = try cbor.encode(a, .{ .map = try a.dupe(cbor.Entry, &.{
-        .{ .key = "event", .value = .{ .text = "broadcast" } },
-        .{ .key = "tx", .value = .{ .cid = try a.dupe(u8, &tx) } },
-        .{ .key = "beef", .value = .{ .bytes = beef } },
-    }) });
-    _ = try result(a, sk.emit, .{ ev.ptr, @as(u32, @intCast(ev.len)) });
-}
-
-/// The broadcast gate's wiring (#57, #65), over the `emit` import.
-pub fn wire() submit.Wire {
-    return .{ .ctx = &dummy, .broadcastFn = broadcastImpl };
-}
-
-/// The libp2p provider's key: the address book's entry with role `libp2p` (#70, the head `peers`), or null.
-fn libp2pProvider(a: std.mem.Allocator) !?[]const u8 {
-    const s = store();
-    const root = (try head(a, "peers")) orelse return null;
-    const list = (try s.getValue(a, root)).getArray("peers") orelse return null;
-    for (list) |x| {
-        const p = try s.getValue(a, x.getCid("peer") orelse continue);
-        if (std.mem.eql(u8, p.getText("role") orelse "", "libp2p")) return p.getBytes("key");
-    }
-    return null;
-}
-
-var provider_key: []const u8 = "";
-
-/// Publish on a GossipSub topic (#74): a message to the libp2p provider, box `publish`, body {topic,
-/// body}. Not awaited — the provider's answer is recorded and runs nothing. Goes out when the step ends.
-fn publishImpl(_: *anyopaque, a: std.mem.Allocator, topic: []const u8, body: []const u8) anyerror!void {
-    const inner = try cbor.encode(a, .{ .map = try a.dupe(cbor.Entry, &.{
-        .{ .key = "topic", .value = .{ .text = topic } },
-        .{ .key = "body", .value = .{ .bytes = body } },
-    }) });
-    const msg = try cbor.encode(a, .{ .map = try a.dupe(cbor.Entry, &.{
-        .{ .key = "to", .value = .{ .bytes = provider_key } },
-        .{ .key = "box", .value = .{ .text = "publish" } },
-        .{ .key = "body", .value = .{ .bytes = inner } },
-    }) });
-    _ = try result(a, sk.emit, .{ msg.ptr, @as(u32, @intCast(msg.len)) });
-}
-
-/// The overlay's gossip out (#74), over `emit` to the libp2p provider; null when the address book has
-/// none (a host without libp2p): nothing is published.
-pub fn gossipOut(a: std.mem.Allocator) !?gossip.Out {
-    provider_key = (try libp2pProvider(a)) orelse return null;
-    return .{ .ctx = &dummy, .publishFn = publishImpl };
-}
-
-/// Rest the thread until a status for this record (a transaction's CID) arrives, or the deadline.
+/// Rest the thread until a reply to this record (a message this step sent), or what else names it, arrives.
 pub fn awaitRecord(cid: []const u8) !void {
     if (sk.@"await"(cid.ptr, @intCast(cid.len)) < 0) return failed();
 }
@@ -226,11 +146,11 @@ pub fn hexAlloc(a: std.mem.Allocator, b: []const u8) ![]u8 {
 
 /// Put a result record, keep it in the thread, and print its CID (hex) on
 /// stdout: what the thread's parent (or the router) reads.
-pub fn finish(a: std.mem.Allocator, s: w.store.Store, rec: Value) ![]const u8 {
-    const c = try s.putValue(a, rec);
-    try keep(c);
-    try std.Io.File.stdout().writeStreamingAll(io(), try std.mem.concat(a, u8, &.{ try hexAlloc(a, c), "\n" }));
-    return c;
+pub fn finish(a: std.mem.Allocator, s: c.store.Store, rec: Value) ![]const u8 {
+    const rc = try s.putValue(a, rec);
+    try keep(rc);
+    try std.Io.File.stdout().writeStreamingAll(io(), try std.mem.concat(a, u8, &.{ try hexAlloc(a, rc), "\n" }));
+    return rc;
 }
 
 /// A program's main around `run`: an error ends the step with exit 1 and a line on stderr.
@@ -246,11 +166,20 @@ pub fn main(comptime name: []const u8, comptime run: fn (std.mem.Allocator) anye
     return 0;
 }
 
-/// The network the shared chain is on (genesis defaults.walletNetwork, else main).
-pub fn network(step: Value) !w.chain.Network {
-    const name = if (step.get("defaults")) |d| d.getText("walletNetwork") orelse "main" else "main";
-    return w.chain.Network.parse(name) orelse error.BadConfig;
+/// A signed message (#70): `body` to `to` (an identity key, 33 bytes) in `box`
+/// → the message's CID. It goes out when the step ends without error.
+pub fn send(a: std.mem.Allocator, to: []const u8, box: []const u8, body: Value) ![]const u8 {
+    const msg = try cbor.encode(a, .{ .map = try a.dupe(cbor.Entry, &.{
+        .{ .key = "to", .value = .{ .bytes = to } },
+        .{ .key = "box", .value = .{ .text = box } },
+        .{ .key = "body", .value = .{ .bytes = try cbor.encode(a, body) } },
+    }) });
+    return result(a, sk.emit, .{ msg.ptr, @as(u32, @intCast(msg.len)) });
 }
 
-/// The chain + settlement core's state (the head `wallet`, #29/#37), shared with a wallet in the same instance.
-pub const state_head = "wallet";
+/// The instance's own identity key (the input's `self.identity`): a message to it is looped back
+/// into the instance (skein #79: to another app of its own, as the instance).
+pub fn selfKey(in: Value) ?[]const u8 {
+    const s = in.get("self") orelse return null;
+    return s.getBytes("identity");
+}
