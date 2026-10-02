@@ -1,13 +1,12 @@
 {
   "kind": "app",
   "name": "overlay",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "programs": {
     "overlay": "bin/overlay.wasm",
     "topic-demo": "bin/topic-demo.wasm",
     "lookup-demo": "bin/lookup-demo.wasm"
   },
-  "handler": "overlay",
   "config": {
     "overlay": {
       "topics": {
@@ -21,44 +20,17 @@
           ]
         }
       },
-      "status": "$status",
       "gossip": {
         "tm_demo": true
       }
     }
   },
-  "requires": [],
-  "routes": [
-    {
-      "path": "/listTopicManagers",
-      "program": "overlay",
-      "fn": "listTopicManagers",
-      "auth": "none"
-    },
-    {
-      "path": "/listLookupServiceProviders",
-      "program": "overlay",
-      "fn": "listLookupServiceProviders",
-      "auth": "none"
-    },
-    {
-      "path": "/getDocumentationForTopicManager",
-      "program": "overlay",
-      "fn": "topicDocumentation",
-      "auth": "none"
-    },
-    {
-      "path": "/getDocumentationForLookupServiceProvider",
-      "program": "overlay",
-      "fn": "lookupDocumentation",
-      "auth": "none"
-    }
+  "requires": ["chain/1"],
+  "dispatch": [
+    {"transport": "http", "address": "/listTopicManagers", "sender": "*", "program": "overlay", "fn": "listTopicManagers"},
+    {"transport": "http", "address": "/listLookupServiceProviders", "sender": "*", "program": "overlay", "fn": "listLookupServiceProviders"},
+    {"transport": "http", "address": "/getDocumentationForTopicManager", "sender": "*", "program": "overlay", "fn": "topicDocumentation"},
+    {"transport": "http", "address": "/getDocumentationForLookupServiceProvider", "sender": "*", "program": "overlay", "fn": "lookupDocumentation"}
   ],
-  "heads": [
-    "overlay",
-    "wallet",
-    "overlay:gossip",
-    "ls:*"
-  ],
-  "description": "Overlay services (BRC-22 submit, BRC-24 lookup; docs/OVERLAY.md): the engine handles the submit entries, the chain feed and the status provider's messages, and serves submit and lookup as route handlers; tm_demo and ls_demo are its example topic manager and lookup service. Its configuration is config.overlay, read from the app record at every step; the install derives its wiring from it (boxes submit, chain, status; routes /submit, /lookup, libp2p:<topic>, -admit, -proof; heads ls:<service>). Gossip on <topic>, <topic>-admit, <topic>-proof (#74)."
+  "description": "Overlay services (BRC-22 submit, BRC-24 lookup; docs/OVERLAY.md): the engine judges submissions with the app's topic managers, hands each to the chain app (shruggr/skein-chain, required: chain/1) and admits it on the chain app's answer (accepted or proven), keeps what its topics admitted under <app>/state, and serves submit and lookup as route handlers; tm_demo and ls_demo are its example topic manager and lookup service (ls_demo's index under <app>/ls_demo). Its configuration is config.overlay, read from the app record <app>/app at every step; the install derives its wiring from it: http /submit and /lookup, libp2p <topic>, <topic>-admit, <topic>-proof (gossip, #74), and the box <app> from events and from the instance itself."
 }
