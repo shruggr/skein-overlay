@@ -294,6 +294,17 @@ fn submit(a: Allocator, in: Value, req: Value) !Value {
     if (eql(u8, req.getText("transport") orelse "", "libp2p")) return gossip(a, in, req);
     const th = header(req, "x-topics") orelse return failure(a, 400, "Missing x-topics header");
     const requested = parseTopics(a, th) catch return failure(a, 400, "Invalid x-topics header: expected a comma-separated list or JSON string array");
+    // shruggr/skein#121: the kernel's door put the BEEF's pointer record where its bytes were (the row's
+    // `filter: "beef"`); bytes are a body it did not take as a BEEF (framed with off-chain values).
+    if (req.getCid("body")) |rc| {
+        const topics = try served(a, requested, try configMap(a, in, "overlayTopics"));
+        var st = try load(a, in);
+        if (req.get("resolved") != null) {
+            const rec = vm.store().getValue(a, rc) catch return failure(a, 400, "Invalid BEEF");
+            return submitted(a, &st, c.record.subjectOf(rec) orelse return failure(a, 400, "Invalid BEEF"), topics);
+        }
+        return submitRouted(a, in, &st, .{ .record = rc }, topics, null, req);
+    }
     var body = req.getBytes("body") orelse "";
     if (body.len == 0) return failure(a, 400, "Missing or empty BEEF body");
     var off: ?[]const u8 = null;
@@ -313,8 +324,13 @@ fn submit(a: Allocator, in: Value, req: Value) !Value {
         const b = c.beef.parse(a, body) catch return failure(a, 400, "Invalid BEEF");
         return submitted(a, &st, b.subject() orelse return failure(a, 400, "Invalid BEEF"), topics);
     }
-    // The BEEF decoded once into records in the step's write cache, verified, judged by the topics (#50).
-    const routed = switch (try submit_mod.route(a, ev_.caller(), &st, in, body, topics, off, try sourceOf(a, req, null))) {
+    return submitRouted(a, in, &st, .{ .bytes = body }, topics, off, req);
+}
+
+/// The submit's route half (submit.zig `route`) and what follows: verified, judged by the topics
+/// (#50), the submission's thread launched, or the answer now.
+fn submitRouted(a: Allocator, in: Value, st: *State, beef: submit_mod.Input, topics: []const []const u8, off: ?[]const u8, req: Value) !Value {
+    const routed = switch (try submit_mod.route(a, ev_.caller(), st, in, beef, topics, off, try sourceOf(a, req, null))) {
         .refused => |why| return failure(a, 400, why),
         // Valid but admitted nowhere: BRC-22's answer is 200 with an empty STEAK.
         .nothing => {
@@ -323,13 +339,13 @@ fn submit(a: Allocator, in: Value, req: Value) !Value {
             return respond(a, 200, "application/json", try jsonOf(a, Steak{ .topics = topics, .entries = entries }));
         },
         // Resubmitted, judged already (#57): the answer is the state's, now.
-        .unchanged => |txid| return submitted(a, &st, txid, topics),
+        .unchanged => |txid| return submitted(a, st, txid, topics),
         // Resubmitted while the first submission's thread awaits the chain app (#66): this request waits
         // on that same thread and gets the same answer, from the state, once it comes to rest.
         .pending => |txid| {
-            const rec = (try st.pendingRecord(txid)) orelse return submitted(a, &st, txid, topics);
-            const thread = rec.getCid("thread") orelse return submitted(a, &st, txid, topics);
-            vm.awaitRecord(thread) catch return submitted(a, &st, txid, topics); // at rest already: the state answers
+            const rec = (try st.pendingRecord(txid)) orelse return submitted(a, st, txid, topics);
+            const thread = rec.getCid("thread") orelse return submitted(a, st, txid, topics);
+            vm.awaitRecord(thread) catch return submitted(a, st, txid, topics); // at rest already: the state answers
             return waiting(a);
         },
         .admit => |x| x,
@@ -361,12 +377,13 @@ fn waiting(a: Allocator) !Value {
 /// the publisher's fault).
 fn gossip(a: Allocator, in: Value, req: Value) !Value {
     const t = req.getText("topic") orelse return verdictOf(a, "ignore", "not a topic message");
-    const body = req.getBytes("body") orelse "";
-    if (body.len == 0) return verdictOf(a, "ignore", "Missing or empty BEEF body");
+    // shruggr/skein#121: the door's pointer record (the row's `filter: "beef"`), or the bytes as received.
+    const beef: submit_mod.Input = if (req.getCid("body")) |rc| .{ .record = rc } else .{ .bytes = req.getBytes("body") orelse "" };
+    if (beef == .bytes and beef.bytes.len == 0) return verdictOf(a, "ignore", "Missing or empty BEEF body");
     const topics = try served(a, &.{t}, try configMap(a, in, "overlayTopics"));
     if (topics.len == 0) return verdictOf(a, "ignore", "the topic is not served here");
     var st = try load(a, in);
-    const routed = switch (try submit_mod.route(a, ev_.caller(), &st, in, body, topics, null, try sourceOf(a, req, t))) {
+    const routed = switch (try submit_mod.route(a, ev_.caller(), &st, in, beef, topics, null, try sourceOf(a, req, t))) {
         .refused => |why| return verdictOf(a, "ignore", why),
         .nothing => |why| return verdictOf(a, "ignore", why),
         .unchanged => return verdictOf(a, "ignore", "already judged"),

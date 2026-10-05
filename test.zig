@@ -285,13 +285,20 @@ const Instance = struct {
         return self.routeFrom(bytes, null);
     }
     fn routeFrom(self: *Instance, bytes: []const u8, source: ?Value) !submit.Routed {
+        return self.routeWith(.{ .bytes = bytes }, source);
+    }
+    /// The kernel's door wrote the BEEF's pointer record (skein #121): the handler gets its CID.
+    fn routeRecord(self: *Instance, rc: []const u8) !submit.Routed {
+        return self.routeWith(.{ .record = rc }, null);
+    }
+    fn routeWith(self: *Instance, input: submit.Input, source: ?Value) !submit.Routed {
         var ovl = Overlay{ .inner = self.ms.store(), .arena = self.a };
         self.current = ovl.store();
         defer self.current = self.ms.store();
         const ch = try state.chainView(self.a, ovl.store(), self.chain_root, .regtest);
         var st = try state.State.load(self.a, ovl.store(), self.ov_root, ch);
         st.now = self.now;
-        return submit.route(self.a, self.caller(), &st, self.in, bytes, &.{"tm_demo"}, null, source);
+        return submit.route(self.a, self.caller(), &st, self.in, input, &.{"tm_demo"}, null, source);
     }
 
     /// A step: the context over the store as it stands, then the state saved.
@@ -1017,4 +1024,78 @@ test "the configuration (skein #72, #79): an installed engine's config.overlay f
     const after = try config.resolve(a, s, hm.heads(), genesis_in, arg);
     const now_topics = try calls.configObject(a, after, "overlayTopics");
     try std.testing.expect(!now_topics.contains("tm_demo") and now_topics.contains("tm_two"));
+}
+
+/// The pointer record the kernel's door would write for `wire` (skein kernel-zig/src/beef.zig
+/// `record`), its blocks put: each transaction under its txid, each BUMP's bytes as a raw block,
+/// and every BUMP proving what it holds (the door checked it against chain/state).
+fn pointerOf(a: Allocator, s: Store, wire: []const u8) ![]const u8 {
+    const b = try beef.parse(a, wire);
+    const txs = try a.alloc(Value, b.entries.len);
+    const marks = try a.alloc(Value, b.entries.len);
+    for (b.entries, txs, marks) |e, *t, *m| {
+        const tc = try a.dupe(u8, &c.store.hashCid(.tx, e.txid));
+        if (e.raw) |r| try s.putBlock(tc, r);
+        t.* = .{ .cid = tc };
+        m.* = switch (e.format) {
+            .txid_only => .{ .text = "txid" },
+            .raw_with_bump => .{ .uint = e.bump.? },
+            .raw => .null,
+        };
+    }
+    const bumps = try a.alloc(Value, b.bumps.len);
+    for (b.bumps, bumps, 0..) |*p, *v, i| {
+        const pb = try p.bytes(a);
+        var d: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(pb, &d, .{});
+        const pc = try a.dupe(u8, &([_]u8{ 0x01, 0x55, 0x12, 0x20 } ++ d));
+        try s.putBlock(pc, pb);
+        var proves: std.ArrayList(Value) = .empty;
+        for (b.entries, 0..) |e, k| if (e.bump == i or (e.format == .raw and beef.bumpHas(p.*, e.txid))) try proves.append(a, .{ .uint = k });
+        v.* = .{ .map = try a.dupe(cbor.Entry, &.{
+            .{ .key = "height", .value = .{ .uint = p.block_height } },
+            .{ .key = "path", .value = .{ .cid = pc } },
+            .{ .key = "block", .value = .null },
+            .{ .key = "proves", .value = .{ .array = proves.items } },
+        }) };
+    }
+    return s.putValue(a, .{ .map = try a.dupe(cbor.Entry, &.{
+        .{ .key = "kind", .value = .{ .text = "beef" } },
+        .{ .key = "form", .value = .{ .text = if (b.atomic != null) "atomic" else "beef" } },
+        .{ .key = "version", .value = .{ .uint = if (b.version == beef.V1) 1 else 2 } },
+        .{ .key = "subject", .value = .{ .cid = try a.dupe(u8, &c.store.hashCid(.tx, b.subject().?)) } },
+        .{ .key = "txs", .value = .{ .array = txs } },
+        .{ .key = "marks", .value = .{ .array = marks } },
+        .{ .key = "bumps", .value = .{ .array = bumps } },
+    }) });
+}
+
+test "a submission by its pointer record (skein #121): read, not parsed or proven again; the event and the ingest carry its CID; beefOf gives the bytes back" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = c.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var inst = try Instance.init(a, &ms);
+    const k = try keys(0x42);
+    const f = try fund(a, 0x11, 2, &k.p2pkh);
+    try inst.headers(&.{&f.h1});
+    const t1 = try spend(a, &f.tx, 0, &.{ .{ 1, &k.token }, .{ 9_000, &k.p2pkh } }, k.priv);
+    const wire = try withFund(a, f, t1);
+    const rc = try pointerOf(a, ms.store(), wire);
+    const parses = beef.parses;
+    const r = try inst.routeRecord(rc);
+    try std.testing.expectEqual(parses, beef.parses);
+    const ev = r.admit.event;
+    try std.testing.expectEqualSlices(u8, rc, ev.getCid("beef").?);
+    try std.testing.expect(ev.getBytes("beef") == null);
+    _ = try inst.begin(ev);
+    const sent = inst.wire_.last();
+    try std.testing.expectEqualStrings("ingest", sent.body.getText("fn").?);
+    try std.testing.expectEqualSlices(u8, rc, sent.body.get("args").?.getCid("beef").?);
+    // The bytes the chain app and the gossip read back: exactly the submitted BEEF.
+    try std.testing.expectEqualSlices(u8, wire, try c.record.beefOf(a, ms.store(), rc));
+    // A record of something else: refused.
+    const junk = try ms.store().putValue(a, .{ .map = try a.dupe(cbor.Entry, &.{.{ .key = "kind", .value = .{ .text = "other" } }}) });
+    try std.testing.expectEqualStrings("InvalidBeef", (try inst.routeRecord(junk)).refused);
 }

@@ -192,7 +192,9 @@ pub fn admitted(a: Allocator, out: Out, st: *st_mod.State, in: Value, ev: Value,
         if (ap.records.len == 0 or !(try st.isApplied(t, txid))) continue;
         if (!try enabled(a, in, t)) continue;
         if (!(eql(u8, src.transport, "libp2p") and eql(u8, src.topic, t))) {
-            const b = ev.getBytes("beef") orelse (try st.ch.beefOf(txid)) orelse return error.UnknownTransaction;
+            // The BEEF as received: from its pointer record (shruggr/skein#121: `beefOf` gives the exact
+            // bytes back from the blocks), or the bytes the event carries.
+            const b = if (ev.getCid("beef")) |rc| try c.record.beefOf(a, st.store, rc) else ev.getBytes("beef") orelse (try st.ch.beefOf(txid)) orelse return error.UnknownTransaction;
             try out.publish(a, t, b);
             n += 1;
         }

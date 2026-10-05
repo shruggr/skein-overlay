@@ -9,7 +9,7 @@ its docs/CHAIN.md), under `chain/state`. The overlay reads it by CID and
 asks the chain app to take a transaction; what the chain app answers
 (accepted, proven, rejected) is the overlay's gate.
 
-A submitted transaction is decoded once into records, checked against the
+A submitted transaction is decoded once into records (by the kernel's door, skein #121), checked against the
 chain app's headers, then judged by topic managers. Topic managers are
 programs. Lookup services are programs too, and they are pluggable in the
 submission flow as topic managers are: the engine calls their hooks when a
@@ -44,7 +44,7 @@ storage are not ported.
 |---|---|
 | `src/engine.zig` → `overlay.wasm` | The engine: called, the front door's route handlers (`routes.zig`); stepped, the submission's thread, a watch, a peer's admit. |
 | `src/submit.zig` | A submission from the wire to the state: the route's half (decode, verify, judge — in the front door's step on the request), the submission's thread (the BEEF to the chain app; admitted on its answer), the watch. |
-| `src/state.zig` | The overlay's state (`<app>/state`) over the chain state (read only): the maps, the previous coins, recording a judgement (`apply`), removing one (`unapply`), `inTopic`, `spender`; the one BEEF parse (`decode`), SPV over the records (`verifyDecoded`), BEEF out for a lookup (`beefFor`, `beefOfMany`). |
+| `src/state.zig` | The overlay's state (`<app>/state`) over the chain state (read only): the maps, the previous coins, recording a judgement (`apply`), removing one (`unapply`), `inTopic`, `spender`; the door's pointer record read (`decodeRecord`, #121) or the one BEEF parse of bytes (`decode`), SPV over the records (`verifyDecoded`; BUMPs only for bytes), BEEF out for a lookup (`beefFor`, `beefOfMany`). |
 | `src/calls.zig` | The configuration as the engine reads it (`configObject`, `listeners`, the app's name) and its calls of topics and lookup services (`Caller`, `hookAdmitted`, `hookRejected`). |
 | `src/routes.zig` | The route handlers (#40): the overlay-express wire contract, and the gossip's inbound routes (`peerAdmit`, `peerProof`, #74). |
 | `src/gossip.zig` | The three gossip topics (#74): message shapes, what an admission and a proof publish, a peer's proof checked, the peer-admit records. |
@@ -65,7 +65,7 @@ zig build bin    # the same, into bin/ (committed)
 zig build test   # the submission flow and the contracts, natively
 ```
 
-The SDK (shruggr/skein-sdk v0.4.0) is a URL+hash dependency in
+The SDK (shruggr/skein-sdk v0.4.0 + `chain.record`, its `beef-as-cid` commit until tagged) is a URL+hash dependency in
 `build.zig.zon`; the overlay uses its `chain` module only (BEEF, SPV,
 merkle paths, the store and its maps, and `state`: the chain app's
 records), and bsvz comes through it. No chain tracker and no wallet
@@ -91,23 +91,29 @@ Paths below that are not this repo's (`docs/*.md`, `programs/frontdoor`,
 
 ## A submission, from the wire to the state (#50)
 
-**Decode once.** The `/submit` route handler runs in the front door's step
-on the request (#68: the request is appended as received). It decodes the
-submitted BEEF (V1, V2 or Atomic; the subject is the Atomic one's, or else
-the last) exactly once, into records:
+**Decoded at the door** (shruggr/skein#121). The submit rows (`/<app>/submit`
+and the libp2p `<topic>`) name `filter: "beef"`. Before the request's
+entry is written, the kernel's door decodes the BEEF in its body (V1, V2,
+Atomic or Outpoint; the subject is the Atomic or Outpoint one's, or else
+the last) — each transaction stored once as its `bitcoin-tx` block (its
+CID is its txid), each BUMP as the raw block of its bytes and the merkle
+nodes it reveals — checks every BUMP against the headers in `chain/state`,
+and puts the BEEF's **pointer record** where the bytes were: the handler's
+`body` is that record's CID (skein-sdk `chain.record`; a bad BUMP is a
+refusal entry and the handler never runs). The submit reads the record
+(`state.decodeRecord`) and does **not** prove the BUMPs again. A body the
+door did not take as a BEEF — framed with off-chain values (`VarInt(len) ‖
+BEEF ‖ values`: no BEEF pattern leads it) — is decoded here once, into
+records in the step's write cache (`state.decode`), and its BUMPs checked
+here as before.
 
-- each transaction a `bitcoin-tx` block (its CID is its txid);
-- each BUMP the merkle nodes it reveals, 64-byte `bitcoin-tx` blocks (#29,
-  #42: a node's CID is its merkle hash).
+SPV for the rest (`state.verifyDecoded`), the previous coins and the topic
+managers read typed records through `get` (the store, and the step's
+write cache), and the chain state, read only (`head("chain/state")`):
 
-The blocks are `putblock`ed, so they land in the step's write cache. SPV
-(`state.verifyDecoded`), the previous coins and the topic managers read
-typed records through `get`, which reads through the cache, and the chain
-state, read only (`head("chain/state")`):
-
-- every BUMP's root is the chain app's header's merkle root at its height
-  (an unknown height is refused), and each transaction a BUMP proves is
-  reached from that root through the merkle nodes;
+- (bytes only) every BUMP's root is the chain app's header's merkle root at
+  its height (an unknown height is refused), and each transaction a BUMP
+  proves is reached from that root through the merkle nodes;
 - every other transaction's inputs come from a transaction decoded before it
   or held by the chain app, with their scripts verified;
 - a subject the chain app has rejected is refused (`TransactionRejected`),
@@ -115,7 +121,7 @@ state, read only (`head("chain/state")`):
   (`DoubleSpend`).
 
 In a test build the SDK's `chain/src/beef.zig` counts its parses
-(`beef.parses`); this repo's test.zig asserts one parse per submit.
+(`beef.parses`); this repo's test.zig asserts one parse per submit of bytes (a pointer record is read, not parsed).
 
 **Judge in the step.** For each requested topic this overlay serves and has
 not judged the transaction for, the handler calls the topic's program (fn
@@ -140,7 +146,7 @@ instead, and the app's row from `event` starts the same engine; its verdict
 goes back at once.)
 
 ```
-{kind: "submit", txid (hex), beef: bytes (the BEEF as received, off-chain framing taken off),
+{kind: "submit", txid (hex), beef: <the pointer record's CID> | bytes (the BEEF as received, off-chain framing taken off),
  topics: [{topic, previousCoins, outputsToAdmit, coinsToRetain}], offChainValues?: bytes,
  source?: {transport, topic?, request}}
 ```
@@ -150,7 +156,7 @@ goes back at once.)
    instance) the chain app's ingest, box `chain`:
 
    ```
-   {fn: "ingest", args: {beef}}
+   {fn: "ingest", args: {beef}}     beef: the pointer record's CID (#121), or the bytes
    ```
 
    notes the submission `pending` (`<app>/state` map `pending`: `{kind:
@@ -541,7 +547,8 @@ a txid and a block hash are hex in display order.
 `{topic, body}` (docs/MESSAGES.md, "The providers"), emitted from the step
 and not awaited. With no libp2p provider in the address book nothing is
 published. The raw submission is the submit event's `beef` (the off-chain
-values do not travel). A submission that arrived by gossip on `<topic>` is
+values do not travel): from its pointer record, the exact bytes received,
+re-encoded by skein-sdk's `chain.record.beefOf` (#121). A submission that arrived by gossip on `<topic>` is
 not re-published there; a proof that arrived on `<topic>-proof` is not
 re-published. The proof is the chain app's: the BUMP rebuilt from its
 merkle nodes (`State.proofFor`), one txid's path, no compound BUMP. It is

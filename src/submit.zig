@@ -2,11 +2,14 @@
 //! Three parts:
 //!
 //! - **The route** (`route`, the front door's `/submit` handler, and the
-//!   `libp2p:<topic>` one: an in-VM call, writing nothing). The BEEF is
-//!   decoded once, into records (`bitcoin-tx` blocks and merkle nodes, put
-//!   into the call's in-memory overlay), checked over them against the chain
-//!   app's headers (state.zig `verifyDecoded`: SPV read through `get`, the
-//!   chain state read only), and judged: each requested topic this overlay
+//!   `libp2p:<topic>` one: an in-VM call, writing nothing). The BEEF comes
+//!   as the pointer record the kernel's door wrote (shruggr/skein#121: the
+//!   transactions are `bitcoin-tx` blocks in the store, every BUMP checked
+//!   against the chain app's headers there) and is read, not proven again;
+//!   bytes (a body framed with off-chain values, or a host with no door) are
+//!   decoded once into records and checked against the headers. Then SPV for
+//!   the unproven transactions (state.zig `verifyDecoded`, read through
+//!   `get`, the chain state read only), and the judgement: each requested topic this overlay
 //!   serves and has not judged it before is called (`identify`, topic.zig)
 //!   on the transaction's CID with its previous coins. If no topic takes
 //!   anything, nothing persists. Otherwise it returns the submit event.
@@ -36,7 +39,7 @@
 //! The submit event (box `<app>` from the libp2p route; or the args of the
 //! thread POST /submit launches):
 //!
-//!   {kind: "submit", txid (hex), beef: bytes (the BEEF as received, the off-chain framing taken off),
+//!   {kind: "submit", txid (hex), beef: <the pointer record> | bytes (the BEEF as received, the off-chain framing taken off),
 //!    topics: [{topic, previousCoins, outputsToAdmit, coinsToRetain}], offChainValues?: bytes,
 //!    source?: {transport, topic?, request: <the request record>}}
 //!
@@ -101,13 +104,44 @@ pub const Routed = union(enum) {
     admit: struct { event: Value, txid: [32]u8 },
 };
 
-/// The route's half (a call): decode once, verify, judge. `st` is the overlay's state over the
-/// call's store; `topics` are the requested ones this overlay serves; `in` is the call's input
-/// (`defaults`, `programs`); `beef` is the BEEF as received (no framing); `source` is carried on
-/// the event (#74).
-pub fn route(a: Allocator, caller: calls.Caller, st: *State, in: Value, beef: []const u8, topics: []const []const u8, off: ?[]const u8, source: ?Value) !Routed {
-    const d = state.decode(a, st.store, beef) catch |e| return .{ .refused = @errorName(e) };
-    const sub = state.verifyDecoded(a, st.store, st.ch, d) catch |e| switch (e) {
+/// A submission's BEEF (shruggr/skein#121): the pointer record the kernel's door wrote — its CID;
+/// the transactions and BUMPs are blocks in the store already, every BUMP checked against the
+/// chain state's headers at the door — or the bytes (a body framed with off-chain values, whose
+/// leading bytes are no BEEF pattern; a host with no door), decoded and checked here as before.
+pub const Input = union(enum) {
+    record: []const u8,
+    bytes: []const u8,
+
+    /// The value the submit event and the ingest message carry: the record's link, or the bytes.
+    pub fn value(self: Input) Value {
+        return switch (self) {
+            .record => |c_| .{ .cid = c_ },
+            .bytes => |b| .{ .bytes = b },
+        };
+    }
+
+    /// An event's or a message's `beef` field read back.
+    pub fn of(v: ?Value) ?Input {
+        const x = v orelse return null;
+        return switch (x) {
+            .cid => |c_| .{ .record = c_ },
+            .bytes => |b| .{ .bytes = b },
+            else => null,
+        };
+    }
+};
+
+/// The route's half (a call): verify, judge. `st` is the overlay's state over the call's store;
+/// `topics` are the requested ones this overlay serves; `in` is the call's input (`defaults`,
+/// `programs`); `beef` is the BEEF (its pointer record, or bytes with no framing); `source` is
+/// carried on the event (#74). A pointer record is read, not decoded again, and its BUMPs are not
+/// proven again (the door did, #121); bytes are decoded once (#50) and checked.
+pub fn route(a: Allocator, caller: calls.Caller, st: *State, in: Value, beef: Input, topics: []const []const u8, off: ?[]const u8, source: ?Value) !Routed {
+    const d = switch (beef) {
+        .record => |rc| state.decodeRecord(a, st.store, rc),
+        .bytes => |b| state.decode(a, st.store, b),
+    } catch |e| return .{ .refused = @errorName(e) };
+    const sub = state.verifyDecoded(a, st.store, st.ch, d, beef == .record) catch |e| switch (e) {
         // A known-rejected transaction is a valid request that admits nothing (200, empty STEAK).
         error.TransactionRejected => return .{ .nothing = @errorName(e) },
         else => return .{ .refused = @errorName(e) },
@@ -139,8 +173,8 @@ pub fn route(a: Allocator, caller: calls.Caller, st: *State, in: Value, beef: []
     return .{ .admit = .{ .event = try event(a, sub.txid, beef, judged.items, off, source), .txid = sub.txid } };
 }
 
-/// The submit event: the BEEF, the judgements, the off-chain values, the source.
-pub fn event(a: Allocator, txid: [32]u8, beef: []const u8, judged: []const Judged, off: ?[]const u8, source: ?Value) !Value {
+/// The submit event: the BEEF (its pointer record's link, or bytes), the judgements, the off-chain values, the source.
+pub fn event(a: Allocator, txid: [32]u8, beef: Input, judged: []const Judged, off: ?[]const u8, source: ?Value) !Value {
     const topics = try a.alloc(Value, judged.len);
     for (judged, topics) |j, *o| o.* = .{ .map = try a.dupe(cbor.Entry, &.{
         .{ .key = "topic", .value = .{ .text = j.topic } },
@@ -152,7 +186,7 @@ pub fn event(a: Allocator, txid: [32]u8, beef: []const u8, judged: []const Judge
     try es.appendSlice(a, &.{
         .{ .key = "kind", .value = .{ .text = "submit" } },
         .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &c.header.toHex(txid)) } },
-        .{ .key = "beef", .value = .{ .bytes = beef } },
+        .{ .key = "beef", .value = beef.value() },
         .{ .key = "topics", .value = .{ .array = topics } },
     });
     if (off) |o| try es.append(a, .{ .key = "offChainValues", .value = .{ .bytes = o } });
@@ -193,11 +227,11 @@ pub const Ctx = struct {
     thread: ?[]const u8 = null,
 };
 
-/// The ingest message's body: `{fn: "ingest", args: {beef}}`.
-pub fn ingestBody(a: Allocator, beef: []const u8) !Value {
+/// The ingest message's body: `{fn: "ingest", args: {beef}}` — the pointer record's CID (#121), or bytes.
+pub fn ingestBody(a: Allocator, beef: Input) !Value {
     return .{ .map = try a.dupe(cbor.Entry, &.{
         .{ .key = "fn", .value = .{ .text = "ingest" } },
-        .{ .key = "args", .value = .{ .map = try a.dupe(cbor.Entry, &.{.{ .key = "beef", .value = .{ .bytes = beef } }}) } },
+        .{ .key = "args", .value = .{ .map = try a.dupe(cbor.Entry, &.{.{ .key = "beef", .value = beef.value() }}) } },
     }) };
 }
 
@@ -216,7 +250,7 @@ pub fn watchBody(a: Allocator, txid: [32]u8, ingest: []const u8) !Value {
 /// submission pending. → the ingest message's CID: the thread awaits it.
 pub fn begin(cx: Ctx, ev: Value) ![]const u8 {
     const txid = try txidOf(ev);
-    const beef = ev.getBytes("beef") orelse return error.BadEvent;
+    const beef = Input.of(ev.get("beef")) orelse return error.BadEvent;
     const m = try cx.wire.send(cx.a, chain_box, try ingestBody(cx.a, beef));
     try cx.st.putPending(txid, cx.thread, m);
     return m;

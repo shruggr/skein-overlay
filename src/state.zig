@@ -462,6 +462,39 @@ pub fn decode(a: Allocator, s: Store, bytes: []const u8) !Decoded {
     return .{ .subject = subject, .txs = txs.items, .nodes = nodes.items, .bumps = bumps.items, .proven = proven.items, .txid_only = txid_only.items };
 }
 
+/// A submission the kernel's door decoded (shruggr/skein#121): its pointer record, read. The
+/// transactions are blocks in the store already; every BUMP was checked against the chain state's
+/// headers at the door, so `proven` names the transactions its BUMPs prove (the record's `proves`)
+/// and nothing is proven again (`verifyDecoded`'s `door`). A txid-only subject is refused.
+pub fn decodeRecord(a: Allocator, s: Store, rc: []const u8) !Decoded {
+    const rec = s.getValue(a, rc) catch return error.InvalidBeef;
+    if (!c.record.isRecord(rec)) return error.InvalidBeef;
+    const subject = c.record.subjectOf(rec) orelse return error.InvalidBeef;
+    const tv = rec.getArray("txs") orelse return error.InvalidBeef;
+    const marks = rec.getArray("marks") orelse return error.InvalidBeef;
+    if (marks.len != tv.len) return error.InvalidBeef;
+    const by = c.record.provenBy(a, rec) catch return error.InvalidBeef;
+    const bv = rec.getArray("bumps") orelse &.{};
+    var txs: std.ArrayList(DecodedTx) = .empty;
+    var proven: std.ArrayList(Proven) = .empty;
+    var txid_only: std.ArrayList([32]u8) = .empty;
+    var has_subject = false;
+    for (tv, marks, by) |t, m, p| {
+        const tc = if (t == .cid) t.cid else return error.InvalidBeef;
+        const txid = store_mod.bitcoinHash(tc) orelse return error.InvalidBeef;
+        if (m == .text) {
+            try txid_only.append(a, txid);
+            continue;
+        }
+        const raw = s.get(a, tc) catch return error.InvalidBeef;
+        try txs.append(a, .{ .txid = txid, .raw = raw });
+        has_subject = has_subject or std.mem.eql(u8, &txid, &subject);
+        if (p) |i| try proven.append(a, .{ .txid = txid, .height = @intCast(bv[i].getUint("height") orelse return error.InvalidBeef), .pos = .{ .depth = 0, .offset = 0 } });
+    }
+    if (!has_subject) return error.InvalidBeef; // a txid-only subject
+    return .{ .subject = subject, .txs = txs.items, .nodes = &.{}, .bumps = &.{}, .proven = proven.items, .txid_only = txid_only.items };
+}
+
 fn provenAt(d: Decoded, txid: [32]u8) ?u32 {
     for (d.proven) |p| if (std.mem.eql(u8, &p.txid, &txid)) return p.height;
     return null;
@@ -478,14 +511,18 @@ fn rootAtHeight(d: Decoded, height: u32) ?[32]u8 {
 /// transaction decoded before it or held by the chain app, read through `get`, with their scripts
 /// verified; a txid-only entry names a transaction the chain holds. A subject the chain has
 /// rejected, or spending an output a proven transaction spends, is refused. → the subject.
-pub fn verifyDecoded(a: Allocator, s: Store, ch: *Chain, d: Decoded) !Subject {
-    for (d.bumps) |b| {
-        const want = (try ch.chain().rootAt(b.height)) orelse return error.UnknownHeader;
-        if (!std.mem.eql(u8, &want, &b.root)) return error.RootMismatch;
-    }
-    for (d.proven) |p| {
-        const root = rootAtHeight(d, p.height) orelse return error.NotInBump;
-        if ((try merkle.pathFor(a, s, root, p.height, p.txid, p.pos)) == null) return error.NotInBump;
+/// `door`: the kernel's door proved the BUMPs (shruggr/skein#121: a pointer record, `decodeRecord`):
+/// they are not proven again.
+pub fn verifyDecoded(a: Allocator, s: Store, ch: *Chain, d: Decoded, door: bool) !Subject {
+    if (!door) {
+        for (d.bumps) |b| {
+            const want = (try ch.chain().rootAt(b.height)) orelse return error.UnknownHeader;
+            if (!std.mem.eql(u8, &want, &b.root)) return error.RootMismatch;
+        }
+        for (d.proven) |p| {
+            const root = rootAtHeight(d, p.height) orelse return error.NotInBump;
+            if ((try merkle.pathFor(a, s, root, p.height, p.txid, p.pos)) == null) return error.NotInBump;
+        }
     }
     for (d.txid_only) |t| if ((try ch.txRaw(t)) == null) return error.UnknownTxidOnly;
     for (d.txs, 0..) |t, i| {
