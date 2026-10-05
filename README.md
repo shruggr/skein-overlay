@@ -76,8 +76,8 @@ lookup services, and `etc/app.json` naming them in `config.overlay`.
 ```zig
 .dependencies = .{
     .skein_overlay = .{
-        .url = "https://github.com/shruggr/skein-overlay/archive/refs/tags/v0.3.0.tar.gz",
-        .hash = "skein_overlay-0.3.0-IMuNgUtjEwCMjfeG0MOYcGW1uD8gssDxdSEn8Ixx1Eta",
+        .url = "https://github.com/shruggr/skein-overlay/archive/refs/tags/v0.4.0.tar.gz",
+        .hash = "skein_overlay-0.4.0-IMuNgRwfFADMLyxiAIDkDNkH4RwJT5SRmG5rqnV1RSXE",
     },
 },
 ```

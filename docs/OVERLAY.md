@@ -76,8 +76,8 @@ and `sk`. An overlay app of its own — its topic managers and lookup
 services — depends on skein-overlay by URL+hash, as on the SDK:
 
 ```zig
-// build.zig.zon: .skein_overlay = .{ .url = "https://github.com/shruggr/skein-overlay/archive/refs/tags/v0.3.0.tar.gz",
-//                                    .hash = "skein_overlay-0.3.0-IMuNgUtjEwCMjfeG0MOYcGW1uD8gssDxdSEn8Ixx1Eta" }
+// build.zig.zon: .skein_overlay = .{ .url = "https://github.com/shruggr/skein-overlay/archive/refs/tags/v0.4.0.tar.gz",
+//                                    .hash = "skein_overlay-0.4.0-IMuNgRwfFADMLyxiAIDkDNkH4RwJT5SRmG5rqnV1RSXE" }
 const ov = b.dependency("skein_overlay", .{ .target = wasi, .optimize = .ReleaseSafe });
 exe.root_module.addImport("topic", ov.module("topic"));   // pub fn main() u8 { return topic.main(identify); }
 exe.root_module.addImport("lookup", ov.module("lookup")); // pub fn main() u8 { return lookup.main(spec); }
