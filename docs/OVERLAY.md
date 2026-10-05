@@ -453,8 +453,10 @@ transaction, the BEEF that proves it exists on chain — its merkle path if
 it is proven, else its parents handled the same way, back to proven ones.
 That is the chain state's `chain.state.State.beefOf` (skein-sdk), read
 only; each `beef` is that Atomic BEEF of the output's transaction. Any BEEF
-handed out is built this way; anything else is not a valid BEEF. Token
-provenance is the topic manager's, judged at submission; history across
+handed out is built this way; anything else is not a valid BEEF. That is
+the least a BEEF carries: one may carry more transactions when there is a
+reason (a proof packet for a token's history, say), each built by the same
+rule. Token provenance is the topic manager's, judged at submission; history across
 overlays is GASP's (not built). The submission as handed over (the
 `applied` record's `beef`) is not what a lookup serves.
 
