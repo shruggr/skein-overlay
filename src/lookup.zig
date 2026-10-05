@@ -33,9 +33,10 @@
 //! the raw block of the bytes as received); its transactions and BUMPs are
 //! read from the store by CID, trimmed to the transaction's own ancestry,
 //! and an input that submission did not carry is filled from the parent's
-//! own submission when the overlay admitted that parent too. Nothing else
-//! of the shared store is walked: a parent neither carried nor admitted is
-//! left out, a proven transaction carries its own BUMP as it was handed.
+//! own submission when the overlay admitted that parent too. A transaction
+//! carried unproven that the chain state has proven since is served with
+//! that proof (its ancestry below it dropped). Nothing else of the shared
+//! store is walked: a parent neither carried nor admitted is left out.
 //!
 //! A lookup service answers its own metadata and documentation (the
 //! LookupService's getMetaData and getDocumentation): the engine's listing
@@ -213,9 +214,11 @@ pub const Admitted = struct {
     store: Store,
     applied: Map,
     topics: []const []const u8,
+    /// The chain state, read only: a proof it has obtained since a transaction was handed over.
+    ch: *Chain,
 
     /// `state`: the overlay state record (null: nothing admitted yet).
-    pub fn load(a: Allocator, s: Store, state: ?[]const u8, topics: []const []const u8) !Admitted {
+    pub fn load(a: Allocator, s: Store, state: ?[]const u8, topics: []const []const u8, ch: *Chain) !Admitted {
         const maps = try c.store.Maps.create(a, s);
         var root: ?[]const u8 = null;
         if (state) |sc| {
@@ -223,7 +226,7 @@ pub const Admitted = struct {
             if (!std.mem.eql(u8, v.getText("kind") orelse "", "overlay-state")) return error.BadOverlayState;
             root = (v.get("maps") orelse return error.BadOverlayState).getCid("applied");
         }
-        return .{ .arena = a, .store = s, .applied = maps.map(root), .topics = topics };
+        return .{ .arena = a, .store = s, .applied = maps.map(root), .topics = topics, .ch = ch };
     }
 
     /// The BEEF the overlay was handed for `txid` (its CID): the `beef` of the first of the topics'
@@ -253,13 +256,17 @@ pub const Admitted = struct {
         return acc.serialize(txid);
     }
 
-    /// `txid`'s submission, trimmed to its ancestry in it (a proven transaction ends a line), into
+    /// `txid`'s submission, trimmed to its ancestry in it (a proven transaction ends a line; one the
+    /// submission carried unproven and the chain state has proven since is served with that proof,
+    /// as Go's engine updates a stored BEEF when a proof arrives), into
     /// `acc` — after the submissions of the admitted parents it does not carry (or names by txid
     /// only). → false: the overlay admitted no `txid`.
     fn into(self: *Admitted, acc: *BeefAcc, seen: *std.AutoHashMap([32]u8, void), txid: [32]u8) !bool {
         if ((try seen.getOrPut(txid)).found_existing) return true;
         const bc = (try self.submission(txid)) orelse return false;
-        const b = try self.parsed(bc);
+        var b = try self.parsed(bc);
+        var bumps: std.ArrayList(c.bsvz.spv.MerklePath) = .fromOwnedSlice(b.bumps);
+        b.entries = try self.arena.dupe(c.beef.Entry, b.entries);
         const keep = try self.arena.alloc(bool, b.entries.len);
         @memset(keep, false);
         var missing: std.ArrayList([32]u8) = .empty;
@@ -272,13 +279,21 @@ pub const Admitted = struct {
             };
             if (keep[i]) continue;
             keep[i] = true;
-            const e = b.entries[i];
+            const e = &b.entries[i];
             if (e.format == .txid_only) try missing.append(self.arena, t);
+            if (e.bump == null and e.raw != null and (try self.ch.status(t)) == .proven) {
+                if (try self.ch.proofFor(t)) |p| {
+                    try bumps.append(self.arena, p);
+                    e.bump = bumps.items.len - 1;
+                    e.format = .raw_with_bump;
+                }
+            }
             if (e.bump != null) continue;
             const tx = e.tx orelse continue;
             for (tx.inputs) |in| try stack.append(self.arena, in.previous_outpoint.txid.bytes);
         }
         if (b.indexOf(txid) == null) return error.BadSubmission;
+        b.bumps = bumps.items;
         for (missing.items) |m| _ = try self.into(acc, seen, m);
         try acc.add(b, keep);
         return true;
@@ -415,7 +430,7 @@ pub fn handle(a: Allocator, spec: Spec, s: Store, network: c.chain.Network, stat
         var net = network;
         if (chain) |r| net = c.chain.Network.parse((try s.getValue(a, r)).getText("network") orelse "") orelse return error.BadChainState;
         var ch = try Chain.load(a, s, chain, net);
-        var adm = try Admitted.load(a, s, overlay, try textList(a, arg.get("topics")));
+        var adm = try Admitted.load(a, s, overlay, try textList(a, arg.get("topics")), &ch);
         return .{ .answer = try answerRecord(a, spec, &svc, &ch, &adm, arg) };
     }
     try hook(a, spec, &svc, func, arg);

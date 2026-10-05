@@ -1183,3 +1183,35 @@ test "a lookup serves what the overlay admitted (#3): the submission's BEEF from
         try std.testing.expectEqualSlices(u8, &y.txid, &b.entries[1].txid);
     }
 }
+
+test "a lookup serves the proof obtained since (#3): X admitted unproven, then proven by the chain state, is served with its BUMP and no parents" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = c.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var inst = try Instance.init(a, &ms);
+    const k = try keys(0x42);
+    const f = try fund(a, 0x44, 1, &k.p2pkh);
+    try inst.headers(&.{&f.h1});
+    const x = try spend(a, &f.tx, 0, &.{.{ 1, &k.token }}, k.priv);
+    _ = try inst.admitted(try withFund(a, f, x), x.txid);
+    {
+        // As handed: the funding transaction with its BUMP, then X.
+        const b = try beef.parse(a, (try inst.look(&.{.{ .key = "topic", .value = .{ .text = "tm_demo" } }}))[0].getBytes("beef").?);
+        try std.testing.expectEqual(@as(usize, 2), b.entries.len);
+        try std.testing.expectEqual(@as(?usize, null), b.entries[1].bump);
+    }
+    const h2 = mine(hdr.hash(&f.h1), x.txid, 1_700_001_200);
+    try inst.headers(&.{&h2});
+    try std.testing.expectEqual(Chain.Outcome.proven, try inst.chainStatus(x.txid, "MINED", try soloPath(a, 2, x.txid)));
+    const outs = try inst.look(&.{.{ .key = "topic", .value = .{ .text = "tm_demo" } }});
+    try std.testing.expectEqual(@as(usize, 1), outs.len);
+    const b = try beef.parse(a, outs[0].getBytes("beef").?);
+    try std.testing.expectEqualSlices(u8, &x.txid, &b.atomic.?);
+    try std.testing.expectEqual(@as(usize, 1), b.entries.len);
+    try std.testing.expectEqual(@as(?usize, 0), b.entries[0].bump);
+    try std.testing.expectEqual(@as(usize, 1), b.bumps.len);
+    try std.testing.expectEqual(@as(u32, 2), b.bumps[0].block_height);
+    try verifiesOn(a, &.{ &f.h1, &h2 }, outs[0].getBytes("beef").?);
+}

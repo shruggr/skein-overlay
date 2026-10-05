@@ -458,15 +458,19 @@ output's transaction, built by the module `lookup` (`Admitted.beefOf`):
 2. That BEEF, read by CID: a pointer record's transactions and BUMPs from
    the store (skein-sdk `chain.record`), or the raw block of the bytes.
 3. Trimmed to the transaction's ancestry within it: its inputs' sources,
-   recursively, ending at a proven transaction (one with a BUMP) or one
-   named by txid only. Other transactions it carried are left out.
+   recursively, ending at a proven transaction or one named by txid only.
+   Other transactions it carried are left out. A transaction it carried
+   without a BUMP that the chain state (`chain/state`) has proven since is
+   served with that proof, and its line ends there: what was admitted,
+   with the proof obtained since (as Go's engine updates a stored BEEF
+   when a proof arrives, `UpdateTransactionBEEF`).
 4. An input it does not carry (or names by txid only) whose transaction
    the overlay admitted too: that parent's own submission, built the same
    way, goes first. An input neither carried nor admitted is left out;
    nothing of the chain state is walked.
 
-So a proven transaction is served with its own BUMP as it was handed, and
-needs no held parent; with `includeSpent` a spent output's BEEF is built
+So a proven transaction is served with its own BUMP, as handed or as
+proven since, and needs no held parent; with `includeSpent` a spent output's BEEF is built
 the same way. The answer lists outputs only (BRC-24's `output-list`); no
 query shape asks for more history than this. A transaction admitted before
 the applied record named its BEEF (v0.4.0 and earlier) fails the lookup
