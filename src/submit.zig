@@ -971,6 +971,23 @@ pub fn received(cx: Ctx, args: Value, source: Value) !Resumed {
     return settle(cx, r, txid, topics, source);
 }
 
+/// The submission event POST /submit admits into box `<app>` (0.7.3: the route launches nothing):
+/// `{kind: "submission", body: {fn: "submit", args: {beef, topics, offChainValues?}}, request:
+/// <the request record>, transport: "http", sender?: <the session's identity>}`. Its step is the
+/// message step's (`received`): `body` the message, `source` `{transport, box: <the box it was
+/// admitted in>, sender?, request}`.
+pub fn submissionOf(a: Allocator, ev: Value, box: []const u8) !struct { body: Value, source: Value } {
+    const body = ev.get("body") orelse return error.BadEvent;
+    var src: std.ArrayList(cbor.Entry) = .empty;
+    try src.appendSlice(a, &.{
+        .{ .key = "transport", .value = .{ .text = ev.getText("transport") orelse "http" } },
+        .{ .key = "box", .value = .{ .text = box } },
+    });
+    if (ev.getBytes("sender")) |sender| try src.append(a, .{ .key = "sender", .value = .{ .bytes = sender } });
+    try src.append(a, .{ .key = "request", .value = .{ .cid = ev.getCid("request") orelse return error.BadEvent } });
+    return .{ .body = body, .source = .{ .map = src.items } };
+}
+
 fn badArgs(cx: Ctx, source: Value, why: []const u8) !Resumed {
     if (submitterOf(source)) |sub| if (cx.wire.answerFn) |f| try f(cx.wire.ctx, cx.a, sub.to, sub.box, try submitAnswer(cx.a, sub.request, .{ .err = .{ .map = try cx.a.dupe(cbor.Entry, &.{
         .{ .key = "code", .value = .{ .text = "bad-args" } },

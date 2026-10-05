@@ -4,9 +4,10 @@
 //!
 //!   a submission              the message {fn: "submit", args: {beef, topics, offChainValues?}} in
 //!                             a box a row routes to the engine (the app's own `<app>`, open to
-//!                             anyone), or POST /submit, which launches the engine on the same
-//!                             message (shruggr/skein#112): routed — its thread launched, paused, or
-//!                             answered at once; its answers go to the sender (submit.zig `received`).
+//!                             anyone), or the `submission` event POST /submit admits into box
+//!                             `<app>` carrying the same message (shruggr/skein#112; 0.7.3): routed —
+//!                             its thread launched, paused, or answered at once; its answers go to
+//!                             the sender (submit.zig `received`).
 //!   the submission's thread   launched by a submission (args {event, box: "submit"}), or by the
 //!                             submit event the `libp2p:<topic>` route admits (box `<app>`, row
 //!                             from `event`): first step `begin` — the BEEF to the chain app (a
@@ -195,12 +196,17 @@ fn run(a: Allocator) anyerror!void {
         ev = try s.getValue(a, ec);
         const kind = ev.getText("kind") orelse return error.BadEvent;
         if (eql(u8, kind, "peer-admit")) return peerAdmitted(a, step, ev);
+        // POST /submit's submission (0.7.3): the message step's, its source from the event.
+        if (eql(u8, kind, "submission")) {
+            const m = try submit.submissionOf(a, ev, args.getText("box") orelse calls.appOf(step));
+            return submissionStep(a, step, m.body, m.source);
+        }
         if (!eql(u8, kind, "submit")) return error.BadEvent;
         op = if (reply == null) "submit" else "answer";
     } else if (args.getCid("body")) |bc| {
         const body = try s.getValue(a, bc);
         // A submission (shruggr/skein#112): from anyone a row admits, in any box routed here.
-        if (eql(u8, body.getText("fn") orelse "", "submit")) return submissionStep(a, step, args, body);
+        if (eql(u8, body.getText("fn") orelse "", "submit")) return submissionStep(a, step, body, try messageSource(a, step, args));
         // Register or deregister a topic, in whatever box a row routed it here (skein #128); in the
         // app's own box, open to anyone for submissions, from the instance itself only.
         switch (topics.asked(body)) {
@@ -348,14 +354,20 @@ fn resumeStep(a: Allocator, step: Value, rargs: Value) !void {
 }
 
 /// A submission by message (shruggr/skein#112): `{fn: "submit", args: {beef, topics,
-/// offChainValues?}}` from anyone a row admits — or POST /submit, which launches the engine on the
-/// same message (args `{body, box, message: <the request record>, sender?: <its session's
-/// identity>, transport: "http"}`). Its source names whom the answers go to: the sender, in the box
-/// it came in, about the message (submit.zig `received`).
-fn submissionStep(a: Allocator, step: Value, args: Value, body: Value) !void {
+/// offChainValues?}}` from anyone a row admits — or POST /submit's `submission` event in box
+/// `<app>` (0.7.3, submit.zig `submissionOf`), which carries the same message. Its source names
+/// whom the answers go to: the sender, in the box it came in, about the message (submit.zig
+/// `received`).
+fn submissionStep(a: Allocator, step: Value, body: Value, source: Value) !void {
     var loaded = try ev_.load(a, step);
     loaded.st.now = @intCast(step.getUint("at") orelse return error.BadInput);
     const cx = try stepCtx(a, step, &loaded.st);
+    var fields: std.ArrayList(cbor.Entry) = .empty;
+    try settled(a, step, &loaded, try submit.received(cx, body.get("args") orelse .null, source), &fields, "received");
+}
+
+/// A message step's source: `{transport, box, sender?, request: <the message>}`.
+fn messageSource(a: Allocator, step: Value, args: Value) !Value {
     var src: std.ArrayList(cbor.Entry) = .empty;
     try src.appendSlice(a, &.{
         .{ .key = "transport", .value = .{ .text = args.getText("transport") orelse "mailbox" } },
@@ -363,8 +375,7 @@ fn submissionStep(a: Allocator, step: Value, args: Value, body: Value) !void {
     });
     if (args.getBytes("sender")) |sender| try src.append(a, .{ .key = "sender", .value = .{ .bytes = sender } });
     try src.append(a, .{ .key = "request", .value = .{ .cid = args.getCid("message") orelse return error.BadInput } });
-    var fields: std.ArrayList(cbor.Entry) = .empty;
-    try settled(a, step, &loaded, try submit.received(cx, body.get("args") orelse .null, .{ .map = src.items }), &fields, "received");
+    return .{ .map = src.items };
 }
 
 fn stepCtx(a: Allocator, step: Value, st: *@import("state.zig").State) !submit.Ctx {

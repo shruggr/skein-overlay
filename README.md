@@ -4,7 +4,7 @@ The overlay services engine for a [skein](https://github.com/shruggr/skein),
 as an app: BRC-22 submit and BRC-24 lookup, served by the instance's own
 front door, with topic managers and lookup services as programs the engine
 calls. It is also a Zig package: an overlay of your own depends on it for
-the topic and lookup contracts. Version **0.7.2**.
+the topic and lookup contracts. Version **0.7.3**.
 
 ## What it is
 
@@ -160,7 +160,7 @@ The manifest (`etc/app.json`, this repo's own, description left out):
 {
   "kind": "app",
   "name": "overlay",
-  "version": "0.7.2",
+  "version": "0.7.3",
   "programs": {
     "overlay": "bin/overlay.wasm",
     "topic-demo": "bin/topic-demo.wasm",
@@ -270,7 +270,7 @@ Not built: BRC-88 SHIP/SLAP, GASP sync and catch-up from a peer, the
 
 | | |
 |---|---|
-| this app and package | 0.7.2 (tag `v0.7.2`) |
+| this app and package | 0.7.3 (tag `v0.7.3`) |
 | skein-sdk | v0.5.1, by tag URL and hash in `build.zig.zon` (module `chain`; bsvz comes through it) |
 | requires | `chain/1` (shruggr/skein-chain 0.3.0) |
 | skein | log format 8; skein's equivs pin this repo by commit |
@@ -333,6 +333,13 @@ wants with no peer. Each want's end is the event `{event: "unwant", txid,
 topic, peer?}` (the builder's smallest option, David to review). The map
 `wants` is `txid ‖ tp ‖ peer? → [subject]`. A `register` / `deregister` in
 `<app>` is taken from the instance itself only.
+
+0.7.3: `POST /submit` launches nothing (a step that launches a thread waits
+on it, so the request did not end: 500 `ERR_FRONT_DOOR`). It answers `200
+{id}` (still the request record's CID) with `admit: [{event, box: <app>}]`,
+the event `{kind: "submission", body: {fn: "submit", args}, request,
+transport: "http", sender?}`, routed into the app's box as the libp2p route
+admits its submit event; the engine's step on it is the message step's.
 
 ## Contributing
 

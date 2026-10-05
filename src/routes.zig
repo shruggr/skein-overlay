@@ -5,9 +5,10 @@
 //!
 //!   POST /submit      fn "submit"   body BEEF, X-Topics (comma list or JSON array),
 //!                                   x-includes-off-chain-values: true → VarInt(len) ‖ BEEF ‖ off-chain values
-//!                                   → 200 {id}: delivered (shruggr/skein#112) — the submission is the
-//!                                   message {fn: "submit", args: {beef, topics, offChainValues?}}, its
-//!                                   answers go to the submitter's box, never on this connection
+//!                                   → 200 {id, admit}: delivered (shruggr/skein#112) — the submission is the
+//!                                   message {fn: "submit", args: {beef, topics, offChainValues?}}, admitted
+//!                                   as the `submission` event in box <app> (0.7.3); its answers go to the
+//!                                   submitter's box, never on this connection
 //!   libp2p:<topic>    fn "submit"   the same submit as a GossipSub message (#57): the message's topic
 //!                                   requested, its body the BEEF → {verdict, admit?} (`gossip` below)
 //!   libp2p:<topic>-admit   fn "peerAdmit"   a peer's verdict (#74, gossip.zig): recorded as a
@@ -27,15 +28,17 @@
 //! Every request is appended, and the front door's step calls these (#68).
 //! A submit over HTTP (shruggr/skein#112) is a transport for the submission
 //! message: the handler checks only that it is one (X-Topics, a body, the
-//! off-chain framing; else 400), launches the engine on the message
-//! `{fn: "submit", args: {beef, topics, offChainValues?}}` as a message step
-//! would be (args `{body, box: <app>, message: <the request record>, sender?:
-//! <the session's identity>, transport: "http"}`), and answers 200 `{id}`:
-//! the request record's CID, which every answer names (`request`). The
-//! engine routes it (submit.zig `received`) and answers the submitter by
-//! message — admitted (pending), each proof, or rejected — when a message
-//! reaches it; an open route has no caller, so its answers are in the log
-//! only. No STEAK is answered here, and no 503.
+//! off-chain framing; else 400) and answers 200 `{id}` — the request
+//! record's CID, which every answer names (`request`) — admitting the
+//! `submission` event `{kind: "submission", body: {fn: "submit", args:
+//! {beef, topics, offChainValues?}}, request, transport: "http", sender?:
+//! <the session's identity>}` into box `<app>` (0.7.3), as the libp2p route
+//! admits its submit event. It launches nothing (a step that launches a
+//! thread waits on it): the request ends at once, and the engine's step on
+//! the event routes the submission (submit.zig `received`) and answers the
+//! submitter by message — admitted (pending), each proof, or rejected —
+//! when a message reaches it; an open route has no caller, so its answers
+//! are in the log only. No STEAK is answered here, and no 503.
 //!
 //! A lookup is a read: the service's program is called (fn "lookup", the
 //! lookup contract, lookup.zig) and its answer shaped for the wire; it
@@ -275,26 +278,21 @@ fn submit(a: Allocator, in: Value, req: Value) !Value {
         if (req.getText("protocol") != null) return stream(a, in, req);
         return gossip(a, in, req);
     }
-    const sub = switch (try httpSubmission(a, req, calls.appOf(in))) {
-        .refused => |answer| return answer,
-        .message => |m| m,
+    return switch (try httpSubmission(a, req, calls.appOf(in))) {
+        .refused => |answer| answer,
+        .admit => |x| x.answer,
     };
-    // The submission message, and the engine launched on it as a message step is (submit.zig `received`).
-    const s = vm.store();
-    const largs = try a.dupe(cbor.Entry, sub.args.map);
-    largs[0].value = .{ .cid = try s.putValue(a, sub.body) };
-    const self = in.getCid("engine") orelse (in.get("programs") orelse return error.BadInput).getCid("overlay") orelse return error.NoOverlayProgram;
-    _ = try vm.launch(a, self, try s.putValue(a, .{ .map = largs }));
-    return sub.answer;
 }
 
 /// POST /submit as a transport for the submission message (shruggr/skein#112): the request is
 /// checked for being one (X-Topics, a body, the off-chain framing; else the 400 answer, `refused`);
-/// then `message`: its `body`, `{fn: "submit", args: {beef, topics, offChainValues?}}`; the `args`
-/// the engine is launched on, as a message step gets them — `{body: <the body's CID, filled in by
-/// the caller>, box: <app>, message: <the request record>, transport: "http", sender?: <the
-/// session's identity>}`; and the `answer`: 200 `{id: <the request record's CID, hex>}`.
-pub fn httpSubmission(a: Allocator, req: Value, app: []const u8) !union(enum) { refused: Value, message: struct { body: Value, args: Value, answer: Value } } {
+/// then `admit`: the `submission` event, `{kind: "submission", body: {fn: "submit", args: {beef,
+/// topics, offChainValues?}}, request: <the request record>, transport: "http", sender?: <the
+/// session's identity>}` (submit.zig `submissionOf`), and the `answer`: 200 `{id: <the request
+/// record's CID, hex>}` admitting that event into box `<app>`, as the libp2p route admits its
+/// submit event (`accepting`). It launches nothing (0.7.3): a step that launches a thread waits
+/// on it, and the request ends at once; the engine's step on the event routes the submission.
+pub fn httpSubmission(a: Allocator, req: Value, app: []const u8) !union(enum) { refused: Value, admit: struct { event: Value, answer: Value } } {
     const th = header(req, "x-topics") orelse return .{ .refused = try failure(a, 400, "Missing x-topics header") };
     const requested = parseTopics(a, th) catch return .{ .refused = try failure(a, 400, "Invalid x-topics header: expected a comma-separated list or JSON string array") };
     // shruggr/skein#121: the kernel's door put the BEEF's pointer record where its bytes were (the row's
@@ -325,22 +323,21 @@ pub fn httpSubmission(a: Allocator, req: Value, app: []const u8) !union(enum) { 
         .{ .key = "topics", .value = .{ .array = ts } },
     });
     if (off) |o| try fargs.append(a, .{ .key = "offChainValues", .value = .{ .bytes = o } });
-    var largs: std.ArrayList(cbor.Entry) = .empty;
-    try largs.appendSlice(a, &.{
-        .{ .key = "body", .value = .null },
-        .{ .key = "box", .value = .{ .text = app } },
-        .{ .key = "message", .value = .{ .cid = request } },
-        .{ .key = "transport", .value = .{ .text = "http" } },
-    });
-    if (req.getBytes("caller")) |k| try largs.append(a, .{ .key = "sender", .value = .{ .bytes = k } });
-    return .{ .message = .{
-        .body = .{ .map = try a.dupe(cbor.Entry, &.{
+    var es: std.ArrayList(cbor.Entry) = .empty;
+    try es.appendSlice(a, &.{
+        .{ .key = "kind", .value = .{ .text = "submission" } },
+        .{ .key = "body", .value = .{ .map = try a.dupe(cbor.Entry, &.{
             .{ .key = "fn", .value = .{ .text = "submit" } },
             .{ .key = "args", .value = .{ .map = fargs.items } },
-        }) },
-        .args = .{ .map = largs.items },
-        .answer = try respond(a, 200, "application/json", try jsonOf(a, .{ .id = try vm.hexAlloc(a, request) })),
-    } };
+        }) } },
+        .{ .key = "request", .value = .{ .cid = request } },
+        .{ .key = "transport", .value = .{ .text = "http" } },
+    });
+    if (req.getBytes("caller")) |k| try es.append(a, .{ .key = "sender", .value = .{ .bytes = k } });
+    const ev: Value = .{ .map = es.items };
+    var answer = try respond(a, 200, "application/json", try jsonOf(a, .{ .id = try vm.hexAlloc(a, request) }));
+    answer.map = try std.mem.concat(a, cbor.Entry, &.{ answer.map, &.{.{ .key = "admit", .value = try admitOne(a, ev, app) }} });
+    return .{ .admit = .{ .event = ev, .answer = answer } };
 }
 
 /// The same submit, arriving as a GossipSub message on a `libp2p:<topic>` route (#57): the message's
@@ -459,11 +456,16 @@ fn peerProof(a: Allocator, in: Value, req: Value) !Value {
 fn accepting(a: Allocator, ev: Value, box: []const u8) !Value {
     return .{ .map = try a.dupe(cbor.Entry, &.{
         .{ .key = "verdict", .value = .{ .text = "accept" } },
-        .{ .key = "admit", .value = .{ .array = try a.dupe(Value, &.{.{ .map = try a.dupe(cbor.Entry, &.{
-            .{ .key = "event", .value = ev },
-            .{ .key = "box", .value = .{ .text = box } },
-        }) }}) } },
+        .{ .key = "admit", .value = try admitOne(a, ev, box) },
     }) };
+}
+
+/// A handler's `admit`: one event into `box` (skein docs/MESSAGES.md: `{event: <record>, box}`).
+fn admitOne(a: Allocator, ev: Value, box: []const u8) !Value {
+    return .{ .array = try a.dupe(Value, &.{.{ .map = try a.dupe(cbor.Entry, &.{
+        .{ .key = "event", .value = ev },
+        .{ .key = "box", .value = .{ .text = box } },
+    }) }}) };
 }
 
 fn verdictOf(a: Allocator, v: []const u8, reason: []const u8) !Value {

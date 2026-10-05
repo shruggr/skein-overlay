@@ -1846,7 +1846,7 @@ test "wants {txid, topic, peer?} (shruggr/skein#112): a gossip pause wants the p
     try std.testing.expectEqual(@as(usize, 0), try st.map("wants").count());
 }
 
-test "a submission over HTTP (shruggr/skein#112): the route answers delivery (200 {id}) and carries the message; a missing parent pauses with a want of no peer; the parent's arrival clears it" {
+test "a submission over HTTP (shruggr/skein#112, 0.7.3): the route answers delivery (200 {id}) and admits the submission event into the app's box, launching nothing; the box step routes it; a missing parent pauses with a want of no peer; the parent's arrival clears it" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -1863,28 +1863,38 @@ test "a submission over HTTP (shruggr/skein#112): the route answers delivery (20
         .{ .key = "body", .value = .{ .bytes = child } },
         .{ .key = "request", .value = .{ .cid = request } },
     });
-    const sub = (try routes.httpSubmission(a, req, "overlay")).message;
+    const sub = (try routes.httpSubmission(a, req, "overlay")).admit;
     try std.testing.expectEqual(@as(u64, 200), sub.answer.getUint("status").?);
     const id = try std.json.parseFromSliceLeaky(std.json.Value, a, sub.answer.getBytes("body").?, .{});
     try std.testing.expectEqualStrings(try @import("sk").hexAlloc(a, request), id.object.get("id").?.string);
-    try std.testing.expectEqualStrings("submit", sub.body.getText("fn").?);
-    try std.testing.expectEqualSlices(u8, child, sub.body.get("args").?.getBytes("beef").?);
-    try std.testing.expectEqualStrings("tm_demo", sub.body.get("args").?.getArray("topics").?[0].text);
-    try std.testing.expectEqualStrings("http", sub.args.getText("transport").?);
-    try std.testing.expectEqualStrings("overlay", sub.args.getText("box").?);
-    try std.testing.expectEqualSlices(u8, request, sub.args.getCid("message").?);
-    try std.testing.expect(sub.args.get("sender") == null); // an open route: no caller, the answers in the log only
-    // Not a submission: 400 at once.
+    // 0.7.3: no launch (a step that launches waits on it) — the answer admits one event into the app's box, and nothing else.
+    try std.testing.expect(sub.answer.get("wait") == null);
+    const admit = sub.answer.getArray("admit").?;
+    try std.testing.expectEqual(@as(usize, 1), admit.len);
+    try std.testing.expectEqualStrings("overlay", admit[0].getText("box").?);
+    const ev = admit[0].get("event").?;
+    try std.testing.expectEqualStrings("submission", ev.getText("kind").?);
+    try std.testing.expect(ev.get("subject") == null); // routed by its box, waking no thread
+    try std.testing.expectEqualStrings("http", ev.getText("transport").?);
+    try std.testing.expectEqualSlices(u8, request, ev.getCid("request").?);
+    try std.testing.expect(ev.get("sender") == null); // an open route: no caller, the answers in the log only
+    const msg = ev.get("body").?;
+    try std.testing.expectEqualStrings("submit", msg.getText("fn").?);
+    try std.testing.expectEqualSlices(u8, child, msg.get("args").?.getBytes("beef").?);
+    try std.testing.expectEqualStrings("tm_demo", msg.get("args").?.getArray("topics").?[0].text);
+    // Not a submission: 400 at once, admitting nothing.
     const bad = (try routes.httpSubmission(a, try mapOf(a, &.{.{ .key = "request", .value = .{ .cid = request } }}), "overlay")).refused;
     try std.testing.expectEqual(@as(u64, 400), bad.getUint("status").?);
+    try std.testing.expect(bad.get("admit") == null);
 
-    // The engine on the message, as its step: t2 lacks t1 — paused, no 400; one want, no peer.
-    const source = try mapOf(a, &.{
-        .{ .key = "transport", .value = .{ .text = "http" } },
-        .{ .key = "box", .value = .{ .text = "overlay" } },
-        .{ .key = "request", .value = .{ .cid = request } },
-    });
-    const r = try inst.received(sub.body.get("args").?, source);
+    // The engine's step on the admitted event (box `overlay`): the message step's, source from the event.
+    const m = try submit.submissionOf(a, ev, "overlay");
+    const source = m.source;
+    try std.testing.expectEqualStrings("http", source.getText("transport").?);
+    try std.testing.expectEqualStrings("overlay", source.getText("box").?);
+    try std.testing.expectEqualSlices(u8, request, source.getCid("request").?);
+    // t2 lacks t1 — paused, no 400; one want, no peer.
+    const r = try inst.received(m.body.get("args").?, source);
     try std.testing.expect(r == .paused);
     try std.testing.expect(try inst.pending(x.t2.txid));
     try std.testing.expectEqual(@as(usize, 1), inst.events.len);

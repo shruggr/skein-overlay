@@ -1,4 +1,4 @@
-# Overlay services in the VM (0.7.2)
+# Overlay services in the VM (0.7.3)
 
 An overlay is an app (skein docs/APPS.md §6). It judges transactions with
 its topic managers and indexes them with its lookup services; it does not
@@ -124,11 +124,16 @@ topic, or for no topic served here, it answers `rejected` at once.
 **POST /submit is a transport for the same message.** The route checks only
 that the request is a submission (`X-Topics`, a body, the off-chain
 framing; else 400), builds the message `{fn: "submit", args: {beef, topics,
-offChainValues?}}` and launches the engine on it exactly as a message step
-is launched (args `{body: <the message>, box: <app>, message: <the request
-record>, sender?: <the BRC-104 session's identity>, transport: "http"}`) —
-the same submission record, the same thread — and answers **200 `{id}`**,
-the request record's CID (hex): the `request` every answer names. No
+offChainValues?}}` and answers **200 `{id}`**, the request record's CID
+(hex): the `request` every answer names, with `admit: [{event, box:
+<app>}]` — the event `{kind: "submission", body: <the message>, request:
+<the request record>, transport: "http", sender?: <the BRC-104 session's
+identity>}`, routed into the app's own box like a delivered message (the
+manifest's row `""`, sender `*`), as the `libp2p:<topic>` route admits its
+submit event. The route launches nothing (0.7.3: a step that launches a
+thread waits on it, so the request would not end): the request ends at
+once, and the engine's step on the event is the message step's — the same
+route's half, the same thread. No
 STEAK, no 503, no 400 for a verdict. **BRC-22's synchronous STEAK is no
 longer answered on `/submit`.** A client that wants the verdict submits by
 message from its own identity (its messagebox in the instance's reach), or
@@ -538,7 +543,7 @@ wire"). Stepped:
 
 | launched by | input | does |
 |---|---|---|
-| a message in box `<app>` from anyone (the manifest's row `""`, sender `*`), or POST /submit (a launch on the same message) | `{fn: "submit", args: {beef, topics, offChainValues?}}` | a submission (shruggr/skein#112): routed — its thread launched, paused, or answered (`rejected`, or `admitted` for one judged before) |
+| a message in box `<app>` from anyone (the manifest's row `""`, sender `*`), or the `submission` event POST /submit admits there (0.7.3) | `{fn: "submit", args: {beef, topics, offChainValues?}}`, or `{kind: "submission", body: <that message>, request, transport: "http", sender?}` | a submission (shruggr/skein#112): routed — its thread launched, paused, or answered (`rejected`, or `admitted` for one judged before) |
 | a submission's launch, or the submit event in box `<app>` (the `libp2p:<topic>` route's admit, row from `event`) | `{kind: "submit", …}` | the submission's thread: the ingest message, pending; on each answer (`reply`) admit, reject or await on; the submitter answered |
 | a message in box `<app>` from the instance itself (row from `$self`) | `{fn: "watch", args: {txid, ingest}}` | the watch: the later proof (`-proof`) or rejection (unwound) |
 | a message in box `<app>` from the instance itself (row from `$self`) | `{fn: "resume", args: {txid}}` | a paused submission routed again (skein-overlay#1): its thread launched, paused again, or dropped |
@@ -864,8 +869,8 @@ overlay apps.
 
 **A submit is the one write**, and only when a topic takes the transaction
 (above). Over HTTP it is the submission message on another transport: the
-route launches the engine on `{fn: "submit", args}` as a message step
-(above), and answers its delivery. **BRC-22's synchronous STEAK is not
+route admits `{fn: "submit", args}` into box `<app>` as the `submission`
+event (above), and answers its delivery. **BRC-22's synchronous STEAK is not
 answered on `/submit`** (shruggr/skein#112): a client takes the verdict from its box (a message, or `/submit` over a BRC-104
 session), or reads what was admitted with a lookup.
 
