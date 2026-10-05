@@ -4,7 +4,7 @@ The overlay services engine for a [skein](https://github.com/shruggr/skein),
 as an app: BRC-22 submit and BRC-24 lookup, served by the instance's own
 front door, with topic managers and lookup services as programs the engine
 calls. It is also a Zig package: an overlay of your own depends on it for
-the topic and lookup contracts. Version **0.3.0**.
+the topic and lookup contracts. Version **0.4.0**.
 
 ## What it is
 
@@ -141,7 +141,7 @@ The manifest (`etc/app.json`, this repo's own, description left out):
 {
   "kind": "app",
   "name": "overlay",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "programs": {
     "overlay": "bin/overlay.wasm",
     "topic-demo": "bin/topic-demo.wasm",
@@ -205,13 +205,18 @@ Not built: BRC-88 SHIP/SLAP, GASP sync and catch-up from a peer, the
 
 | | |
 |---|---|
-| this app and package | 0.3.0 (tag `v0.3.0`) |
+| this app and package | 0.4.0 (tag `v0.4.0`) |
 | skein-sdk | v0.5.0, by tag URL and hash in `build.zig.zon` (module `chain`; bsvz comes through it) |
-| requires | `chain/1` (shruggr/skein-chain 0.2.0) |
+| requires | `chain/1` (shruggr/skein-chain 0.3.0) |
 | skein | log format 8; skein's equivs pin this repo by commit |
 
 0.3.0 moved the state under `<app>/…`, made the chain app's answer the gate
 and exported the modules (shruggr/skein#79).
+
+0.4.0 gave the topic and lookup contracts `metadata` and `documentation`,
+answered by the programs on the listing and documentation routes (#2), and
+made submit take the BEEF as its pointer record, with no re-proof at submit
+and the CID carried by ingest and gossip (shruggr/skein#121).
 
 ## Contributing
 
