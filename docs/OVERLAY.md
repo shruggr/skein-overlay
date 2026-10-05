@@ -1,4 +1,4 @@
-# Overlay services in the VM (0.4.1)
+# Overlay services in the VM (0.5.0)
 
 An overlay is an app (skein docs/APPS.md §6). It judges transactions with
 its topic managers and indexes them with its lookup services; it does not
