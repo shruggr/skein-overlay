@@ -146,30 +146,12 @@ pub fn hookRejected(a: Allocator, caller: Caller, in: Value, gone: []const st.Un
     }
 }
 
-/// The topics a lookup service listens to (`listeners`' rule), in the served topics' order.
-pub fn listenedTopics(a: Allocator, in: Value, service: []const u8) ![]const []const u8 {
-    var out: std.ArrayList([]const u8) = .empty;
-    for (try servedTopics(a, in)) |t| {
-        for (try listeners(a, in, t)) |l| if (std.mem.eql(u8, l.service, service)) {
-            try out.append(a, t);
-            break;
-        };
-    }
-    return out.items;
-}
-
-/// A lookup-call's argument for `service` (the `/lookup` route's): `query` the client's JSON as
-/// dag-cbor; `topics` the ones it listens to (the overlay's `applied` records of an output's
-/// transaction are read under them: its BEEF, lookup.zig).
+/// A lookup-call's argument for `service` (the `/lookup` route's): `query` the client's JSON as dag-cbor.
 pub fn lookupArg(a: Allocator, in: Value, service: []const u8, query: Value) !Value {
-    const ts = try listenedTopics(a, in, service);
-    const topics = try a.alloc(Value, ts.len);
-    for (ts, topics) |t, *v| v.* = .{ .text = t };
     return .{ .map = try a.dupe(cbor.Entry, &.{
         .{ .key = "kind", .value = .{ .text = "lookup-call" } },
         .{ .key = "app", .value = .{ .text = appOf(in) } },
         .{ .key = "service", .value = .{ .text = service } },
-        .{ .key = "topics", .value = .{ .array = topics } },
         .{ .key = "query", .value = query },
     }) };
 }

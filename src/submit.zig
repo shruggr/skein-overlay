@@ -374,7 +374,7 @@ fn admit(cx: Ctx, ev: Value, out: *Stepped) !void {
     const st = cx.st;
     const sub = try state.subjectOf(a, st.store, out.txid);
     const served = try calls.configObject(a, cx.in, "overlayTopics");
-    // The BEEF as handed, named by each `applied` record (what a lookup serves, skein-overlay#3).
+    // The BEEF as handed, named by each `applied` record (for internalizing; skein-overlay#3).
     const beef = switch (Input.of(ev.get("beef")) orelse return error.BadEvent) {
         .record => |rc| rc,
         .bytes => |b| try state.putRaw(a, st.store, b),
