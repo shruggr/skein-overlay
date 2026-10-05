@@ -44,14 +44,14 @@ storage are not ported.
 |---|---|
 | `src/engine.zig` → `overlay.wasm` | The engine: called, the front door's route handlers (`routes.zig`); stepped, the submission's thread, a watch, a peer's admit. |
 | `src/submit.zig` | A submission from the wire to the state: the route's half (decode, verify, judge — in the front door's step on the request), the submission's thread (the BEEF to the chain app; admitted on its answer), the watch. |
-| `src/state.zig` | The overlay's state (`<app>/state`) over the chain state (read only): the maps, the previous coins, recording a judgement (`apply`), removing one (`unapply`), `inTopic`, `spender`; the door's pointer record read (`decodeRecord`, #121) or the one BEEF parse of bytes (`decode`), SPV over the records (`verifyDecoded`; BUMPs only for bytes), BEEF out for a lookup (`beefFor`, `beefOfMany`). |
+| `src/state.zig` | The overlay's state (`<app>/state`) over the chain state (read only): the maps, the previous coins, recording a judgement (`apply`), removing one (`unapply`), `inTopic`, `spender`; the door's pointer record read (`decodeRecord`, #121) or the one BEEF parse of bytes (`decode`), SPV over the records (`verifyDecoded`; BUMPs only for bytes); the bytes of a BEEF that came as bytes kept as a raw block (`putRaw`), which the `applied` record names. |
 | `src/calls.zig` | The configuration as the engine reads it (`configObject`, `listeners`, the app's name) and its calls of topics and lookup services (`Caller`, `hookAdmitted`, `hookRejected`). |
 | `src/routes.zig` | The route handlers (#40): the overlay-express wire contract, and the gossip's inbound routes (`peerAdmit`, `peerProof`, #74). |
 | `src/gossip.zig` | The three gossip topics (#74): message shapes, what an admission and a proof publish, a peer's proof checked, the peer-admit records. |
 | `src/config.zig` | Where the engine's configuration comes from: its app record (`<app>/app`), else the genesis. |
 | `src/engine_vm.zig` | The engine's wiring over the `skein` imports. |
 | `src/topic.zig` | The topic contract — the module `topic`. |
-| `src/lookup.zig` | The lookup contract: hooks, own storage, answers — the module `lookup`. |
+| `src/lookup.zig` | The lookup contract: hooks, own storage, answers, and each output's BEEF from what the overlay admitted (`Admitted`, `BeefAcc`) — the module `lookup`. |
 | `src/vm.zig` | The `skein` imports as an overlay program sees them — the module `sk`. |
 | `src/topic_demo.zig` → `topic-demo.wasm` | `tm_demo`, an example topic. |
 | `src/lookup_demo.zig` → `lookup-demo.wasm` | `ls_demo`, an example lookup service with its own index. |
@@ -218,12 +218,13 @@ answer from the state:
 | state of the transaction | answer |
 |---|---|
 | admitted (or judged before) | 200, the STEAK from each topic's `applied` record (empty for a topic that took nothing) |
-| still pending, or the chain app does not hold it (an error answer) | **503** `{status: "error", message}` with `Retry-After: 30`: nothing admitted; resubmit |
+| still pending when the client's wait ends (below) | **503** from the host: `{status: "error", code: "ERR_UNAVAILABLE", description}` with `Retry-After: 5` (skein `src/host/frontdoor.ts`); nothing admitted yet; resubmit |
+| the thread ended and the chain app does not hold it (an error answer) | **503** `{status: "error", message}` with `Retry-After: 30`: nothing admitted; resubmit |
 | rejected by the chain app | **400** `{status: "error", message: "Transaction rejected: <reason>"}` (overlay-express's error form) |
 
 While the thread waits on the chain app the client waits too, up to the
 host's bound (`answerWaitMs`, the host's `SKEIN_ANSWER_WAIT_MS`, default
-two minutes): then 503 + `Retry-After` from the host, and
+two minutes): then the host's 503 (`Retry-After: 5`, above), and
 the thread goes on. A resubmission while pending waits on the same thread
 (the pending record names it) and gets the same answer; after admission it
 gets the STEAK at once. A resubmission of a rejected transaction is refused
@@ -248,7 +249,11 @@ in its call (`TransactionRejected`: 200, the empty STEAK).
 - **Admittance:** `{kind: "admitted", topic, txid, vout, script, satoshis,
   admittedAt, tx: <tx CID>, refs: [{to: <tx CID>, rel: "admits"}]}`.
 - **Applied:** `{kind: "applied", topic, txid, outputsToAdmit,
-  coinsToRetain, coinsRemoved, at, tx, refs}`.
+  coinsToRetain, coinsRemoved, at, tx, beef, refs}`. `beef` is the
+  submission's BEEF as the overlay was handed it: the pointer record the
+  kernel's door wrote (shruggr/skein#121), or, for a BEEF that came as
+  bytes (framed with off-chain values, or a host with no door), the raw
+  block of those bytes. A lookup serves it (below).
 - **Submission:** `{kind: "submission", txid, thread, ingest}`.
 
 The step keeps the admittance and applied records; their `refs` give the
@@ -424,7 +429,7 @@ runs as:
 | `admitted` | `{kind: "lookup-hook", app, service, topic, tx: <CID>, outputsToAdmit: [vout], coinsRetained: [input index]}` | a topic it listens to admitted a transaction (or consumed previous coins) |
 | `spent` | `{kind: "lookup-hook", app, service, topic, outpoint: {tx: <CID>, vout}, spendingTx: <CID>}` | for each previous coin that transaction consumed (retained or removed) |
 | `rejected` | `{kind: "lookup-hook", app, service, topic, tx: <CID>}` | a judgement of that topic was removed by a rejection |
-| `lookup` | `{kind: "lookup-call", app, service, query}` | `POST /lookup`: a read |
+| `lookup` | `{kind: "lookup-call", app, service, topics, query}` (`topics`: the ones the service listens to) | `POST /lookup`: a read |
 
 A hook may be a no-op. **Own storage:** a service keeps named maps (the
 SDK chain library's `store.zig`) under its own head `<app>/ls_<service>`
@@ -433,7 +438,7 @@ maps: {name: root | null}}`. A head under its app's name: the kernel lets
 the service's program write it (its program record names the same app). The
 maps are written only through the hooks: a hook that changes them puts the
 new nodes and state record and advances the head. `lookup` reads them (and
-the chain state, read only, for the BEEF), and writes nothing.
+the chain state and the overlay's state, read only), and writes nothing.
 
 The `lookup` answer (dag-cbor on stdout) is one of:
 
@@ -442,10 +447,31 @@ The `lookup` answer (dag-cbor on stdout) is one of:
 {kind: "lookup-answer", type: "freeform", result}
 ```
 
-Each `beef` is the Atomic BEEF of the output's transaction, built from the
-chain app's records (`chain.state.State.beefOf`): the ancestry back to
-proven transactions, with their BUMPs. The query is the client's JSON as
-dag-cbor; integers only.
+**BEEF out for a lookup** (skein-overlay#3, Go's rule): a lookup serves
+what the overlay was handed and admitted, never what the shared store
+happens to hold. Each `beef` is the Atomic BEEF (BRC-95 over BRC-96) of the
+output's transaction, built by the module `lookup` (`Admitted.beefOf`):
+
+1. The transaction's `applied` record: the first of the call's `topics`
+   whose record of it exists, in the overlay's state (`<app>/state`, read
+   only). Its `beef` names the submission's BEEF.
+2. That BEEF, read by CID: a pointer record's transactions and BUMPs from
+   the store (skein-sdk `chain.record`), or the raw block of the bytes.
+3. Trimmed to the transaction's ancestry within it: its inputs' sources,
+   recursively, ending at a proven transaction (one with a BUMP) or one
+   named by txid only. Other transactions it carried are left out.
+4. An input it does not carry (or names by txid only) whose transaction
+   the overlay admitted too: that parent's own submission, built the same
+   way, goes first. An input neither carried nor admitted is left out;
+   nothing of the chain state is walked.
+
+So a proven transaction is served with its own BUMP as it was handed, and
+needs no held parent; with `includeSpent` a spent output's BEEF is built
+the same way. The answer lists outputs only (BRC-24's `output-list`); no
+query shape asks for more history than this. A transaction admitted before
+the applied record named its BEEF (v0.4.0 and earlier) fails the lookup
+(`NoSubmissionBeef`). The query is the client's JSON as dag-cbor; integers
+only.
 
 With the module `lookup`, a service is a `Spec`:
 
@@ -504,7 +530,7 @@ overlay apps.
 | route | fn | | answer |
 |---|---|---|---|
 | `POST /submit` | `submit` | body BEEF (`application/octet-stream`); `X-Topics` a comma list (the SDK's form) or a JSON array; `x-includes-off-chain-values: true` → VarInt(len) ‖ BEEF ‖ values | the STEAK `{topic: {outputsToAdmit, coinsToRetain, coinsRemoved}}` over the requested topics this overlay serves; 400 `{status: "error", message}` if refused or rejected; 503 with `Retry-After` while it is undecided |
-| `POST /lookup` | `lookup` | `{service, query}` JSON; `X-Aggregation: yes` | `{type: "output-list", outputs: [{beef: [bytes], outputIndex, context?}]}`, or the compact octet-stream (count, per output txid ‖ index ‖ context, then one BEEF of them all, `state.beefOfMany`); a freeform answer as `{type, result}` |
+| `POST /lookup` | `lookup` | `{service, query}` JSON; `X-Aggregation: yes` | `{type: "output-list", outputs: [{beef: [bytes], outputIndex, context?}]}`, or the compact octet-stream (count, per output txid ‖ index ‖ context, then one BEEF of them all: the outputs' own BEEFs gathered, `lookup.BeefAcc`); a freeform answer as `{type, result}` |
 | `GET /listTopicManagers`, `/listLookupServiceProviders` | `listTopicManagers`, `listLookupServiceProviders` | | `{name: {name, shortDescription, iconURL?, version?, informationURL?}}`: each configured topic's or service's fn `metadata` |
 | `GET /getDocumentationForTopicManager?manager=`, `/getDocumentationForLookupServiceProvider?lookupService=` | `topicDocumentation`, `lookupDocumentation` | | `text/markdown`: its fn `documentation`; 400 if not configured |
 

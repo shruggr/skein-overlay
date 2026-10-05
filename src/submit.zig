@@ -365,8 +365,8 @@ fn unwind(cx: Ctx, txid: [32]u8, out: *Stepped) !void {
     try calls.hookRejected(cx.a, cx.caller, cx.in, out.unapplied);
 }
 
-/// The admission: each topic's judgement the event carries recorded (`applied`, the
-/// admittances), and the listening lookup services' hooks called (`admitted`, then `spent` for
+/// The admission: each topic's judgement the event carries recorded (`applied`, naming the
+/// submission's BEEF; the admittances), and the listening lookup services' hooks called (`admitted`, then `spent` for
 /// each previous coin consumed). The transaction is the chain app's now (it put and kept the
 /// blocks). A judgement is taken again only if the topic's previous coins moved since the route.
 fn admit(cx: Ctx, ev: Value, out: *Stepped) !void {
@@ -374,6 +374,11 @@ fn admit(cx: Ctx, ev: Value, out: *Stepped) !void {
     const st = cx.st;
     const sub = try state.subjectOf(a, st.store, out.txid);
     const served = try calls.configObject(a, cx.in, "overlayTopics");
+    // The BEEF as handed, named by each `applied` record (what a lookup serves, skein-overlay#3).
+    const beef = switch (Input.of(ev.get("beef")) orelse return error.BadEvent) {
+        .record => |rc| rc,
+        .bytes => |b| try state.putRaw(a, st.store, b),
+    };
     const js = ev.getArray("topics") orelse return error.BadEvent;
     const topics = try a.alloc([]const u8, js.len);
     const applied = try a.alloc(state.Applied, js.len);
@@ -388,7 +393,7 @@ fn admit(cx: Ctx, ev: Value, out: *Stepped) !void {
             const prog = (try calls.configuredProgram(cx.in, served, t.*)) orelse continue;
             break :blk identify(a, cx.caller, prog, t.*, sub, previous, ev.getBytes("offChainValues")) catch continue;
         };
-        ap.* = st.apply(sub, t.*, previous, ins) catch |e| switch (e) {
+        ap.* = st.apply(sub, t.*, previous, ins, beef) catch |e| switch (e) {
             error.BadInstructions => continue,
             else => return e,
         };

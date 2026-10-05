@@ -17,16 +17,25 @@
 //! (each may be a no-op), and answers queries from them — a read (#40): the
 //! `/lookup` route calls fn "lookup" with
 //!
-//!   {kind: "lookup-call", app, service, query}          (query: the client's JSON as dag-cbor)
+//!   {kind: "lookup-call", app, service, topics, query}  (query: the client's JSON as dag-cbor;
+//!                                                         topics: the ones the service listens to)
 //!
 //! and the answer is the call's answer (dag-cbor on stdout), one of
 //!
 //!   {kind: "lookup-answer", type: "output-list", outputs: [{beef, outputIndex, context?}]}
 //!   {kind: "lookup-answer", type: "freeform", result}
 //!
-//! Each output's `beef` is the Atomic BEEF of its transaction, built from the
-//! chain app's records (its head `chain/state`, read only: ancestry back to
-//! proven transactions, with their BUMPs).
+//! Each output's `beef` is the Atomic BEEF of its transaction as the overlay
+//! was handed it and admitted it (skein-overlay#3, Go's rule): the overlay's
+//! `applied` record of the transaction (its head `<app>/state`, read only,
+//! under the first of `topics` that judged it) names the submission's BEEF
+//! (`beef`: the pointer record the kernel's door wrote, shruggr/skein#121, or
+//! the raw block of the bytes as received); its transactions and BUMPs are
+//! read from the store by CID, trimmed to the transaction's own ancestry,
+//! and an input that submission did not carry is filled from the parent's
+//! own submission when the overlay admitted that parent too. Nothing else
+//! of the shared store is walked: a parent neither carried nor admitted is
+//! left out, a proven transaction carries its own BUMP as it was handed.
 //!
 //! A lookup service answers its own metadata and documentation (the
 //! LookupService's getMetaData and getDocumentation): the engine's listing
@@ -145,6 +154,137 @@ pub const Service = struct {
     }
 };
 
+/// The overlay's state head (the engine's, under its app's name): its `applied` records name each
+/// admitted transaction's submission BEEF.
+pub fn overlayHead(a: Allocator, app: []const u8) ![]u8 {
+    return std.mem.concat(a, u8, &.{ app, "/state" });
+}
+
+/// One BEEF gathered from several (an admitted transaction's submission and its admitted parents',
+/// or an aggregated answer's outputs): transactions in the order they come, each once (the first
+/// wins), BUMPs merged per block.
+pub const BeefAcc = struct {
+    a: Allocator,
+    entries: std.ArrayList(c.beef.Entry) = .empty,
+    bumps: std.ArrayList(c.bsvz.spv.MerklePath) = .empty,
+
+    pub fn has(self: *const BeefAcc, txid: [32]u8) bool {
+        for (self.entries.items) |e| if (std.mem.eql(u8, &e.txid, &txid)) return true;
+        return false;
+    }
+
+    fn bumpFor(self: *BeefAcc, p: c.bsvz.spv.MerklePath) !usize {
+        for (self.bumps.items, 0..) |*bp, i| {
+            if (bp.block_height != p.block_height) continue;
+            bp.combine(&p, self.a) catch continue;
+            return i;
+        }
+        try self.bumps.append(self.a, p);
+        return self.bumps.items.len - 1;
+    }
+
+    /// `b`'s transactions (those `keep` marks; null: all), in its order, with their BUMPs.
+    pub fn add(self: *BeefAcc, b: c.beef.Beef, keep: ?[]const bool) !void {
+        for (b.entries, 0..) |e, i| {
+            if (keep) |k| if (!k[i]) continue;
+            if (self.has(e.txid)) continue;
+            var x = e;
+            if (e.bump) |bi| x.bump = try self.bumpFor(b.bumps[bi]);
+            try self.entries.append(self.a, x);
+        }
+    }
+
+    /// The BEEF V2 gathered (Atomic, BRC-95, on `subject`).
+    pub fn serialize(self: *BeefAcc, subject: ?[32]u8) ![]u8 {
+        for (self.entries.items) |e| {
+            const bi = e.bump orelse continue;
+            for (self.bumps.items[bi].path[0]) |*l| if (l.hash) |h| if (std.mem.eql(u8, &h.bytes, &e.txid)) {
+                l.txid = true;
+            };
+        }
+        return c.beef.serialize(self.a, .{ .version = c.beef.V2, .atomic = subject, .bumps = self.bumps.items, .entries = self.entries.items });
+    }
+};
+
+/// What the overlay admitted, as a lookup reads it: its `applied` map (the head `<app>/state`,
+/// read only) under the topics the service listens to (the lookup-call's `topics`).
+pub const Admitted = struct {
+    arena: Allocator,
+    store: Store,
+    applied: Map,
+    topics: []const []const u8,
+
+    /// `state`: the overlay state record (null: nothing admitted yet).
+    pub fn load(a: Allocator, s: Store, state: ?[]const u8, topics: []const []const u8) !Admitted {
+        const maps = try c.store.Maps.create(a, s);
+        var root: ?[]const u8 = null;
+        if (state) |sc| {
+            const v = try s.getValue(a, sc);
+            if (!std.mem.eql(u8, v.getText("kind") orelse "", "overlay-state")) return error.BadOverlayState;
+            root = (v.get("maps") orelse return error.BadOverlayState).getCid("applied");
+        }
+        return .{ .arena = a, .store = s, .applied = maps.map(root), .topics = topics };
+    }
+
+    /// The BEEF the overlay was handed for `txid` (its CID): the `beef` of the first of the topics'
+    /// `applied` records of it. Null: none of them admitted it.
+    pub fn submission(self: *Admitted, txid: [32]u8) !?[]const u8 {
+        const a = self.arena;
+        for (self.topics) |t| {
+            const key = try std.mem.concat(a, u8, &.{ try c.store.nameKey(a, t, &.{}), &txid });
+            const rc = (try self.applied.link(key)) orelse continue;
+            return (try self.store.getValue(a, rc)).getCid("beef") orelse return error.NoSubmissionBeef;
+        }
+        return null;
+    }
+
+    /// A submission's BEEF by its CID: a pointer record (dag-cbor), or the raw block of the bytes.
+    fn parsed(self: *Admitted, bc: []const u8) !c.beef.Beef {
+        if (bc.len == 36 and std.mem.eql(u8, bc[0..2], &.{ 0x01, 0x55 }))
+            return c.beef.parse(self.arena, try self.store.get(self.arena, bc));
+        return c.record.parsed(self.arena, self.store, bc);
+    }
+
+    /// The Atomic BEEF (BRC-95 over BRC-96) of a transaction the overlay admitted.
+    pub fn beefOf(self: *Admitted, txid: [32]u8) ![]const u8 {
+        var acc = BeefAcc{ .a = self.arena };
+        var seen = std.AutoHashMap([32]u8, void).init(self.arena);
+        if (!(try self.into(&acc, &seen, txid))) return error.NotAdmitted;
+        return acc.serialize(txid);
+    }
+
+    /// `txid`'s submission, trimmed to its ancestry in it (a proven transaction ends a line), into
+    /// `acc` — after the submissions of the admitted parents it does not carry (or names by txid
+    /// only). → false: the overlay admitted no `txid`.
+    fn into(self: *Admitted, acc: *BeefAcc, seen: *std.AutoHashMap([32]u8, void), txid: [32]u8) !bool {
+        if ((try seen.getOrPut(txid)).found_existing) return true;
+        const bc = (try self.submission(txid)) orelse return false;
+        const b = try self.parsed(bc);
+        const keep = try self.arena.alloc(bool, b.entries.len);
+        @memset(keep, false);
+        var missing: std.ArrayList([32]u8) = .empty;
+        var stack: std.ArrayList([32]u8) = .empty;
+        try stack.append(self.arena, txid);
+        while (stack.pop()) |t| {
+            const i = b.indexOf(t) orelse {
+                try missing.append(self.arena, t);
+                continue;
+            };
+            if (keep[i]) continue;
+            keep[i] = true;
+            const e = b.entries[i];
+            if (e.format == .txid_only) try missing.append(self.arena, t);
+            if (e.bump != null) continue;
+            const tx = e.tx orelse continue;
+            for (tx.inputs) |in| try stack.append(self.arena, in.previous_outpoint.txid.bytes);
+        }
+        if (b.indexOf(txid) == null) return error.BadSubmission;
+        for (missing.items) |m| _ = try self.into(acc, seen, m);
+        try acc.add(b, keep);
+        return true;
+    }
+};
+
 /// A lookup service's metadata (BRC-24's listing entry). `name` null: the configured service name.
 pub const Metadata = struct {
     name: ?[]const u8 = null,
@@ -185,7 +325,7 @@ pub fn describe(a: Allocator, comptime Program: type, func: []const u8, args: Va
 pub const Spec = struct {
     /// The names of the service's maps (its state record's `maps`).
     maps: []const []const u8,
-    /// `ch`: the chain state, read only (an output's spender, its BEEF).
+    /// `ch`: the chain state, read only (an output's spender).
     answer: *const fn (a: Allocator, svc: *Service, ch: *Chain, query: Value) anyerror!Answer,
     admitted: ?*const fn (a: Allocator, svc: *Service, topic: []const u8, tx: Tx, outputs_to_admit: []const u32, coins_retained: []const u32) anyerror!void = null,
     spent: ?*const fn (a: Allocator, svc: *Service, topic: []const u8, outpoint: Outpoint, spending: Tx) anyerror!void = null,
@@ -196,6 +336,13 @@ fn uintList(a: Allocator, v: ?Value) ![]u32 {
     const items = if (v) |x| (if (x == .array) x.array else return error.BadArgs) else return &.{};
     const out = try a.alloc(u32, items.len);
     for (items, out) |it, *o| o.* = if (it == .uint and it.uint <= std.math.maxInt(u32)) @intCast(it.uint) else return error.BadArgs;
+    return out;
+}
+
+fn textList(a: Allocator, v: ?Value) ![]const []const u8 {
+    const items = if (v) |x| (if (x == .array) x.array else return error.BadArgs) else return &.{};
+    const out = try a.alloc([]const u8, items.len);
+    for (items, out) |it, *o| o.* = if (it == .text) it.text else return error.BadArgs;
     return out;
 }
 
@@ -218,8 +365,9 @@ pub fn hook(a: Allocator, spec: Spec, svc: *Service, func: []const u8, arg: Valu
     } else return error.UnknownFunction;
 }
 
-/// The answer record for a lookup-call: outputs with their transactions' BEEF.
-pub fn answerRecord(a: Allocator, spec: Spec, svc: *Service, ch: *Chain, args: Value) !Value {
+/// The answer record for a lookup-call: outputs with their transactions' BEEF, as the overlay
+/// admitted them (`adm`).
+pub fn answerRecord(a: Allocator, spec: Spec, svc: *Service, ch: *Chain, adm: *Admitted, args: Value) !Value {
     if (!std.mem.eql(u8, args.getText("kind") orelse "", "lookup-call")) return error.BadArgs;
     const ans = try spec.answer(a, svc, ch, args.get("query") orelse .null);
     switch (ans) {
@@ -234,7 +382,7 @@ pub fn answerRecord(a: Allocator, spec: Spec, svc: *Service, ch: *Chain, args: V
             const items = try a.alloc(Value, outs.len);
             for (outs, items) |o, *it| {
                 const gop = try beefs.getOrPut(o.txid);
-                if (!gop.found_existing) gop.value_ptr.* = (try ch.beefOf(o.txid)) orelse return error.UnknownTransaction;
+                if (!gop.found_existing) gop.value_ptr.* = try adm.beefOf(o.txid);
                 var es: std.ArrayList(cbor.Entry) = .empty;
                 try es.appendSlice(a, &.{
                     .{ .key = "beef", .value = .{ .bytes = gop.value_ptr.* } },
@@ -257,16 +405,18 @@ pub const Handled = struct { answer: Value, state: ?[]const u8 = null };
 
 /// One call of the service (fn "lookup" or a hook) over its storage (`state`:
 /// its head's record) and, for a lookup, the chain state (`chain`: the head
-/// `chain/state`'s record; its network is its own, else `network`). What
-/// `main` runs; the tests call it directly.
-pub fn handle(a: Allocator, spec: Spec, s: Store, network: c.chain.Network, state: ?[]const u8, chain: ?[]const u8, func: []const u8, arg: Value) !Handled {
+/// `chain/state`'s record; its network is its own, else `network`) and the
+/// overlay's (`overlay`: the head `<app>/state`'s record). What `main` runs;
+/// the tests call it directly.
+pub fn handle(a: Allocator, spec: Spec, s: Store, network: c.chain.Network, state: ?[]const u8, chain: ?[]const u8, overlay: ?[]const u8, func: []const u8, arg: Value) !Handled {
     const service = arg.getText("service") orelse return error.BadArgs;
     var svc = try Service.load(a, s, service, spec.maps, state);
     if (std.mem.eql(u8, func, "lookup")) {
         var net = network;
         if (chain) |r| net = c.chain.Network.parse((try s.getValue(a, r)).getText("network") orelse "") orelse return error.BadChainState;
         var ch = try Chain.load(a, s, chain, net);
-        return .{ .answer = try answerRecord(a, spec, &svc, &ch, arg) };
+        var adm = try Admitted.load(a, s, overlay, try textList(a, arg.get("topics")));
+        return .{ .answer = try answerRecord(a, spec, &svc, &ch, &adm, arg) };
     }
     try hook(a, spec, &svc, func, arg);
     const done: Value = .{ .map = try a.dupe(cbor.Entry, &.{
@@ -291,10 +441,12 @@ pub fn main(comptime spec: Spec) u8 {
             if (std.mem.eql(u8, func, "metadata") or std.mem.eql(u8, func, "documentation"))
                 return vm.answer(a, try describe(a, @import("root"), func, arg));
             const head = try headName(a, appOf(arg), arg.getText("service") orelse return error.BadArgs);
-            const chain_state = if (std.mem.eql(u8, func, "lookup")) try vm.head(a, chain_head) else null;
+            const is_lookup = std.mem.eql(u8, func, "lookup");
+            const chain_state = if (is_lookup) try vm.head(a, chain_head) else null;
+            const overlay_state = if (is_lookup) try vm.head(a, try overlayHead(a, appOf(arg))) else null;
             const net_name = if (in.get("defaults")) |d| d.getText("walletNetwork") orelse "main" else "main";
             const network = c.chain.Network.parse(net_name) orelse return error.BadConfig;
-            const h = try handle(a, spec, vm.store(), network, try vm.head(a, head), chain_state, func, arg);
+            const h = try handle(a, spec, vm.store(), network, try vm.head(a, head), chain_state, overlay_state, func, arg);
             if (h.state) |sc| try vm.advance(head, sc);
             try vm.answer(a, h.answer);
         }

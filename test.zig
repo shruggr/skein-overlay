@@ -238,7 +238,7 @@ const Instance = struct {
         }
         if (std.mem.eql(u8, program, self.lookup_prog)) {
             try std.testing.expectEqualStrings("overlay", arg.getText("app").?);
-            const h = try lookup.handle(a, ls.spec, self.current, .regtest, self.ls_state, self.chain_root, func, arg);
+            const h = try lookup.handle(a, ls.spec, self.current, .regtest, self.ls_state, self.chain_root, self.ov_root, func, arg);
             if (h.state) |sc| self.ls_state = sc;
             return h.answer;
         }
@@ -1098,4 +1098,88 @@ test "a submission by its pointer record (skein #121): read, not parsed or prove
     // A record of something else: refused.
     const junk = try ms.store().putValue(a, .{ .map = try a.dupe(cbor.Entry, &.{.{ .key = "kind", .value = .{ .text = "other" } }}) });
     try std.testing.expectEqualStrings("InvalidBeef", (try inst.routeRecord(junk)).refused);
+}
+
+/// A served BEEF verifies against a node that holds only these headers.
+fn verifiesOn(a: Allocator, headers: []const []const u8, beef_bytes: []const u8) !void {
+    var headers_only = c.store.MemStore.init(std.testing.allocator);
+    defer headers_only.deinit();
+    var hc = try Chain.load(a, headers_only.store(), null, .regtest);
+    _ = try hc.addHeaders(headers);
+    var sctx = Chain.SpvCtx{ .st = &hc };
+    _ = try c.spv.verify(a, try beef.parse(a, beef_bytes), .{ .ptr = &sctx, .rootAtFn = Chain.SpvCtx.rootAt, .knownRawFn = Chain.SpvCtx.knownRaw });
+}
+
+test "a lookup serves what the overlay admitted (#3): the submission's BEEF from its record, a proven output with no held parent with its own BUMP, includeSpent with the admitted parent's submission" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = c.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var inst = try Instance.init(a, &ms);
+    const k = try keys(0x42);
+    // X spends a parent nobody here holds (the funding transaction never reaches the chain app),
+    // and is mined alone at height 1.
+    const f = try fund(a, 0x33, 1, &k.p2pkh);
+    const x = try spend(a, &f.tx, 0, &.{.{ 1, &k.token }}, k.priv);
+    const hx = mine(hdr.hash(&c.chain.Network.regtest.genesis()), x.txid, 1_700_000_600);
+    try inst.headers(&.{&hx});
+    const x_bumps = try a.dupe(bsvz.spv.MerklePath, &.{try bsvz.spv.MerklePath.parse(a, try soloPath(a, 1, x.txid))});
+    const x_wire = try beef.serialize(a, .{ .version = beef.V2, .bumps = x_bumps, .entries = try a.dupe(beef.Entry, &.{.{ .txid = x.txid, .format = .raw_with_bump, .bump = 0, .raw = x.raw, .tx = x.tx }}) });
+
+    // ------------------------------------------------ X by its pointer record: admitted on the chain app's proof
+    const rc = try pointerOf(a, ms.store(), x_wire);
+    {
+        const r = try inst.routeRecord(rc);
+        _ = try inst.begin(r.admit.event);
+        try std.testing.expectEqual(c.state.Status.proven, try inst.ingest(x_wire));
+        var held = try inst.chain();
+        try std.testing.expect(!(try held.holds(f.txid)));
+        const done = try inst.answer(x.txid, .{ .proven = .{} });
+        try std.testing.expect(done.admitted);
+        // The applied record names the submission's record.
+        var st = try inst.load();
+        try std.testing.expectEqualSlices(u8, rc, (try st.appliedRecord("tm_demo", x.txid)).?.getCid("beef").?);
+        // The chain state's walk of X's inputs fails: the lookup no longer takes it.
+        var ch = try inst.chain();
+        try std.testing.expectError(error.MissingAncestor, ch.beefOf(x.txid));
+    }
+    {
+        const outs = try inst.look(&.{.{ .key = "topic", .value = .{ .text = "tm_demo" } }});
+        try std.testing.expectEqual(@as(usize, 1), outs.len);
+        const b = try beef.parse(a, outs[0].getBytes("beef").?);
+        try std.testing.expectEqualSlices(u8, &x.txid, &b.atomic.?);
+        try std.testing.expectEqual(@as(usize, 1), b.entries.len);
+        try std.testing.expectEqual(@as(?usize, 0), b.entries[0].bump);
+        try std.testing.expectEqual(@as(usize, 1), b.bumps.len);
+        try verifiesOn(a, &.{&hx}, outs[0].getBytes("beef").?);
+        const all = try inst.look(&.{ .{ .key = "topic", .value = .{ .text = "tm_demo" } }, .{ .key = "includeSpent", .value = .{ .boolean = true } } });
+        try std.testing.expectEqual(@as(usize, 1), all.len);
+    }
+
+    // ------------------------------------------------ Y spends X's token, submitted as bytes without X: X spent, includeSpent
+    const y = try spend(a, &x.tx, 0, &.{.{ 1, &k.token }}, k.priv);
+    {
+        inst.now = 2000;
+        const y_wire = try atomic(a, y);
+        const done = try inst.admitted(y_wire, y.txid);
+        try std.testing.expectEqualSlices(u32, &.{0}, done.applied[0].coins_to_retain);
+        // The bytes as received, kept as a raw block the applied record names.
+        var st = try inst.load();
+        const yb = (try st.appliedRecord("tm_demo", y.txid)).?.getCid("beef").?;
+        try std.testing.expectEqualSlices(u8, y_wire, ms.blocks.get(yb).?);
+        try std.testing.expectEqual(@as(usize, 1), try inst.lookTopic());
+        const all = try inst.look(&.{ .{ .key = "topic", .value = .{ .text = "tm_demo" } }, .{ .key = "includeSpent", .value = .{ .boolean = true } } });
+        try std.testing.expectEqual(@as(usize, 2), all.len);
+        for (all) |o| try verifiesOn(a, &.{&hx}, o.getBytes("beef").?);
+        // Y's: X (the admitted parent's own submission, with its BUMP) first, then Y.
+        const yo = for (all) |o| {
+            if (std.mem.eql(u8, &(try subjectOf(a, o)), &y.txid)) break o;
+        } else return error.NoY;
+        const b = try beef.parse(a, yo.getBytes("beef").?);
+        try std.testing.expectEqual(@as(usize, 2), b.entries.len);
+        try std.testing.expectEqualSlices(u8, &x.txid, &b.entries[0].txid);
+        try std.testing.expectEqual(@as(?usize, 0), b.entries[0].bump);
+        try std.testing.expectEqualSlices(u8, &y.txid, &b.entries[1].txid);
+    }
 }

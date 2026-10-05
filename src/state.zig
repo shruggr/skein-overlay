@@ -4,7 +4,8 @@
 //! chain app's (shruggr/skein-chain, the head `chain/state`, the SDK's
 //! `chain.state.State`), read here by CID and never written: a submission is
 //! SPV-checked against its headers, an admitted output's spender is its
-//! `spent`, a lookup's BEEF is built from its records. Two overlay apps on one
+//! `spent`. A lookup's BEEF is the submission's, which the `applied` record
+//! names (skein-overlay#3; lookup.zig). Two overlay apps on one
 //! instance each keep their own record under their own name and share the one
 //! chain.
 //!
@@ -14,7 +15,9 @@
 //!
 //! The maps (keys bytes, ordered bytewise; `tp` = len ‖ topic):
 //!   admitted   tp ‖ txid ‖ vout → admittance record {kind: "admitted", topic, txid, vout, script, satoshis, admittedAt, tx, refs}
-//!   applied    tp ‖ txid → applied record {kind: "applied", topic, txid, outputsToAdmit, coinsToRetain, coinsRemoved, at, tx, refs}
+//!   applied    tp ‖ txid → applied record {kind: "applied", topic, txid, outputsToAdmit, coinsToRetain, coinsRemoved, at, tx, beef, refs}
+//!                (beef: the submission's BEEF as the overlay was handed it — its pointer record
+//!                 (shruggr/skein#121), or the raw block of the bytes — what a lookup serves)
 //!   pending    txid → {kind: "submission", txid, thread, ingest}   a submission the chain app has not yet
 //!                                                                   answered with accepted or proven
 //!
@@ -252,8 +255,9 @@ pub const State = struct {
     /// Record a topic's judgement of a submission the chain app has (accepted or proven): each
     /// admitted output as an admittance record, the judgement in `applied`. `previous` is
     /// `previousCoins` for this topic, taken before any judgement of this step. A transaction the
-    /// topic judged before is a dupe: nothing is written.
-    pub fn apply(self: *State, sub: Subject, t: []const u8, previous: []const u32, ins: Instructions) !Applied {
+    /// topic judged before is a dupe: nothing is written. `beef`: the submission's BEEF (its CID:
+    /// the pointer record, or the raw block of the bytes, `putRaw`), named by the applied record.
+    pub fn apply(self: *State, sub: Subject, t: []const u8, previous: []const u32, ins: Instructions, beef: []const u8) !Applied {
         const a = self.arena;
         if (try self.isApplied(t, sub.txid)) return .{ .dupe = true };
         try check(sub.tx, previous, ins);
@@ -293,6 +297,7 @@ pub const State = struct {
             .{ .key = "coinsRemoved", .value = .{ .array = try uints(a, removed.items) } },
             .{ .key = "at", .value = .{ .uint = @intCast(@max(self.now, 0)) } },
             .{ .key = "tx", .value = .{ .cid = sub.cid } },
+            .{ .key = "beef", .value = .{ .cid = beef } },
             .{ .key = "refs", .value = try admitsRef(a, sub.cid) },
         }) });
         try self.map("applied").putLink(try cat(a, &.{ tp, &sub.txid }), applied);
@@ -558,55 +563,15 @@ pub fn verifyDecoded(a: Allocator, s: Store, ch: *Chain, d: Decoded, door: bool)
     return subject;
 }
 
-// ---------------------------------------------------------------- BEEF out (a lookup's answer), from the chain state
+// ---------------------------------------------------------------- a submission's bytes, kept
 
-/// The Atomic BEEF of a transaction the chain holds: its ancestry back to proven transactions.
-pub fn beefFor(ch: *Chain, txid: [32]u8) ![]const u8 {
-    return (try ch.beefOf(txid)) orelse error.UnknownTransaction;
+/// The bytes of a BEEF that came as bytes (no pointer record: a body framed with off-chain values,
+/// a host with no door), put as a raw block (CIDv1 raw, sha2-256) → its CID: what the `applied`
+/// records name.
+pub fn putRaw(a: Allocator, s: Store, bytes: []const u8) ![]const u8 {
+    var cid: [36]u8 = .{ 0x01, 0x55, 0x12, 0x20 } ++ @as([32]u8, undefined);
+    std.crypto.hash.sha2.Sha256.hash(bytes, cid[4..36], .{});
+    const out = try a.dupe(u8, &cid);
+    try s.putBlock(out, bytes);
+    return out;
 }
-
-/// One BEEF (V2, not atomic) of several transactions the chain holds, with their ancestry back to
-/// proven ones: an aggregated lookup answer's.
-pub fn beefOfMany(ch: *Chain, txids: []const [32]u8) ![]const u8 {
-    var acc = BeefAcc{ .ch = ch };
-    for (txids) |t| try acc.visit(t);
-    acc.flagLeaves();
-    return beef_mod.serialize(ch.arena, .{ .version = beef_mod.V2, .bumps = acc.bumps.items, .entries = acc.entries.items });
-}
-
-const BeefAcc = struct {
-    ch: *Chain,
-    entries: std.ArrayList(beef_mod.Entry) = .empty,
-    bumps: std.ArrayList(bsvz.spv.MerklePath) = .empty,
-
-    fn visit(acc: *BeefAcc, txid: [32]u8) anyerror!void {
-        const a = acc.ch.arena;
-        for (acc.entries.items) |e| if (std.mem.eql(u8, &e.txid, &txid)) return;
-        const raw = (try acc.ch.txRaw(txid)) orelse return error.MissingAncestor;
-        const tx = try Transaction.parse(a, raw);
-        if ((try acc.ch.status(txid)) == .proven) {
-            const p = (try acc.ch.proofFor(txid)) orelse return error.MissingProof;
-            const idx = for (acc.bumps.items, 0..) |*b, i| {
-                if (b.block_height != p.block_height) continue;
-                b.combine(&p, a) catch continue;
-                break i;
-            } else blk: {
-                try acc.bumps.append(a, p);
-                break :blk acc.bumps.items.len - 1;
-            };
-            try acc.entries.append(a, .{ .txid = txid, .format = .raw_with_bump, .bump = idx, .raw = raw, .tx = tx });
-            return;
-        }
-        for (tx.inputs) |in| try acc.visit(in.previous_outpoint.txid.bytes);
-        try acc.entries.append(a, .{ .txid = txid, .format = .raw, .raw = raw, .tx = tx });
-    }
-
-    fn flagLeaves(acc: *BeefAcc) void {
-        for (acc.entries.items) |e| {
-            const bi = e.bump orelse continue;
-            for (acc.bumps.items[bi].path[0]) |*l| if (l.hash) |h| if (std.mem.eql(u8, &h.bytes, &e.txid)) {
-                l.txid = true;
-            };
-        }
-    }
-};

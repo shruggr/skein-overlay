@@ -48,6 +48,7 @@ const submit_mod = @import("submit.zig");
 const gossip_mod = @import("gossip.zig");
 const calls = @import("calls.zig");
 const state = @import("state.zig");
+const lookup_mod = @import("lookup");
 
 const cbor = c.cbor;
 const Value = cbor.Value;
@@ -519,10 +520,10 @@ fn lookup(a: Allocator, in: Value, req: Value) !Value {
             .{ .key = "outputs", .value = .{ .array = outs } },
         }) }));
     }
-    // The compact form (overlay-express): count, each [txid, index, context], then one BEEF of them all.
-    const st = try load(a, in);
+    // The compact form (overlay-express): count, each [txid, index, context], then one BEEF of them
+    // all: the outputs' own BEEFs gathered (skein-overlay#3: what the overlay admitted, no store walk).
     var out: std.ArrayList(u8) = .empty;
-    var txids: std.ArrayList([32]u8) = .empty;
+    var acc = lookup_mod.BeefAcc{ .a = a };
     try writeVarInt(a, &out, outs.len);
     for (outs) |o| {
         const b = try c.beef.parse(a, o.getBytes("beef") orelse return error.BadAnswer);
@@ -534,11 +535,9 @@ fn lookup(a: Allocator, in: Value, req: Value) !Value {
         const ctx = o.getBytes("context") orelse "";
         try writeVarInt(a, &out, ctx.len);
         try out.appendSlice(a, ctx);
-        for (txids.items) |t| {
-            if (eql(u8, &t, &txid)) break;
-        } else try txids.append(a, txid);
+        try acc.add(b, null);
     }
-    try out.appendSlice(a, try state.beefOfMany(st.ch, txids.items));
+    try out.appendSlice(a, try acc.serialize(null));
     return respond(a, 200, "application/octet-stream", out.items);
 }
 
