@@ -67,6 +67,19 @@ fn libp2pProvider(a: Allocator) !?[]const u8 {
     return null;
 }
 
+/// Whether a message can reach `key`: the instance itself (looped back), or an entry of the address book.
+pub fn reaches(a: Allocator, in: Value, key: []const u8) !bool {
+    if (vm.selfKey(in)) |me| if (std.mem.eql(u8, me, key)) return true;
+    const s = vm.store();
+    const root = (try vm.head(a, "peers")) orelse return false;
+    const list = (try s.getValue(a, root)).getArray("peers") orelse return false;
+    for (list) |x| {
+        const p = try s.getValue(a, x.getCid("peer") orelse continue);
+        if (std.mem.eql(u8, p.getBytes("key") orelse "", key)) return true;
+    }
+    return false;
+}
+
 var provider_key: []const u8 = "";
 
 /// Publish on a GossipSub topic (#74): a message to the libp2p provider, box `publish`, body {topic,

@@ -15,10 +15,15 @@
 //!                             (`<topic>-proof`), rejected (the judgements removed, `rejected` hooks).
 //!   a peer's admit            the `peer-admit` event the `-admit` route admits (box `<app>`):
 //!                             recorded under `<app>/gossip`.
+//!   register / deregister     a message in box `<app>`, {fn: "register", args: {topic, program}} or
+//!                             {fn: "deregister", args: {topic}}, from whoever the app's rows admit
+//!                             there (topics.zig, shruggr/skein#120): the registered set under
+//!                             `<app>/topics`, the subscribe / unsubscribe events; answered {topic, active}.
 //!
 //! The state is the overlay's own, under its app's name (state.zig: `<app>/state`), over the
 //! chain app's (`chain/state`), read only. The topics and lookup services are the app's (#72,
-//! config.zig): `config.overlay` of the app record `<app>/app`, read at every step and call. A
+//! config.zig): `config.overlay` of the app record `<app>/app` and the topics registered under
+//! `<app>/topics`, read at every step and call. A
 //! genesis-wired engine (no app record) reads the genesis config instead
 //! (defaults.overlayTopics, defaults.overlayLookups, defaults.overlayGossip) and its heads are
 //! under its program's name.
@@ -28,6 +33,7 @@
 //!   {kind: "overlay-result", op: "submit" | "answer" | "watch" | "watched", txid, ingest?, heard?,
 //!    admitted?, steak?, unapplied?, watch?, awaiting?, published?, refs, state}
 //!   {kind: "overlay-result", op: "peer-admit", topic, txid, record, state}
+//!   {kind: "overlay-result", op: "register" | "deregister", topic, active, changed, topics?}
 //!   {kind: "overlay-result", op, error}                         refused
 const std = @import("std");
 const c = @import("chain");
@@ -37,6 +43,8 @@ const routes = @import("routes.zig");
 const submit = @import("submit.zig");
 const gossip = @import("gossip.zig");
 const calls = @import("calls.zig");
+const config = @import("config.zig");
+const topics = @import("topics.zig");
 
 const cbor = c.cbor;
 const Value = cbor.Value;
@@ -81,6 +89,58 @@ fn peerAdmitted(a: Allocator, step: Value, ev: Value) !void {
     }));
 }
 
+/// `register {topic, program}` / `deregister {topic}` (topics.zig, shruggr/skein#120): a message in
+/// box `<app>`, `{fn, args}`, from whoever the app's rows admit there. The set written under
+/// `<app>/topics` and the events emitted when it changes; the answer `{fn, request, replyTo,
+/// result: {topic, active} | error: {code, message}}` (skein docs/APPS.md §4) to the sender when a
+/// message can reach it. A refusal writes and emits nothing.
+fn registration(a: Allocator, step: Value, args: Value, body: Value, func: []const u8) !void {
+    const s = vm.store();
+    const head = try topics.headName(a, calls.appOf(step));
+    const root = try vm.head(a, head);
+    const list = try topics.entriesOf(a, if (root) |r| try s.getValue(a, r) else null);
+    const fargs: Value = body.get("args") orelse .{ .map = &.{} };
+    const change = if (eql(u8, func, "register"))
+        try topics.register(a, list, fargs, step.get("programs") orelse return error.BadConfig, try config.selfRole(a, s, step, null))
+    else
+        try topics.deregister(a, list, fargs);
+    const message = args.getCid("message") orelse return error.BadInput;
+    var ans: std.ArrayList(cbor.Entry) = .empty;
+    try ans.appendSlice(a, &.{
+        .{ .key = "fn", .value = .{ .text = func } },
+        .{ .key = "request", .value = .{ .cid = message } },
+        .{ .key = "replyTo", .value = .{ .cid = message } },
+    });
+    var fields: std.ArrayList(cbor.Entry) = .empty;
+    switch (change) {
+        .refused => |why| {
+            try ans.append(a, .{ .key = "error", .value = .{ .map = try a.dupe(cbor.Entry, &.{
+                .{ .key = "code", .value = .{ .text = "bad-args" } },
+                .{ .key = "message", .value = .{ .text = why } },
+            }) } });
+            try fields.append(a, .{ .key = "error", .value = .{ .text = why } });
+        },
+        .done => |d| {
+            if (d.list) |l| {
+                const rc = try s.putValue(a, try topics.recordOf(a, l));
+                try vm.advance(head, rc);
+                try fields.append(a, .{ .key = "topics", .value = .{ .cid = rc } });
+            }
+            for (d.events) |ev| _ = try vm.emitEvent(a, ev);
+            try ans.append(a, .{ .key = "result", .value = d.answer });
+            try fields.appendSlice(a, &.{
+                .{ .key = "topic", .value = d.answer.get("topic").? },
+                .{ .key = "active", .value = d.answer.get("active").? },
+                .{ .key = "changed", .value = .{ .boolean = d.list != null } },
+            });
+        },
+    }
+    if (args.getBytes("sender")) |sender| if (try ev_.reaches(a, step, sender)) {
+        _ = try vm.send(a, sender, args.getText("box") orelse calls.appOf(step), .{ .map = ans.items });
+    };
+    _ = try vm.finish(a, s, try resultRecord(a, func, fields.items));
+}
+
 fn run(a: Allocator) anyerror!void {
     const s = vm.store();
     const in = try vm.input(a);
@@ -100,10 +160,13 @@ fn run(a: Allocator) anyerror!void {
         if (!eql(u8, kind, "submit")) return error.BadEvent;
         op = if (reply == null) "submit" else "answer";
     } else if (args.getCid("body")) |bc| {
-        // A message in the app's box: from the instance itself (its own watch), nothing else.
+        const body = try s.getValue(a, bc);
+        // Register or deregister a topic: from whoever the app's rows admit to its box.
+        const f = body.getText("fn") orelse "";
+        if (eql(u8, f, "register") or eql(u8, f, "deregister")) return registration(a, step, args, body, f);
+        // Any other message in the app's box: from the instance itself (its own watch), nothing else.
         const me = vm.selfKey(step) orelse return error.NoIdentity;
         if (!eql(u8, args.getBytes("sender") orelse "", me)) return error.NotFromThisInstance;
-        const body = try s.getValue(a, bc);
         if (!eql(u8, body.getText("fn") orelse "", "watch")) return error.UnknownFn;
         watch_args = body.get("args") orelse return error.BadInput;
         op = if (reply == null) "watch" else "watched";

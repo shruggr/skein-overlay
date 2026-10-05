@@ -1,4 +1,4 @@
-# Overlay services in the VM (0.5.0)
+# Overlay services in the VM (0.6.0)
 
 An overlay is an app (skein docs/APPS.md §6). It judges transactions with
 its topic managers and indexes them with its lookup services; it does not
@@ -20,7 +20,8 @@ its own head. A lookup answers from those indexes.
 **Everything the overlay writes is under its app's name** (skein #77: an app
 writes only heads under its own name): `<app>/state` (what its topics
 admitted), `<app>/gossip` (its peers' admits), `<app>/ls_<service>` (each
-lookup service's index); its app record is `<app>/app`. Two overlay apps on
+lookup service's index), `<app>/topics` (the topics registered at runtime,
+"Register a topic", below); its app record is `<app>/app`. Two overlay apps on
 one instance — `overlay` and `amm`, say — therefore keep two sets of heads
 and share the one chain: they coexist by construction.
 
@@ -303,8 +304,9 @@ wire"). Stepped:
 | POST /submit (a launch), or the submit event in box `<app>` (the `libp2p:<topic>` route's admit, row from `event`) | `{kind: "submit", …}` | the submission's thread: the ingest message, pending; on each answer (`reply`) admit, reject or await on |
 | a message in box `<app>` from the instance itself (row from `$self`) | `{fn: "watch", args: {txid, ingest}}` | the watch: the later proof (`-proof`) or rejection (unwound) |
 | the `peer-admit` event in box `<app>` (the `-admit` route's admit) | `{kind: "peer-admit", …}` | recorded under `<app>/gossip` ("Gossip", below); nothing admitted |
+| a message in box `<app>` from whoever the app's rows admit there | `{fn: "register", args: {topic, program}}` or `{fn: "deregister", args: {topic}}` | the registered set under `<app>/topics` and its events ("Register a topic", below) |
 
-A message in box `<app>` from anyone else is refused. There is no `lookup`
+Any other message in box `<app>` from anyone but the instance itself is refused. There is no `lookup`
 box: a lookup is a read: its request is recorded, and it moves nothing.
 
 **Config.** An installed engine reads its configuration from its app
@@ -318,32 +320,17 @@ name is where its heads are (`<name>/state`, …). A reinstall with a changed
 `config.overlay` is read at the next step or call; nothing restarts.
 
 - `config.overlay.topics = {"tm_demo": "topic-demo"}` maps each topic to a
-  role in `programs`.
+  role in `programs`: the topics declared at install. It may be empty or
+  absent (a dynamic overlay); the topics registered at runtime are served
+  beside them ("Register a topic", below).
 - `config.overlay.lookups = {"ls_demo": {"program": "lookup-demo",
   "topics": ["tm_demo"]}}` maps each lookup service to a role and the
-  topics it listens to. The short form `{"ls_demo": "lookup-demo"}` listens
-  to every topic the overlay serves.
+  topics it listens to. Without `topics` — `{"ls_demo": {"program":
+  "lookup-demo"}}`, or the short form `{"ls_demo": "lookup-demo"}` — it
+  listens to every topic the overlay serves, declared or registered: a
+  dynamic overlay's lookup service needs no topic list.
 - `config.overlay.gossip = {"tm_demo": false}` turns a topic's gossip
   publishing off (#74; default on).
-- `config.overlay.prefixes = {"tm_": {"program": "mandala-topic",
-  "active": "mandala"}}` serves topics the app activates live (skein #119,
-  #120: one topic per token, `tm_<txid>`, not known at install). `active`
-  names a head under the app's name (`<app>/mandala`) whose root record
-  lists the topics served now, `{topics: [<topic>, …]}`, written by the
-  app's own program. Each listed topic that starts with the prefix is
-  served as if `topics` named it, judged by `program` (a topic `topics`
-  names keeps its own program). A lookup service in the object form may add
-  `"prefixes": ["tm_"]` to listen to those topics too. The list is read at
-  every step and call, like the rest. The install derives no rows from a
-  prefix: the app's manifest names one libp2p prefix row `{transport:
-  "libp2p", address: "tm_", prefix: true, sender: "*", program: "overlay",
-  fn: "submit", filter: "beef"}`, and the app emits `subscribe` for
-  `<topic>`, `<topic>-admit` and `<topic>-proof` when it activates one
-  (skein docs/OVERLAY.md "How an overlay app activates a token topic
-  live"). A message on `<topic>-admit` or `<topic>-proof` of a served
-  topic that reaches `submit` (the one prefix row takes all three) is
-  handled as `peerAdmit` or `peerProof`.
-
 There is no `status` (statuses are the chain app's) and no admission
 setting (#73).
 
@@ -353,7 +340,7 @@ instance), or a host's call with no row, reads the genesis `defaults`
 (`etc/config.json`) instead, the same mappings as JSON in strings, the
 program names the genesis's: `overlayTopics = '{"tm_demo":"topic-demo"}'`,
 `overlayLookups = '{"ls_demo":{"program":"lookup-demo","topics":["tm_demo"]}}'`,
-`overlayGossip = '{"tm_demo": false}'`, `overlayPrefixes`. Its heads are under its program's
+`overlayGossip = '{"tm_demo": false}'`. Its heads are under its program's
 name (`overlay/…`), which the tree's `scopes` must grant. `walletNetwork`
 is the network of a chain state not written yet (the chain app's record
 says its own).
@@ -367,6 +354,77 @@ admitted events) and from `$self` (its own watch) — all to the role
 `overlay`. The manifest lists the listing and documentation routes and
 `requires: ["chain/1"]`: the chain app must be installed.
 
+### Register a topic (shruggr/skein#120)
+
+Registering a topic is one call: register this topic, deregister this
+topic. A dynamic overlay — one topic per token, `tm_<txid>`, the topics
+the operator chooses to run (Mandala, the AMM) — declares no topics in
+its manifest and registers each at runtime. An overlay may still
+pre-configure topics in `config.overlay.topics` (OpNS: one global topic,
+nothing to choose); both kinds are served alike. There are no topic
+prefixes anywhere: not in the configuration, not in the rows.
+
+The engine's two functions, a message in box `<app>` (`{fn, args}`, skein
+docs/APPS.md §4):
+
+- `register {topic, program}` adds `topic` to the registered set, judged by
+  the topic manager `program` (a role in `programs`: the manifest of a
+  dynamic overlay lists no topic, so the call names it; an unknown role is
+  refused);
+- `deregister {topic}` removes it.
+
+Both are idempotent: a topic registered already with the same program, or
+not registered, changes nothing and emits nothing. A topic registered with
+another program is refused (deregister it first). The answer is `{topic,
+active}`, `active` whether the topic is in the registered set now, sent to
+the sender as `{fn, request, replyTo, result}` (or `error: {code:
+"bad-args", message}` for a refusal, which writes nothing) when a message
+can reach it (the instance itself, or an address-book entry); the step's
+result record says the same.
+
+Who may call them is the embedding app's manifest: a row for box `<app>`
+to the engine, for the sender it chooses, e.g. the owner:
+
+```json
+{"address": "<app>", "sender": "$owner", "program": "overlay"}
+```
+
+The function is the body's `fn`: a mailbox row's own `fn` is not handed to
+the program (the kernel launches the row's program on the message), and
+one row per sender takes both functions. Another program of the same app
+reaches them through the instance's own row (`$self`), which the install
+derives.
+
+**The set** is the engine's own head, `<app>/topics`:
+
+```
+{kind: "overlay-topics", topics: [{topic, program}, …]}     sorted by topic, each once
+```
+
+read at every step and call with `config.overlay` (`src/config.zig`): each
+registered topic is served as if `config.overlay.topics` named it, judged
+by its `program` (a declared topic keeps its own). Submit, lookup listening,
+the listings, gossip publishing and the three gossip routes all see the one
+set.
+
+**The events** (skein docs/MESSAGES.md "Topics an app asks for", #119),
+emitted when the set changes:
+
+| call | events |
+|---|---|
+| `register` | `{event: "subscribe", topic: "<topic>", program: <engine's role>, fn: "submit"}`, the same for `<topic>-admit` with `fn: "peerAdmit"` and for `<topic>-proof` with `fn: "peerProof"` |
+| `deregister` | `{event: "unsubscribe", topic}` for `<topic>`, `<topic>-admit`, `<topic>-proof` |
+
+`program` is the engine's own role in `programs` (`overlay` in this repo's
+manifest) and `fn` its function for that topic: the handler the host routes
+the topic's messages to (the kernel records the event as `{kind: "event",
+event, app, topic, program, fn}`). The install derives no rows for a
+registered topic: the host subscribes it and routes its messages by these
+events. A message arriving on a registered topic is handled as on a
+declared one: the routes take the topic from the message and look it up in
+the served set (`<topic>` → `submit`, `<topic>-admit` → `peerAdmit`,
+`<topic>-proof` → `peerProof`).
+
 **Result.** Each step keeps a result record and prints its CID:
 
 - `{kind: "overlay-result", op: "submit" | "answer" | "watch" | "watched",
@@ -374,6 +432,9 @@ admitted events) and from `$self` (its own watch) — all to the role
   coinsToRetain, coinsRemoved}}, unapplied?: [topic], watch?, published?,
   awaiting?, refs (mentions), state}`;
 - `{kind: "overlay-result", op: "peer-admit", topic, txid, record, state}`;
+- `{kind: "overlay-result", op: "register" | "deregister", topic, active,
+  changed, topics?}` (`topics`: the set's new record), or `{op, error}`
+  for a refusal;
 - `{op, error}` when the step fails.
 
 A topic whose instructions do not fit the transaction admits nothing.

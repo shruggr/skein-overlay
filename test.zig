@@ -26,6 +26,7 @@ const state = @import("src/state.zig");
 const submit = @import("src/submit.zig");
 const gossip = @import("src/gossip.zig");
 const config = @import("src/config.zig");
+const topics_mod = @import("src/topics.zig");
 const calls = @import("src/calls.zig");
 
 const bsvz = c.bsvz;
@@ -199,6 +200,8 @@ const Instance = struct {
     now: i64 = 1000,
     topic_prog: []const u8,
     lookup_prog: []const u8,
+    /// The topics a submission requests (X-Topics, or the gossip message's).
+    topics: []const []const u8 = &.{"tm_demo"},
     calls_: std.StringHashMapUnmanaged(usize) = .empty,
     wire_: *FakeWire,
     out_: *FakeOut,
@@ -298,7 +301,7 @@ const Instance = struct {
         const ch = try state.chainView(self.a, ovl.store(), self.chain_root, .regtest);
         var st = try state.State.load(self.a, ovl.store(), self.ov_root, ch);
         st.now = self.now;
-        return submit.route(self.a, self.caller(), &st, self.in, input, &.{"tm_demo"}, null, source);
+        return submit.route(self.a, self.caller(), &st, self.in, input, self.topics, null, source);
     }
 
     /// A step: the context over the store as it stands, then the state saved.
@@ -1133,88 +1136,127 @@ test "the applied record names the submission's BEEF as handed (#3): its pointer
     try std.testing.expectEqualSlices(u8, w2, ms.blocks.get(b2).?);
 }
 
-test "topic prefixes (skein #119, #120): the topics an app activates live, served by the prefix's program; a lookup's prefixes" {
+test "register and deregister (skein #120): the set under <app>/topics, the events with their handler, idempotent, an unknown role refused; a registered topic judged and seen by a lookup with no topic list" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
     var ms = c.store.MemStore.init(std.testing.allocator);
     defer ms.deinit();
+    var inst = try Instance.init(a, &ms);
     const s = ms.store();
     var hm = HeadMap{};
 
+    // A dynamic overlay: its manifest declares no topic; its lookup service names no topic list.
     const engine = try s.putValue(a, try mapOf(a, &.{
         .{ .key = "kind", .value = .{ .text = "program" } },
         .{ .key = "name", .value = .{ .text = "overlay" } },
-        .{ .key = "app", .value = .{ .text = "mandala" } },
+        .{ .key = "app", .value = .{ .text = "overlay" } },
     }));
-    const tp = try s.putValue(a, try mapOf(a, &.{ .{ .key = "kind", .value = .{ .text = "program" } }, .{ .key = "name", .value = .{ .text = "token-topic" } } }));
-    const lp = try s.putValue(a, try mapOf(a, &.{ .{ .key = "kind", .value = .{ .text = "program" } }, .{ .key = "name", .value = .{ .text = "token-lookup" } } }));
-    const strs = struct {
-        fn of(al: Allocator, xs: []const []const u8) !Value {
-            const out = try al.alloc(Value, xs.len);
-            for (xs, out) |x, *o| o.* = .{ .text = x };
-            return .{ .array = out };
-        }
-    }.of;
-    try hm.m.put(a, "mandala/app", try s.putValue(a, try mapOf(a, &.{
+    try hm.m.put(a, "overlay/app", try s.putValue(a, try mapOf(a, &.{
         .{ .key = "kind", .value = .{ .text = "app" } },
-        .{ .key = "name", .value = .{ .text = "mandala" } },
+        .{ .key = "name", .value = .{ .text = "overlay" } },
         .{ .key = "programs", .value = try mapOf(a, &.{
-            .{ .key = "overlay", .value = .{ .cid = engine } },
-            .{ .key = "token-topic", .value = .{ .cid = tp } },
-            .{ .key = "token-lookup", .value = .{ .cid = lp } },
+            .{ .key = "engine", .value = .{ .cid = engine } },
+            .{ .key = "topic-demo", .value = .{ .cid = inst.topic_prog } },
+            .{ .key = "lookup-demo", .value = .{ .cid = inst.lookup_prog } },
         }) },
         .{ .key = "config", .value = try mapOf(a, &.{.{ .key = "overlay", .value = try mapOf(a, &.{
-            .{ .key = "topics", .value = try mapOf(a, &.{.{ .key = "tm_fixed", .value = .{ .text = "token-topic" } }}) },
-            .{ .key = "prefixes", .value = try mapOf(a, &.{.{ .key = "tm_", .value = try mapOf(a, &.{
-                .{ .key = "program", .value = .{ .text = "token-topic" } },
-                .{ .key = "active", .value = .{ .text = "tokens" } },
-            }) }}) },
-            .{ .key = "lookups", .value = try mapOf(a, &.{
-                .{ .key = "ls_tokens", .value = try mapOf(a, &.{
-                    .{ .key = "program", .value = .{ .text = "token-lookup" } },
-                    .{ .key = "topics", .value = try strs(a, &.{}) },
-                    .{ .key = "prefixes", .value = try strs(a, &.{"tm_"}) },
-                }) },
-                .{ .key = "ls_fixed", .value = try mapOf(a, &.{
-                    .{ .key = "program", .value = .{ .text = "token-lookup" } },
-                    .{ .key = "topics", .value = try strs(a, &.{"tm_fixed"}) },
-                }) },
-            }) },
+            .{ .key = "lookups", .value = try mapOf(a, &.{.{ .key = "ls_demo", .value = try mapOf(a, &.{.{ .key = "program", .value = .{ .text = "lookup-demo" } }}) }}) },
         }) }}) },
     })));
-    const in = try withThread(a, s, try mapOf(a, &.{.{ .key = "defaults", .value = try mapOf(a, &.{}) }}), engine);
+    const genesis_in = try mapOf(a, &.{.{ .key = "defaults", .value = try mapOf(a, &.{.{ .key = "walletNetwork", .value = .{ .text = "regtest" } }}) }});
+    const in = try withThread(a, s, genesis_in, engine);
 
-    // Nothing active yet (no head `mandala/tokens`): the exact topic only.
     const before = try config.resolve(a, s, hm.heads(), in, null);
-    try std.testing.expectEqual(@as(usize, 1), (try calls.configObject(a, before, "overlayTopics")).count());
-    try std.testing.expectEqual(@as(usize, 0), (try calls.listeners(a, before, "tm_aa")).len);
+    try std.testing.expectEqual(@as(usize, 0), (try calls.configObject(a, before, "overlayTopics")).count());
+    try std.testing.expectEqual(@as(usize, 0), (try calls.listeners(a, before, "tm_reg")).len);
+    // The engine's own role is the app's name for its program record (here `engine`), what the events name.
+    const self = try config.selfRole(a, s, before, null);
+    try std.testing.expectEqualStrings("engine", self);
+    const programs = before.get("programs").?;
+    const args = struct {
+        fn of(al: Allocator, topic_: []const u8, program: ?[]const u8) !Value {
+            var es: std.ArrayList(cbor.Entry) = .empty;
+            try es.append(al, .{ .key = "topic", .value = .{ .text = topic_ } });
+            if (program) |p| try es.append(al, .{ .key = "program", .value = .{ .text = p } });
+            return .{ .map = es.items };
+        }
+    }.of;
 
-    // The app's program writes its list: the topics under the prefix are served by its program;
-    // a listed name outside the prefix (or the bare prefix) is not.
-    try hm.m.put(a, "mandala/tokens", try s.putValue(a, try mapOf(a, &.{
-        .{ .key = "kind", .value = .{ .text = "mandala-tokens" } },
-        .{ .key = "topics", .value = try strs(a, &.{ "tm_aa", "tm_bb", "tm_", "other" }) },
-    })));
+    // register: the set, the three subscribes with the engine's role and its function for each.
+    const reg = (try topics_mod.register(a, &.{}, try args(a, "tm_reg", "topic-demo"), programs, self)).done;
+    try std.testing.expectEqual(@as(usize, 1), reg.list.?.len);
+    try std.testing.expectEqualStrings("topic-demo", reg.list.?[0].program);
+    try std.testing.expect(reg.answer.get("active").?.boolean);
+    try std.testing.expectEqualStrings("tm_reg", reg.answer.getText("topic").?);
+    const want = [_][2][]const u8{ .{ "tm_reg", "submit" }, .{ "tm_reg-admit", "peerAdmit" }, .{ "tm_reg-proof", "peerProof" } };
+    try std.testing.expectEqual(@as(usize, 3), reg.events.len);
+    for (reg.events, want) |ev, w| {
+        try std.testing.expectEqual(@as(usize, 4), ev.map.len);
+        try std.testing.expectEqualStrings("subscribe", ev.getText("event").?);
+        try std.testing.expectEqualStrings(w[0], ev.getText("topic").?);
+        try std.testing.expectEqualStrings("engine", ev.getText("program").?);
+        try std.testing.expectEqualStrings(w[1], ev.getText("fn").?);
+    }
+    // Idempotent: again, nothing written, nothing emitted.
+    const again = (try topics_mod.register(a, reg.list.?, try args(a, "tm_reg", "topic-demo"), programs, self)).done;
+    try std.testing.expect(again.list == null and again.events.len == 0 and again.answer.get("active").?.boolean);
+    // Refused: an unknown role, no program, another program for a registered topic.
+    try std.testing.expect(try topics_mod.register(a, reg.list.?, try args(a, "tm_x", "nope"), programs, self) == .refused);
+    try std.testing.expect(try topics_mod.register(a, reg.list.?, try args(a, "tm_x", null), programs, self) == .refused);
+    try std.testing.expect(try topics_mod.register(a, reg.list.?, try args(a, "tm_reg", "lookup-demo"), programs, self) == .refused);
+
+    // The engine writes the set under `overlay/topics`: served from the next step or call on.
+    const rec = try topics_mod.recordOf(a, reg.list.?);
+    try std.testing.expectEqualDeep(reg.list.?, try topics_mod.entriesOf(a, rec));
+    try std.testing.expectEqualStrings("overlay/topics", try topics_mod.headName(a, "overlay"));
+    try hm.m.put(a, "overlay/topics", try s.putValue(a, rec));
     const now = try config.resolve(a, s, hm.heads(), in, null);
-    const topics = try calls.configObject(a, now, "overlayTopics");
-    try std.testing.expectEqual(@as(usize, 3), topics.count());
-    try std.testing.expect(topics.contains("tm_aa") and topics.contains("tm_bb") and topics.contains("tm_fixed"));
-    try std.testing.expect(!topics.contains("tm_") and !topics.contains("other"));
-    try std.testing.expectEqualSlices(u8, tp, (try calls.configuredProgram(now, topics, "tm_aa")).?);
-    try std.testing.expectEqualStrings("mandala", calls.appOf(now));
-    const la = try calls.listeners(a, now, "tm_aa");
-    try std.testing.expectEqual(@as(usize, 1), la.len);
-    try std.testing.expectEqualStrings("ls_tokens", la[0].service);
-    try std.testing.expectEqual(@as(usize, 1), (try calls.listeners(a, now, "tm_fixed")).len);
-    try std.testing.expectEqualStrings("ls_fixed", (try calls.listeners(a, now, "tm_fixed"))[0].service);
-    try std.testing.expect(try gossip.enabled(a, now, "tm_bb"));
+    const served = try calls.configObject(a, now, "overlayTopics");
+    try std.testing.expectEqual(@as(usize, 1), served.count());
+    try std.testing.expectEqualSlices(u8, inst.topic_prog, (try calls.configuredProgram(now, served, "tm_reg")).?);
+    const ls_ = try calls.listeners(a, now, "tm_reg");
+    try std.testing.expectEqual(@as(usize, 1), ls_.len);
+    try std.testing.expectEqualStrings("ls_demo", ls_[0].service);
+    try std.testing.expect(try gossip.enabled(a, now, "tm_reg"));
 
-    // Deactivated: gone at the next step.
-    try hm.m.put(a, "mandala/tokens", try s.putValue(a, try mapOf(a, &.{
-        .{ .key = "kind", .value = .{ .text = "mandala-tokens" } },
-        .{ .key = "topics", .value = try strs(a, &.{"tm_bb"}) },
-    })));
-    const later = try calls.configObject(a, try config.resolve(a, s, hm.heads(), in, null), "overlayTopics");
-    try std.testing.expect(!later.contains("tm_aa") and later.contains("tm_bb"));
+    // A submission to the registered topic: judged by its program, admitted, and the lookup sees it.
+    inst.in = now;
+    inst.topics = &.{"tm_reg"};
+    const k = try keys(0x3c);
+    const f = try fund(a, 0x4d, 1, &k.p2pkh);
+    try inst.headers(&.{&f.h1});
+    const tok = try spend(a, &f.tx, 0, &.{ .{ 1, &k.token }, .{ 9_000, &k.p2pkh } }, k.priv);
+    const done = try inst.admitted(try withFund(a, f, tok), tok.txid);
+    try std.testing.expect(done.admitted);
+    try std.testing.expectEqual(@as(usize, 1), inst.count("identify"));
+    var st = try inst.load();
+    try std.testing.expect(try st.isApplied("tm_reg", tok.txid));
+    try std.testing.expectEqual(@as(usize, 1), (try inst.look(&.{.{ .key = "topic", .value = .{ .text = "tm_reg" } }})).len);
+
+    // deregister: the set without it, three unsubscribes {event, topic}; again, nothing.
+    const dereg = (try topics_mod.deregister(a, reg.list.?, try args(a, "tm_reg", null))).done;
+    try std.testing.expectEqual(@as(usize, 0), dereg.list.?.len);
+    try std.testing.expect(!dereg.answer.get("active").?.boolean);
+    for (dereg.events, want) |ev, w| {
+        try std.testing.expectEqual(@as(usize, 2), ev.map.len);
+        try std.testing.expectEqualStrings("unsubscribe", ev.getText("event").?);
+        try std.testing.expectEqualStrings(w[0], ev.getText("topic").?);
+    }
+    const none = (try topics_mod.deregister(a, dereg.list.?, try args(a, "tm_reg", null))).done;
+    try std.testing.expect(none.list == null and none.events.len == 0 and !none.answer.get("active").?.boolean);
+    try hm.m.put(a, "overlay/topics", try s.putValue(a, try topics_mod.recordOf(a, dereg.list.?)));
+    try std.testing.expect(!(try calls.configObject(a, try config.resolve(a, s, hm.heads(), in, null), "overlayTopics")).contains("tm_reg"));
+
+    // A declared topic keeps its own program; a genesis-wired engine's role is its record's name.
+    try hm.m.put(a, "overlay/topics", try s.putValue(a, try topics_mod.recordOf(a, &.{.{ .topic = "tm_demo", .program = "lookup-demo" }})));
+    const g = try s.putValue(a, try mapOf(a, &.{ .{ .key = "kind", .value = .{ .text = "program" } }, .{ .key = "name", .value = .{ .text = "overlay" } } }));
+    const wired = try mapOf(a, &.{
+        .{ .key = "defaults", .value = try mapOf(a, &.{.{ .key = "overlayTopics", .value = .{ .text = "{\"tm_demo\":\"topic-demo\"}" } }}) },
+        .{ .key = "programs", .value = try mapOf(a, &.{.{ .key = "topic-demo", .value = .{ .cid = inst.topic_prog } }}) },
+    });
+    const w = try config.resolve(a, s, hm.heads(), try withThread(a, s, wired, g), null);
+    try std.testing.expectEqualStrings("overlay", try config.selfRole(a, s, w, null));
+    const wt = try calls.configObject(a, w, "overlayTopics");
+    try std.testing.expectEqualStrings("topic-demo", wt.get("tm_demo").?.string);
 }

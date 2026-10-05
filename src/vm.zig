@@ -183,3 +183,10 @@ pub fn selfKey(in: Value) ?[]const u8 {
     const s = in.get("self") orelse return null;
     return s.getBytes("identity");
 }
+
+/// An event (skein #119, docs/VM.md "emit"): `{event: <name>, …fields}`, recorded by the kernel as
+/// `{kind: "event", event, app?, …fields}` and handed to the host after the step → the record's CID.
+pub fn emitEvent(a: std.mem.Allocator, ev: Value) ![]const u8 {
+    const bytes = try cbor.encode(a, ev);
+    return result(a, sk.emit, .{ bytes.ptr, @as(u32, @intCast(bytes.len)) });
+}
