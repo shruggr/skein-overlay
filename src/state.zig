@@ -10,7 +10,7 @@
 //!
 //! The record, the root of `<app>/state`:
 //!
-//!   {kind: "overlay-state", maps: {admitted, applied, pending}}
+//!   {kind: "overlay-state", maps: {admitted, applied, pending, wants}}
 //!
 //! The maps (keys bytes, ordered bytewise; `tp` = len ‖ topic):
 //!   admitted   tp ‖ txid ‖ vout → admittance record {kind: "admitted", topic, txid, vout, script, satoshis, admittedAt, tx, refs}
@@ -18,8 +18,14 @@
 //!                (beef: the submission's BEEF as the overlay was handed it — its pointer record
 //!                 (shruggr/skein#121), or the raw block of the bytes — for internalizing; a
 //!                 lookup's BEEF is the chain state's, `beefFor`)
-//!   pending    txid → {kind: "submission", txid, thread, ingest}   a submission the chain app has not yet
-//!                                                                   answered with accepted or proven
+//!   pending    txid → {kind: "submission", txid, thread?, submission, ingest?, heard?, via?, waiting?, event?}
+//!                a transaction of a submission handed to the chain app and not yet admitted (or
+//!                rejected): `submission` the submission's subject (hex), `ingest` its own ingest
+//!                message, `heard` the chain app's admitting answer while an earlier transaction of
+//!                the same submission is still pending (skein-overlay#1); or a submission paused on
+//!                parents neither in its BEEF nor held (`waiting`: their txids, hex; `event`: the
+//!                submit event to route again)
+//!   wants      wanted txid ‖ waiting subject txid → null   the parents a paused submission waits on
 //!
 //! Nothing here is derived from the chain: whether an admitted output is
 //! spent is the chain state's `spent` (the first held spender that is not
@@ -53,7 +59,7 @@ pub const Network = c.chain.Network;
 /// The head the chain state lives under: the chain app's (its name is `chain`).
 pub const chain_head = "chain/state";
 
-pub const map_names = [_][]const u8{ "admitted", "applied", "pending" };
+pub const map_names = [_][]const u8{ "admitted", "applied", "pending", "wants" };
 
 /// What a topic's judgement came to (the STEAK's entry for it).
 pub const Applied = struct {
@@ -187,17 +193,40 @@ pub const State = struct {
 
     // ------------------------------------------------------------ pending submissions
 
-    /// A submission handed to the chain app (its ingest message) and not yet admitted: the thread
-    /// carrying it (a resubmission's client waits on it, #66) and the message its answers name.
-    pub fn putPending(self: *State, txid: [32]u8, thread: ?[]const u8, ingest: []const u8) !void {
+    /// A pending record's fields (skein-overlay#1). A transaction handed to the chain app: `ingest`
+    /// (the message its answers name), `submission` (the subject of the submission it came in;
+    /// the thread carrying it, which a resubmission's client waits on, #66), `heard` (an admitting
+    /// answer heard while an earlier transaction of the submission is still pending). A paused
+    /// submission: `waiting` (the parents neither in its BEEF nor held) and `event` (the submit
+    /// event, routed again when one of them arrives).
+    pub const Pending = struct {
+        thread: ?[]const u8 = null,
+        submission: ?[32]u8 = null,
+        ingest: ?[]const u8 = null,
+        heard: ?[]const u8 = null,
+        via: ?[]const u8 = null,
+        waiting: []const [32]u8 = &.{},
+        event: ?[]const u8 = null,
+    };
+
+    pub fn putPending(self: *State, txid: [32]u8, p: Pending) !void {
         const a = self.arena;
         var fields: std.ArrayList(cbor.Entry) = .empty;
         try fields.appendSlice(a, &.{
             .{ .key = "kind", .value = .{ .text = "submission" } },
             .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &hdr.toHex(txid)) } },
-            .{ .key = "ingest", .value = .{ .cid = ingest } },
+            .{ .key = "submission", .value = .{ .text = try a.dupe(u8, &hdr.toHex(p.submission orelse txid)) } },
         });
-        if (thread) |t| try fields.append(a, .{ .key = "thread", .value = .{ .cid = t } });
+        if (p.ingest) |m| try fields.append(a, .{ .key = "ingest", .value = .{ .cid = m } });
+        if (p.thread) |t| try fields.append(a, .{ .key = "thread", .value = .{ .cid = t } });
+        if (p.heard) |h| try fields.append(a, .{ .key = "heard", .value = .{ .text = h } });
+        if (p.via) |v| try fields.append(a, .{ .key = "via", .value = .{ .text = v } });
+        if (p.waiting.len > 0) {
+            const ws = try a.alloc(Value, p.waiting.len);
+            for (p.waiting, ws) |w, *o| o.* = .{ .text = try a.dupe(u8, &hdr.toHex(w)) };
+            try fields.append(a, .{ .key = "waiting", .value = .{ .array = ws } });
+        }
+        if (p.event) |e| try fields.append(a, .{ .key = "event", .value = .{ .cid = e } });
         try self.map("pending").putLink(&txid, try self.store.putValue(a, .{ .map = fields.items }));
     }
 
@@ -210,8 +239,40 @@ pub const State = struct {
         return self.map("pending").has(&txid);
     }
 
+    /// Whether the submission of this subject is paused on parents it lacks (skein-overlay#1).
+    pub fn isPaused(self: *State, txid: [32]u8) !bool {
+        const rec = (try self.pendingRecord(txid)) orelse return false;
+        return rec.get("waiting") != null;
+    }
+
     pub fn dropPending(self: *State, txid: [32]u8) !void {
         _ = try self.map("pending").remove(&txid);
+    }
+
+    // ------------------------------------------------------------ wanted parents (skein-overlay#1)
+
+    /// Note that the paused submission `waiter` waits on `txid`. → whether `txid` was wanted by no
+    /// one before (its `want` event is emitted only then).
+    pub fn want(self: *State, txid: [32]u8, waiter: [32]u8) !bool {
+        const fresh = (try self.map("wants").prefixed(&txid)).len == 0;
+        try self.map("wants").add(try cat(self.arena, &.{ &txid, &waiter }));
+        return fresh;
+    }
+
+    pub fn isWanted(self: *State, txid: [32]u8) !bool {
+        return (try self.map("wants").prefixed(&txid)).len > 0;
+    }
+
+    /// `txid` has arrived (the chain app answered for it): its waiters, each once, and the wants removed.
+    pub fn takeWants(self: *State, txid: [32]u8) ![][32]u8 {
+        const kvs = try self.map("wants").prefixed(&txid);
+        const out = try self.arena.alloc([32]u8, kvs.len);
+        for (kvs, out) |kv, *o| {
+            if (kv.key.len != 64) return error.BadIndex;
+            o.* = kv.key[32..64].*;
+            _ = try self.map("wants").remove(kv.key);
+        }
+        return out;
     }
 
     // ------------------------------------------------------------ judgements
@@ -239,12 +300,26 @@ pub const State = struct {
     /// The input indices of `tx` that spend an output live in the topic (admitted, and not spent by
     /// another transaction the chain holds that is not rejected): BRC-22's `previousCoins`.
     pub fn previousCoins(self: *State, t: []const u8, tx: Transaction) ![]u32 {
+        return self.previousCoinsWith(t, tx, &.{});
+    }
+
+    /// `previousCoins`, counting as live in the topic also `walked`: the outputs this topic took in
+    /// the transactions of the same submission judged before this one (skein-overlay#1: judged
+    /// oldest first, admitted only when the chain app answers for each).
+    pub fn previousCoinsWith(self: *State, t: []const u8, tx: Transaction, walked: []const [36]u8) ![]u32 {
         const a = self.arena;
         const tp = try topicPrefix(a, t);
         const self_txid = (try tx.txid(a)).bytes;
         var out: std.ArrayList(u32) = .empty;
         for (tx.inputs, 0..) |in, i| {
             const op = store_mod.outpointKey(in.previous_outpoint.txid.bytes, in.previous_outpoint.index);
+            const in_walk = for (walked) |w| {
+                if (std.mem.eql(u8, &w, &op)) break true;
+            } else false;
+            if (in_walk) {
+                try out.append(a, @intCast(i));
+                continue;
+            }
             if (!(try self.map("admitted").has(try cat(a, &.{ tp, &op })))) continue;
             if (try self.spentByOther(op, self_txid)) continue;
             try out.append(a, @intCast(i));
@@ -510,6 +585,36 @@ fn rootAtHeight(d: Decoded, height: u32) ?[32]u8 {
     return null;
 }
 
+/// The parents a submission lacks (skein-overlay#1): for every transaction its BUMPs do not prove,
+/// each input's source that is neither a transaction decoded before it nor held by the chain app;
+/// and each txid-only entry the chain app does not hold. Each once, in BEEF order. Every input
+/// counts, not only those spending outputs live in a topic: an input whose source is missing cannot
+/// have its script verified, and the chain app's ingest refuses the BEEF (`MissingInput`) — and an
+/// output live in a topic is always held (it was admitted on the chain app's answer).
+pub fn missingParents(a: Allocator, ch: *Chain, d: Decoded) ![][32]u8 {
+    var out: std.ArrayList([32]u8) = .empty;
+    const add = struct {
+        fn f(al: Allocator, o: *std.ArrayList([32]u8), t: [32]u8) !void {
+            for (o.items) |x| if (std.mem.eql(u8, &x, &t)) return;
+            try o.append(al, t);
+        }
+    }.f;
+    for (d.txid_only) |t| if (!(try ch.holds(t))) try add(a, &out, t);
+    for (d.txs, 0..) |t, i| {
+        if (provenAt(d, t.txid) != null) continue;
+        const tx = Transaction.parse(a, t.raw) catch return error.InvalidBeef;
+        for (tx.inputs) |in| {
+            const src = in.previous_outpoint.txid.bytes;
+            const earlier = for (d.txs[0..i]) |x| {
+                if (std.mem.eql(u8, &x.txid, &src)) break true;
+            } else false;
+            if (earlier or try ch.holds(src)) continue;
+            try add(a, &out, src);
+        }
+    }
+    return out.items;
+}
+
 /// SPV over the decoded records (#50), against the chain state's headers (read only): every BUMP's
 /// root is our header's at its height (an unknown height is refused) and each proven transaction is
 /// reached from it through the merkle nodes; every other transaction's inputs come from a
@@ -574,6 +679,53 @@ pub fn putRaw(a: Allocator, s: Store, bytes: []const u8) ![]const u8 {
     const out = try a.dupe(u8, &cid);
     try s.putBlock(out, bytes);
     return out;
+}
+
+/// The Atomic BEEF (V2) of one transaction a submission's BEEF carries (skein-overlay#1: each
+/// transaction judged before the subject is ingested on its own, so the chain app answers for it):
+/// the transaction and its ancestors in that BEEF, in its order, back to the ones its BUMPs prove
+/// (and txid-only entries); the BUMPs those name. Nothing is added that the BEEF did not carry.
+pub fn atomicFor(a: Allocator, bytes: []const u8, txid: [32]u8) ![]const u8 {
+    const b = beef_mod.parse(a, bytes) catch return error.InvalidBeef;
+    const keep = try a.alloc(bool, b.entries.len);
+    @memset(keep, false);
+    const at = b.indexOf(txid) orelse return error.InvalidBeef;
+    keep[at] = true;
+    var i = at + 1;
+    while (i > 0) {
+        i -= 1;
+        if (!keep[i]) continue;
+        const e = b.entries[i];
+        if (e.format != .raw) continue; // proven by its BUMP, or txid-only: no further
+        if (provedIn(b, e.txid) != null) continue;
+        for ((e.tx orelse return error.InvalidBeef).inputs) |in| {
+            if (b.indexOf(in.previous_outpoint.txid.bytes)) |j| keep[j] = true;
+        }
+    }
+    var bumps: std.ArrayList(bsvz.spv.MerklePath) = .empty;
+    const remap = try a.alloc(?usize, b.bumps.len);
+    @memset(remap, null);
+    var entries: std.ArrayList(beef_mod.Entry) = .empty;
+    for (b.entries, keep) |e, k| {
+        if (!k) continue;
+        var out = e;
+        const bi = e.bump orelse provedIn(b, e.txid);
+        if (bi) |x| {
+            if (remap[x] == null) {
+                remap[x] = bumps.items.len;
+                try bumps.append(a, b.bumps[x]);
+            }
+            if (e.bump != null) out.bump = remap[x];
+        }
+        try entries.append(a, out);
+    }
+    return beef_mod.serialize(a, .{ .version = beef_mod.V2, .atomic = txid, .bumps = bumps.items, .entries = entries.items });
+}
+
+/// The BUMP of a BEEF that flags this txid as a transaction, if any.
+fn provedIn(b: beef_mod.Beef, txid: [32]u8) ?usize {
+    for (b.bumps, 0..) |p, i| if (flagged(p, txid)) return i;
+    return null;
 }
 
 // ---------------------------------------------------------------- BEEF out (a lookup's answer), from the chain state

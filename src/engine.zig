@@ -13,6 +13,9 @@
 //!                             the instance itself (row from `$self`): sent by a submission admitted
 //!                             on `accepted`; later answers to the same ingest message — proven
 //!                             (`<topic>-proof`), rejected (the judgements removed, `rejected` hooks).
+//!   a resume                  the message {fn: "resume", args: {txid}} in box `<app>` from the
+//!                             instance itself (skein-overlay#1): a paused submission's parent has
+//!                             come; it is routed again — its thread launched, paused again, or dropped.
 //!   a peer's admit            the `peer-admit` event the `-admit` route admits (box `<app>`):
 //!                             recorded under `<app>/gossip`.
 //!   register / deregister     a message in any box a row routes to the engine (`<app>`, or e.g.
@@ -169,10 +172,12 @@ fn run(a: Allocator) anyerror!void {
             .deregister => return registration(a, step, args, body, "deregister"),
             .other => {},
         }
-        // Any other message in the app's box: from the instance itself (its own watch), nothing else.
+        // Any other message in the app's box: from the instance itself (its own watch, a resume), nothing else.
         const me = vm.selfKey(step) orelse return error.NoIdentity;
         if (!eql(u8, args.getBytes("sender") orelse "", me)) return error.NotFromThisInstance;
-        if (!eql(u8, body.getText("fn") orelse "", "watch")) return error.UnknownFn;
+        const func = body.getText("fn") orelse "";
+        if (eql(u8, func, "resume")) return resumeStep(a, step, body.get("args") orelse return error.BadInput);
+        if (!eql(u8, func, "watch")) return error.UnknownFn;
         watch_args = body.get("args") orelse return error.BadInput;
         op = if (reply == null) "watch" else "watched";
     } else return error.BadInput;
@@ -191,12 +196,19 @@ fn run(a: Allocator) anyerror!void {
     };
 
     var fields: std.ArrayList(cbor.Entry) = .empty;
-    // The ingest message this thread awaits the answers of.
+    // The ingest message this step heard (or, for a watch, awaits) the answers of.
     var ingest: ?[]const u8 = null;
     var done: submit.Stepped = undefined;
     if (eql(u8, op, "submit")) {
-        ingest = try submit.begin(cx, ev);
-        done = .{ .txid = try submit.txidOf(ev), .done = false };
+        const begun = try submit.begin(cx, ev);
+        for (begun.wants) |w| _ = try vm.emitEvent(a, w);
+        done = .{ .txid = try submit.txidOf(ev), .awaiting = begun.ingests, .done = begun.ingests.len == 0 };
+        if (begun.ingests.len > 0) ingest = begun.ingests[begun.ingests.len - 1];
+        try fields.append(a, .{ .key = "ingests", .value = .{ .array = try cids(a, begun.ingests) } });
+        if (begun.paused) try fields.appendSlice(a, &.{
+            .{ .key = "waiting", .value = .{ .array = try hexes(a, begun.waiting) } },
+            .{ .key = "wanted", .value = .{ .uint = begun.wants.len } },
+        });
     } else if (eql(u8, op, "answer")) {
         ingest = reply.?.getCid("replyTo") orelse return error.BadInput;
         const body = try s.getValue(a, reply.?.getCid("body") orelse return error.BadInput);
@@ -207,30 +219,34 @@ fn run(a: Allocator) anyerror!void {
         if (reply) |r| {
             done = try submit.watched(cx, txid, submit.answerOf(try s.getValue(a, r.getCid("body") orelse return error.BadInput)));
         } else done = try submit.watchStart(cx, txid);
+        if (!done.done) done.awaiting = try a.dupe([]const u8, &.{ingest.?});
     }
 
     for (done.records) |r| try vm.keep(r);
     const tx_cid = try a.dupe(u8, &c.store.hashCid(.tx, done.txid));
     try fields.appendSlice(a, &.{
         .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &c.header.toHex(done.txid)) } },
-        .{ .key = "ingest", .value = .{ .cid = ingest.? } },
         .{ .key = "refs", .value = .{ .array = try a.dupe(Value, &.{.{ .map = try a.dupe(cbor.Entry, &.{
             .{ .key = "to", .value = .{ .cid = tx_cid } },
             .{ .key = "rel", .value = .{ .text = "mentions" } },
         }) }}) } },
     });
+    if (ingest) |m| try fields.append(a, .{ .key = "ingest", .value = .{ .cid = m } });
     if (done.heard.len > 0) try fields.append(a, .{ .key = "heard", .value = .{ .text = done.heard } });
     if (done.admitted) {
-        var steak: std.ArrayList(cbor.Entry) = .empty;
-        for (done.topics, done.applied) |t, ap| try steak.append(a, .{ .key = t, .value = .{ .map = try a.dupe(cbor.Entry, &.{
-            .{ .key = "outputsToAdmit", .value = .{ .array = try uints(a, ap.outputs_to_admit) } },
-            .{ .key = "coinsToRetain", .value = .{ .array = try uints(a, ap.coins_to_retain) } },
-            .{ .key = "coinsRemoved", .value = .{ .array = try uints(a, ap.coins_removed) } },
-        }) } });
         try fields.appendSlice(a, &.{
             .{ .key = "admitted", .value = .{ .boolean = true } },
-            .{ .key = "steak", .value = .{ .map = steak.items } },
+            .{ .key = "steak", .value = try steakOf(a, done.topics, done.applied) },
         });
+        // skein-overlay#1: every transaction this step admitted, oldest first.
+        if (done.admissions.len > 1) {
+            const xs = try a.alloc(Value, done.admissions.len);
+            for (done.admissions, xs) |adm, *x| x.* = .{ .map = try a.dupe(cbor.Entry, &.{
+                .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &c.header.toHex(adm.txid)) } },
+                .{ .key = "steak", .value = try steakOf(a, adm.topics, adm.applied) },
+            }) };
+            try fields.append(a, .{ .key = "admissions", .value = .{ .array = xs } });
+        }
     }
     if (done.unapplied.len > 0) {
         const gone = try a.alloc(Value, done.unapplied.len);
@@ -238,10 +254,11 @@ fn run(a: Allocator) anyerror!void {
         try fields.append(a, .{ .key = "unapplied", .value = .{ .array = gone } });
     }
     if (done.watch) |wc| try fields.append(a, .{ .key = "watch", .value = .{ .cid = wc } });
+    if (done.resumes.len > 0) try fields.append(a, .{ .key = "resumes", .value = .{ .array = try cids(a, done.resumes) } });
     if (done.published > 0) try fields.append(a, .{ .key = "published", .value = .{ .uint = done.published } });
     if (!done.done) {
-        // Rest until the chain app answers the ingest message (again).
-        try vm.awaitRecord(ingest.?);
+        // Rest until the chain app answers the ingest messages still pending (again).
+        for (done.awaiting) |m| try vm.awaitRecord(m);
         try fields.append(a, .{ .key = "awaiting", .value = .{ .boolean = true } });
     }
 
@@ -249,4 +266,76 @@ fn run(a: Allocator) anyerror!void {
     if (loaded.head == null or !eql(u8, loaded.head.?, new_state)) try vm.advance(try ev_.stateHead(a, step), new_state);
     try fields.append(a, .{ .key = "state", .value = .{ .cid = new_state } });
     _ = try vm.finish(a, s, try resultRecord(a, op, fields.items));
+}
+
+fn cids(a: Allocator, xs: []const []const u8) ![]Value {
+    const out = try a.alloc(Value, xs.len);
+    for (xs, out) |x, *o| o.* = .{ .cid = x };
+    return out;
+}
+
+fn hexes(a: Allocator, xs: []const [32]u8) ![]Value {
+    const out = try a.alloc(Value, xs.len);
+    for (xs, out) |x, *o| o.* = .{ .text = try a.dupe(u8, &c.header.toHex(x)) };
+    return out;
+}
+
+fn steakOf(a: Allocator, topics_: []const []const u8, applied: []const @import("state.zig").Applied) !Value {
+    var steak: std.ArrayList(cbor.Entry) = .empty;
+    for (topics_, applied) |t, ap| try steak.append(a, .{ .key = t, .value = .{ .map = try a.dupe(cbor.Entry, &.{
+        .{ .key = "outputsToAdmit", .value = .{ .array = try uints(a, ap.outputs_to_admit) } },
+        .{ .key = "coinsToRetain", .value = .{ .array = try uints(a, ap.coins_to_retain) } },
+        .{ .key = "coinsRemoved", .value = .{ .array = try uints(a, ap.coins_removed) } },
+    }) } });
+    return .{ .map = steak.items };
+}
+
+/// `resume {txid}` (skein-overlay#1), a message from the instance itself in the app's box: a parent a
+/// paused submission waited on has come. Its submission routed again (submit.zig `resumed`): whole
+/// now, the submission's thread launched on its event (args `{event, box: "submit"}`, as POST
+/// /submit launches it); still missing parents, paused again (a `want` for each no one wanted
+/// before); routed to nothing, the pause dropped.
+fn resumeStep(a: Allocator, step: Value, rargs: Value) !void {
+    const s = vm.store();
+    const txid = c.header.fromHex(rargs.getText("txid") orelse return error.BadInput) catch return error.BadInput;
+    var loaded = try ev_.load(a, step);
+    const st = &loaded.st;
+    st.now = @intCast(step.getUint("at") orelse return error.BadInput);
+    const cx = submit.Ctx{ .a = a, .caller = ev_.caller(), .wire = try ev_.wire(step), .st = st, .in = step, .thread = step.getCid("thread") };
+    var fields: std.ArrayList(cbor.Entry) = .empty;
+    try fields.append(a, .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &c.header.toHex(txid)) } });
+    switch (try submit.resumed(cx, txid)) {
+        .none => try fields.append(a, .{ .key = "outcome", .value = .{ .text = "none" } }),
+        .paused => |b| {
+            for (b.wants) |w| _ = try vm.emitEvent(a, w);
+            try fields.appendSlice(a, &.{
+                .{ .key = "outcome", .value = .{ .text = "paused" } },
+                .{ .key = "waiting", .value = .{ .array = try hexes(a, b.waiting) } },
+                .{ .key = "wanted", .value = .{ .uint = b.wants.len } },
+            });
+        },
+        .launch => |ev| {
+            const thread = step.getCid("thread") orelse return error.BadInput;
+            const self = (try s.getValue(a, thread)).getCid("program") orelse return error.BadInput;
+            const ec = try s.putValue(a, ev);
+            const largs = try s.putValue(a, .{ .map = try a.dupe(cbor.Entry, &.{
+                .{ .key = "event", .value = .{ .cid = ec } },
+                .{ .key = "box", .value = .{ .text = "submit" } },
+            }) });
+            const t = try vm.launch(a, self, largs);
+            try fields.appendSlice(a, &.{
+                .{ .key = "outcome", .value = .{ .text = "launched" } },
+                .{ .key = "event", .value = .{ .cid = ec } },
+                .{ .key = "launched", .value = .{ .cid = t } },
+            });
+        },
+        .dropped => |why| try fields.appendSlice(a, &.{
+            .{ .key = "outcome", .value = .{ .text = "dropped" } },
+            .{ .key = "why", .value = .{ .text = why } },
+        }),
+    }
+    const new_state = try st.save();
+    if (loaded.head == null or !eql(u8, loaded.head.?, new_state)) try vm.advance(try ev_.stateHead(a, step), new_state);
+    try fields.append(a, .{ .key = "state", .value = .{ .cid = new_state } });
+    _ = try vm.finish(a, s, try resultRecord(a, "resume", fields.items));
 }

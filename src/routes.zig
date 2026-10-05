@@ -301,7 +301,7 @@ fn submit(a: Allocator, in: Value, req: Value) !Value {
         var st = try load(a, in);
         if (req.get("resolved") != null) {
             const rec = vm.store().getValue(a, rc) catch return failure(a, 400, "Invalid BEEF");
-            return submitted(a, &st, c.record.subjectOf(rec) orelse return failure(a, 400, "Invalid BEEF"), topics);
+            return submittedAs(a, &st, c.record.subjectOf(rec) orelse return failure(a, 400, "Invalid BEEF"), topics, untakenSubject(a, req));
         }
         return submitRouted(a, in, &st, .{ .record = rc }, topics, null, req);
     }
@@ -322,9 +322,25 @@ fn submit(a: Allocator, in: Value, req: Value) !Value {
     // Called again (#66): the submission's thread this request waited on has come to rest — the answer is the state's.
     if (req.get("resolved") != null) {
         const b = c.beef.parse(a, body) catch return failure(a, 400, "Invalid BEEF");
-        return submitted(a, &st, b.subject() orelse return failure(a, 400, "Invalid BEEF"), topics);
+        return submittedAs(a, &st, b.subject() orelse return failure(a, 400, "Invalid BEEF"), topics, untakenSubject(a, req));
     }
     return submitRouted(a, in, &st, .{ .bytes = body }, topics, off, req);
+}
+
+/// Whether the thread this request waited on (`resolved`, #66) was the submission's thread of an
+/// event whose subject no topic took (skein-overlay#1: only transactions before it): its origin's
+/// `args.event` names no judgement of the subject and is not paused.
+fn untakenSubject(a: Allocator, req: Value) bool {
+    const rs = req.getArray("resolved") orelse return false;
+    const s = vm.store();
+    for (rs) |r| {
+        const origin = s.getValue(a, r.getCid("thread") orelse continue) catch continue;
+        const args = origin.get("args") orelse continue;
+        const ev = s.getValue(a, args.getCid("event") orelse continue) catch continue;
+        if (!eql(u8, ev.getText("kind") orelse "", "submit") or ev.get("waiting") != null) continue;
+        if ((ev.getArray("topics") orelse continue).len == 0 and ev.get("earlier") != null) return true;
+    }
+    return false;
 }
 
 /// The submit's route half (submit.zig `route`) and what follows: verified, judged by the topics
@@ -348,12 +364,18 @@ fn submitRouted(a: Allocator, in: Value, st: *State, beef: submit_mod.Input, top
             vm.awaitRecord(thread) catch return submitted(a, st, txid, topics); // at rest already: the state answers
             return waiting(a);
         },
-        .admit => |x| x,
+        // skein-overlay#1: parents neither in the BEEF nor held. Paused already on the same parents (a
+        // resubmission of the same BEEF): the answer is the state's, now (503); else the thread notes it.
+        .paused => |p| blk: {
+            if (try samePause(st, p.txid, p.waiting)) return submitted(a, st, p.txid, topics);
+            break :blk p.event;
+        },
+        .admit => |x| x.event,
     };
     // The submission's thread (engine.zig, stepped on the submit record as a `submit` event would be):
     // launched by this request's step, which waits on it; its answer, when it comes to rest, is the state's.
     const self = in.getCid("engine") orelse (in.get("programs") orelse return error.BadInput).getCid("overlay") orelse return error.NoOverlayProgram;
-    const ev = try vm.store().putValue(a, routed.event);
+    const ev = try vm.store().putValue(a, routed);
     const args = try vm.store().putValue(a, .{ .map = try a.dupe(cbor.Entry, &.{
         .{ .key = "event", .value = .{ .cid = ev } },
         .{ .key = "box", .value = .{ .text = "submit" } },
@@ -392,9 +414,11 @@ fn gossip(a: Allocator, in: Value, req: Value) !Value {
         .nothing => |why| return verdictOf(a, "ignore", why),
         .unchanged => return verdictOf(a, "ignore", "already judged"),
         .pending => return verdictOf(a, "ignore", "already submitted: awaiting the chain app"),
-        .admit => |x| x,
+        // skein-overlay#1: accepted as any submission; its thread pauses it and wants the parents.
+        .paused => |p| if (try samePause(&st, p.txid, p.waiting)) return verdictOf(a, "ignore", "already submitted: waiting for its parents") else p.event,
+        .admit => |x| x.event,
     };
-    return accepting(a, routed.event, calls.appOf(in));
+    return accepting(a, routed, calls.appOf(in));
 }
 
 /// Where a submission came from, carried on its entry (#74: an admission re-publishes it on `<topic>`
@@ -461,24 +485,50 @@ fn verdictOf(a: Allocator, v: []const u8, reason: []const u8) !Value {
     }) };
 }
 
+/// Whether the submission of this subject is paused already on exactly these parents (skein-overlay#1).
+fn samePause(st: *State, txid: [32]u8, wanted: []const [32]u8) !bool {
+    const rec = (try st.pendingRecord(txid)) orelse return false;
+    const ws = rec.getArray("waiting") orelse return false;
+    if (ws.len != wanted.len) return false;
+    for (ws, wanted) |w, x| if (!eql(u8, if (w == .text) w.text else return false, &c.header.toHex(x))) return false;
+    return true;
+}
+
 /// After the submission's thread came to rest (#57, #66): still pending (the chain app has not
 /// answered: a 503 with Retry-After — nothing admitted; the client resubmits); the chain app
 /// rejected it → 400 {status: "error", message}; any topic's `applied` record → the STEAK (this
 /// submission's judgement or an earlier one's; a topic that took nothing: empty); the chain holds it
 /// with nothing applied → the empty STEAK; else (an error answer) 503. A STEAK only ever names
 /// outputs of a transaction the chain app accepted, or a mined one.
+///
+/// skein-overlay#1: a paused submission (parents neither in its BEEF nor held) is still pending:
+/// the same 503, its message naming the parents it waits on. `untaken`: the thread came to rest
+/// on a submission whose subject no topic took (only transactions before it in the BEEF): with
+/// nothing applied, the empty STEAK (200), as for a submission no topic takes.
 fn submitted(a: Allocator, st: *State, txid: [32]u8, topics: []const []const u8) !Value {
+    return submittedAs(a, st, txid, topics, false);
+}
+
+fn submittedAs(a: Allocator, st: *State, txid: [32]u8, topics: []const []const u8, untaken: bool) !Value {
     const undecided = struct {
-        fn f(al: Allocator) !Value {
+        fn f(al: Allocator, message: []const u8) !Value {
             return .{ .map = try al.dupe(cbor.Entry, &.{
                 .{ .key = "status", .value = .{ .uint = 503 } },
                 .{ .key = "type", .value = .{ .text = "application/json" } },
                 .{ .key = "headers", .value = .{ .map = try al.dupe(cbor.Entry, &.{.{ .key = "retry-after", .value = .{ .text = try std.fmt.allocPrint(al, "{d}", .{retry_after}) } }}) } },
-                .{ .key = "body", .value = .{ .bytes = try jsonOf(al, .{ .status = "error", .message = "Not yet accepted by the network: nothing is admitted until it is. Resubmit after Retry-After seconds." }) } },
+                .{ .key = "body", .value = .{ .bytes = try jsonOf(al, .{ .status = "error", .message = message }) } },
             }) };
         }
     }.f;
-    if (try st.isPending(txid)) return undecided(a);
+    const not_yet = "Not yet accepted by the network: nothing is admitted until it is. Resubmit after Retry-After seconds.";
+    if (try st.pendingRecord(txid)) |rec| {
+        const ws = rec.getArray("waiting") orelse return undecided(a, not_yet);
+        var msg: std.ArrayList(u8) = .empty;
+        try msg.appendSlice(a, "Waiting for parent transactions neither in the BEEF nor held here:");
+        for (ws) |w| try msg.print(a, " {s}", .{if (w == .text) w.text else "?"});
+        try msg.appendSlice(a, ". Nothing is admitted until they arrive; resubmit with them, or after Retry-After seconds.");
+        return undecided(a, msg.items);
+    }
     if (try st.ch.settlementCid(txid)) |sc| {
         const rec = try st.store.getValue(a, sc);
         return failure(a, 400, try std.fmt.allocPrint(a, "Transaction rejected: {s}", .{rec.getText("reason") orelse "rejected"}));
@@ -495,7 +545,7 @@ fn submitted(a: Allocator, st: *State, txid: [32]u8, topics: []const []const u8)
             try uintsJson(a, rec.getArray("coinsRemoved") orelse &.{}),
         };
     }
-    if (!any and !(try st.ch.holds(txid))) return undecided(a);
+    if (!any and !untaken and !(try st.ch.holds(txid))) return undecided(a, not_yet);
     return respond(a, 200, "application/json", try jsonOf(a, Steak{ .topics = topics, .entries = entries }));
 }
 

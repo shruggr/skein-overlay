@@ -184,14 +184,17 @@ pub fn sourceOf(ev: Value) Source {
 /// What one admission publishes, per topic that admitted it with gossip on:
 /// the raw submission on `<topic>` (the submit event's `beef`: the BEEF as
 /// received; not when it arrived by gossip on that topic), then the verdict
-/// on `<topic>-admit`. → how many messages.
-pub fn admitted(a: Allocator, out: Out, st: *st_mod.State, in: Value, ev: Value, txid: [32]u8, topics: []const []const u8, applied: []const st_mod.Applied) !usize {
+/// on `<topic>-admit`. `subject`: the transaction is the submission's subject;
+/// a transaction admitted before it from the same BEEF (skein-overlay#1)
+/// publishes its verdict only — the raw submission goes with the subject's,
+/// and a peer judges what it carries oldest first itself. → how many messages.
+pub fn admitted(a: Allocator, out: Out, st: *st_mod.State, in: Value, ev: Value, txid: [32]u8, subject: bool, topics: []const []const u8, applied: []const st_mod.Applied) !usize {
     const src = sourceOf(ev);
     var n: usize = 0;
     for (topics, applied) |t, ap| {
         if (ap.records.len == 0 or !(try st.isApplied(t, txid))) continue;
         if (!try enabled(a, in, t)) continue;
-        if (!(eql(u8, src.transport, "libp2p") and eql(u8, src.topic, t))) {
+        if (subject and !(eql(u8, src.transport, "libp2p") and eql(u8, src.topic, t))) {
             // The BEEF as received: from its pointer record (shruggr/skein#121: `beefOf` gives the exact
             // bytes back from the blocks), or the bytes the event carries.
             const b = if (ev.getCid("beef")) |rc| try c.record.beefOf(a, st.store, rc) else ev.getBytes("beef") orelse (try st.ch.beefOf(txid)) orelse return error.UnknownTransaction;

@@ -1,4 +1,4 @@
-# Overlay services in the VM (0.6.2)
+# Overlay services in the VM (0.7.0)
 
 An overlay is an app (skein docs/APPS.md §6). It judges transactions with
 its topic managers and indexes them with its lookup services; it does not
@@ -36,6 +36,9 @@ storage are not ported.
   `hostOverrides` / `facilitator` options of the @bsv/sdk clients.
 - Sync between overlay nodes (GASP); catch-up from a peer. The push half —
   submissions, admits and proofs as they happen — is the gossip (#74, below).
+  The engine's half of catch-up is the `want` event of a paused submission
+  ("Paused on a missing parent", below); carrying it to peers and feeding
+  back what they find is the host's (shruggr/skein#112, #126).
 - The `historical-tx` modes.
 - BRC-64 history queries beyond "spent too" (`includeSpent`).
 
@@ -44,8 +47,8 @@ storage are not ported.
 | where | what |
 |---|---|
 | `src/engine.zig` → `overlay.wasm` | The engine: called, the front door's route handlers (`routes.zig`); stepped, the submission's thread, a watch, a peer's admit. |
-| `src/submit.zig` | A submission from the wire to the state: the route's half (decode, verify, judge — in the front door's step on the request), the submission's thread (the BEEF to the chain app; admitted on its answer), the watch. |
-| `src/state.zig` | The overlay's state (`<app>/state`) over the chain state (read only): the maps, the previous coins, recording a judgement (`apply`), removing one (`unapply`), `inTopic`, `spender`; the door's pointer record read (`decodeRecord`, #121) or the one BEEF parse of bytes (`decode`), SPV over the records (`verifyDecoded`; BUMPs only for bytes); the bytes of a BEEF that came as bytes kept as a raw block (`putRaw`), which the `applied` record names; BEEF out for a lookup (`beefFor`, `beefOfMany`). |
+| `src/submit.zig` | A submission from the wire to the state: the route's half (decode, missing parents, verify, judge oldest first — in the front door's step on the request), the submission's thread (one ingest per item to the chain app; each admitted, in order, on its answer), a pause and its `resume`, the watch. |
+| `src/state.zig` | The overlay's state (`<app>/state`) over the chain state (read only): the maps, the previous coins, recording a judgement (`apply`), removing one (`unapply`), `inTopic`, `spender`; a paused submission's `wants`; the parents a BEEF lacks (`missingParents`) and an item's Atomic BEEF cut from a submission's (`atomicFor`); the door's pointer record read (`decodeRecord`, #121) or the one BEEF parse of bytes (`decode`), SPV over the records (`verifyDecoded`; BUMPs only for bytes); the bytes of a BEEF that came as bytes kept as a raw block (`putRaw`), which the `applied` record names; BEEF out for a lookup (`beefFor`, `beefOfMany`). |
 | `src/calls.zig` | The configuration as the engine reads it (`configObject`, `listeners`, the app's name) and its calls of topics and lookup services (`Caller`, `hookAdmitted`, `hookRejected`). |
 | `src/routes.zig` | The route handlers (#40): the overlay-express wire contract, and the gossip's inbound routes (`peerAdmit`, `peerProof`, #74). |
 | `src/gossip.zig` | The three gossip topics (#74): message shapes, what an admission and a proof publish, a peer's proof checked, the peer-admit records. |
@@ -108,6 +111,13 @@ BEEF ‖ values`: no BEEF pattern leads it) — is decoded here once, into
 records in the step's write cache (`state.decode`), and its BUMPs checked
 here as before.
 
+**Missing parents pause** (skein-overlay#1). Before SPV, the route lists
+the parents the BEEF lacks (`state.missingParents`): for every transaction
+its BUMPs do not prove, each input's source that is neither a transaction
+before it in the BEEF nor held by the chain app, and each txid-only entry
+the chain app does not hold. Any → the submission **pauses** (below, "Paused
+on a missing parent"); nothing is judged.
+
 SPV for the rest (`state.verifyDecoded`), the previous coins and the topic
 managers read typed records through `get` (the store, and the step's
 write cache), and the chain state, read only (`head("chain/state")`):
@@ -124,14 +134,27 @@ write cache), and the chain state, read only (`head("chain/state")`):
 In a test build the SDK's `chain/src/beef.zig` counts its parses
 (`beef.parses`); this repo's test.zig asserts one parse per submit of bytes (a pointer record is read, not parsed).
 
-**Judge in the step.** For each requested topic this overlay serves and has
-not judged the transaction for, the handler calls the topic's program (fn
-`identify`, below) with the transaction's CID and its previous coins. The
-topic reads the transaction and its inputs' sources through the same cache.
+**Judge in the step, oldest first** (skein-overlay#1). The handler walks
+the BEEF's transactions in order, up to and including the subject. Each one
+that is not pending in a submission of its own is judged by each requested
+topic this overlay serves that has not judged it before (its `applied`
+record): the topic's program (fn `identify`, below) is called with the
+transaction's CID and its previous coins. The topic reads the transaction
+and its inputs' sources through the same cache. The previous coins of a
+transaction in the walk are the inputs spending an output live in the topic
+**or an output the same topic took earlier in the walk**
+(`State.previousCoinsWith`): those are not admitted yet — nothing is until
+the chain app answers — but will be before this one is (below). Off-chain
+values go with the subject's call only.
 
-**Nothing moves until admitted.** If no topic takes anything (no output
-admitted and no previous coin consumed), or every such topic's program fails,
-or the transaction is one the chain app rejected, the handler answers **200
+Every transaction a topic takes is an **item** of the submission, and so is
+one a paused submission wants (`wants`, below), taken or not, so that the
+chain app holds it.
+
+**Nothing moves until admitted.** If there is no item (no topic takes
+anything in the walk — no output admitted and no previous coin consumed —
+or every such topic's program fails, and no transaction is wanted), or the
+subject is one the chain app rejected, the handler answers **200
 with the empty STEAK** (BRC-22 and overlay-express's answer; the reasons are
 kept for the log) and starts nothing: the request is recorded, and no head
 moves. Only a BEEF that does not decode or verify answers 400 `{status:
@@ -147,47 +170,70 @@ instead, and the app's row from `event` starts the same engine; its verdict
 goes back at once.)
 
 ```
-{kind: "submit", txid (hex), beef: <the pointer record's CID> | bytes (the BEEF as received, off-chain framing taken off),
- topics: [{topic, previousCoins, outputsToAdmit, coinsToRetain}], offChainValues?: bytes,
- source?: {transport, topic?, request}}
+{kind: "submit", txid (hex: the subject), beef: <the pointer record's CID> | bytes (the BEEF as received, off-chain framing taken off),
+ topics: [{topic, previousCoins, outputsToAdmit, coinsToRetain}],     the subject's judgements ([] when no topic took it)
+ earlier?: [{txid (hex), topics: [{topic, previousCoins, outputsToAdmit, coinsToRetain}]}],
+                                       the items before the subject, oldest first (topics [] for one only wanted)
+ wanted?: true,                        no topic took the subject, but a paused submission wants it: it is an item all the same
+ offChainValues?: bytes, source?: {transport, topic?, request}}
 ```
 
-1. **To the chain app.** Its first step sends the instance itself (skein
-   #79: a message to the instance's own key is looped back, from the
-   instance) the chain app's ingest, box `chain`:
+The items are `earlier`, then the subject when a topic took it (or it is
+`wanted`).
+
+1. **To the chain app, one ingest per item.** Its first step sends the
+   instance itself (skein #79: a message to the instance's own key is looped
+   back, from the instance) the chain app's ingest, box `chain`, for each
+   item, oldest first:
 
    ```
-   {fn: "ingest", args: {beef}}     beef: the pointer record's CID (#121), or the bytes
+   {fn: "ingest", args: {beef}}     the subject's: the pointer record's CID (#121), or the bytes, as handed;
+                                    an earlier item's: its Atomic BEEF cut from the submission's (`state.atomicFor`:
+                                    it and its ancestors in that BEEF back to the ones its BUMPs prove, those BUMPs) — bytes
    ```
 
-   notes the submission `pending` (`<app>/state` map `pending`: `{kind:
-   "submission", txid, thread, ingest: <the message>}`) and rests awaiting
-   that message's answers. The chain app records the BEEF (SPV against its
-   headers), and — unproven — registers its broadcast and broadcasts it: the
-   overlay never broadcasts.
-2. **The gate is the chain app's answer** (#73). Each answer is `{fn,
-   request, replyTo: <the ingest message>, result: {txid, tx, state, …}}`
-   (or `{…, error}`), the input `reply`:
+   notes each item `pending` (`<app>/state` map `pending`: `{kind:
+   "submission", txid, submission: <the subject, hex>, thread, ingest: <its
+   message>}`) and rests awaiting those messages' answers. The chain app
+   records each BEEF (SPV against its headers), and — unproven — registers
+   its broadcast and broadcasts it: the overlay never broadcasts. Each item
+   is a watcher of its own transaction, so the chain app answers for each.
+2. **The gate is the chain app's answer, per item** (#73). Each answer is
+   `{fn, request, replyTo: <an ingest message>, result: {txid, tx, state,
+   …}}` (or `{…, error}`), the input `reply`; it is about the item whose
+   ingest it names:
    - `accepted` (a status provider's first word that is not a rejection) or
      `proven` (its proof, validated by the chain app against its headers) —
-     the first of them **admits**: each judgement recorded (`apply`: the
-     admittances and the `applied` record; the previous coins are taken
-     again and, if they moved since the call, the topic is asked again),
-     then each listening lookup service's hooks (`admitted`, then `spent`
-     for each previous coin consumed), then the gossip out;
+     noted on the item's pending record (`heard`; a later `proven` replaces
+     `accepted`);
    - `rejected` (a status provider's rejection, a competing proof,
-     abandonment, a rejected input) — nothing admitted;
-   - an error answer (the chain app refused the ingest) — nothing admitted;
-   - anything else — the thread awaits on.
+     abandonment, a rejected input) — the item resolved, nothing admitted;
+   - an error answer (the chain app refused the ingest) — the item resolved,
+     nothing admitted;
+   - anything else — nothing.
 
-   With no status provider, no status ever accepts it: it is admitted at its
-   proof. Admission on validation alone is not a mode.
-3. **It finishes** (#66), admitted or not: the requests waiting on it
-   answer. Admitted on `accepted` (not yet proven), its last step sends the
-   app itself a **watch**, box `<app>`:
+   Then, oldest first, each item whose answer admits it is **admitted**, up
+   to the first item still unanswered: an item is never admitted before the
+   ones before it in the BEEF are resolved, so its previous coins are the
+   ones it was judged with. Admitting one: each judgement recorded (`apply`:
+   the admittances and the `applied` record, naming the submission's BEEF;
+   the previous coins are taken again and, if they moved since the call, the
+   topic is asked again), then each listening lookup service's hooks
+   (`admitted`, then `spent` for each previous coin consumed), then the
+   gossip out (`<topic>-admit` for every item; the raw submission on
+   `<topic>` with the subject's). An item only wanted records nothing.
+   Each item admitted or rejected **resumes** the paused submissions waiting
+   on it (below).
+
+   With no status provider, no status ever accepts an item: it is admitted
+   at its proof. Admission on validation alone is not a mode.
+3. **It finishes** (#66) when none of its items is pending, admitted or
+   not: the requests waiting on it answer. For each item admitted on
+   `accepted` (not yet proven) it sends the app itself a **watch**, box
+   `<app>`:
 
    ```
-   {fn: "watch", args: {txid (hex), ingest: <the ingest message>}}
+   {fn: "watch", args: {txid (hex), ingest: <that item's ingest message>}}
    ```
 
 **The watch.** The app's row from `$self` steps the engine on it. It reads
@@ -201,12 +247,81 @@ record and its admittances) and each listening lookup service told
 (`rejected`); then it finishes. No deadline: abandonment is the chain app's,
 and reaches the watch as a `rejected` answer.
 
-**Next (not built).** skein-overlay#1: submit walks the whole BEEF
-oldest-first and judges every transaction of the topic before the subject
-(known ones skip, unknown valid ones are admitted on the way, each ingested
-through the chain app); a submission whose parent is neither in the BEEF nor
-held pauses until something changes, and fetching it is a separate monitor
-tool's. With it comes the decided direction of shruggr/skein#31 ("Decided
+### Paused on a missing parent (skein-overlay#1)
+
+A submission whose BEEF lacks a parent (above, "Missing parents pause") is
+not judged and goes nowhere yet. **Which inputs pause it: every input** of
+every transaction its BUMPs do not prove. Not only the inputs spending an
+output live in a topic: such an output is always held (it was admitted on
+the chain app's answer), so that rule would never pause; and an input whose
+source is missing cannot have its script verified, and the chain app's
+ingest refuses the BEEF (`MissingInput`) — no topic could judge it either.
+
+The route answers as for any submission it hands on: it launches the
+submission's thread on the paused event (`/submit`; on `libp2p:<topic>`,
+accept, the event admitted into box `<app>`) —
+
+```
+{kind: "submit", txid (hex), beef, topics: [], requested: [<topic>, …] (the topics requested this overlay serves),
+ waiting: [<txid hex>, …] (the parents, in BEEF order), offChainValues?, source?}
+```
+
+— whose one step notes it pending, emits the `want` events and finishes:
+
+- the pending record of the subject: `{kind: "submission", txid,
+  submission, thread, waiting: [<txid hex>, …], event: <the paused event>}`
+  (no `ingest`);
+- the map `wants`: `<parent txid> ‖ <subject txid> → null` for each parent;
+- **one event per parent no one wanted before** (skein docs/VM.md "emit",
+  an open event, recorded once in the step's `emitted`; a parent wanted
+  already is not emitted again):
+
+  ```
+  {event: "want", txid: <hex>, topic: <the first topic requested>}
+  ```
+
+  The kernel records it as `{kind: "event", event: "want", app, txid,
+  topic}`. What the host does with it — ask its peers, a monitor — is the
+  host's (shruggr/skein#112, #126); there is no cancelling event: a wanted
+  parent that arrives resolves the pause by itself.
+
+**The answer** to the client is a pending submission's: the thread came to
+rest with the subject pending, so **503** `{status: "error", message}`
+with `Retry-After: 30`, the message naming the parents (`Waiting for parent
+transactions neither in the BEEF nor held here: <txid> …`). A resubmission
+of the same BEEF is answered so at once (`/submit`; `ignore` on libp2p),
+with no thread. A resubmission that carries the parents is routed as any
+submission and replaces the pause.
+
+**Resumed.** A later submission whose BEEF carries a wanted parent makes it
+an item (above), ingested even if no topic takes it. When the chain app
+answers for it (admitted, or rejected) the thread sends the app itself, box
+`<app>`, for each paused submission waiting on it:
+
+```
+{fn: "resume", args: {txid: <the paused subject, hex>}}
+```
+
+and drops the parent's `wants`. The engine (row from `$self`) routes the
+paused submission again — its BEEF, the topics requested, its off-chain
+values, its source — as the route does: whole now, it **launches** the
+submission's thread on the new event (args `{event, box: "submit"}`, as
+`/submit` does) and drops the pause; still missing a parent, it pauses again
+(a `want` for a parent no one wanted before); routed to nothing (refused,
+taken by no topic, judged before), the pause is dropped. A `resume` for a
+submission no longer paused does nothing.
+
+**Not resumed: a parent fed to the chain app's ingest directly.** The
+engine learns of an arriving parent only through a submission to this
+overlay (`/submit`, the `<topic>` gossip). A BEEF the host feeds to the
+chain app's `ingest` itself reaches no overlay thread: the chain app answers
+only the callers of an ingest, about the transactions it ingests, and has no
+registration for a transaction it does not hold yet — and the kernel's
+`await` refuses a CID not in the store. A host that finds a wanted parent
+submits it to the overlay (`/<app>/submit` with the want's topic) or
+publishes it on `<topic>`.
+
+**Next (not built).** The decided direction of shruggr/skein#31 ("Decided
 2026-10-02 (night)"): the one-shot watch becomes a registration for the life
 of the transaction, there is no unwind as an action (whether an admission
 counts is a read of the chain state), and a judgement is re-run when the
@@ -219,6 +334,8 @@ answer from the state:
 | state of the transaction | answer |
 |---|---|
 | admitted (or judged before) | 200, the STEAK from each topic's `applied` record (empty for a topic that took nothing) |
+| no topic took the subject (only transactions before it: skein-overlay#1) | 200, the empty STEAK |
+| paused on a missing parent (skein-overlay#1) | **503** `{status: "error", message}` (the parents it waits on) with `Retry-After: 30`; nothing admitted |
 | still pending when the client's wait ends (below) | **503** from the host: `{status: "error", code: "ERR_UNAVAILABLE", description}` with `Retry-After: 5` (skein `src/host/frontdoor.ts`); nothing admitted yet; resubmit |
 | the thread ended and the chain app does not hold it (an error answer) | **503** `{status: "error", message}` with `Retry-After: 30`: nothing admitted; resubmit |
 | rejected by the chain app | **400** `{status: "error", message: "Transaction rejected: <reason>"}` (overlay-express's error form) |
@@ -234,7 +351,7 @@ in its call (`TransactionRejected`: 200, the empty STEAK).
 ## The state: `<app>/state`
 
 ```
-{kind: "overlay-state", maps: {admitted, applied, pending}}
+{kind: "overlay-state", maps: {admitted, applied, pending, wants}}
 ```
 
 `tp` is len ‖ topic. The outpoint is txid (internal order) ‖ vout (u32 BE).
@@ -243,7 +360,8 @@ in its call (`TransactionRejected`: 200, the empty STEAK).
 |---|---|---|
 | `admitted` | tp ‖ outpoint → admittance record | an output a topic admitted |
 | `applied` | tp ‖ txid → applied record | the topic's judgement of this transaction: a later submission is a dupe; which previous coins it retained |
-| `pending` | txid → submission record | handed to the chain app, not yet admitted (or rejected) |
+| `pending` | txid → submission record | a submission's transaction handed to the chain app, not yet admitted (or rejected); or a paused submission (skein-overlay#1) |
+| `wants` | parent txid ‖ subject txid → null | the parents a paused submission waits on (skein-overlay#1) |
 
 **Records.**
 
@@ -256,7 +374,13 @@ in its call (`TransactionRejected`: 200, the empty STEAK).
   bytes (framed with off-chain values, or a host with no door), the raw
   block of those bytes. It is kept for internalizing the transaction as
   handed over; a lookup does not serve it (below).
-- **Submission:** `{kind: "submission", txid, thread, ingest}`.
+- **Submission:** `{kind: "submission", txid, submission, thread?, ingest,
+  heard?, via?}` for a transaction of a submission handed to the chain app
+  (`submission` the subject, hex — the transaction itself, or a later one of
+  the same BEEF; `heard` the admitting answer heard while an item before it
+  is unanswered, `via` a proof's); `{kind: "submission", txid, submission,
+  thread?, waiting: [txid hex], event}` for a paused one (skein-overlay#1).
+  A record without `submission` (before 0.7.0) is its own.
 
 The step keeps the admittance and applied records; their `refs` give the
 kernel `admits` edges (docs/VM.md, "Edges"). Indexes for answering queries
@@ -303,10 +427,11 @@ wire"). Stepped:
 |---|---|---|
 | POST /submit (a launch), or the submit event in box `<app>` (the `libp2p:<topic>` route's admit, row from `event`) | `{kind: "submit", …}` | the submission's thread: the ingest message, pending; on each answer (`reply`) admit, reject or await on |
 | a message in box `<app>` from the instance itself (row from `$self`) | `{fn: "watch", args: {txid, ingest}}` | the watch: the later proof (`-proof`) or rejection (unwound) |
+| a message in box `<app>` from the instance itself (row from `$self`) | `{fn: "resume", args: {txid}}` | a paused submission routed again (skein-overlay#1): its thread launched, paused again, or dropped |
 | the `peer-admit` event in box `<app>` (the `-admit` route's admit) | `{kind: "peer-admit", …}` | recorded under `<app>/gossip` ("Gossip", below); nothing admitted |
 | a message in any box a row routes to the engine (the manifest's: `overlay`, i.e. `<app>/overlay`, from `$owner`; `<app>` too) | `{fn: "register", args: {topic, program}}` or `{fn: "deregister", args: {topic}}` | the registered set under `<app>/topics` and its events ("Register a topic", below) |
 
-Any other message (not `register` / `deregister`) from anyone but the instance itself is refused. There is no `lookup`
+Any other message (not `register` / `deregister`) from anyone but the instance itself is refused; from the instance itself, only `watch` and `resume`. There is no `lookup`
 box: a lookup is a read: its request is recorded, and it moves nothing.
 
 **Config.** An installed engine reads its configuration from its app
@@ -440,9 +565,14 @@ the served set (`<topic>` → `submit`, `<topic>-admit` → `peerAdmit`,
 **Result.** Each step keeps a result record and prints its CID:
 
 - `{kind: "overlay-result", op: "submit" | "answer" | "watch" | "watched",
-  txid, ingest, heard?, admitted?, steak?: {topic: {outputsToAdmit,
-  coinsToRetain, coinsRemoved}}, unapplied?: [topic], watch?, published?,
+  txid, ingest?, ingests? (op submit: one per item), waiting?, wanted? (op
+  submit, paused: the parents, how many `want` events), heard?, admitted?,
+  steak?: {topic: {outputsToAdmit, coinsToRetain, coinsRemoved}} (the last
+  transaction admitted), admissions?: [{txid, steak}] (more than one
+  admitted in the step), unapplied?: [topic], watch?, resumes?, published?,
   awaiting?, refs (mentions), state}`;
+- `{kind: "overlay-result", op: "resume", txid, outcome: "none" | "paused" |
+  "launched" | "dropped", waiting?, wanted?, event?, launched?, why?, state}`;
 - `{kind: "overlay-result", op: "peer-admit", topic, txid, record, state}`;
 - `{kind: "overlay-result", op: "register" | "deregister", topic, active,
   changed, topics?}` (`topics`: the set's new record), or `{op, error}`

@@ -4,7 +4,7 @@ The overlay services engine for a [skein](https://github.com/shruggr/skein),
 as an app: BRC-22 submit and BRC-24 lookup, served by the instance's own
 front door, with topic managers and lookup services as programs the engine
 calls. It is also a Zig package: an overlay of your own depends on it for
-the topic and lookup contracts. Version **0.6.2**.
+the topic and lookup contracts. Version **0.7.0**.
 
 ## What it is
 
@@ -33,15 +33,20 @@ Exported Zig modules:
 
 They pull in the SDK's `chain` module only.
 
-**What is built and where it goes.** A submission admitted on `accepted`
-sends the app itself a one-shot `watch`, which waits for `proven` (publishes
-`-proof`) or `rejected` (unwinds). Next is skein-overlay#1: submit walks the
-whole BEEF oldest-first and judges every transaction of the topic before the
-subject, and a submission whose parent is neither in the BEEF nor held
-pauses. With it comes the decided direction of shruggr/skein#31 ("Decided
-2026-10-02 (night)"): a reference to a transaction is a registration for the
-life of the transaction, and a judgement is re-run when the chain state it
-depended on changes. Neither is built yet.
+**What is built and where it goes.** Submit walks the whole BEEF oldest
+first and judges every transaction of the requested topics before the
+subject; each one a topic takes is ingested through the chain app on its
+own and admitted, in order, on its own answer (skein-overlay#1). A
+submission whose parent is neither in the BEEF nor held pauses: it is
+noted pending, waiting on those parents, and the engine emits one `want`
+event per parent (`{event: "want", txid, topic}`) for the host to find;
+when a later submission carries the parent, the paused one is routed
+again. A transaction admitted on `accepted` sends the app itself a
+one-shot `watch`, which waits for `proven` (publishes `-proof`) or
+`rejected` (unwinds). Not built: the decided direction of shruggr/skein#31
+("Decided 2026-10-02 (night)"): a reference to a transaction is a
+registration for the life of the transaction, and a judgement is re-run
+when the chain state it depended on changes.
 
 ## Use it
 
@@ -141,7 +146,7 @@ The manifest (`etc/app.json`, this repo's own, description left out):
 {
   "kind": "app",
   "name": "overlay",
-  "version": "0.6.2",
+  "version": "0.7.0",
   "programs": {
     "overlay": "bin/overlay.wasm",
     "topic-demo": "bin/topic-demo.wasm",
@@ -239,7 +244,7 @@ Not built: BRC-88 SHIP/SLAP, GASP sync and catch-up from a peer, the
 
 | | |
 |---|---|
-| this app and package | 0.6.2 (tag `v0.6.2`) |
+| this app and package | 0.7.0 (tag `v0.7.0`) |
 | skein-sdk | v0.5.1, by tag URL and hash in `build.zig.zon` (module `chain`; bsvz comes through it) |
 | requires | `chain/1` (shruggr/skein-chain 0.3.0) |
 | skein | log format 8; skein's equivs pin this repo by commit |
@@ -269,6 +274,13 @@ decodes a gossiped submission's BEEF as it does for `/submit`.
 0.6.2 takes `register` / `deregister` in any box a row routes to the
 engine, and the manifest routes the owner's to the app's `overlay` box
 (`<app>/overlay`, shruggr/skein#128).
+
+0.7.0 walks the submission's BEEF oldest first (skein-overlay#1): every
+transaction before the subject is judged, each one taken is ingested and
+admitted on its own answer, in order; a submission missing a parent pauses
+(`pending` with `waiting`, a `want` event per parent, a `resume` to itself
+when a later submission brings one). The submit event gains `earlier`,
+`wanted`, `requested` and `waiting`; the state gains the map `wants`.
 
 ## Contributing
 
