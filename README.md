@@ -52,11 +52,19 @@ skein-host install https://github.com/shruggr/skein-chain --instance <handle>
 skein-host install https://github.com/shruggr/skein-overlay --instance <handle>
 ```
 
-Its endpoints are under its BRC-23 base URL, `/<handle>/<app>`:
-`POST /overlay/submit`, `POST /overlay/lookup`, the listing and
-documentation routes, all open. The @bsv/sdk `TopicBroadcaster` and
-`LookupResolver` reject a base URL with a path, so call the endpoints
-directly (`POST <base>/submit` with the BEEF and `X-Topics`).
+The chain app proves nothing without the host's headers feed and broadcasts
+nothing without its broadcaster; shruggr/skein-chain's README, "Use it",
+has what the host must provide.
+
+Its BRC-23 base URL is `https://<handle>.<host>/<app>`; on a host without
+wildcard DNS (local dev) the router also serves it as `/@<handle>/<app>` on
+the host's origin. Its endpoints are under it: `POST <base>/submit`
+(`POST https://alice.skein.nexus/overlay/submit`, or
+`POST http://127.0.0.1:8100/@alice/overlay/submit`), `POST <base>/lookup`,
+the listing and documentation routes, all open. The @bsv/sdk
+`TopicBroadcaster` and `LookupResolver` reject a base URL with a path, so
+call the endpoints directly (`POST <base>/submit` with the BEEF and
+`X-Topics`).
 
 ### Write an overlay of your own
 

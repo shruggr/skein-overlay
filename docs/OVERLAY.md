@@ -216,7 +216,8 @@ answer from the state:
 | rejected by the chain app | **400** `{status: "error", message: "Transaction rejected: <reason>"}` (overlay-express's error form) |
 
 While the thread waits on the chain app the client waits too, up to the
-host's bound (`answerWaitMs`): then 503 + `Retry-After` from the host, and
+host's bound (`answerWaitMs`, the host's `SKEIN_ANSWER_WAIT_MS`, default
+two minutes): then 503 + `Retry-After` from the host, and
 the thread goes on. A resubmission while pending waits on the same thread
 (the pending record names it) and gets the same answer; after admission it
 gets the STEAK at once. A resubmission of a rejected transaction is refused
@@ -461,9 +462,11 @@ The overlay is served by the instance itself: its front door
 (`programs/frontdoor`) matches the request against the dispatch table's
 http rows and calls the engine's handler with it. The rows are open (sender
 `*`), as overlay-express is, and under the app's prefix: the app's BRC-23
-base URL is `https://<host>/<handle>/<app>`, and a client calls
-`${baseUrl}/submit`. The @bsv/sdk `TopicBroadcaster` and `LookupResolver`
-reject a base URL with a path, so they work only against an overlay served
+base URL is `https://<handle>.<host>/<app>` (on a host without wildcard
+DNS, `/@<handle>/<app>` on the host's origin), and a client calls
+`${baseUrl}/submit` (`POST https://alice.skein.nexus/overlay/submit`). The
+@bsv/sdk `TopicBroadcaster` and `LookupResolver` reject a base URL with a
+path, so they work only against an overlay served
 at an origin's root (a system tree, below); skein does not use them for
 overlay apps.
 
