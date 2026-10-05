@@ -378,15 +378,32 @@ pub fn main() u8 { return topic.main(identify); }
 its CID, the previous coins, the off-chain values, and `sourceOutput(i)` /
 `transaction(txid)`, which read other transactions through `get` as well.
 
-**Documentation and metadata** come from the program record (`bin/<name>.json`
-`description`): the first line is the `shortDescription`, the whole text the
-documentation. The listing and documentation routes read them from the
-store, running no topic or lookup.
+**Metadata and documentation** are the program's own (the TopicManager's
+`getMetaData` and `getDocumentation`, as in the Go and TypeScript engines).
+The listing and documentation routes call fn `metadata` or fn
+`documentation` with `{kind: "topic-describe", topic}`; the answers are
+
+```
+{kind: "metadata", name, shortDescription, iconURL?, version?, informationURL?}
+{kind: "documentation", documentation: <markdown>}
+```
+
+A program may define, beside `main`,
+
+```zig
+pub fn metadata(a: std.mem.Allocator, topic_name: []const u8) anyerror!topic.Metadata { … }
+pub fn documentation(a: std.mem.Allocator, topic_name: []const u8) anyerror![]const u8 { … }
+```
+
+and `topic.main` finds them. One it does not define answers the default:
+`name` the configured topic name, `shortDescription` and the documentation
+empty. How a program answers is its own: a literal in the code, or a file
+it reads from its tree. The engine reads no file.
 
 **`tm_demo`.** An output whose script starts `<"tm_demo"> OP_DROP` and
 carries at least 1 satoshi is a token, and every token is admitted. A
 transaction that admits a token retains the tokens it spends. One that admits
-none removes them.
+none removes them. It answers its metadata and documentation with literals.
 
 ## The lookup contract (#50)
 
@@ -441,6 +458,14 @@ pub fn main() u8 { return lookup.main(spec); }
 `Service.map(name)` is one of its maps; `lookup.handle` runs one call over a
 given store and heads (the tests call it directly).
 
+**Metadata and documentation** are the service's own, as for a topic
+manager (the LookupService's `getMetaData` and `getDocumentation`): fn
+`metadata` or fn `documentation` with `{kind: "lookup-describe", app,
+service}`, answered from `pub fn metadata(a, service) !lookup.Metadata` and
+`pub fn documentation(a, service) ![]const u8` if the program defines them,
+else the default (`name` the configured service name, the rest empty). The
+same answers as a topic's; no state is loaded for them.
+
 **`ls_demo`** keeps its own index through the hooks:
 
 | map | key → value |
@@ -454,7 +479,7 @@ spent and names its spender; `rejected` drops the rejected transaction's
 outputs and gives back the ones it had spent. It answers from these maps
 alone: `{topic}`, `{scriptHash (hex sha256 of the locking script),
 topic?}`, `{txid, outputIndex, topic}`, each with `includeSpent` for spent
-outputs too.
+outputs too. It answers its metadata and documentation with literals.
 
 ## The wire: the instance's own front door (#40)
 
@@ -474,8 +499,8 @@ overlay apps.
 |---|---|---|---|
 | `POST /submit` | `submit` | body BEEF (`application/octet-stream`); `X-Topics` a comma list (the SDK's form) or a JSON array; `x-includes-off-chain-values: true` → VarInt(len) ‖ BEEF ‖ values | the STEAK `{topic: {outputsToAdmit, coinsToRetain, coinsRemoved}}` over the requested topics this overlay serves; 400 `{status: "error", message}` if refused or rejected; 503 with `Retry-After` while it is undecided |
 | `POST /lookup` | `lookup` | `{service, query}` JSON; `X-Aggregation: yes` | `{type: "output-list", outputs: [{beef: [bytes], outputIndex, context?}]}`, or the compact octet-stream (count, per output txid ‖ index ‖ context, then one BEEF of them all, `state.beefOfMany`); a freeform answer as `{type, result}` |
-| `GET /listTopicManagers`, `/listLookupServiceProviders` | `listTopicManagers`, `listLookupServiceProviders` | | `{name: {name, shortDescription}}` |
-| `GET /getDocumentationForTopicManager?manager=`, `/getDocumentationForLookupServiceProvider?lookupService=` | `topicDocumentation`, `lookupDocumentation` | | `text/markdown` |
+| `GET /listTopicManagers`, `/listLookupServiceProviders` | `listTopicManagers`, `listLookupServiceProviders` | | `{name: {name, shortDescription, iconURL?, version?, informationURL?}}`: each configured topic's or service's fn `metadata` |
+| `GET /getDocumentationForTopicManager?manager=`, `/getDocumentationForLookupServiceProvider?lookupService=` | `topicDocumentation`, `lookupDocumentation` | | `text/markdown`: its fn `documentation`; 400 if not configured |
 
 **A submit is the one write**, and only when a topic takes the transaction
 (above).
@@ -493,8 +518,9 @@ takes it, or it is pending) or the BEEF is refused — a refusal may be this
 instance's missing headers rather than the publisher's fault.
 
 **A lookup writes nothing.** The handler calls the service's program and
-shapes its answer for the wire. Listings and documentation read the program
-records.
+shapes its answer for the wire. Listings and documentation call the
+programs too (fn `metadata`, fn `documentation`) and read no file; a call
+that fails answers 500.
 
 **The STEAK.** It carries exactly the three fields the @bsv/sdk client accepts
 (`validateSTEAK` refuses any other field).
@@ -584,7 +610,7 @@ system tree wires the engine and the chain app into an instance's genesis
 instead (the fallback above; skein docs/BOOTSTRAP.md has the file formats):
 
 ```
-bin/frontdoor.wasm, bin/chain.wasm (shruggr/skein-chain), bin/overlay.wasm, bin/topic-demo.wasm, bin/lookup-demo.wasm   (+ .json)
+bin/frontdoor.wasm, bin/chain.wasm (shruggr/skein-chain), bin/overlay.wasm, bin/topic-demo.wasm, bin/lookup-demo.wasm
 etc/config.json     {"defaults": {"walletNetwork": "regtest", "overlayTopics": "{\"tm_demo\":\"topic-demo\"}",
                                   "overlayLookups": "{\"ls_demo\":{\"program\":\"lookup-demo\",\"topics\":[\"tm_demo\"]}}"},
                      "scopes": {"overlay": ["overlay/"], "lookup-demo": ["overlay/"]}}

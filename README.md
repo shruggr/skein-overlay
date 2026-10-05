@@ -128,6 +128,13 @@ A lookup service is a `lookup.Spec` (its map names, `answer`, and the
 `admitted` / `spent` / `rejected` hooks); `src/lookup_demo.zig` is a complete
 one with its own index.
 
+Either may also define `pub fn metadata(a, name) !topic.Metadata` (or
+`lookup.Metadata`: name, shortDescription, iconURL?, version?,
+informationURL?) and `pub fn documentation(a, name) ![]const u8`
+(markdown); the listing and documentation routes call them. Without them it
+lists under its configured name with an empty description. Where the text
+comes from (a literal, a file in the tree) is the program's own.
+
 The manifest (`etc/app.json`, this repo's own, description left out):
 
 ```json

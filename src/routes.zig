@@ -37,7 +37,9 @@
 //! A lookup is a read: the service's program is called (fn "lookup", the
 //! lookup contract, lookup.zig) and its answer shaped for the wire; it
 //! writes nothing but the request's own record. Listings and documentation
-//! are the program records' `description`.
+//! are the programs' own answers: each configured topic's or service's
+//! program is called (fn "metadata" / "documentation", topic.zig and
+//! lookup.zig) and its answer shaped for the wire; they read no file.
 const std = @import("std");
 const c = @import("chain");
 const vm = @import("sk");
@@ -219,15 +221,6 @@ pub const configMap = calls.configObject;
 
 /// The program record a served name runs: `programs` (the app's roles, or the genesis's) by the configured name.
 pub const programFor = calls.configuredProgram;
-
-/// The `bin/` program name a configured name runs (a string, or `{program, …}`).
-fn programName(v: std.json.Value) ![]const u8 {
-    return switch (v) {
-        .string => |s| s,
-        .object => |o| if (o.get("program")) |p| (if (p == .string) p.string else error.BadConfig) else error.BadConfig,
-        else => error.BadConfig,
-    };
-}
 
 /// The overlay's state over the chain state, through the call's store (its write cache).
 fn load(a: Allocator, in: Value) !State {
@@ -532,31 +525,37 @@ fn lookup(a: Allocator, in: Value, req: Value) !Value {
     return respond(a, 200, "application/octet-stream", out.items);
 }
 
-fn description(a: Allocator, in: Value, program: []const u8) ![]const u8 {
-    const progs = in.get("programs") orelse return "";
-    const cid = progs.getCid(program) orelse return "";
-    const rec = vm.store().getValue(a, cid) catch return "";
-    return rec.getText("description") orelse "";
+/// A configured topic's or service's answer to fn "metadata" / "documentation" (its program's call).
+fn describe(a: Allocator, in: Value, key: []const u8, prog: []const u8, name: []const u8, func: []const u8) !Value {
+    return vm.call(a, prog, func, try calls.describeArg(a, in, key, name));
+}
+
+fn callFailure(a: Allocator, e: anyerror) !Value {
+    return failure(a, 500, if (e == error.ImportFailed) vm.lastError() else @errorName(e));
 }
 
 fn listing(a: Allocator, in: Value, key: []const u8) !Value {
     const map = try configMap(a, in, key);
-    var out: std.Io.Writer.Allocating = .init(a);
-    var jw: std.json.Stringify = .{ .writer = &out.writer };
-    try jw.beginObject();
-    var it = map.iterator();
-    while (it.next()) |e| {
-        const d = try description(a, in, try programName(e.value_ptr.*));
-        const first = std.mem.trim(u8, d[0 .. std.mem.indexOfScalar(u8, d, '\n') orelse d.len], " \t\r");
-        try jw.objectField(e.key_ptr.*);
-        try jw.write(.{ .name = e.key_ptr.*, .shortDescription = first });
+    var es: std.ArrayList(cbor.Entry) = .empty;
+    for (map.keys()) |name| {
+        const prog = (try programFor(in, map, name)).?;
+        const m = describe(a, in, key, prog, name, "metadata") catch |e| return callFailure(a, e);
+        var fs: std.ArrayList(cbor.Entry) = .empty;
+        try fs.appendSlice(a, &.{
+            .{ .key = "name", .value = .{ .text = m.getText("name") orelse name } },
+            .{ .key = "shortDescription", .value = .{ .text = m.getText("shortDescription") orelse "" } },
+        });
+        for ([_][]const u8{ "iconURL", "version", "informationURL" }) |f| {
+            if (m.getText(f)) |x| try fs.append(a, .{ .key = f, .value = .{ .text = x } });
+        }
+        try es.append(a, .{ .key = name, .value = .{ .map = fs.items } });
     }
-    try jw.endObject();
-    return respond(a, 200, "application/json", out.written());
+    return respond(a, 200, "application/json", try toJson(a, .{ .map = es.items }));
 }
 
 fn documentation(a: Allocator, in: Value, key: []const u8, name: []const u8, what: []const u8) !Value {
     const map = try configMap(a, in, key);
-    const v = map.get(name) orelse return failure(a, 400, try std.fmt.allocPrint(a, "{s} not found: {s}", .{ what, name }));
-    return respond(a, 200, "text/markdown", try description(a, in, try programName(v)));
+    const prog = (try programFor(in, map, name)) orelse return failure(a, 400, try std.fmt.allocPrint(a, "{s} not found: {s}", .{ what, name }));
+    const d = describe(a, in, key, prog, name, "documentation") catch |e| return callFailure(a, e);
+    return respond(a, 200, "text/markdown", d.getText("documentation") orelse "");
 }

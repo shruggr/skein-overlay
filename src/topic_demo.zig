@@ -19,6 +19,22 @@ pub fn identify(a: std.mem.Allocator, call: topic.Call) anyerror!topic.Instructi
     return .{ .outputs_to_admit = admit.items, .coins_to_retain = if (admit.items.len > 0) call.previous_coins else &.{} };
 }
 
+pub fn metadata(_: std.mem.Allocator, _: []const u8) anyerror!topic.Metadata {
+    return .{ .short_description = "Example tokens: outputs starting <\"tm_demo\"> OP_DROP with at least 1 satoshi." };
+}
+
+pub fn documentation(_: std.mem.Allocator, _: []const u8) anyerror![]const u8 {
+    return
+    \\# tm_demo
+    \\
+    \\An example topic manager. A token is an output whose locking script starts with the push
+    \\`"tm_demo"` and `OP_DROP` (then any spending condition, e.g. P2PKH) and carries at least
+    \\one satoshi. Every token is admitted. A transaction that admits a token retains the tokens
+    \\it spends (the history of a token moving); one that admits none removes them.
+    \\
+    ;
+}
+
 pub fn main() u8 {
     return topic.main(identify);
 }

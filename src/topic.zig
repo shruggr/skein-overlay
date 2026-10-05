@@ -18,8 +18,26 @@
 //! A topic program is `pub fn main() u8 { return topic.main(identify); }`
 //! with `identify(arena, Call) !Instructions` — the TopicManager's
 //! identifyAdmissibleOutputs. `judge` is the same over any store (tests).
-//! Documentation and metadata are the program record's (bin/<name>.json
-//! `description`): the router serves them without running anything.
+//!
+//! A topic manager answers its own metadata and documentation (the
+//! TopicManager's getMetaData and getDocumentation): the engine's listing and
+//! documentation routes call fn "metadata" or fn "documentation" with
+//!
+//!   {kind: "topic-describe", topic}
+//!
+//! and the answer is
+//!
+//!   {kind: "metadata", name, shortDescription, iconURL?, version?, informationURL?}
+//!   {kind: "documentation", documentation: <markdown>}
+//!
+//! A program may define, beside `main`,
+//!
+//!   pub fn metadata(a, topic: []const u8) !topic.Metadata
+//!   pub fn documentation(a, topic: []const u8) ![]const u8
+//!
+//! and `main` finds them. One it does not define answers the default: name
+//! the configured topic name, shortDescription "", documentation "". How a
+//! program answers is its own: a literal, or a file it reads from its tree.
 //!
 //! This file is the module `topic` of the skein-overlay package: an overlay
 //! app's own topic manager depends on skein-overlay by URL+hash and does
@@ -67,6 +85,15 @@ pub const Call = struct {
         if (in.previous_outpoint.index >= src.outputs.len) return null;
         return src.outputs[in.previous_outpoint.index];
     }
+};
+
+/// A topic manager's metadata (BRC-22/24's listing entry). `name` null: the configured topic name.
+pub const Metadata = struct {
+    name: ?[]const u8 = null,
+    short_description: []const u8 = "",
+    icon_url: ?[]const u8 = null,
+    version: ?[]const u8 = null,
+    information_url: ?[]const u8 = null,
 };
 
 pub const Identify = fn (a: std.mem.Allocator, call: Call) anyerror!Instructions;
@@ -121,14 +148,51 @@ pub fn instructionsOf(a: std.mem.Allocator, rec: Value) !Instructions {
     return .{ .outputs_to_admit = try uintList(a, rec.get("outputsToAdmit")), .coins_to_retain = try uintList(a, rec.get("coinsToRetain")) };
 }
 
-/// The program's main: a call of fn "identify"; its answer is the admittance record.
+/// A metadata record (`{kind: "metadata", …}`): `name` the configured name unless `m` names one.
+pub fn metadataRecord(a: std.mem.Allocator, name: []const u8, m: Metadata) !Value {
+    var es: std.ArrayList(cbor.Entry) = .empty;
+    try es.appendSlice(a, &.{
+        .{ .key = "kind", .value = .{ .text = "metadata" } },
+        .{ .key = "name", .value = .{ .text = m.name orelse name } },
+        .{ .key = "shortDescription", .value = .{ .text = m.short_description } },
+    });
+    if (m.icon_url) |x| try es.append(a, .{ .key = "iconURL", .value = .{ .text = x } });
+    if (m.version) |x| try es.append(a, .{ .key = "version", .value = .{ .text = x } });
+    if (m.information_url) |x| try es.append(a, .{ .key = "informationURL", .value = .{ .text = x } });
+    return .{ .map = es.items };
+}
+
+/// Answer fn "metadata" or fn "documentation" from `Program`'s own (a namespace: the program's
+/// root; `main` passes it), else the default.
+pub fn describe(a: std.mem.Allocator, comptime Program: type, func: []const u8, args: Value) !Value {
+    if (!std.mem.eql(u8, args.getText("kind") orelse "", "topic-describe")) return error.BadArgs;
+    const name = args.getText("topic") orelse return error.BadArgs;
+    if (std.mem.eql(u8, func, "metadata")) {
+        const m: Metadata = if (@hasDecl(Program, "metadata")) try Program.metadata(a, name) else .{};
+        return metadataRecord(a, name, m);
+    }
+    if (std.mem.eql(u8, func, "documentation")) {
+        const d: []const u8 = if (@hasDecl(Program, "documentation")) try Program.documentation(a, name) else "";
+        return .{ .map = try a.dupe(cbor.Entry, &.{
+            .{ .key = "kind", .value = .{ .text = "documentation" } },
+            .{ .key = "documentation", .value = .{ .text = d } },
+        }) };
+    }
+    return error.UnknownFunction;
+}
+
+/// The program's main: a call of fn "identify" (its answer the admittance record), or of fn
+/// "metadata" / "documentation" (the program's own, else the default).
 pub fn main(comptime identify: Identify) u8 {
     const vm = @import("sk");
     const S = struct {
         fn run(a: std.mem.Allocator) anyerror!void {
             const in = try vm.input(a);
-            if (!std.mem.eql(u8, in.getText("kind") orelse "", "call") or !std.mem.eql(u8, in.getText("fn") orelse "", "identify")) return error.CalledOnly;
-            try vm.answer(a, try judge(a, vm.store(), identify, try vm.callArg(a, in)));
+            if (!std.mem.eql(u8, in.getText("kind") orelse "", "call")) return error.CalledOnly;
+            const func = in.getText("fn") orelse "";
+            const arg = try vm.callArg(a, in);
+            if (std.mem.eql(u8, func, "identify")) return vm.answer(a, try judge(a, vm.store(), identify, arg));
+            try vm.answer(a, try describe(a, @import("root"), func, arg));
         }
     };
     return vm.main("topic", S.run);

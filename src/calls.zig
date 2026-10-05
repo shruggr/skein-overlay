@@ -155,3 +155,17 @@ pub fn lookupArg(a: Allocator, in: Value, service: []const u8, query: Value) !Va
         .{ .key = "query", .value = query },
     }) };
 }
+
+/// The argument of fn "metadata" / "documentation" for a configured topic (`overlayTopics`: {kind:
+/// "topic-describe", topic}) or lookup service (`overlayLookups`: {kind: "lookup-describe", app, service}).
+pub fn describeArg(a: Allocator, in: Value, key: []const u8, name: []const u8) !Value {
+    if (std.mem.eql(u8, key, "overlayTopics")) return .{ .map = try a.dupe(cbor.Entry, &.{
+        .{ .key = "kind", .value = .{ .text = "topic-describe" } },
+        .{ .key = "topic", .value = .{ .text = name } },
+    }) };
+    return .{ .map = try a.dupe(cbor.Entry, &.{
+        .{ .key = "kind", .value = .{ .text = "lookup-describe" } },
+        .{ .key = "app", .value = .{ .text = appOf(in) } },
+        .{ .key = "service", .value = .{ .text = name } },
+    }) };
+}

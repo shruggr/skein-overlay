@@ -716,6 +716,50 @@ test "the topic contract: identify on a CID, reading records" {
     try std.testing.expectError(error.UnknownTransaction, topic.judge(a, s, demo.identify, missing));
 }
 
+test "metadata and documentation: the program's own, else the default" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const in: Value = .{ .map = try a.dupe(cbor.Entry, &.{.{ .key = "app", .value = .{ .text = "overlay" } }}) };
+    const ta = try calls.describeArg(a, in, "overlayTopics", "tm_demo");
+    const la = try calls.describeArg(a, in, "overlayLookups", "ls_demo");
+
+    const tm = try topic.describe(a, demo, "metadata", ta);
+    try std.testing.expectEqualStrings("metadata", tm.getText("kind").?);
+    try std.testing.expectEqualStrings("tm_demo", tm.getText("name").?);
+    try std.testing.expectEqualStrings((try demo.metadata(a, "tm_demo")).short_description, tm.getText("shortDescription").?);
+    try std.testing.expect(tm.get("iconURL") == null);
+    try std.testing.expect(std.mem.startsWith(u8, (try topic.describe(a, demo, "documentation", ta)).getText("documentation").?, "# tm_demo"));
+
+    const lm = try lookup.describe(a, ls, "metadata", la);
+    try std.testing.expectEqualStrings("ls_demo", lm.getText("name").?);
+    try std.testing.expect(lm.getText("shortDescription").?.len > 0);
+    try std.testing.expect(std.mem.startsWith(u8, (try lookup.describe(a, ls, "documentation", la)).getText("documentation").?, "# ls_demo"));
+
+    // A program that defines neither: its configured name, "" and "".
+    const None = struct {};
+    const dm = try topic.describe(a, None, "metadata", ta);
+    try std.testing.expectEqualStrings("tm_demo", dm.getText("name").?);
+    try std.testing.expectEqualStrings("", dm.getText("shortDescription").?);
+    try std.testing.expectEqualStrings("", (try lookup.describe(a, None, "documentation", la)).getText("documentation").?);
+    try std.testing.expectEqualStrings("ls_demo", (try lookup.describe(a, None, "metadata", la)).getText("name").?);
+
+    // Optional fields when the program gives them.
+    const Full = struct {
+        pub fn metadata(_: Allocator, _: []const u8) anyerror!topic.Metadata {
+            return .{ .name = "Full", .short_description = "s", .icon_url = "i", .version = "1", .information_url = "u" };
+        }
+    };
+    const fm = try topic.describe(a, Full, "metadata", ta);
+    try std.testing.expectEqualStrings("Full", fm.getText("name").?);
+    try std.testing.expectEqualStrings("i", fm.getText("iconURL").?);
+    try std.testing.expectEqualStrings("1", fm.getText("version").?);
+    try std.testing.expectEqualStrings("u", fm.getText("informationURL").?);
+
+    try std.testing.expectError(error.BadArgs, topic.describe(a, demo, "metadata", la));
+    try std.testing.expectError(error.UnknownFunction, lookup.describe(a, ls, "nope", la));
+}
+
 /// The config with `defaults.<key>` set to `value`.
 fn withDefault(a: Allocator, in: Value, key: []const u8, value: []const u8) !Value {
     const es = try a.dupe(cbor.Entry, in.map);

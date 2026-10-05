@@ -151,6 +151,26 @@ pub fn answer(a: Allocator, svc: *Service, _: *lookup.Chain, query: Value) anyer
     return .{ .output_list = out.items };
 }
 
+pub fn metadata(_: Allocator, _: []const u8) anyerror!lookup.Metadata {
+    return .{ .short_description = "Example index of tm_demo tokens: by topic, by script hash, or by outpoint." };
+}
+
+pub fn documentation(_: Allocator, _: []const u8) anyerror![]const u8 {
+    return
+    \\# ls_demo
+    \\
+    \\An example lookup service. It indexes the outputs its topics admit, through the
+    \\`admitted`, `spent` and `rejected` hooks, and answers output-lists. Queries:
+    \\
+    \\- `{"topic": "tm_demo"}`: every unspent output admitted into the topic
+    \\- `{"scriptHash": "<hex sha256 of the locking script>", "topic"?: …}`: unspent outputs with that script
+    \\- `{"txid": "<hex>", "outputIndex": n, "topic": "tm_demo"}`: that output, if admitted and unspent
+    \\
+    \\Add `"includeSpent": true` for spent outputs too.
+    \\
+    ;
+}
+
 pub fn main() u8 {
     return lookup.main(spec);
 }

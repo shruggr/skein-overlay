@@ -28,9 +28,29 @@
 //! chain app's records (its head `chain/state`, read only: ancestry back to
 //! proven transactions, with their BUMPs).
 //!
+//! A lookup service answers its own metadata and documentation (the
+//! LookupService's getMetaData and getDocumentation): the engine's listing
+//! and documentation routes call fn "metadata" or fn "documentation" with
+//!
+//!   {kind: "lookup-describe", app, service}
+//!
+//! and the answer is
+//!
+//!   {kind: "metadata", name, shortDescription, iconURL?, version?, informationURL?}
+//!   {kind: "documentation", documentation: <markdown>}
+//!
 //! A service is `pub fn main() u8 { return lookup.main(spec); }` with a
-//! `Spec`: its map names, `answer`, and the hooks it implements. This file is
-//! the module `lookup` of the skein-overlay package (`@import("lookup")`).
+//! `Spec`: its map names, `answer`, and the hooks it implements. It may
+//! define, beside `main`,
+//!
+//!   pub fn metadata(a, service: []const u8) !lookup.Metadata
+//!   pub fn documentation(a, service: []const u8) ![]const u8
+//!
+//! and `main` finds them. One it does not define answers the default: name
+//! the configured service name, shortDescription "", documentation "". How a
+//! service answers is its own: a literal, or a file it reads from its tree.
+//! This file is the module `lookup` of the skein-overlay package
+//! (`@import("lookup")`).
 const std = @import("std");
 const c = @import("chain");
 
@@ -124,6 +144,43 @@ pub const Service = struct {
         return .{ .cid = tc, .txid = txid, .tx = Transaction.parse(self.arena, raw) catch return error.BadTransaction };
     }
 };
+
+/// A lookup service's metadata (BRC-24's listing entry). `name` null: the configured service name.
+pub const Metadata = struct {
+    name: ?[]const u8 = null,
+    short_description: []const u8 = "",
+    icon_url: ?[]const u8 = null,
+    version: ?[]const u8 = null,
+    information_url: ?[]const u8 = null,
+};
+
+/// Answer fn "metadata" or fn "documentation" from `Program`'s own (a namespace: the program's
+/// root; `main` passes it), else the default.
+pub fn describe(a: Allocator, comptime Program: type, func: []const u8, args: Value) !Value {
+    if (!std.mem.eql(u8, args.getText("kind") orelse "", "lookup-describe")) return error.BadArgs;
+    const name = args.getText("service") orelse return error.BadArgs;
+    if (std.mem.eql(u8, func, "metadata")) {
+        const m: Metadata = if (@hasDecl(Program, "metadata")) try Program.metadata(a, name) else .{};
+        var es: std.ArrayList(cbor.Entry) = .empty;
+        try es.appendSlice(a, &.{
+            .{ .key = "kind", .value = .{ .text = "metadata" } },
+            .{ .key = "name", .value = .{ .text = m.name orelse name } },
+            .{ .key = "shortDescription", .value = .{ .text = m.short_description } },
+        });
+        if (m.icon_url) |x| try es.append(a, .{ .key = "iconURL", .value = .{ .text = x } });
+        if (m.version) |x| try es.append(a, .{ .key = "version", .value = .{ .text = x } });
+        if (m.information_url) |x| try es.append(a, .{ .key = "informationURL", .value = .{ .text = x } });
+        return .{ .map = es.items };
+    }
+    if (std.mem.eql(u8, func, "documentation")) {
+        const d: []const u8 = if (@hasDecl(Program, "documentation")) try Program.documentation(a, name) else "";
+        return .{ .map = try a.dupe(cbor.Entry, &.{
+            .{ .key = "kind", .value = .{ .text = "documentation" } },
+            .{ .key = "documentation", .value = .{ .text = d } },
+        }) };
+    }
+    return error.UnknownFunction;
+}
 
 pub const Spec = struct {
     /// The names of the service's maps (its state record's `maps`).
@@ -219,9 +276,10 @@ pub fn handle(a: Allocator, spec: Spec, s: Store, network: c.chain.Network, stat
     return .{ .answer = done, .state = if (svc.dirty()) try svc.save() else null };
 }
 
-/// The program's main: a call — fn "lookup" (a read) or a hook (in a step:
-/// the service's head `<app>/ls_<service>` advances when its maps changed —
-/// a head under its own app's name, so the kernel lets it).
+/// The program's main: a call — fn "lookup" (a read), fn "metadata" or
+/// "documentation" (the service's own, else the default), or a hook (in a
+/// step: the service's head `<app>/ls_<service>` advances when its maps
+/// changed — a head under its own app's name, so the kernel lets it).
 pub fn main(comptime spec: Spec) u8 {
     const vm = @import("sk");
     const S = struct {
@@ -230,6 +288,8 @@ pub fn main(comptime spec: Spec) u8 {
             if (!std.mem.eql(u8, in.getText("kind") orelse "", "call")) return error.CalledOnly;
             const func = in.getText("fn") orelse return error.BadInput;
             const arg = try vm.callArg(a, in);
+            if (std.mem.eql(u8, func, "metadata") or std.mem.eql(u8, func, "documentation"))
+                return vm.answer(a, try describe(a, @import("root"), func, arg));
             const head = try headName(a, appOf(arg), arg.getText("service") orelse return error.BadArgs);
             const chain_state = if (std.mem.eql(u8, func, "lookup")) try vm.head(a, chain_head) else null;
             const net_name = if (in.get("defaults")) |d| d.getText("walletNetwork") orelse "main" else "main";
