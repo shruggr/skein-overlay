@@ -15,9 +15,10 @@
 //!                             (`<topic>-proof`), rejected (the judgements removed, `rejected` hooks).
 //!   a peer's admit            the `peer-admit` event the `-admit` route admits (box `<app>`):
 //!                             recorded under `<app>/gossip`.
-//!   register / deregister     a message in box `<app>`, {fn: "register", args: {topic, program}} or
-//!                             {fn: "deregister", args: {topic}}, from whoever the app's rows admit
-//!                             there (topics.zig, shruggr/skein#120): the registered set under
+//!   register / deregister     a message in any box a row routes to the engine (`<app>`, or e.g.
+//!                             `<app>/overlay`, shruggr/skein#128), {fn: "register", args: {topic,
+//!                             program}} or {fn: "deregister", args: {topic}}, from whoever that row
+//!                             admits (topics.zig, shruggr/skein#120): the registered set under
 //!                             `<app>/topics`, the subscribe / unsubscribe events; answered {topic, active}.
 //!
 //! The state is the overlay's own, under its app's name (state.zig: `<app>/state`), over the
@@ -90,7 +91,8 @@ fn peerAdmitted(a: Allocator, step: Value, ev: Value) !void {
 }
 
 /// `register {topic, program}` / `deregister {topic}` (topics.zig, shruggr/skein#120): a message in
-/// box `<app>`, `{fn, args}`, from whoever the app's rows admit there. The set written under
+/// any box a row routes to the engine (shruggr/skein#128), `{fn, args}`, from whoever the row admits;
+/// the app is the step's, not the box's. The set written under
 /// `<app>/topics` and the events emitted when it changes; the answer `{fn, request, replyTo,
 /// result: {topic, active} | error: {code, message}}` (skein docs/APPS.md §4) to the sender when a
 /// message can reach it. A refusal writes and emits nothing.
@@ -136,7 +138,7 @@ fn registration(a: Allocator, step: Value, args: Value, body: Value, func: []con
         },
     }
     if (args.getBytes("sender")) |sender| if (try ev_.reaches(a, step, sender)) {
-        _ = try vm.send(a, sender, args.getText("box") orelse calls.appOf(step), .{ .map = ans.items });
+        _ = try vm.send(a, sender, topics.answerBox(args, calls.appOf(step)), .{ .map = ans.items });
     };
     _ = try vm.finish(a, s, try resultRecord(a, func, fields.items));
 }
@@ -161,9 +163,12 @@ fn run(a: Allocator) anyerror!void {
         op = if (reply == null) "submit" else "answer";
     } else if (args.getCid("body")) |bc| {
         const body = try s.getValue(a, bc);
-        // Register or deregister a topic: from whoever the app's rows admit to its box.
-        const f = body.getText("fn") orelse "";
-        if (eql(u8, f, "register") or eql(u8, f, "deregister")) return registration(a, step, args, body, f);
+        // Register or deregister a topic, in whatever box a row routed it here (skein #128).
+        switch (topics.asked(body)) {
+            .register => return registration(a, step, args, body, "register"),
+            .deregister => return registration(a, step, args, body, "deregister"),
+            .other => {},
+        }
         // Any other message in the app's box: from the instance itself (its own watch), nothing else.
         const me = vm.selfKey(step) orelse return error.NoIdentity;
         if (!eql(u8, args.getBytes("sender") orelse "", me)) return error.NotFromThisInstance;

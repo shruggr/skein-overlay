@@ -4,7 +4,7 @@ The overlay services engine for a [skein](https://github.com/shruggr/skein),
 as an app: BRC-22 submit and BRC-24 lookup, served by the instance's own
 front door, with topic managers and lookup services as programs the engine
 calls. It is also a Zig package: an overlay of your own depends on it for
-the topic and lookup contracts. Version **0.6.1**.
+the topic and lookup contracts. Version **0.6.2**.
 
 ## What it is
 
@@ -141,7 +141,7 @@ The manifest (`etc/app.json`, this repo's own, description left out):
 {
   "kind": "app",
   "name": "overlay",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "programs": {
     "overlay": "bin/overlay.wasm",
     "topic-demo": "bin/topic-demo.wasm",
@@ -156,6 +156,7 @@ The manifest (`etc/app.json`, this repo's own, description left out):
   },
   "requires": ["chain/1"],
   "dispatch": [
+    {"address": "overlay", "sender": "$owner", "program": "overlay"},
     {"transport": "http", "address": "/listTopicManagers", "sender": "*", "program": "overlay", "fn": "listTopicManagers"},
     {"transport": "http", "address": "/listLookupServiceProviders", "sender": "*", "program": "overlay", "fn": "listLookupServiceProviders"},
     {"transport": "http", "address": "/getDocumentationForTopicManager", "sender": "*", "program": "overlay", "fn": "topicDocumentation"},
@@ -181,8 +182,11 @@ The manifest (`etc/app.json`, this repo's own, description left out):
 Topics may be declared in `config.overlay.topics` (an overlay with fixed
 topics, e.g. OpNS's one global topic) or registered at runtime: one call
 per topic. A dynamic overlay (one topic per token, `tm_<txid>`) declares
-none and registers the ones the operator runs. The engine's two functions,
-a message in box `<app>`:
+none and registers the ones the operator runs. The engine's two functions:
+the owner sends them to the app's `overlay` box (the manifest row
+`{"address": "overlay", "sender": "$owner", "program": "overlay"}`; a
+mailbox address is relative to the app, so installed it is `<app>/overlay`,
+shruggr/skein#128):
 
 ```
 {fn: "register",   args: {topic, program}}   program: the role in `programs` that judges it
@@ -198,8 +202,11 @@ door decodes the BEEF as for `/submit`), `<topic>-admit` (`peerAdmit`) and
 `<topic>-proof` (`peerProof`), `program` the engine's own role;
 `deregister` emits `unsubscribe {topic}` for the three (skein #119): the
 host subscribes and routes by them. Who may call is your manifest's row,
-e.g. `{"address": "<app>", "sender": "$owner", "program": "overlay"}`
-(the function is the body's `fn`). A lookup service without a `topics`
+e.g. the one above (the function is the body's `fn`); the engine takes
+them in any box a row routes to it (`<app>` too) and answers in the box
+they came in. Until skein's install resolves a relative mailbox address
+(shruggr/skein#128, landing separately), a local run takes the address as
+written: the box `overlay`. A lookup service without a `topics`
 list listens to every topic, declared or registered. docs/OVERLAY.md
 "Register a topic" has the rest.
 
@@ -232,7 +239,7 @@ Not built: BRC-88 SHIP/SLAP, GASP sync and catch-up from a peer, the
 
 | | |
 |---|---|
-| this app and package | 0.6.1 (tag `v0.6.1`) |
+| this app and package | 0.6.2 (tag `v0.6.2`) |
 | skein-sdk | v0.5.1, by tag URL and hash in `build.zig.zon` (module `chain`; bsvz comes through it) |
 | requires | `chain/1` (shruggr/skein-chain 0.3.0) |
 | skein | log format 8; skein's equivs pin this repo by commit |
@@ -258,6 +265,10 @@ ones, with the `subscribe` / `unsubscribe` events the host routes by
 
 0.6.1 puts `filter: "beef"` on the `<topic>` subscribe, so the door
 decodes a gossiped submission's BEEF as it does for `/submit`.
+
+0.6.2 takes `register` / `deregister` in any box a row routes to the
+engine, and the manifest routes the owner's to the app's `overlay` box
+(`<app>/overlay`, shruggr/skein#128).
 
 ## Contributing
 

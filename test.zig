@@ -1263,3 +1263,47 @@ test "register and deregister (skein #120): the set under <app>/topics, the even
     const wt = try calls.configObject(a, w, "overlayTopics");
     try std.testing.expectEqualStrings("topic-demo", wt.get("tm_demo").?.string);
 }
+
+test "register / deregister in any box a row routes to the engine (skein #128): `<app>/overlay` and `<app>` alike; the app is the step's, the answer in the box it came in" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = c.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    const s = ms.store();
+    const prog = try s.putValue(a, try mapOf(a, &.{.{ .key = "kind", .value = .{ .text = "program" } }}));
+    const programs = try mapOf(a, &.{.{ .key = "topic-demo", .value = .{ .cid = prog } }});
+    const app = "amm";
+
+    for ([_][]const u8{ "amm/overlay", "amm" }) |box| {
+        const args = try mapOf(a, &.{.{ .key = "box", .value = .{ .text = box } }});
+        const reg = try mapOf(a, &.{
+            .{ .key = "fn", .value = .{ .text = "register" } },
+            .{ .key = "args", .value = try mapOf(a, &.{
+                .{ .key = "topic", .value = .{ .text = "tm_x" } },
+                .{ .key = "program", .value = .{ .text = "topic-demo" } },
+            }) },
+        });
+        try std.testing.expectEqual(topics_mod.Asked.register, topics_mod.asked(reg));
+        try std.testing.expectEqualStrings(box, topics_mod.answerBox(args, app));
+        // The set is the step's app's, whatever the box.
+        try std.testing.expectEqualStrings("amm/topics", try topics_mod.headName(a, app));
+        const done = (try topics_mod.register(a, &.{}, reg.get("args").?, programs, "overlay")).done;
+        try std.testing.expectEqual(@as(usize, 1), done.list.?.len);
+        try std.testing.expect(done.answer.get("active").?.boolean);
+
+        const dereg = try mapOf(a, &.{
+            .{ .key = "fn", .value = .{ .text = "deregister" } },
+            .{ .key = "args", .value = try mapOf(a, &.{.{ .key = "topic", .value = .{ .text = "tm_x" } }}) },
+        });
+        try std.testing.expectEqual(topics_mod.Asked.deregister, topics_mod.asked(dereg));
+        const gone = (try topics_mod.deregister(a, done.list.?, dereg.get("args").?)).done;
+        try std.testing.expectEqual(@as(usize, 0), gone.list.?.len);
+        try std.testing.expect(!gone.answer.get("active").?.boolean);
+
+        // Anything else is not a registration (the engine's watch path: the instance itself only).
+        try std.testing.expectEqual(topics_mod.Asked.other, topics_mod.asked(try mapOf(a, &.{.{ .key = "fn", .value = .{ .text = "watch" } }})));
+    }
+    // No box on the step: the answer goes to the app's own.
+    try std.testing.expectEqualStrings(app, topics_mod.answerBox(try mapOf(a, &.{}), app));
+}

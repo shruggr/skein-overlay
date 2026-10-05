@@ -1,7 +1,7 @@
 {
   "kind": "app",
   "name": "overlay",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "programs": {
     "overlay": "bin/overlay.wasm",
     "topic-demo": "bin/topic-demo.wasm",
@@ -27,10 +27,11 @@
   },
   "requires": ["chain/1"],
   "dispatch": [
+    {"address": "overlay", "sender": "$owner", "program": "overlay"},
     {"transport": "http", "address": "/listTopicManagers", "sender": "*", "program": "overlay", "fn": "listTopicManagers"},
     {"transport": "http", "address": "/listLookupServiceProviders", "sender": "*", "program": "overlay", "fn": "listLookupServiceProviders"},
     {"transport": "http", "address": "/getDocumentationForTopicManager", "sender": "*", "program": "overlay", "fn": "topicDocumentation"},
     {"transport": "http", "address": "/getDocumentationForLookupServiceProvider", "sender": "*", "program": "overlay", "fn": "lookupDocumentation"}
   ],
-  "description": "Overlay services (BRC-22 submit, BRC-24 lookup; docs/OVERLAY.md): the engine judges submissions with the app's topic managers, hands each to the chain app (shruggr/skein-chain, required: chain/1) and admits it on the chain app's answer (accepted or proven), keeps what its topics admitted under <app>/state, and serves submit and lookup as route handlers; tm_demo and ls_demo are its example topic manager and lookup service (ls_demo's index under <app>/ls_demo). Its configuration is config.overlay, read from the app record <app>/app at every step; the install derives its wiring from it: http /submit and /lookup, libp2p <topic>, <topic>-admit, <topic>-proof (gossip, #74), and the box <app> from events and from the instance itself. Topics may also be registered at runtime: {fn: \"register\", args: {topic, program}} / {fn: \"deregister\", args: {topic}} in box <app> (the set under <app>/topics; subscribe / unsubscribe events)."
+  "description": "Overlay services (BRC-22 submit, BRC-24 lookup; docs/OVERLAY.md): the engine judges submissions with the app's topic managers, hands each to the chain app (shruggr/skein-chain, required: chain/1) and admits it on the chain app's answer (accepted or proven), keeps what its topics admitted under <app>/state, and serves submit and lookup as route handlers; tm_demo and ls_demo are its example topic manager and lookup service (ls_demo's index under <app>/ls_demo). Its configuration is config.overlay, read from the app record <app>/app at every step; the install derives its wiring from it: http /submit and /lookup, libp2p <topic>, <topic>-admit, <topic>-proof (gossip, #74), and the box <app> from events and from the instance itself. Topics may also be registered at runtime: {fn: \"register\", args: {topic, program}} / {fn: \"deregister\", args: {topic}} from the owner in the app's box overlay (<app>/overlay once installed; the engine takes them in any box a row routes to it): the set under <app>/topics; subscribe / unsubscribe events."
 }

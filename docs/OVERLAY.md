@@ -1,4 +1,4 @@
-# Overlay services in the VM (0.6.1)
+# Overlay services in the VM (0.6.2)
 
 An overlay is an app (skein docs/APPS.md §6). It judges transactions with
 its topic managers and indexes them with its lookup services; it does not
@@ -304,9 +304,9 @@ wire"). Stepped:
 | POST /submit (a launch), or the submit event in box `<app>` (the `libp2p:<topic>` route's admit, row from `event`) | `{kind: "submit", …}` | the submission's thread: the ingest message, pending; on each answer (`reply`) admit, reject or await on |
 | a message in box `<app>` from the instance itself (row from `$self`) | `{fn: "watch", args: {txid, ingest}}` | the watch: the later proof (`-proof`) or rejection (unwound) |
 | the `peer-admit` event in box `<app>` (the `-admit` route's admit) | `{kind: "peer-admit", …}` | recorded under `<app>/gossip` ("Gossip", below); nothing admitted |
-| a message in box `<app>` from whoever the app's rows admit there | `{fn: "register", args: {topic, program}}` or `{fn: "deregister", args: {topic}}` | the registered set under `<app>/topics` and its events ("Register a topic", below) |
+| a message in any box a row routes to the engine (the manifest's: `overlay`, i.e. `<app>/overlay`, from `$owner`; `<app>` too) | `{fn: "register", args: {topic, program}}` or `{fn: "deregister", args: {topic}}` | the registered set under `<app>/topics` and its events ("Register a topic", below) |
 
-Any other message in box `<app>` from anyone but the instance itself is refused. There is no `lookup`
+Any other message (not `register` / `deregister`) from anyone but the instance itself is refused. There is no `lookup`
 box: a lookup is a read: its request is recorded, and it moves nothing.
 
 **Config.** An installed engine reads its configuration from its app
@@ -364,8 +364,11 @@ pre-configure topics in `config.overlay.topics` (OpNS: one global topic,
 nothing to choose); both kinds are served alike. There are no topic
 prefixes anywhere: not in the configuration, not in the rows.
 
-The engine's two functions, a message in box `<app>` (`{fn, args}`, skein
-docs/APPS.md §4):
+The engine's two functions, a message `{fn, args}` (skein docs/APPS.md §4)
+the owner sends to the app's `overlay` box — installed, `<app>/overlay`: a
+manifest's mailbox address is relative to the app, like its http paths and
+heads (shruggr/skein#128). The engine takes them in any box a row routes to
+it (the app's own `<app>` too); the app is the step's, never the box's:
 
 - `register {topic, program}` adds `topic` to the registered set, judged by
   the topic manager `program` (a role in `programs`: the manifest of a
@@ -377,17 +380,22 @@ Both are idempotent: a topic registered already with the same program, or
 not registered, changes nothing and emits nothing. A topic registered with
 another program is refused (deregister it first). The answer is `{topic,
 active}`, `active` whether the topic is in the registered set now, sent to
-the sender as `{fn, request, replyTo, result}` (or `error: {code:
+the sender, in the box the message came in, as `{fn, request, replyTo, result}` (or `error: {code:
 "bad-args", message}` for a refusal, which writes nothing) when a message
 can reach it (the instance itself, or an address-book entry); the step's
 result record says the same.
 
-Who may call them is the embedding app's manifest: a row for box `<app>`
-to the engine, for the sender it chooses, e.g. the owner:
+Who may call them is the embedding app's manifest: a row for a box of its
+own to the engine, for the sender it chooses; this repo's manifest has the
+owner's:
 
 ```json
-{"address": "<app>", "sender": "$owner", "program": "overlay"}
+{"address": "overlay", "sender": "$owner", "program": "overlay"}
 ```
+
+The install resolves the address to `<app>/overlay`. Until skein's install
+resolves relative mailbox addresses (shruggr/skein#128, landing separately),
+a local run takes it as written: the box `overlay`.
 
 The function is the body's `fn`: a mailbox row's own `fn` is not handed to
 the program (the kernel launches the row's program on the message), and

@@ -28,6 +28,13 @@
 //! emits nothing. The answer is `{topic, active}` (whether the topic is in
 //! the registered set now).
 //!
+//! Either message is handled in whatever box a dispatch row delivers it to
+//! the engine's program (shruggr/skein#128, 0.6.2): the app's own box
+//! `<app>`, or another of its boxes, e.g. `<app>/overlay` from the manifest
+//! row `{address: "overlay", sender: "$owner", program: "overlay"}`. The app
+//! is the step's, never the box's; the answer goes back in the box the
+//! message came in.
+//!
 //! The logic, natively testable; engine.zig runs it in a step.
 const std = @import("std");
 const c = @import("chain");
@@ -152,6 +159,23 @@ pub fn register(a: Allocator, list: []const Entry, args: Value, programs: Value,
     out[list.len] = .{ .topic = topic, .program = program };
     std.mem.sort(Entry, out, {}, lessThan);
     return .{ .done = .{ .list = out, .events = try a.dupe(Value, &try events(a, true, topic, self)), .answer = try answerOf(a, topic, true) } };
+}
+
+/// What a mailbox message asks of the engine, by its body's `fn` alone: the box it came in plays no
+/// part (shruggr/skein#128): `register` / `deregister` in any box a row routes to the engine.
+pub const Asked = enum { register, deregister, other };
+
+pub fn asked(body: Value) Asked {
+    const f = body.getText("fn") orelse return .other;
+    if (eql(u8, f, "register")) return .register;
+    if (eql(u8, f, "deregister")) return .deregister;
+    return .other;
+}
+
+/// The box a registration's answer goes back in: the one the message came in (the step's
+/// `args.box`), else the app's own.
+pub fn answerBox(args: Value, app: []const u8) []const u8 {
+    return args.getText("box") orelse app;
 }
 
 /// `deregister {topic}`.
