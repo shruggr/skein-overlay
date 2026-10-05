@@ -1132,3 +1132,89 @@ test "the applied record names the submission's BEEF as handed (#3): its pointer
     const b2 = (try st.appliedRecord("tm_demo", t2.txid)).?.getCid("beef").?;
     try std.testing.expectEqualSlices(u8, w2, ms.blocks.get(b2).?);
 }
+
+test "topic prefixes (skein #119, #120): the topics an app activates live, served by the prefix's program; a lookup's prefixes" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = c.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    const s = ms.store();
+    var hm = HeadMap{};
+
+    const engine = try s.putValue(a, try mapOf(a, &.{
+        .{ .key = "kind", .value = .{ .text = "program" } },
+        .{ .key = "name", .value = .{ .text = "overlay" } },
+        .{ .key = "app", .value = .{ .text = "mandala" } },
+    }));
+    const tp = try s.putValue(a, try mapOf(a, &.{ .{ .key = "kind", .value = .{ .text = "program" } }, .{ .key = "name", .value = .{ .text = "token-topic" } } }));
+    const lp = try s.putValue(a, try mapOf(a, &.{ .{ .key = "kind", .value = .{ .text = "program" } }, .{ .key = "name", .value = .{ .text = "token-lookup" } } }));
+    const strs = struct {
+        fn of(al: Allocator, xs: []const []const u8) !Value {
+            const out = try al.alloc(Value, xs.len);
+            for (xs, out) |x, *o| o.* = .{ .text = x };
+            return .{ .array = out };
+        }
+    }.of;
+    try hm.m.put(a, "mandala/app", try s.putValue(a, try mapOf(a, &.{
+        .{ .key = "kind", .value = .{ .text = "app" } },
+        .{ .key = "name", .value = .{ .text = "mandala" } },
+        .{ .key = "programs", .value = try mapOf(a, &.{
+            .{ .key = "overlay", .value = .{ .cid = engine } },
+            .{ .key = "token-topic", .value = .{ .cid = tp } },
+            .{ .key = "token-lookup", .value = .{ .cid = lp } },
+        }) },
+        .{ .key = "config", .value = try mapOf(a, &.{.{ .key = "overlay", .value = try mapOf(a, &.{
+            .{ .key = "topics", .value = try mapOf(a, &.{.{ .key = "tm_fixed", .value = .{ .text = "token-topic" } }}) },
+            .{ .key = "prefixes", .value = try mapOf(a, &.{.{ .key = "tm_", .value = try mapOf(a, &.{
+                .{ .key = "program", .value = .{ .text = "token-topic" } },
+                .{ .key = "active", .value = .{ .text = "tokens" } },
+            }) }}) },
+            .{ .key = "lookups", .value = try mapOf(a, &.{
+                .{ .key = "ls_tokens", .value = try mapOf(a, &.{
+                    .{ .key = "program", .value = .{ .text = "token-lookup" } },
+                    .{ .key = "topics", .value = try strs(a, &.{}) },
+                    .{ .key = "prefixes", .value = try strs(a, &.{"tm_"}) },
+                }) },
+                .{ .key = "ls_fixed", .value = try mapOf(a, &.{
+                    .{ .key = "program", .value = .{ .text = "token-lookup" } },
+                    .{ .key = "topics", .value = try strs(a, &.{"tm_fixed"}) },
+                }) },
+            }) },
+        }) }}) },
+    })));
+    const in = try withThread(a, s, try mapOf(a, &.{.{ .key = "defaults", .value = try mapOf(a, &.{}) }}), engine);
+
+    // Nothing active yet (no head `mandala/tokens`): the exact topic only.
+    const before = try config.resolve(a, s, hm.heads(), in, null);
+    try std.testing.expectEqual(@as(usize, 1), (try calls.configObject(a, before, "overlayTopics")).count());
+    try std.testing.expectEqual(@as(usize, 0), (try calls.listeners(a, before, "tm_aa")).len);
+
+    // The app's program writes its list: the topics under the prefix are served by its program;
+    // a listed name outside the prefix (or the bare prefix) is not.
+    try hm.m.put(a, "mandala/tokens", try s.putValue(a, try mapOf(a, &.{
+        .{ .key = "kind", .value = .{ .text = "mandala-tokens" } },
+        .{ .key = "topics", .value = try strs(a, &.{ "tm_aa", "tm_bb", "tm_", "other" }) },
+    })));
+    const now = try config.resolve(a, s, hm.heads(), in, null);
+    const topics = try calls.configObject(a, now, "overlayTopics");
+    try std.testing.expectEqual(@as(usize, 3), topics.count());
+    try std.testing.expect(topics.contains("tm_aa") and topics.contains("tm_bb") and topics.contains("tm_fixed"));
+    try std.testing.expect(!topics.contains("tm_") and !topics.contains("other"));
+    try std.testing.expectEqualSlices(u8, tp, (try calls.configuredProgram(now, topics, "tm_aa")).?);
+    try std.testing.expectEqualStrings("mandala", calls.appOf(now));
+    const la = try calls.listeners(a, now, "tm_aa");
+    try std.testing.expectEqual(@as(usize, 1), la.len);
+    try std.testing.expectEqualStrings("ls_tokens", la[0].service);
+    try std.testing.expectEqual(@as(usize, 1), (try calls.listeners(a, now, "tm_fixed")).len);
+    try std.testing.expectEqualStrings("ls_fixed", (try calls.listeners(a, now, "tm_fixed"))[0].service);
+    try std.testing.expect(try gossip.enabled(a, now, "tm_bb"));
+
+    // Deactivated: gone at the next step.
+    try hm.m.put(a, "mandala/tokens", try s.putValue(a, try mapOf(a, &.{
+        .{ .key = "kind", .value = .{ .text = "mandala-tokens" } },
+        .{ .key = "topics", .value = try strs(a, &.{"tm_bb"}) },
+    })));
+    const later = try calls.configObject(a, try config.resolve(a, s, hm.heads(), in, null), "overlayTopics");
+    try std.testing.expect(!later.contains("tm_aa") and later.contains("tm_bb"));
+}

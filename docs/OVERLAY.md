@@ -325,6 +325,24 @@ name is where its heads are (`<name>/state`, …). A reinstall with a changed
   to every topic the overlay serves.
 - `config.overlay.gossip = {"tm_demo": false}` turns a topic's gossip
   publishing off (#74; default on).
+- `config.overlay.prefixes = {"tm_": {"program": "mandala-topic",
+  "active": "mandala"}}` serves topics the app activates live (skein #119,
+  #120: one topic per token, `tm_<txid>`, not known at install). `active`
+  names a head under the app's name (`<app>/mandala`) whose root record
+  lists the topics served now, `{topics: [<topic>, …]}`, written by the
+  app's own program. Each listed topic that starts with the prefix is
+  served as if `topics` named it, judged by `program` (a topic `topics`
+  names keeps its own program). A lookup service in the object form may add
+  `"prefixes": ["tm_"]` to listen to those topics too. The list is read at
+  every step and call, like the rest. The install derives no rows from a
+  prefix: the app's manifest names one libp2p prefix row `{transport:
+  "libp2p", address: "tm_", prefix: true, sender: "*", program: "overlay",
+  fn: "submit", filter: "beef"}`, and the app emits `subscribe` for
+  `<topic>`, `<topic>-admit` and `<topic>-proof` when it activates one
+  (skein docs/OVERLAY.md "How an overlay app activates a token topic
+  live"). A message on `<topic>-admit` or `<topic>-proof` of a served
+  topic that reaches `submit` (the one prefix row takes all three) is
+  handled as `peerAdmit` or `peerProof`.
 
 There is no `status` (statuses are the chain app's) and no admission
 setting (#73).
@@ -335,7 +353,7 @@ instance), or a host's call with no row, reads the genesis `defaults`
 (`etc/config.json`) instead, the same mappings as JSON in strings, the
 program names the genesis's: `overlayTopics = '{"tm_demo":"topic-demo"}'`,
 `overlayLookups = '{"ls_demo":{"program":"lookup-demo","topics":["tm_demo"]}}'`,
-`overlayGossip = '{"tm_demo": false}'`. Its heads are under its program's
+`overlayGossip = '{"tm_demo": false}'`, `overlayPrefixes`. Its heads are under its program's
 name (`overlay/…`), which the tree's `scopes` must grant. `walletNetwork`
 is the network of a chain state not written yet (the chain app's record
 says its own).

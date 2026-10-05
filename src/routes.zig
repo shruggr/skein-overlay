@@ -375,13 +375,22 @@ fn waiting(a: Allocator) !Value {
 /// back at once — GossipSub's validator waits on nothing further; ignore — no forward, no penalty —
 /// when nothing is new or the BEEF is refused (a refusal may be this instance's missing headers, not
 /// the publisher's fault).
+///
+/// A message on `<topic>-admit` or `<topic>-proof` of a served topic that reaches `submit` (one
+/// libp2p prefix row takes all three, skein #119: `tm_` for every `tm_<txid>`) goes to `peerAdmit` or
+/// `peerProof`, as the exact rows route it.
 fn gossip(a: Allocator, in: Value, req: Value) !Value {
     const t = req.getText("topic") orelse return verdictOf(a, "ignore", "not a topic message");
+    const map = try configMap(a, in, "overlayTopics");
+    if (!map.contains(t)) {
+        if (gossip_mod.baseOf(t, gossip_mod.admit_suffix)) |b| if (map.contains(b)) return peerAdmit(a, in, req);
+        if (gossip_mod.baseOf(t, gossip_mod.proof_suffix)) |b| if (map.contains(b)) return peerProof(a, in, req);
+        return verdictOf(a, "ignore", "the topic is not served here");
+    }
     // shruggr/skein#121: the door's pointer record (the row's `filter: "beef"`), or the bytes as received.
     const beef: submit_mod.Input = if (req.getCid("body")) |rc| .{ .record = rc } else .{ .bytes = req.getBytes("body") orelse "" };
     if (beef == .bytes and beef.bytes.len == 0) return verdictOf(a, "ignore", "Missing or empty BEEF body");
-    const topics = try served(a, &.{t}, try configMap(a, in, "overlayTopics"));
-    if (topics.len == 0) return verdictOf(a, "ignore", "the topic is not served here");
+    const topics = try served(a, &.{t}, map);
     var st = try load(a, in);
     const routed = switch (try submit_mod.route(a, ev_.caller(), &st, in, beef, topics, null, try sourceOf(a, req, t))) {
         .refused => |why| return verdictOf(a, "ignore", why),

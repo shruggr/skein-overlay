@@ -20,6 +20,18 @@
 //!   config.overlay.topics    {<topic>: <role>}                                   (was defaults.overlayTopics)
 //!   config.overlay.lookups   {<service>: <role> | {program: <role>, topics?}}    (was defaults.overlayLookups)
 //!   config.overlay.gossip    {<topic>: bool}                                     (was defaults.overlayGossip)
+//!   config.overlay.prefixes  {<prefix>: {program: <role>, active: <head>}}       (defaults.overlayPrefixes)
+//!
+//! A prefix serves the topics an app activates live (skein #119, #120: a
+//! topic per token, `tm_<txid>`, cannot be listed at install). `active` names
+//! a head under the app's name, `<app>/<active>`, whose root record lists the
+//! topics served now: `{topics: [<topic>, …]}` (the app's own program writes
+//! it). Each listed topic that starts with the prefix is served as if
+//! `topics` named it, judged by `program`; a topic `topics` names itself
+//! keeps its own program. A lookup service in the object form may name
+//! `prefixes: [<prefix>]`: it also listens to every active topic under them.
+//! `resolve` expands them: the rest of the engine sees `overlayTopics` and
+//! `overlayLookups` with the active topics in, read at every step and call.
 //!
 //! No app record — a program record without `app` (a genesis-wired engine:
 //! its programs and config are the genesis's; its name is its program
@@ -51,7 +63,7 @@ pub const Heads = struct {
 };
 
 /// The genesis default each `config.overlay` key replaces.
-const keys = [_][2][]const u8{ .{ "topics", "overlayTopics" }, .{ "lookups", "overlayLookups" }, .{ "gossip", "overlayGossip" } };
+const keys = [_][2][]const u8{ .{ "topics", "overlayTopics" }, .{ "lookups", "overlayLookups" }, .{ "gossip", "overlayGossip" }, .{ "prefixes", "overlayPrefixes" } };
 
 /// The engine's own program record: a step's thread's `program`, a route call's `match.program`; null for a host's call.
 pub fn selfProgram(a: Allocator, s: Store, in: Value, arg: ?Value) !?[]const u8 {
@@ -83,7 +95,83 @@ pub fn resolve(a: Allocator, s: Store, heads: Heads, in: Value, arg: ?Value) !Va
     const self = try selfProgram(a, s, in, arg);
     const name = try appName(a, s, self);
     const base = if (try appRecord(a, s, heads, self)) |app| try fromApp(a, in, app, self) else in;
-    return withApp(a, base, name);
+    return withApp(a, try withPrefixes(a, s, heads, base, name), name);
+}
+
+/// A JSON default (`defaults.<key>`, an object in a string), parsed; `{}` when absent.
+fn defaultObject(a: Allocator, in: Value, key: []const u8) !std.json.ObjectMap {
+    const text = if (in.get("defaults")) |d| d.getText(key) orelse "{}" else "{}";
+    const j = std.json.parseFromSliceLeaky(std.json.Value, a, text, .{}) catch return error.BadConfig;
+    if (j != .object) return error.BadConfig;
+    return j.object;
+}
+
+/// The topics active under a prefix: the root record of `<app>/<active>`, its `topics` that start
+/// with the prefix (longer than it). None when the head is not there yet.
+pub fn activeTopics(a: Allocator, s: Store, heads: Heads, app: []const u8, prefix: []const u8, active: []const u8) ![]const []const u8 {
+    const root = (try heads.head(a, try std.fmt.allocPrint(a, "{s}/{s}", .{ app, active }))) orelse return &.{};
+    const rec = try s.getValue(a, root);
+    const list = rec.getArray("topics") orelse return &.{};
+    var out: std.ArrayList([]const u8) = .empty;
+    for (list) |t| {
+        if (t != .text) return error.BadConfig;
+        if (t.text.len > prefix.len and std.mem.startsWith(u8, t.text, prefix)) try out.append(a, t.text);
+    }
+    return out.items;
+}
+
+/// `in` with `defaults.overlayPrefixes` expanded: each prefix's active topics added to
+/// `overlayTopics` (judged by its program, unless named there already) and to the `topics` of every
+/// lookup service in the object form whose `prefixes` names it.
+pub fn withPrefixes(a: Allocator, s: Store, heads: Heads, in: Value, app: []const u8) !Value {
+    const prefixes = try defaultObject(a, in, "overlayPrefixes");
+    if (prefixes.count() == 0) return in;
+    var topics = try defaultObject(a, in, "overlayTopics");
+    var lookups = try defaultObject(a, in, "overlayLookups");
+    var it = prefixes.iterator();
+    while (it.next()) |e| {
+        const prefix = e.key_ptr.*;
+        if (prefix.len == 0 or e.value_ptr.* != .object) return error.BadConfig;
+        const o = e.value_ptr.object;
+        const prog = o.get("program") orelse return error.BadConfig;
+        const active = o.get("active") orelse return error.BadConfig;
+        if (prog != .string or active != .string or active.string.len == 0) return error.BadConfig;
+        const live = try activeTopics(a, s, heads, app, prefix, active.string);
+        for (live) |t| {
+            if (!topics.contains(t)) try topics.put(a, t, .{ .string = prog.string });
+        }
+        var lt = lookups.iterator();
+        while (lt.next()) |l| {
+            if (l.value_ptr.* != .object) continue;
+            const ps = l.value_ptr.object.get("prefixes") orelse continue;
+            if (ps != .array) return error.BadConfig;
+            const names = for (ps.array.items) |p| {
+                if (p != .string) return error.BadConfig;
+                if (eql(u8, p.string, prefix)) break true;
+            } else false;
+            if (!names) continue;
+            var list: std.json.Array = .init(a);
+            if (l.value_ptr.object.get("topics")) |ts| {
+                if (ts != .array) return error.BadConfig;
+                try list.appendSlice(ts.array.items);
+            }
+            for (live) |t| try list.append(.{ .string = t });
+            try l.value_ptr.object.put(a, "topics", .{ .array = list });
+        }
+    }
+    var es: std.ArrayList(cbor.Entry) = .empty;
+    if (in.get("defaults")) |d| if (d == .map) for (d.map) |e| {
+        if (eql(u8, e.key, "overlayTopics") or eql(u8, e.key, "overlayLookups")) continue;
+        try es.append(a, e);
+    };
+    try es.append(a, .{ .key = "overlayTopics", .value = .{ .text = try std.json.Stringify.valueAlloc(a, std.json.Value{ .object = topics }, .{}) } });
+    try es.append(a, .{ .key = "overlayLookups", .value = .{ .text = try std.json.Stringify.valueAlloc(a, std.json.Value{ .object = lookups }, .{}) } });
+    var out: std.ArrayList(cbor.Entry) = .empty;
+    if (in == .map) for (in.map) |e| {
+        if (!eql(u8, e.key, "defaults")) try out.append(a, e);
+    };
+    try out.append(a, .{ .key = "defaults", .value = .{ .map = es.items } });
+    return .{ .map = out.items };
 }
 
 /// `in` with `app` set.
