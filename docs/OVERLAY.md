@@ -1,4 +1,4 @@
-# Overlay services in the VM (0.4.0)
+# Overlay services in the VM (0.4.1)
 
 An overlay is an app (skein docs/APPS.md §6). It judges transactions with
 its topic managers and indexes them with its lookup services; it does not
@@ -65,7 +65,7 @@ zig build bin    # the same, into bin/ (committed)
 zig build test   # the submission flow and the contracts, natively
 ```
 
-The SDK (shruggr/skein-sdk v0.5.0) is a URL+hash dependency in
+The SDK (shruggr/skein-sdk v0.5.1) is a URL+hash dependency in
 `build.zig.zon`; the overlay uses its `chain` module only (BEEF, SPV,
 merkle paths, the store and its maps, and `state`: the chain app's
 records), and bsvz comes through it. No chain tracker and no wallet
@@ -460,9 +460,6 @@ rule. Token provenance is the topic manager's, judged at submission; history acr
 overlays is GASP's (not built). The submission as handed over (the
 `applied` record's `beef`) is not what a lookup serves.
 
-Pending in skein-sdk: `beefOf` walks the inputs of a transaction that is
-itself proven, instead of stopping at its own merkle path; until that fix,
-a proven output whose parents the chain does not hold fails the lookup.
 
 The query is the client's JSON as dag-cbor; integers only.
 
