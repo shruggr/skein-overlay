@@ -206,7 +206,7 @@ Not built: BRC-88 SHIP/SLAP, GASP sync and catch-up from a peer, the
 | | |
 |---|---|
 | this app and package | 0.3.0 (tag `v0.3.0`) |
-| skein-sdk | v0.4.0 + `chain.record` (shruggr/skein#121): its branch `beef-as-cid` at commit 0b99828, by commit tarball and hash in `build.zig.zon`, until it is tagged (module `chain`; bsvz comes through it) |
+| skein-sdk | v0.5.0, by tag URL and hash in `build.zig.zon` (module `chain`; bsvz comes through it) |
 | requires | `chain/1` (shruggr/skein-chain 0.2.0) |
 | skein | log format 8; skein's equivs pin this repo by commit |
 

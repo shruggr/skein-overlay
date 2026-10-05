@@ -65,7 +65,7 @@ zig build bin    # the same, into bin/ (committed)
 zig build test   # the submission flow and the contracts, natively
 ```
 
-The SDK (shruggr/skein-sdk v0.4.0 + `chain.record`, its `beef-as-cid` commit until tagged) is a URL+hash dependency in
+The SDK (shruggr/skein-sdk v0.5.0) is a URL+hash dependency in
 `build.zig.zon`; the overlay uses its `chain` module only (BEEF, SPV,
 merkle paths, the store and its maps, and `state`: the chain app's
 records), and bsvz comes through it. No chain tracker and no wallet
