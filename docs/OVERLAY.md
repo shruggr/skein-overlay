@@ -1,4 +1,4 @@
-# Overlay services in the VM (0.6.0)
+# Overlay services in the VM (0.6.1)
 
 An overlay is an app (skein docs/APPS.md §6). It judges transactions with
 its topic managers and indexes them with its lookup services; it does not
@@ -412,13 +412,17 @@ emitted when the set changes:
 
 | call | events |
 |---|---|
-| `register` | `{event: "subscribe", topic: "<topic>", program: <engine's role>, fn: "submit"}`, the same for `<topic>-admit` with `fn: "peerAdmit"` and for `<topic>-proof` with `fn: "peerProof"` |
+| `register` | `{event: "subscribe", topic: "<topic>", program: <engine's role>, fn: "submit", filter: "beef"}`, the same without `filter` for `<topic>-admit` with `fn: "peerAdmit"` and for `<topic>-proof` with `fn: "peerProof"` |
 | `deregister` | `{event: "unsubscribe", topic}` for `<topic>`, `<topic>-admit`, `<topic>-proof` |
 
 `program` is the engine's own role in `programs` (`overlay` in this repo's
 manifest) and `fn` its function for that topic: the handler the host routes
 the topic's messages to (the kernel records the event as `{kind: "event",
-event, app, topic, program, fn}`). The install derives no rows for a
+event, app, topic, program, fn, filter?}`). `filter: "beef"` on `<topic>`
+only: its body is the submission's BEEF, which the kernel's door decodes
+into its pointer record as for the `/submit` row (skein #121), so `submit`
+takes it the same way whether a row or the subscription routed it;
+`-admit` and `-proof` bodies are dag-cbor, handed over as received. The install derives no rows for a
 registered topic: the host subscribes it and routes its messages by these
 events. A message arriving on a registered topic is handled as on a
 declared one: the routes take the topic from the message and look it up in

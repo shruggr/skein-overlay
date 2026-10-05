@@ -4,7 +4,7 @@ The overlay services engine for a [skein](https://github.com/shruggr/skein),
 as an app: BRC-22 submit and BRC-24 lookup, served by the instance's own
 front door, with topic managers and lookup services as programs the engine
 calls. It is also a Zig package: an overlay of your own depends on it for
-the topic and lookup contracts. Version **0.6.0**.
+the topic and lookup contracts. Version **0.6.1**.
 
 ## What it is
 
@@ -141,7 +141,7 @@ The manifest (`etc/app.json`, this repo's own, description left out):
 {
   "kind": "app",
   "name": "overlay",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "programs": {
     "overlay": "bin/overlay.wasm",
     "topic-demo": "bin/topic-demo.wasm",
@@ -193,7 +193,8 @@ Both are idempotent and answer `{topic, active}`; an unknown role is
 refused. The set is the engine's own head `<app>/topics` (`{kind:
 "overlay-topics", topics: [{topic, program}]}`), served beside the declared
 topics from the next step or call. `register` emits `subscribe {topic,
-program, fn}` for `<topic>` (`submit`), `<topic>-admit` (`peerAdmit`) and
+program, fn, filter?}` for `<topic>` (`submit`, `filter: "beef"`: the
+door decodes the BEEF as for `/submit`), `<topic>-admit` (`peerAdmit`) and
 `<topic>-proof` (`peerProof`), `program` the engine's own role;
 `deregister` emits `unsubscribe {topic}` for the three (skein #119): the
 host subscribes and routes by them. Who may call is your manifest's row,
@@ -231,7 +232,7 @@ Not built: BRC-88 SHIP/SLAP, GASP sync and catch-up from a peer, the
 
 | | |
 |---|---|
-| this app and package | 0.6.0 (tag `v0.6.0`) |
+| this app and package | 0.6.1 (tag `v0.6.1`) |
 | skein-sdk | v0.5.1, by tag URL and hash in `build.zig.zon` (module `chain`; bsvz comes through it) |
 | requires | `chain/1` (shruggr/skein-chain 0.3.0) |
 | skein | log format 8; skein's equivs pin this repo by commit |
@@ -254,6 +255,9 @@ engine's `register {topic, program}` / `deregister {topic}`: the topics
 registered at runtime under `<app>/topics`, served beside the declared
 ones, with the `subscribe` / `unsubscribe` events the host routes by
 (shruggr/skein#119, #120).
+
+0.6.1 puts `filter: "beef"` on the `<topic>` subscribe, so the door
+decodes a gossiped submission's BEEF as it does for `/submit`.
 
 ## Contributing
 

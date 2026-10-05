@@ -16,8 +16,11 @@
 //! topic keeps its own program).
 //!
 //! `register {topic, program}` adds it and emits the skein #119 events
-//! `subscribe {topic, program, fn}` for `<topic>` (fn `submit`),
-//! `<topic>-admit` (`peerAdmit`) and `<topic>-proof` (`peerProof`), where
+//! `subscribe {topic, program, fn, filter?}` for `<topic>` (fn `submit`,
+//! `filter: "beef"`: the body is the submission's BEEF, decoded at the
+//! kernel's door as for the `/submit` row, skein #121), `<topic>-admit`
+//! (`peerAdmit`) and `<topic>-proof` (`peerProof`; dag-cbor bodies, no
+//! filter), where
 //! `program` is the engine's own role (the handler the kernel routes the
 //! topic's messages to); `deregister {topic}` removes it and emits
 //! `unsubscribe {topic}` for the three. Both are idempotent: a topic already
@@ -81,25 +84,32 @@ fn lessThan(_: void, x: Entry, y: Entry) bool {
     return std.mem.order(u8, x.topic, y.topic) == .lt;
 }
 
-/// The three GossipSub topics of one overlay topic, and the engine's function for each (routes.zig).
-pub const gossip_topics = [_]struct { suffix: []const u8, func: []const u8 }{
-    .{ .suffix = "", .func = "submit" },
+/// The three GossipSub topics of one overlay topic, the engine's function for each (routes.zig), and
+/// the door's filter for its body: `beef` for `<topic>` (the submission's BEEF), none for the
+/// dag-cbor `-admit` / `-proof` bodies.
+pub const gossip_topics = [_]struct { suffix: []const u8, func: []const u8, filter: ?[]const u8 = null }{
+    .{ .suffix = "", .func = "submit", .filter = "beef" },
     .{ .suffix = "-admit", .func = "peerAdmit" },
     .{ .suffix = "-proof", .func = "peerProof" },
 };
 
-/// The events of one change: `subscribe {topic, program: <self>, fn}` for each of the three topics
-/// (register), or `unsubscribe {topic}` (deregister).
+/// The events of one change: `subscribe {topic, program: <self>, fn, filter?}` for each of the three
+/// topics (register), or `unsubscribe {topic}` (deregister).
 pub fn events(a: Allocator, subscribe: bool, topic: []const u8, self: []const u8) ![gossip_topics.len]Value {
     var out: [gossip_topics.len]Value = undefined;
     for (gossip_topics, &out) |g, *o| {
         const t: Value = .{ .text = try std.mem.concat(a, u8, &.{ topic, g.suffix }) };
-        o.* = .{ .map = if (subscribe) try a.dupe(cbor.Entry, &.{
-            .{ .key = "event", .value = .{ .text = "subscribe" } },
-            .{ .key = "topic", .value = t },
-            .{ .key = "program", .value = .{ .text = self } },
-            .{ .key = "fn", .value = .{ .text = g.func } },
-        }) else try a.dupe(cbor.Entry, &.{
+        o.* = .{ .map = if (subscribe) sub: {
+            var es: std.ArrayList(cbor.Entry) = .empty;
+            try es.appendSlice(a, &.{
+                .{ .key = "event", .value = .{ .text = "subscribe" } },
+                .{ .key = "topic", .value = t },
+                .{ .key = "program", .value = .{ .text = self } },
+                .{ .key = "fn", .value = .{ .text = g.func } },
+            });
+            if (g.filter) |f| try es.append(a, .{ .key = "filter", .value = .{ .text = f } });
+            break :sub es.items;
+        } else try a.dupe(cbor.Entry, &.{
             .{ .key = "event", .value = .{ .text = "unsubscribe" } },
             .{ .key = "topic", .value = t },
         }) };

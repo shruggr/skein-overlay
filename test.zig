@@ -1183,16 +1183,19 @@ test "register and deregister (skein #120): the set under <app>/topics, the even
         }
     }.of;
 
-    // register: the set, the three subscribes with the engine's role and its function for each.
+    // register: the set, the three subscribes with the engine's role and its function for each;
+    // `filter: "beef"` on `<topic>` only (its body is the BEEF; `-admit` / `-proof` are dag-cbor).
     const reg = (try topics_mod.register(a, &.{}, try args(a, "tm_reg", "topic-demo"), programs, self)).done;
     try std.testing.expectEqual(@as(usize, 1), reg.list.?.len);
     try std.testing.expectEqualStrings("topic-demo", reg.list.?[0].program);
     try std.testing.expect(reg.answer.get("active").?.boolean);
     try std.testing.expectEqualStrings("tm_reg", reg.answer.getText("topic").?);
     const want = [_][2][]const u8{ .{ "tm_reg", "submit" }, .{ "tm_reg-admit", "peerAdmit" }, .{ "tm_reg-proof", "peerProof" } };
+    const want_filter = [_]?[]const u8{ "beef", null, null };
     try std.testing.expectEqual(@as(usize, 3), reg.events.len);
-    for (reg.events, want) |ev, w| {
-        try std.testing.expectEqual(@as(usize, 4), ev.map.len);
+    for (reg.events, want, want_filter) |ev, w, wf| {
+        try std.testing.expectEqual(@as(usize, if (wf == null) 4 else 5), ev.map.len);
+        if (wf) |f| try std.testing.expectEqualStrings(f, ev.getText("filter").?) else try std.testing.expect(ev.get("filter") == null);
         try std.testing.expectEqualStrings("subscribe", ev.getText("event").?);
         try std.testing.expectEqualStrings(w[0], ev.getText("topic").?);
         try std.testing.expectEqualStrings("engine", ev.getText("program").?);
