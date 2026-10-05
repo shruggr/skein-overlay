@@ -173,18 +173,27 @@ pub fn checkProof(a: Allocator, ch: *Chain, p: Proof, via: []const u8) !union(en
 // ---------------------------------------------------------------- what a step publishes
 
 /// Where a submission came from (the submit event's `source`, routes.zig):
-/// {transport, topic? (a libp2p topic), request: <the request record's CID>}.
-pub const Source = struct { transport: []const u8 = "", topic: []const u8 = "", request: ?[]const u8 = null };
+/// {transport, topic? (a libp2p topic), protocol? (a libp2p stream protocol: the answer to a want,
+/// skein-overlay#1), from? (the libp2p peer that published it or sent it on the stream: bytes,
+/// the peer ID's multihash), request: <the request record's CID>}.
+pub const Source = struct { transport: []const u8 = "", topic: []const u8 = "", protocol: []const u8 = "", from: ?[]const u8 = null, request: ?[]const u8 = null };
 
 pub fn sourceOf(ev: Value) Source {
     const s = ev.get("source") orelse return .{};
-    return .{ .transport = s.getText("transport") orelse "", .topic = s.getText("topic") orelse "", .request = s.getCid("request") };
+    return .{
+        .transport = s.getText("transport") orelse "",
+        .topic = s.getText("topic") orelse "",
+        .protocol = s.getText("protocol") orelse "",
+        .from = if (eql(u8, s.getText("transport") orelse "", "libp2p")) s.getBytes("from") else null,
+        .request = s.getCid("request"),
+    };
 }
 
 /// What one admission publishes, per topic that admitted it with gossip on:
 /// the raw submission on `<topic>` (the submit event's `beef`: the BEEF as
 /// received; not when it arrived by gossip on that topic), then the verdict
-/// on `<topic>-admit`. `subject`: the transaction is the submission's subject;
+/// on `<topic>-admit` (the raw submission not either when it came on a stream, the answer to a
+/// want, skein-overlay#1: its holders published it long since). `subject`: the transaction is the submission's subject;
 /// a transaction admitted before it from the same BEEF (skein-overlay#1)
 /// publishes its verdict only — the raw submission goes with the subject's,
 /// and a peer judges what it carries oldest first itself. → how many messages.
@@ -194,7 +203,7 @@ pub fn admitted(a: Allocator, out: Out, st: *st_mod.State, in: Value, ev: Value,
     for (topics, applied) |t, ap| {
         if (ap.records.len == 0 or !(try st.isApplied(t, txid))) continue;
         if (!try enabled(a, in, t)) continue;
-        if (subject and !(eql(u8, src.transport, "libp2p") and eql(u8, src.topic, t))) {
+        if (subject and !(eql(u8, src.transport, "libp2p") and (eql(u8, src.topic, t) or src.protocol.len > 0))) {
             // The BEEF as received: from its pointer record (shruggr/skein#121: `beefOf` gives the exact
             // bytes back from the blocks), or the bytes the event carries.
             const b = if (ev.getCid("beef")) |rc| try c.record.beefOf(a, st.store, rc) else ev.getBytes("beef") orelse (try st.ch.beefOf(txid)) orelse return error.UnknownTransaction;

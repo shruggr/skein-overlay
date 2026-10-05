@@ -4,7 +4,7 @@ The overlay services engine for a [skein](https://github.com/shruggr/skein),
 as an app: BRC-22 submit and BRC-24 lookup, served by the instance's own
 front door, with topic managers and lookup services as programs the engine
 calls. It is also a Zig package: an overlay of your own depends on it for
-the topic and lookup contracts. Version **0.7.0**.
+the topic and lookup contracts. Version **0.7.1**.
 
 ## What it is
 
@@ -37,11 +37,15 @@ They pull in the SDK's `chain` module only.
 first and judges every transaction of the requested topics before the
 subject; each one a topic takes is ingested through the chain app on its
 own and admitted, in order, on its own answer (skein-overlay#1). A
-submission whose parent is neither in the BEEF nor held pauses: it is
-noted pending, waiting on those parents, and the engine emits one `want`
-event per parent (`{event: "want", txid, topic}`) for the host to find;
-when a later submission carries the parent, the paused one is routed
-again. A transaction admitted on `accepted` sends the app itself a
+submission from a libp2p peer whose parent is neither in the BEEF nor held
+pauses: it is noted pending, waiting on those parents, and the engine
+records a want per (parent, peer) — `{event: "want", txid, peer}`, the peer
+that announced it (or something needing it) — for the host to ask that
+peer (shruggr/skein#112); over HTTP such a BEEF is refused, 400, naming the
+parents. A peer answers a want on the stream `/skein/overlay/beef/1.0.0`
+(one Atomic BEEF per frame, the wanted txid its subject; no reply frame),
+routed to `submit` as a submission from that peer; when the parent is in,
+the paused one is routed again. A transaction admitted on `accepted` sends the app itself a
 one-shot `watch`, which waits for `proven` (publishes `-proof`) or
 `rejected` (unwinds). Not built: the decided direction of shruggr/skein#31
 ("Decided 2026-10-02 (night)"): a reference to a transaction is a
@@ -146,7 +150,7 @@ The manifest (`etc/app.json`, this repo's own, description left out):
 {
   "kind": "app",
   "name": "overlay",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "programs": {
     "overlay": "bin/overlay.wasm",
     "topic-demo": "bin/topic-demo.wasm",
@@ -165,7 +169,8 @@ The manifest (`etc/app.json`, this repo's own, description left out):
     {"transport": "http", "address": "/listTopicManagers", "sender": "*", "program": "overlay", "fn": "listTopicManagers"},
     {"transport": "http", "address": "/listLookupServiceProviders", "sender": "*", "program": "overlay", "fn": "listLookupServiceProviders"},
     {"transport": "http", "address": "/getDocumentationForTopicManager", "sender": "*", "program": "overlay", "fn": "topicDocumentation"},
-    {"transport": "http", "address": "/getDocumentationForLookupServiceProvider", "sender": "*", "program": "overlay", "fn": "lookupDocumentation"}
+    {"transport": "http", "address": "/getDocumentationForLookupServiceProvider", "sender": "*", "program": "overlay", "fn": "lookupDocumentation"},
+    {"transport": "libp2p", "address": "/skein/overlay/beef/1.0.0", "sender": "*", "program": "overlay", "fn": "submit", "filter": "beef"}
   ]
 }
 ```
@@ -176,6 +181,11 @@ The manifest (`etc/app.json`, this repo's own, description left out):
   http `/submit` and `/lookup` (open, under `/<app>/`), the libp2p rows
   `<topic>`, `<topic>-admit`, `<topic>-proof`, and box `<app>` from `event`
   and from `$self`. The install prompt reads them all aloud.
+- The libp2p row `/skein/overlay/beef/1.0.0` is the want-answer stream
+  (shruggr/skein#112): a peer the engine wants a parent from answers on
+  it, one Atomic BEEF per frame; the door decodes it (`filter: "beef"`)
+  and `submit` takes it as a submission from that peer. Keep it in your
+  manifest for catch-up to work.
 - The name rule: every head your programs write is under your app's name.
   Install under another name (`amm`, say) and its state is `amm/state`,
   `amm/ls_<service>`.
@@ -244,7 +254,7 @@ Not built: BRC-88 SHIP/SLAP, GASP sync and catch-up from a peer, the
 
 | | |
 |---|---|
-| this app and package | 0.7.0 (tag `v0.7.0`) |
+| this app and package | 0.7.1 (tag `v0.7.1`) |
 | skein-sdk | v0.5.1, by tag URL and hash in `build.zig.zon` (module `chain`; bsvz comes through it) |
 | requires | `chain/1` (shruggr/skein-chain 0.3.0) |
 | skein | log format 8; skein's equivs pin this repo by commit |
@@ -281,6 +291,15 @@ admitted on its own answer, in order; a submission missing a parent pauses
 (`pending` with `waiting`, a `want` event per parent, a `resume` to itself
 when a later submission brings one). The submit event gains `earlier`,
 `wanted`, `requested` and `waiting`; the state gains the map `wants`.
+
+0.7.1 (shruggr/skein#112, revised): the want is `{event: "want", txid,
+peer}` — one per (parent, peer), the peer that announced the submission or
+something needing it; no topic. The map `wants` is `parent ‖ peer →
+[subject]`; all of a subject's wants clear when it resumes and are recorded
+again for what it still lacks. Only a submission from a libp2p peer
+pauses; over HTTP a BEEF lacking parents is refused, 400, naming them. The
+manifest gains the stream row `/skein/overlay/beef/1.0.0` (filter `beef`,
+fn `submit`), where a peer answers a want with one Atomic BEEF per frame.
 
 ## Contributing
 

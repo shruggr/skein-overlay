@@ -12,6 +12,10 @@
 //!                                           `peer-admit` record, never admitting → {verdict, admit?}
 //!   libp2p:<topic>-proof   fn "peerProof"   a peer's proof (#74): checked against the chain state,
 //!                                           admitted as the `proof` event in box `chain` → {verdict, admit?}
+//!   libp2p:/skein/overlay/beef/1.0.0   fn "submit"   a direct stream (skein-overlay#1, shruggr/skein#112):
+//!                                           a peer answering a want, one Atomic BEEF per frame (the
+//!                                           wanted txid its subject), submitted as from that peer
+//!                                           with the topics its waiters requested → {verdict, admit?}
 //!   POST /lookup      fn "lookup"   {service, query} (JSON) → {type: "output-list", outputs: [{beef, outputIndex, context?}]}
 //!                                   X-Aggregation: yes → the compact octet-stream form (count, [txid, index, context], one BEEF)
 //!   GET  /listTopicManagers, /listLookupServiceProviders         fn "listTopicManagers" / "listLookupServiceProviders"
@@ -30,7 +34,9 @@
 //! when it comes to rest the handler is called again (`resolved`) and
 //! answers from the state: the STEAK (each topic's `applied` record); 400
 //! if the chain app rejected it; 503 with Retry-After if it ended with
-//! nothing decided. A resubmission judged before answers the STEAK at once;
+//! nothing decided. A BEEF lacking parents (neither in it nor held) answers
+//! 400 naming them (skein-overlay#1: only a submission from a libp2p peer
+//! pauses; a BEEF that is not enough is not admitted). A resubmission judged before answers the STEAK at once;
 //! one while the first is pending awaits that same thread (the pending
 //! record names it) and gets the same answer.
 //!
@@ -291,7 +297,10 @@ const Steak = struct {
 };
 
 fn submit(a: Allocator, in: Value, req: Value) !Value {
-    if (eql(u8, req.getText("transport") orelse "", "libp2p")) return gossip(a, in, req);
+    if (eql(u8, req.getText("transport") orelse "", "libp2p")) {
+        if (req.getText("protocol") != null) return stream(a, in, req);
+        return gossip(a, in, req);
+    }
     const th = header(req, "x-topics") orelse return failure(a, 400, "Missing x-topics header");
     const requested = parseTopics(a, th) catch return failure(a, 400, "Invalid x-topics header: expected a comma-separated list or JSON string array");
     // shruggr/skein#121: the kernel's door put the BEEF's pointer record where its bytes were (the row's
@@ -348,6 +357,9 @@ fn untakenSubject(a: Allocator, req: Value) bool {
 fn submitRouted(a: Allocator, in: Value, st: *State, beef: submit_mod.Input, topics: []const []const u8, off: ?[]const u8, req: Value) !Value {
     const routed = switch (try submit_mod.route(a, ev_.caller(), st, in, beef, topics, off, try sourceOf(a, req, null))) {
         .refused => |why| return failure(a, 400, why),
+        // skein-overlay#1: parents neither in the BEEF nor held; over HTTP there is no peer to ask.
+        .missing => |m| return failure(a, 400, try submit_mod.missingMessage(a, m)),
+        .paused => |p| return failure(a, 400, try submit_mod.missingMessage(a, p.waiting)),
         // Valid but admitted nowhere: BRC-22's answer is 200 with an empty STEAK.
         .nothing => {
             const entries = try a.alloc([3][]const u64, topics.len);
@@ -363,12 +375,6 @@ fn submitRouted(a: Allocator, in: Value, st: *State, beef: submit_mod.Input, top
             const thread = rec.getCid("thread") orelse return submitted(a, st, txid, topics);
             vm.awaitRecord(thread) catch return submitted(a, st, txid, topics); // at rest already: the state answers
             return waiting(a);
-        },
-        // skein-overlay#1: parents neither in the BEEF nor held. Paused already on the same parents (a
-        // resubmission of the same BEEF): the answer is the state's, now (503); else the thread notes it.
-        .paused => |p| blk: {
-            if (try samePause(st, p.txid, p.waiting)) return submitted(a, st, p.txid, topics);
-            break :blk p.event;
         },
         .admit => |x| x.event,
     };
@@ -409,24 +415,59 @@ fn gossip(a: Allocator, in: Value, req: Value) !Value {
     const topics = try served(a, &.{t}, try configMap(a, in, "overlayTopics"));
     if (topics.len == 0) return verdictOf(a, "ignore", "the topic is not served here");
     var st = try load(a, in);
-    const routed = switch (try submit_mod.route(a, ev_.caller(), &st, in, beef, topics, null, try sourceOf(a, req, t))) {
+    return libp2pRouted(a, in, &st, beef, topics, try sourceOf(a, req, t), req);
+}
+
+/// The route's half for a libp2p submission (a topic message, a stream frame) → its verdict.
+/// skein-overlay#1: a BEEF lacking parents is accepted as any submission (its thread pauses it and
+/// records the wants against the peer); ignored when that peer is asked for them on its behalf already.
+fn libp2pRouted(a: Allocator, in: Value, st: *State, beef: submit_mod.Input, topics: []const []const u8, source: Value, req: Value) !Value {
+    const routed = switch (try submit_mod.route(a, ev_.caller(), st, in, beef, topics, null, source)) {
         .refused => |why| return verdictOf(a, "ignore", why),
         .nothing => |why| return verdictOf(a, "ignore", why),
+        .missing => return verdictOf(a, "ignore", "parents missing, and no peer to ask"),
         .unchanged => return verdictOf(a, "ignore", "already judged"),
         .pending => return verdictOf(a, "ignore", "already submitted: awaiting the chain app"),
-        // skein-overlay#1: accepted as any submission; its thread pauses it and wants the parents.
-        .paused => |p| if (try samePause(&st, p.txid, p.waiting)) return verdictOf(a, "ignore", "already submitted: waiting for its parents") else p.event,
+        .paused => |p| if (try samePause(st, p.txid, p.waiting) and try st.wantsFrom(p.txid, p.waiting, req.getBytes("from") orelse ""))
+            return verdictOf(a, "ignore", "already submitted by this peer: waiting for its parents")
+        else
+            p.event,
         .admit => |x| x.event,
     };
     return accepting(a, routed, calls.appOf(in));
 }
 
+/// A frame on the direct stream `/skein/overlay/beef/1.0.0` (skein-overlay#1, shruggr/skein#112):
+/// a peer answering a want, one Atomic BEEF per frame, the wanted txid its subject. Submitted as
+/// from that peer (the stream's remote, `from`), with the topics the paused submissions waiting on
+/// it requested (`wantedTopics`); it may itself pause and want. Not wanted here: ignore. The answer
+/// is the route's verdict as for a topic message (no reply frame: no `body`).
+fn stream(a: Allocator, in: Value, req: Value) !Value {
+    const beef: submit_mod.Input = if (req.getCid("body")) |rc| .{ .record = rc } else .{ .bytes = req.getBytes("body") orelse "" };
+    if (beef == .bytes and beef.bytes.len == 0) return verdictOf(a, "ignore", "Missing or empty BEEF body");
+    const subject = switch (beef) {
+        .record => |rc| c.record.subjectOf(vm.store().getValue(a, rc) catch return verdictOf(a, "ignore", "Invalid BEEF")),
+        .bytes => |b| (c.beef.parse(a, b) catch return verdictOf(a, "ignore", "Invalid BEEF")).subject(),
+    } orelse return verdictOf(a, "ignore", "Invalid BEEF: no subject");
+    var st = try load(a, in);
+    const topics = try served(a, try submit_mod.wantedTopics(a, &st, subject), try configMap(a, in, "overlayTopics"));
+    if (topics.len == 0) return verdictOf(a, "ignore", "not wanted here");
+    return libp2pRouted(a, in, &st, beef, topics, try sourceOf(a, req, null), req);
+}
+
 /// Where a submission came from, carried on its entry (#74: an admission re-publishes it on `<topic>`
-/// unless it arrived by gossip on that topic): {transport, topic? (the libp2p topic), request}.
+/// unless it arrived by gossip on that topic, or on a stream): {transport, topic? (the libp2p
+/// topic), protocol? (a libp2p stream's), from? (the libp2p peer: whom its wants are asked of,
+/// skein-overlay#1), request}.
 fn sourceOf(a: Allocator, req: Value, topic: ?[]const u8) !Value {
     var es: std.ArrayList(cbor.Entry) = .empty;
-    try es.append(a, .{ .key = "transport", .value = .{ .text = req.getText("transport") orelse "http" } });
+    const transport = req.getText("transport") orelse "http";
+    try es.append(a, .{ .key = "transport", .value = .{ .text = transport } });
     if (topic) |t| try es.append(a, .{ .key = "topic", .value = .{ .text = t } });
+    if (eql(u8, transport, "libp2p")) {
+        if (req.getText("protocol")) |p| try es.append(a, .{ .key = "protocol", .value = .{ .text = p } });
+        if (req.getBytes("from")) |f| try es.append(a, .{ .key = "from", .value = .{ .bytes = f } });
+    }
     if (req.getCid("request")) |rc| try es.append(a, .{ .key = "request", .value = .{ .cid = rc } });
     return .{ .map = es.items };
 }
@@ -501,8 +542,7 @@ fn samePause(st: *State, txid: [32]u8, wanted: []const [32]u8) !bool {
 /// with nothing applied → the empty STEAK; else (an error answer) 503. A STEAK only ever names
 /// outputs of a transaction the chain app accepted, or a mined one.
 ///
-/// skein-overlay#1: a paused submission (parents neither in its BEEF nor held) is still pending:
-/// the same 503, its message naming the parents it waits on. `untaken`: the thread came to rest
+/// skein-overlay#1: `untaken`: the thread came to rest
 /// on a submission whose subject no topic took (only transactions before it in the BEEF): with
 /// nothing applied, the empty STEAK (200), as for a submission no topic takes.
 fn submitted(a: Allocator, st: *State, txid: [32]u8, topics: []const []const u8) !Value {
@@ -521,14 +561,7 @@ fn submittedAs(a: Allocator, st: *State, txid: [32]u8, topics: []const []const u
         }
     }.f;
     const not_yet = "Not yet accepted by the network: nothing is admitted until it is. Resubmit after Retry-After seconds.";
-    if (try st.pendingRecord(txid)) |rec| {
-        const ws = rec.getArray("waiting") orelse return undecided(a, not_yet);
-        var msg: std.ArrayList(u8) = .empty;
-        try msg.appendSlice(a, "Waiting for parent transactions neither in the BEEF nor held here:");
-        for (ws) |w| try msg.print(a, " {s}", .{if (w == .text) w.text else "?"});
-        try msg.appendSlice(a, ". Nothing is admitted until they arrive; resubmit with them, or after Retry-After seconds.");
-        return undecided(a, msg.items);
-    }
+    if (try st.isPending(txid)) return undecided(a, not_yet);
     if (try st.ch.settlementCid(txid)) |sc| {
         const rec = try st.store.getValue(a, sc);
         return failure(a, 400, try std.fmt.allocPrint(a, "Transaction rejected: {s}", .{rec.getText("reason") orelse "rejected"}));

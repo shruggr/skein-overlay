@@ -39,12 +39,18 @@
 //! skein-overlay#1: the route walks the BEEF oldest first and judges every
 //! transaction before the subject too; each one a topic takes (or a paused
 //! submission wants) is an item, ingested on its own and admitted, in order,
-//! on its own answer. A BEEF lacking a parent (neither in it nor held) is
-//! **paused**: pending with the parents it waits on, a `want` event per
-//! parent no one wanted before; when the chain app answers for a wanted
-//! parent a later submission brought, the thread sends the app itself
-//! `{fn: "resume", args: {txid}}` and the paused submission is routed again
-//! (`resumed`).
+//! on its own answer. A BEEF lacking a parent (neither in it nor held) that
+//! came over libp2p (a gossip message, or a stream answering a want) is
+//! **paused**: pending with the parents it waits on, and a want — the event
+//! `{event: "want", txid, peer}` — for each (parent, peer) not standing
+//! already, `peer` each peer that announced it or something needing it
+//! (shruggr/skein#112: the host asks that peer for the parent's BEEF on a
+//! direct stream). Over HTTP there is no peer to ask, and a BEEF that is not
+//! enough is not admitted: refused (400), naming the parents (`missing`).
+//! When the chain app answers for a wanted parent, every want for it is
+//! removed and the thread sends the app itself `{fn: "resume", args: {txid}}`;
+//! the paused submission is routed again (`resumed`): its wants cleared, and
+//! recorded again for what it still lacks.
 //!
 //! The submit event (box `<app>` from the libp2p route; or the args of the
 //! thread POST /submit launches):
@@ -112,9 +118,12 @@ pub const Routed = union(enum) {
     unchanged: [32]u8,
     /// Handed to the chain app, nothing admitted yet: a resubmission adds nothing; the answer is read from the state.
     pending: [32]u8,
-    /// Parents neither in the BEEF nor held by the chain app (skein-overlay#1): the event of a
-    /// paused submission (its thread notes it pending, `waiting` on them, and emits `want`).
+    /// Parents neither in the BEEF nor held by the chain app (skein-overlay#1), the submission
+    /// from a libp2p peer: the event of a paused submission (its thread notes it pending,
+    /// `waiting` on them, and records the wants).
     paused: struct { event: Value, txid: [32]u8, waiting: []const [32]u8 },
+    /// The same, from no peer (HTTP): refused (400), naming the parents (`missingMessage`).
+    missing: []const [32]u8,
     /// The event to admit (the topics that were dupes are answered from their `applied` records).
     admit: struct { event: Value, txid: [32]u8 },
 };
@@ -157,7 +166,8 @@ pub const Input = union(enum) {
 /// BUMPs are not proven again (the door did, #121); bytes are decoded once (#50) and checked.
 ///
 /// skein-overlay#1: a BEEF with parents neither in it nor held by the chain app (`missingParents`)
-/// is **paused**, judged by nothing yet. Otherwise the BEEF is walked oldest first, up to and
+/// is **paused**, judged by nothing yet, when `source` names a libp2p peer (`from`); from no peer
+/// it is `missing` (refused). Otherwise the BEEF is walked oldest first, up to and
 /// including the subject: each transaction every requested topic has not judged, and that is not
 /// pending in a submission of its own, is judged by each such topic, with the previous coins it
 /// would have once the transactions before it are admitted (`previousCoinsWith`: the outputs the
@@ -174,6 +184,7 @@ pub fn route(a: Allocator, caller: calls.Caller, st: *State, in: Value, beef: In
         var all = true;
         for (topics) |t| all = all and try st.isApplied(t, d.subject);
         if (all) return .{ .unchanged = d.subject };
+        if (peerOf(source) == null) return .{ .missing = missing };
         return .{ .paused = .{ .event = try pausedEvent(a, d.subject, beef, topics, missing, off, source), .txid = d.subject, .waiting = missing } };
     }
     const sub = state.verifyDecoded(a, st.store, st.ch, d, beef == .record) catch |e| switch (e) {
@@ -223,6 +234,40 @@ pub fn route(a: Allocator, caller: calls.Caller, st: *State, in: Value, beef: In
         return .{ .nothing = if (why.items.len > 0) why.items else "NotAdmitted: no topic admitted an output or consumed a previous coin" };
     }
     return .{ .admit = .{ .event = try event(a, sub.txid, beef, items.items, off, source), .txid = sub.txid } };
+}
+
+/// The libp2p peer a submission came from (its source's `from`), or null (HTTP, a host's own).
+pub fn peerOf(source: ?Value) ?[]const u8 {
+    const src = source orelse return null;
+    if (!eql(u8, src.getText("transport") orelse "", "libp2p")) return null;
+    const f = src.getBytes("from") orelse return null;
+    return if (f.len > 0) f else null;
+}
+
+/// The refusal of a BEEF lacking parents over HTTP (skein-overlay#1): it names them.
+pub fn missingMessage(a: Allocator, missing: []const [32]u8) ![]const u8 {
+    var msg: std.ArrayList(u8) = .empty;
+    try msg.appendSlice(a, "Missing parent transactions, neither in the BEEF nor held here:");
+    for (missing) |m| try msg.print(a, " {s}", .{&c.header.toHex(m)});
+    try msg.appendSlice(a, ". Submit a BEEF that carries them.");
+    return msg.items;
+}
+
+/// The topics a BEEF answering a want is routed with (skein-overlay#1, the libp2p stream): those
+/// the paused submissions waiting on its subject requested, each once, in their order. None: no
+/// one wants it.
+pub fn wantedTopics(a: Allocator, st: *State, txid: [32]u8) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    for (try st.waitersOf(txid)) |w| {
+        const rec = (try st.pendingRecord(w)) orelse continue;
+        const ev = try st.store.getValue(a, rec.getCid("event") orelse continue);
+        outer: for (ev.getArray("requested") orelse &.{}) |r| {
+            const t = if (r == .text) r.text else continue;
+            for (out.items) |x| if (eql(u8, x, t)) continue :outer;
+            try out.append(a, t);
+        }
+    }
+    return out.items;
 }
 
 fn judgements(a: Allocator, judged: []const Judged) ![]Value {
@@ -379,14 +424,15 @@ pub fn resumeBody(a: Allocator, txid: [32]u8) !Value {
     }) };
 }
 
-/// The `want` event (skein-overlay#1, skein docs/VM.md "emit"): `{event: "want", txid (hex), topic}`
-/// — a parent a paused submission waits on, for the host to find; emitted once per txid while it
-/// is wanted.
-pub fn wantEvent(a: Allocator, txid: [32]u8, topic: []const u8) !Value {
+/// The `want` event (skein-overlay#1, shruggr/skein#112, skein docs/VM.md "emit"):
+/// `{event: "want", txid (hex), peer (bytes: the libp2p peer ID's multihash)}` — a parent a paused
+/// submission waits on, for the host to ask `peer` for on a direct stream; emitted once per
+/// (txid, peer) while that want stands.
+pub fn wantEvent(a: Allocator, txid: [32]u8, peer: []const u8) !Value {
     return .{ .map = try a.dupe(cbor.Entry, &.{
         .{ .key = "event", .value = .{ .text = "want" } },
         .{ .key = "txid", .value = try hexText(a, txid) },
-        .{ .key = "topic", .value = .{ .text = topic } },
+        .{ .key = "peer", .value = .{ .bytes = peer } },
     }) };
 }
 
@@ -394,7 +440,7 @@ pub fn wantEvent(a: Allocator, txid: [32]u8, topic: []const u8) !Value {
 pub const Begun = struct {
     /// The ingest messages sent, oldest first (the subject's last): the thread awaits them.
     ingests: []const []const u8 = &.{},
-    /// Paused: the parents it waits on; the `want` events to emit (a parent wanted already is not).
+    /// Paused: the parents it waits on; the `want` events to emit (a want standing already is not).
     paused: bool = false,
     waiting: []const [32]u8 = &.{},
     wants: []const Value = &.{},
@@ -403,12 +449,13 @@ pub const Begun = struct {
 /// The submission thread's first step. Each item of the event (oldest first) to the chain app — an
 /// ingest message of its own: the subject's carries the submission's BEEF as handed, each earlier
 /// one its Atomic BEEF cut from it (`state.atomicFor`) — and noted pending. A paused submission
-/// (`waiting`) is noted pending with its event and the parents it waits on, and each parent no one
-/// wanted before gets its `want` event; nothing goes to the chain app.
+/// (`waiting`) is noted pending with its event and the parents it waits on, and its wants recorded
+/// (`pause`); nothing goes to the chain app. A paused submission taken whole now has its wants cleared.
 pub fn begin(cx: Ctx, ev: Value) !Begun {
     const a = cx.a;
     const txid = try txidOf(ev);
     if (ev.get("waiting") != null) return pause(cx, ev, txid);
+    try unwantAll(cx.st, txid);
     const beef = Input.of(ev.get("beef")) orelse return error.BadEvent;
     const its = try itemsOf(a, ev);
     var bytes: ?[]const u8 = null;
@@ -428,20 +475,57 @@ pub fn begin(cx: Ctx, ev: Value) !Begun {
         try ms.append(a, m);
     }
     // A paused submission whose subject no topic takes now: no longer paused.
-    if (!has_subject and try cx.st.isPaused(txid)) try cx.st.dropPending(txid);
+    if (!has_subject and try cx.st.isPaused(txid)) try unpause(cx.st, txid);
     return .{ .ingests = ms.items };
 }
 
+/// A paused submission's wants (shruggr/skein#112): one per (parent it waits on, peer), the peers
+/// every one that announced it — the event's `from`, and the peers its wants stood against
+/// already (an earlier announcement; a resume) — or something needing it (the peers its own
+/// subject is wanted from). Its earlier wants are cleared first; a `want` event is emitted for each
+/// (parent, peer) that did not stand before this step.
 fn pause(cx: Ctx, ev: Value, txid: [32]u8) !Begun {
     const a = cx.a;
+    const st = cx.st;
     const waiting = try hexList(a, ev.get("waiting"));
-    const req = ev.getArray("requested") orelse return error.BadEvent;
-    const topic = if (req.len > 0 and req[0] == .text) req[0].text else return error.BadEvent;
-    const ec = try cx.st.store.putValue(a, ev);
-    try cx.st.putPending(txid, .{ .thread = cx.thread, .waiting = waiting, .event = ec });
+    var peers: std.ArrayList([]const u8) = .empty;
+    if (peerOf(ev.get("source"))) |p| try state.addPeer(a, &peers, p);
+    const before = try waitingOf(a, st, txid);
+    for (try st.peersOf(txid, before)) |p| try state.addPeer(a, &peers, p);
+    for (try st.wantedFrom(txid)) |p| try state.addPeer(a, &peers, p);
+    if (peers.items.len == 0) return error.NoPeer;
+    // Which (parent, peer) wants stood before this step: their events were emitted then.
+    const stood = try a.alloc(bool, waiting.len * peers.items.len);
+    for (waiting, 0..) |w, i| for (peers.items, 0..) |p, j| {
+        stood[i * peers.items.len + j] = try st.hasWant(w, p);
+    };
+    try st.unwant(txid, before);
+    const ec = try st.store.putValue(a, ev);
+    try st.putPending(txid, .{ .thread = cx.thread, .waiting = waiting, .event = ec });
     var wants: std.ArrayList(Value) = .empty;
-    for (waiting) |w| if (try cx.st.want(w, txid)) try wants.append(a, try wantEvent(a, w, topic));
+    for (waiting, 0..) |w, i| for (peers.items, 0..) |p, j| {
+        _ = try st.want(w, p, txid);
+        if (!stood[i * peers.items.len + j]) try wants.append(a, try wantEvent(a, w, p));
+    };
     return .{ .paused = true, .waiting = waiting, .wants = wants.items };
+}
+
+/// The parents a paused submission of this subject waits on (none: not paused).
+fn waitingOf(a: Allocator, st: *State, txid: [32]u8) ![]const [32]u8 {
+    const rec = (try st.pendingRecord(txid)) orelse return &.{};
+    return hexList(a, rec.get("waiting"));
+}
+
+/// A paused submission's wants, all cleared (it is routed to something else now).
+fn unwantAll(st: *State, txid: [32]u8) !void {
+    const w = try waitingOf(st.arena, st, txid);
+    if (w.len > 0) try st.unwant(txid, w);
+}
+
+/// The pause of this subject ended: its wants cleared, its pending record dropped.
+fn unpause(st: *State, txid: [32]u8) !void {
+    try unwantAll(st, txid);
+    try st.dropPending(txid);
 }
 
 /// What the chain app said: an answer body `{fn, request, replyTo, result: {txid, tx, state, …}}`
@@ -617,7 +701,7 @@ fn resumeWaiters(cx: Ctx, txid: [32]u8, out: *std.ArrayList([]const u8)) !void {
 pub const Resumed = union(enum) {
     /// Not paused (any more): nothing to do.
     none,
-    /// Still missing parents: paused again (`want` for any no one wanted before).
+    /// Still missing parents: paused again (its wants recorded again; `want` for any new one).
     paused: Begun,
     /// Whole now: the submit event to launch the submission's thread on (the pause is dropped).
     launch: Value,
@@ -626,7 +710,9 @@ pub const Resumed = union(enum) {
 };
 
 /// A `resume` step: the paused submission of this subject routed again, as the route does, with
-/// its BEEF, the topics requested, its off-chain values and source.
+/// its BEEF, the topics requested, its off-chain values and source. Its wants are cleared; paused
+/// again, they are recorded again for what it still lacks, against every peer that announced it or
+/// something needing it by now.
 pub fn resumed(cx: Ctx, txid: [32]u8) !Resumed {
     const a = cx.a;
     const rec = (try cx.st.pendingRecord(txid)) orelse return .none;
@@ -640,20 +726,24 @@ pub fn resumed(cx: Ctx, txid: [32]u8) !Resumed {
     switch (r) {
         .paused => |p| return .{ .paused = try begin(cx, p.event) },
         .admit => |x| {
-            try cx.st.dropPending(txid);
+            try unpause(cx.st, txid);
             return .{ .launch = x.event };
         },
         .pending => return .none,
         .refused => |why| {
-            try cx.st.dropPending(txid);
+            try unpause(cx.st, txid);
             return .{ .dropped = why };
         },
         .nothing => |why| {
-            try cx.st.dropPending(txid);
+            try unpause(cx.st, txid);
             return .{ .dropped = why };
         },
+        .missing => {
+            try unpause(cx.st, txid);
+            return .{ .dropped = "no peer to ask for its parents" };
+        },
         .unchanged => {
-            try cx.st.dropPending(txid);
+            try unpause(cx.st, txid);
             return .{ .dropped = "judged before" };
         },
     }

@@ -24,8 +24,11 @@
 //!                message, `heard` the chain app's admitting answer while an earlier transaction of
 //!                the same submission is still pending (skein-overlay#1); or a submission paused on
 //!                parents neither in its BEEF nor held (`waiting`: their txids, hex; `event`: the
-//!                submit event to route again)
-//!   wants      wanted txid ‖ waiting subject txid → null   the parents a paused submission waits on
+//!                submit event to route again); only a submission that came over libp2p pauses
+//!   wants      wanted txid ‖ peer → [subject txid (bytes)]   a want (skein-overlay#1, shruggr/skein#112):
+//!                a parent the paused submissions `subject` wait on, to be asked of `peer` (the
+//!                libp2p peer ID's multihash, a gossip message's `from`), which announced one of
+//!                them or something needing it
 //!
 //! Nothing here is derived from the chain: whether an admitted output is
 //! spent is the chain state's `spent` (the first held spender that is not
@@ -111,6 +114,12 @@ pub const Unapplied = struct { topic: []const u8, txid: [32]u8 };
 pub fn topicPrefix(a: Allocator, t: []const u8) ![]u8 {
     if (t.len == 0) return error.BadTopic;
     return store_mod.nameKey(a, t, &.{});
+}
+
+/// `peer` onto `out` unless there already.
+pub fn addPeer(a: Allocator, out: *std.ArrayList([]const u8), peer: []const u8) !void {
+    for (out.items) |p| if (std.mem.eql(u8, p, peer)) return;
+    try out.append(a, peer);
 }
 
 fn cat(a: Allocator, parts: []const []const u8) ![]u8 {
@@ -251,27 +260,111 @@ pub const State = struct {
 
     // ------------------------------------------------------------ wanted parents (skein-overlay#1)
 
-    /// Note that the paused submission `waiter` waits on `txid`. → whether `txid` was wanted by no
-    /// one before (its `want` event is emitted only then).
-    pub fn want(self: *State, txid: [32]u8, waiter: [32]u8) !bool {
-        const fresh = (try self.map("wants").prefixed(&txid)).len == 0;
-        try self.map("wants").add(try cat(self.arena, &.{ &txid, &waiter }));
-        return fresh;
+    fn subjectsValue(self: *State, subs: []const [32]u8) !store_mod.MValue {
+        const vs = try self.arena.alloc(store_mod.MValue, subs.len);
+        for (subs, vs) |s_, *o| o.* = .{ .bytes = try self.arena.dupe(u8, &s_) };
+        return .{ .array = vs };
+    }
+
+    /// Whether the want (`txid`, `peer`) stands: some paused submission waits on `txid` and `peer`
+    /// announced something needing it.
+    pub fn hasWant(self: *State, txid: [32]u8, peer: []const u8) !bool {
+        return self.map("wants").has(try cat(self.arena, &.{ &txid, peer }));
+    }
+
+    /// Note that the paused submission `subject` waits on `txid`, to be asked of `peer`. → whether
+    /// the want (`txid`, `peer`) is new (its `want` event is emitted only then).
+    pub fn want(self: *State, txid: [32]u8, peer: []const u8, subject: [32]u8) !bool {
+        const key = try cat(self.arena, &.{ &txid, peer });
+        const cur = try self.map("wants").get(key);
+        var subs: std.ArrayList([32]u8) = .empty;
+        if (cur) |v| for (try self.subjects(v)) |x| {
+            if (std.mem.eql(u8, &x, &subject)) return false;
+            try subs.append(self.arena, x);
+        };
+        try subs.append(self.arena, subject);
+        try self.map("wants").put(key, try self.subjectsValue(subs.items));
+        return cur == null;
+    }
+
+    fn subjects(self: *State, v: store_mod.MValue) ![][32]u8 {
+        const xs = if (v == .array) v.array else return error.BadIndex;
+        const out = try self.arena.alloc([32]u8, xs.len);
+        for (xs, out) |x, *o| o.* = if (x == .bytes and x.bytes.len == 32) x.bytes[0..32].* else return error.BadIndex;
+        return out;
+    }
+
+    /// Whether `peer` is asked for every one of `waiting` on `subject`'s behalf already.
+    pub fn wantsFrom(self: *State, subject: [32]u8, waiting: []const [32]u8, peer: []const u8) !bool {
+        for (waiting) |w| {
+            const v = (try self.map("wants").get(try cat(self.arena, &.{ &w, peer }))) orelse return false;
+            for (try self.subjects(v)) |x| {
+                if (std.mem.eql(u8, &x, &subject)) break;
+            } else return false;
+        }
+        return true;
     }
 
     pub fn isWanted(self: *State, txid: [32]u8) !bool {
         return (try self.map("wants").prefixed(&txid)).len > 0;
     }
 
-    /// `txid` has arrived (the chain app answered for it): its waiters, each once, and the wants removed.
-    pub fn takeWants(self: *State, txid: [32]u8) ![][32]u8 {
+    /// The peers a want for `txid` stands against (those that announced something needing it), in key order.
+    pub fn wantedFrom(self: *State, txid: [32]u8) ![]const []const u8 {
         const kvs = try self.map("wants").prefixed(&txid);
-        const out = try self.arena.alloc([32]u8, kvs.len);
-        for (kvs, out) |kv, *o| {
-            if (kv.key.len != 64) return error.BadIndex;
-            o.* = kv.key[32..64].*;
-            _ = try self.map("wants").remove(kv.key);
+        const out = try self.arena.alloc([]const u8, kvs.len);
+        for (kvs, out) |kv, *o| o.* = kv.key[32..];
+        return out;
+    }
+
+    /// The paused submissions waiting on `txid` (each once, in key order).
+    pub fn waitersOf(self: *State, txid: [32]u8) ![][32]u8 {
+        var out: std.ArrayList([32]u8) = .empty;
+        for (try self.map("wants").prefixed(&txid)) |kv| {
+            if (kv.key.len <= 32) return error.BadIndex;
+            outer: for (try self.subjects(kv.value)) |x| {
+                for (out.items) |y| if (std.mem.eql(u8, &x, &y)) continue :outer;
+                try out.append(self.arena, x);
+            }
         }
+        return out.items;
+    }
+
+    /// The peers `subject`'s wants on `waiting` stand against (those that announced it, or
+    /// something needing it), each once, in key order.
+    pub fn peersOf(self: *State, subject: [32]u8, waiting: []const [32]u8) ![]const []const u8 {
+        var out: std.ArrayList([]const u8) = .empty;
+        for (waiting) |w| for (try self.map("wants").prefixed(&w)) |kv| {
+            for (try self.subjects(kv.value)) |x| {
+                if (!std.mem.eql(u8, &x, &subject)) continue;
+                try addPeer(self.arena, &out, kv.key[32..]);
+                break;
+            }
+        };
+        return out.items;
+    }
+
+    /// `subject`'s wants (on each of `waiting`) cleared: the subject out of each want's value, a
+    /// want left with no subject removed.
+    pub fn unwant(self: *State, subject: [32]u8, waiting: []const [32]u8) !void {
+        for (waiting) |w| for (try self.map("wants").prefixed(&w)) |kv| {
+            var rest: std.ArrayList([32]u8) = .empty;
+            var had = false;
+            for (try self.subjects(kv.value)) |x| {
+                if (std.mem.eql(u8, &x, &subject)) had = true else try rest.append(self.arena, x);
+            }
+            if (!had) continue;
+            if (rest.items.len == 0) {
+                _ = try self.map("wants").remove(kv.key);
+            } else try self.map("wants").put(kv.key, try self.subjectsValue(rest.items));
+        };
+    }
+
+    /// `txid` has arrived (the chain app answered for it): its waiters, each once, and every want
+    /// for it (whatever the peer) removed.
+    pub fn takeWants(self: *State, txid: [32]u8) ![][32]u8 {
+        const out = try self.waitersOf(txid);
+        for (try self.map("wants").prefixed(&txid)) |kv| _ = try self.map("wants").remove(kv.key);
         return out;
     }
 
