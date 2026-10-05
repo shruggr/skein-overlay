@@ -2,7 +2,12 @@
 //! Called (#40), it is the overlay's front-door route handlers (routes.zig:
 //! submit, lookup, the listings and documentation); stepped, it is:
 //!
-//!   the submission's thread   launched by POST /submit (args {event, box: "submit"}), or by the
+//!   a submission              the message {fn: "submit", args: {beef, topics, offChainValues?}} in
+//!                             a box a row routes to the engine (the app's own `<app>`, open to
+//!                             anyone), or POST /submit, which launches the engine on the same
+//!                             message (shruggr/skein#112): routed — its thread launched, paused, or
+//!                             answered at once; its answers go to the sender (submit.zig `received`).
+//!   the submission's thread   launched by a submission (args {event, box: "submit"}), or by the
 //!                             submit event the `libp2p:<topic>` route admits (box `<app>`, row
 //!                             from `event`): first step `begin` — the BEEF to the chain app (a
 //!                             message to the instance itself, box `chain`: {fn: "ingest", args:
@@ -35,7 +40,8 @@
 //! Every step keeps its result record and prints its CID:
 //!
 //!   {kind: "overlay-result", op: "submit" | "answer" | "watch" | "watched", txid, ingest?, heard?,
-//!    admitted?, steak?, unapplied?, watch?, awaiting?, published?, refs, state}
+//!    admitted?, steak?, unapplied?, watch?, awaiting?, published?, answers?, refs, state}
+//!   {kind: "overlay-result", op: "received" | "resume", txid?, outcome, …, answers?, state}
 //!   {kind: "overlay-result", op: "peer-admit", topic, txid, record, state}
 //!   {kind: "overlay-result", op: "register" | "deregister", topic, active, changed, topics?}
 //!   {kind: "overlay-result", op, error}                         refused
@@ -85,12 +91,39 @@ fn peerAdmitted(a: Allocator, step: Value, ev: Value) !void {
     try vm.keep(rec);
     const new_state = try gs.save();
     try vm.advance(head, new_state);
-    _ = try vm.finish(a, s, try resultRecord(a, "peer-admit", &.{
+    // shruggr/skein#112: a submission of that transaction paused here wants its parents from that peer too.
+    var fields: std.ArrayList(cbor.Entry) = .empty;
+    if (ev.getBytes("peer")) |peer| {
+        const txid = c.header.fromHex(ev.getText("txid") orelse return error.BadEvent) catch return error.BadEvent;
+        var loaded = try ev_.load(a, step);
+        const cx = submit.Ctx{ .a = a, .caller = ev_.caller(), .wire = try ev_.wire(step), .st = &loaded.st, .in = step };
+        try submit.admitSeen(cx, ev.getText("topic") orelse return error.BadEvent, txid, peer);
+        const wanted = try emitWants(a, &loaded.st);
+        if (wanted > 0) {
+            const ns = try loaded.st.save();
+            try vm.advance(try ev_.stateHead(a, step), ns);
+            try fields.append(a, .{ .key = "wanted", .value = .{ .uint = wanted } });
+        }
+    }
+    try fields.appendSlice(a, &.{
         .{ .key = "topic", .value = .{ .text = ev.getText("topic") orelse "" } },
         .{ .key = "txid", .value = .{ .text = ev.getText("txid") orelse "" } },
         .{ .key = "record", .value = .{ .cid = rec } },
         .{ .key = "state", .value = .{ .cid = new_state } },
-    }));
+    });
+    _ = try vm.finish(a, s, try resultRecord(a, "peer-admit", fields.items));
+}
+
+/// The step's want / unwant events (state.zig `wantEvents`, shruggr/skein#112), emitted. → how many.
+fn emitWants(a: Allocator, st: *@import("state.zig").State) !usize {
+    const evs = try st.wantEvents();
+    for (evs) |w| _ = try vm.emitEvent(a, w);
+    return evs.len;
+}
+
+/// The answers to submitters this step made, for its result record (shruggr/skein#112).
+fn answersField(fields: *std.ArrayList(cbor.Entry), a: Allocator) !void {
+    if (ev_.answers.items.len > 0) try fields.append(a, .{ .key = "answers", .value = .{ .array = ev_.answers.items } });
 }
 
 /// `register {topic, program}` / `deregister {topic}` (topics.zig, shruggr/skein#120): a message in
@@ -166,7 +199,14 @@ fn run(a: Allocator) anyerror!void {
         op = if (reply == null) "submit" else "answer";
     } else if (args.getCid("body")) |bc| {
         const body = try s.getValue(a, bc);
-        // Register or deregister a topic, in whatever box a row routed it here (skein #128).
+        // A submission (shruggr/skein#112): from anyone a row admits, in any box routed here.
+        if (eql(u8, body.getText("fn") orelse "", "submit")) return submissionStep(a, step, args, body);
+        // Register or deregister a topic, in whatever box a row routed it here (skein #128); in the
+        // app's own box, open to anyone for submissions, from the instance itself only.
+        switch (topics.asked(body)) {
+            .register, .deregister => if (!topics.mayRegister(args, calls.appOf(step), vm.selfKey(step))) return error.NotAdmitted,
+            .other => {},
+        }
         switch (topics.asked(body)) {
             .register => return registration(a, step, args, body, "register"),
             .deregister => return registration(a, step, args, body, "deregister"),
@@ -193,6 +233,7 @@ fn run(a: Allocator) anyerror!void {
         .st = st,
         .in = step,
         .thread = step.getCid("thread"),
+        .gossip = try ev_.gossipState(a, step),
     };
 
     var fields: std.ArrayList(cbor.Entry) = .empty;
@@ -201,7 +242,6 @@ fn run(a: Allocator) anyerror!void {
     var done: submit.Stepped = undefined;
     if (eql(u8, op, "submit")) {
         const begun = try submit.begin(cx, ev);
-        for (begun.wants) |w| _ = try vm.emitEvent(a, w);
         done = .{ .txid = try submit.txidOf(ev), .awaiting = begun.ingests, .done = begun.ingests.len == 0 };
         if (begun.ingests.len > 0) ingest = begun.ingests[begun.ingests.len - 1];
         try fields.append(a, .{ .key = "ingests", .value = .{ .array = try cids(a, begun.ingests) } });
@@ -214,11 +254,11 @@ fn run(a: Allocator) anyerror!void {
         const body = try s.getValue(a, reply.?.getCid("body") orelse return error.BadInput);
         done = try submit.answered(cx, ev, ingest.?, submit.answerOf(body));
     } else {
-        const txid = c.header.fromHex(watch_args.getText("txid") orelse return error.BadInput) catch return error.BadInput;
-        ingest = watch_args.getCid("ingest") orelse return error.BadInput;
+        const w = try submit.watchOf(watch_args);
+        ingest = w.ingest;
         if (reply) |r| {
-            done = try submit.watched(cx, txid, submit.answerOf(try s.getValue(a, r.getCid("body") orelse return error.BadInput)));
-        } else done = try submit.watchStart(cx, txid);
+            done = try submit.watched(cx, w, submit.answerOf(try s.getValue(a, r.getCid("body") orelse return error.BadInput)));
+        } else done = try submit.watchStart(cx, w);
         if (!done.done) done.awaiting = try a.dupe([]const u8, &.{ingest.?});
     }
 
@@ -261,6 +301,9 @@ fn run(a: Allocator) anyerror!void {
         for (done.awaiting) |m| try vm.awaitRecord(m);
         try fields.append(a, .{ .key = "awaiting", .value = .{ .boolean = true } });
     }
+    const wanted = try emitWants(a, st);
+    if (wanted > 0 and !eql(u8, op, "submit")) try fields.append(a, .{ .key = "wanted", .value = .{ .uint = wanted } });
+    try answersField(&fields, a);
 
     const new_state = try st.save();
     if (loaded.head == null or !eql(u8, loaded.head.?, new_state)) try vm.advance(try ev_.stateHead(a, step), new_state);
@@ -292,28 +335,52 @@ fn steakOf(a: Allocator, topics_: []const []const u8, applied: []const @import("
 
 /// `resume {txid}` (skein-overlay#1), a message from the instance itself in the app's box: a parent a
 /// paused submission waited on has come. Its submission routed again (submit.zig `resumed`): whole
-/// now, the submission's thread launched on its event (args `{event, box: "submit"}`, as POST
-/// /submit launches it); still missing parents, paused again (a `want` for each no one wanted
-/// before); routed to nothing, the pause dropped.
+/// now, the submission's thread launched on its event (args `{event, box: "submit"}`); still
+/// missing parents, paused again; routed to nothing, the pause dropped (and its submitter answered).
 fn resumeStep(a: Allocator, step: Value, rargs: Value) !void {
-    const s = vm.store();
     const txid = c.header.fromHex(rargs.getText("txid") orelse return error.BadInput) catch return error.BadInput;
     var loaded = try ev_.load(a, step);
-    const st = &loaded.st;
-    st.now = @intCast(step.getUint("at") orelse return error.BadInput);
-    const cx = submit.Ctx{ .a = a, .caller = ev_.caller(), .wire = try ev_.wire(step), .st = st, .in = step, .thread = step.getCid("thread") };
+    loaded.st.now = @intCast(step.getUint("at") orelse return error.BadInput);
+    const cx = try stepCtx(a, step, &loaded.st);
     var fields: std.ArrayList(cbor.Entry) = .empty;
     try fields.append(a, .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &c.header.toHex(txid)) } });
-    switch (try submit.resumed(cx, txid)) {
+    try settled(a, step, &loaded, try submit.resumed(cx, txid), &fields, "resume");
+}
+
+/// A submission by message (shruggr/skein#112): `{fn: "submit", args: {beef, topics,
+/// offChainValues?}}` from anyone a row admits — or POST /submit, which launches the engine on the
+/// same message (args `{body, box, message: <the request record>, sender?: <its session's
+/// identity>, transport: "http"}`). Its source names whom the answers go to: the sender, in the box
+/// it came in, about the message (submit.zig `received`).
+fn submissionStep(a: Allocator, step: Value, args: Value, body: Value) !void {
+    var loaded = try ev_.load(a, step);
+    loaded.st.now = @intCast(step.getUint("at") orelse return error.BadInput);
+    const cx = try stepCtx(a, step, &loaded.st);
+    var src: std.ArrayList(cbor.Entry) = .empty;
+    try src.appendSlice(a, &.{
+        .{ .key = "transport", .value = .{ .text = args.getText("transport") orelse "mailbox" } },
+        .{ .key = "box", .value = .{ .text = args.getText("box") orelse calls.appOf(step) } },
+    });
+    if (args.getBytes("sender")) |sender| try src.append(a, .{ .key = "sender", .value = .{ .bytes = sender } });
+    try src.append(a, .{ .key = "request", .value = .{ .cid = args.getCid("message") orelse return error.BadInput } });
+    var fields: std.ArrayList(cbor.Entry) = .empty;
+    try settled(a, step, &loaded, try submit.received(cx, body.get("args") orelse .null, .{ .map = src.items }), &fields, "received");
+}
+
+fn stepCtx(a: Allocator, step: Value, st: *@import("state.zig").State) !submit.Ctx {
+    return .{ .a = a, .caller = ev_.caller(), .wire = try ev_.wire(step), .st = st, .in = step, .thread = step.getCid("thread"), .gossip = try ev_.gossipState(a, step) };
+}
+
+/// A routed submission acted on (a resume, a submission by message): its thread launched, or paused,
+/// or answered; the step's want events emitted; the state saved; the result kept.
+fn settled(a: Allocator, step: Value, loaded: anytype, outcome: submit.Resumed, fields: *std.ArrayList(cbor.Entry), op: []const u8) !void {
+    const s = vm.store();
+    switch (outcome) {
         .none => try fields.append(a, .{ .key = "outcome", .value = .{ .text = "none" } }),
-        .paused => |b| {
-            for (b.wants) |w| _ = try vm.emitEvent(a, w);
-            try fields.appendSlice(a, &.{
-                .{ .key = "outcome", .value = .{ .text = "paused" } },
-                .{ .key = "waiting", .value = .{ .array = try hexes(a, b.waiting) } },
-                .{ .key = "wanted", .value = .{ .uint = b.wants.len } },
-            });
-        },
+        .paused => |b| try fields.appendSlice(a, &.{
+            .{ .key = "outcome", .value = .{ .text = "paused" } },
+            .{ .key = "waiting", .value = .{ .array = try hexes(a, b.waiting) } },
+        }),
         .launch => |ev| {
             const thread = step.getCid("thread") orelse return error.BadInput;
             const self = (try s.getValue(a, thread)).getCid("program") orelse return error.BadInput;
@@ -334,8 +401,11 @@ fn resumeStep(a: Allocator, step: Value, rargs: Value) !void {
             .{ .key = "why", .value = .{ .text = why } },
         }),
     }
-    const new_state = try st.save();
+    const wanted = try emitWants(a, &loaded.st);
+    if (wanted > 0) try fields.append(a, .{ .key = "wanted", .value = .{ .uint = wanted } });
+    try answersField(fields, a);
+    const new_state = try loaded.st.save();
     if (loaded.head == null or !eql(u8, loaded.head.?, new_state)) try vm.advance(try ev_.stateHead(a, step), new_state);
     try fields.append(a, .{ .key = "state", .value = .{ .cid = new_state } });
-    _ = try vm.finish(a, s, try resultRecord(a, "resume", fields.items));
+    _ = try vm.finish(a, s, try resultRecord(a, op, fields.items));
 }

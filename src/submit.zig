@@ -39,21 +39,31 @@
 //! skein-overlay#1: the route walks the BEEF oldest first and judges every
 //! transaction before the subject too; each one a topic takes (or a paused
 //! submission wants) is an item, ingested on its own and admitted, in order,
-//! on its own answer. A BEEF lacking a parent (neither in it nor held) that
-//! came over libp2p (a gossip message, or a stream answering a want) is
-//! **paused**: pending with the parents it waits on, and a want — the event
-//! `{event: "want", txid, peer}` — for each (parent, peer) not standing
-//! already, `peer` each peer that announced it or something needing it
-//! (shruggr/skein#112: the host asks that peer for the parent's BEEF on a
-//! direct stream). Over HTTP there is no peer to ask, and a BEEF that is not
-//! enough is not admitted: refused (400), naming the parents (`missing`).
-//! When the chain app answers for a wanted parent, every want for it is
-//! removed and the thread sends the app itself `{fn: "resume", args: {txid}}`;
-//! the paused submission is routed again (`resumed`): its wants cleared, and
-//! recorded again for what it still lacks.
+//! on its own answer. A BEEF lacking a parent (neither in it nor held) is
+//! **paused**, however it came: pending with the parents it waits on, and a
+//! want per (parent, topic, peer?) — the event `{event: "want", txid, topic,
+//! peer?}` (shruggr/skein#112) — `peer` each peer that announced it (its
+//! publisher, the peers whose `-admit` for it was seen, more as admits
+//! arrive) or something needing it, the host asking that peer on a direct
+//! stream; no peer (a submission by message or HTTP): the host asks peers
+//! from its mesh for the topic. When the chain app answers for a wanted
+//! parent, every want for it is removed and the thread sends the app itself
+//! `{fn: "resume", args: {txid}}`; the paused submission is routed again
+//! (`resumed`): its wants cleared, and recorded again for what it still
+//! lacks. Each want that ends is cleared by the event `{event: "unwant",
+//! txid, topic, peer?}` in the step that ends it (`State.wantEvents`).
+//!
+//! shruggr/skein#112 (0.7.2): a submission is a message, `{fn: "submit",
+//! args: {beef, topics, offChainValues?}}`, into a box a row routes to the
+//! engine (`received`); POST /submit carries the same message. Its answers go
+//! to the sender, in the box it came in (skein docs/APPS.md §4: `{fn:
+//! "submit", request, replyTo, result}`): **admitted** with status `pending`
+//! (the chain app's `accepted`; `proven` when admitted at its proof), the
+//! STEAK per topic; then **every proof** (`proven`, a reorg's proof another);
+//! or **rejected**. A pause is internal: the submitter hears nothing of it.
 //!
 //! The submit event (box `<app>` from the libp2p route; or the args of the
-//! thread POST /submit launches):
+//! thread a submission launches):
 //!
 //!   {kind: "submit", txid (hex), beef: <the pointer record> | bytes (the BEEF as received, the off-chain framing taken off),
 //!    topics: [{topic, previousCoins, outputsToAdmit, coinsToRetain}] (the subject's),
@@ -112,18 +122,15 @@ pub fn identify(a: Allocator, caller: calls.Caller, program: []const u8, topic: 
 pub const Routed = union(enum) {
     /// The BEEF does not decode or verify: the error message (400).
     refused: []const u8,
-    /// A valid transaction no served topic admitted (BRC-22: 200 with an empty STEAK); the reasons, for the log.
+    /// A valid transaction no served topic admitted: answered `rejected` (shruggr/skein#112); the reasons.
     nothing: []const u8,
     /// Every served topic judged it before (a dupe): nothing new; the answer is its judgements, from the state.
     unchanged: [32]u8,
     /// Handed to the chain app, nothing admitted yet: a resubmission adds nothing; the answer is read from the state.
     pending: [32]u8,
-    /// Parents neither in the BEEF nor held by the chain app (skein-overlay#1), the submission
-    /// from a libp2p peer: the event of a paused submission (its thread notes it pending,
-    /// `waiting` on them, and records the wants).
+    /// Parents neither in the BEEF nor held by the chain app (skein-overlay#1): the event of a
+    /// paused submission (its thread notes it pending, `waiting` on them, and records the wants).
     paused: struct { event: Value, txid: [32]u8, waiting: []const [32]u8 },
-    /// The same, from no peer (HTTP): refused (400), naming the parents (`missingMessage`).
-    missing: []const [32]u8,
     /// The event to admit (the topics that were dupes are answered from their `applied` records).
     admit: struct { event: Value, txid: [32]u8 },
 };
@@ -166,8 +173,7 @@ pub const Input = union(enum) {
 /// BUMPs are not proven again (the door did, #121); bytes are decoded once (#50) and checked.
 ///
 /// skein-overlay#1: a BEEF with parents neither in it nor held by the chain app (`missingParents`)
-/// is **paused**, judged by nothing yet, when `source` names a libp2p peer (`from`); from no peer
-/// it is `missing` (refused). Otherwise the BEEF is walked oldest first, up to and
+/// is **paused**, judged by nothing yet, however it came (shruggr/skein#112). Otherwise the BEEF is walked oldest first, up to and
 /// including the subject: each transaction every requested topic has not judged, and that is not
 /// pending in a submission of its own, is judged by each such topic, with the previous coins it
 /// would have once the transactions before it are admitted (`previousCoinsWith`: the outputs the
@@ -184,11 +190,10 @@ pub fn route(a: Allocator, caller: calls.Caller, st: *State, in: Value, beef: In
         var all = true;
         for (topics) |t| all = all and try st.isApplied(t, d.subject);
         if (all) return .{ .unchanged = d.subject };
-        if (peerOf(source) == null) return .{ .missing = missing };
         return .{ .paused = .{ .event = try pausedEvent(a, d.subject, beef, topics, missing, off, source), .txid = d.subject, .waiting = missing } };
     }
     const sub = state.verifyDecoded(a, st.store, st.ch, d, beef == .record) catch |e| switch (e) {
-        // A known-rejected transaction is a valid request that admits nothing (200, empty STEAK).
+        // A known-rejected transaction is a valid request that admits nothing (answered `rejected`).
         error.TransactionRejected => return .{ .nothing = @errorName(e) },
         else => return .{ .refused = @errorName(e) },
     };
@@ -242,15 +247,6 @@ pub fn peerOf(source: ?Value) ?[]const u8 {
     if (!eql(u8, src.getText("transport") orelse "", "libp2p")) return null;
     const f = src.getBytes("from") orelse return null;
     return if (f.len > 0) f else null;
-}
-
-/// The refusal of a BEEF lacking parents over HTTP (skein-overlay#1): it names them.
-pub fn missingMessage(a: Allocator, missing: []const [32]u8) ![]const u8 {
-    var msg: std.ArrayList(u8) = .empty;
-    try msg.appendSlice(a, "Missing parent transactions, neither in the BEEF nor held here:");
-    for (missing) |m| try msg.print(a, " {s}", .{&c.header.toHex(m)});
-    try msg.appendSlice(a, ". Submit a BEEF that carries them.");
-    return msg.items;
 }
 
 /// The topics a BEEF answering a want is routed with (skein-overlay#1, the libp2p stream): those
@@ -376,6 +372,9 @@ pub const Wire = struct {
     ctx: *anyopaque,
     /// `body` to the instance itself in `box` → the message's CID.
     sendFn: *const fn (ctx: *anyopaque, a: Allocator, box: []const u8, body: Value) anyerror![]const u8,
+    /// An answer to a submitter (shruggr/skein#112): `body` to `to` in `box`, sent when a message
+    /// can reach `to` (the instance itself, an address-book entry), else in the step's result only.
+    answerFn: ?*const fn (ctx: *anyopaque, a: Allocator, to: []const u8, box: []const u8, body: Value) anyerror!void = null,
 
     pub fn send(self: Wire, a: Allocator, box: []const u8, body: Value) ![]const u8 {
         return self.sendFn(self.ctx, a, box, body);
@@ -392,8 +391,11 @@ pub const Ctx = struct {
     st: *State,
     /// The configuration (calls.zig: `defaults.overlay*`, `programs`, `app`).
     in: Value,
-    /// The thread this step is of (the submission's: a resubmission's client waits on it).
+    /// The thread this step is of (the submission's).
     thread: ?[]const u8 = null,
+    /// The peers' admits (`<app>/gossip`, read only): whom a paused submission's parents are
+    /// wanted from beside its publisher (shruggr/skein#112). None: no admits seen.
+    gossip: ?*gossip.State = null,
 };
 
 /// The ingest message's body: `{fn: "ingest", args: {beef}}` — the pointer record's CID (#121), or bytes.
@@ -404,15 +406,35 @@ pub fn ingestBody(a: Allocator, beef: Input) !Value {
     }) };
 }
 
-/// The watch message's body: `{fn: "watch", args: {txid (hex), ingest: <the ingest message>}}`.
-pub fn watchBody(a: Allocator, txid: [32]u8, ingest: []const u8) !Value {
+/// A watch (the message `{fn: "watch", args}` to the app itself): the transaction, the ingest
+/// message whose later answers it awaits, the submission's `source` when the submission has a
+/// submitter to answer (shruggr/skein#112), and `proven` when a proof was relayed already (the
+/// watch then awaits a later proof only: a reorg's).
+pub const Watch = struct { txid: [32]u8, ingest: []const u8, source: ?Value = null, proven: bool = false };
+
+/// The watch message's body: `{fn: "watch", args: {txid (hex), ingest: <the ingest message>, source?, proven?: true}}`.
+pub fn watchBody(a: Allocator, w: Watch) !Value {
+    var es: std.ArrayList(cbor.Entry) = .empty;
+    try es.appendSlice(a, &.{
+        .{ .key = "txid", .value = try hexText(a, w.txid) },
+        .{ .key = "ingest", .value = .{ .cid = w.ingest } },
+    });
+    if (w.source) |src| try es.append(a, .{ .key = "source", .value = src });
+    if (w.proven) try es.append(a, .{ .key = "proven", .value = .{ .boolean = true } });
     return .{ .map = try a.dupe(cbor.Entry, &.{
         .{ .key = "fn", .value = .{ .text = "watch" } },
-        .{ .key = "args", .value = .{ .map = try a.dupe(cbor.Entry, &.{
-            .{ .key = "txid", .value = try hexText(a, txid) },
-            .{ .key = "ingest", .value = .{ .cid = ingest } },
-        }) } },
+        .{ .key = "args", .value = .{ .map = es.items } },
     }) };
+}
+
+/// A watch message's args read back.
+pub fn watchOf(args: Value) !Watch {
+    return .{
+        .txid = c.header.fromHex(args.getText("txid") orelse return error.BadInput) catch return error.BadInput,
+        .ingest = args.getCid("ingest") orelse return error.BadInput,
+        .source = args.get("source"),
+        .proven = args.getBool("proven") orelse false,
+    };
 }
 
 /// The resume message's body (skein-overlay#1): `{fn: "resume", args: {txid (hex)}}` — a paused
@@ -424,23 +446,11 @@ pub fn resumeBody(a: Allocator, txid: [32]u8) !Value {
     }) };
 }
 
-/// The `want` event (skein-overlay#1, shruggr/skein#112, skein docs/VM.md "emit"):
-/// `{event: "want", txid (hex), peer (bytes: the libp2p peer ID's multihash)}` — a parent a paused
-/// submission waits on, for the host to ask `peer` for on a direct stream; emitted once per
-/// (txid, peer) while that want stands.
-pub fn wantEvent(a: Allocator, txid: [32]u8, peer: []const u8) !Value {
-    return .{ .map = try a.dupe(cbor.Entry, &.{
-        .{ .key = "event", .value = .{ .text = "want" } },
-        .{ .key = "txid", .value = try hexText(a, txid) },
-        .{ .key = "peer", .value = .{ .bytes = peer } },
-    }) };
-}
-
 /// What a submission thread's first step did.
 pub const Begun = struct {
     /// The ingest messages sent, oldest first (the subject's last): the thread awaits them.
     ingests: []const []const u8 = &.{},
-    /// Paused: the parents it waits on; the `want` events to emit (a want standing already is not).
+    /// Paused: the parents it waits on; the step's `want` / `unwant` events (`State.wantEvents`).
     paused: bool = false,
     waiting: []const [32]u8 = &.{},
     wants: []const Value = &.{},
@@ -476,38 +486,58 @@ pub fn begin(cx: Ctx, ev: Value) !Begun {
     }
     // A paused submission whose subject no topic takes now: no longer paused.
     if (!has_subject and try cx.st.isPaused(txid)) try unpause(cx.st, txid);
-    return .{ .ingests = ms.items };
+    return .{ .ingests = ms.items, .wants = try cx.st.wantEvents() };
 }
 
-/// A paused submission's wants (shruggr/skein#112): one per (parent it waits on, peer), the peers
-/// every one that announced it — the event's `from`, and the peers its wants stood against
-/// already (an earlier announcement; a resume) — or something needing it (the peers its own
-/// subject is wanted from). Its earlier wants are cleared first; a `want` event is emitted for each
-/// (parent, peer) that did not stand before this step.
+/// A paused submission's wants (shruggr/skein#112): one per (parent it waits on, topic requested,
+/// peer). The peers: every one that announced it — the event's `from`, the peers whose `-admit`
+/// for it was seen (`<app>/gossip`), the peers its wants stood against already (an earlier
+/// announcement; a resume) — or something needing it (the peers its own subject is wanted from).
+/// No peer (a submission by message or HTTP, or one whose wants had none): the want with no peer
+/// too, the host asking its mesh for the topic. Its earlier wants are cleared first; the step's
+/// events are the difference (`State.wantEvents`).
 fn pause(cx: Ctx, ev: Value, txid: [32]u8) !Begun {
     const a = cx.a;
     const st = cx.st;
     const waiting = try hexList(a, ev.get("waiting"));
+    const topics = try textList(a, ev.get("requested"));
     var peers: std.ArrayList([]const u8) = .empty;
-    if (peerOf(ev.get("source"))) |p| try state.addPeer(a, &peers, p);
+    const own = peerOf(ev.get("source"));
+    if (own) |p| try state.addPeer(a, &peers, p);
+    if (cx.gossip) |g| for (topics) |t| for (try g.peersOf(t, txid)) |p| try state.addPeer(a, &peers, p);
     const before = try waitingOf(a, st, txid);
-    for (try st.peersOf(txid, before)) |p| try state.addPeer(a, &peers, p);
+    const had = try st.peersOf(txid, before);
+    for (had.peers) |p| try state.addPeer(a, &peers, p);
     for (try st.wantedFrom(txid)) |p| try state.addPeer(a, &peers, p);
-    if (peers.items.len == 0) return error.NoPeer;
-    // Which (parent, peer) wants stood before this step: their events were emitted then.
-    const stood = try a.alloc(bool, waiting.len * peers.items.len);
-    for (waiting, 0..) |w, i| for (peers.items, 0..) |p, j| {
-        stood[i * peers.items.len + j] = try st.hasWant(w, p);
-    };
+    const none = own == null or had.none;
     try st.unwant(txid, before);
     const ec = try st.store.putValue(a, ev);
     try st.putPending(txid, .{ .thread = cx.thread, .waiting = waiting, .event = ec });
-    var wants: std.ArrayList(Value) = .empty;
-    for (waiting, 0..) |w, i| for (peers.items, 0..) |p, j| {
-        _ = try st.want(w, p, txid);
-        if (!stood[i * peers.items.len + j]) try wants.append(a, try wantEvent(a, w, p));
+    for (waiting) |w| for (topics) |t| {
+        if (none) try st.want(w, t, null, txid);
+        for (peers.items) |p| try st.want(w, t, p, txid);
     };
-    return .{ .paused = true, .waiting = waiting, .wants = wants.items };
+    return .{ .paused = true, .waiting = waiting, .wants = try st.wantEvents() };
+}
+
+fn textList(a: Allocator, v: ?Value) ![]const []const u8 {
+    const xs = (v orelse return &.{}).array;
+    const out = try a.alloc([]const u8, xs.len);
+    for (xs, out) |x, *o| o.* = if (x == .text) x.text else return error.BadEvent;
+    return out;
+}
+
+/// A peer's `-admit` for `txid` under `topic` was seen (shruggr/skein#112, the `peer-admit` step):
+/// if a submission of that subject is paused and requested the topic, its parents are wanted from
+/// that peer too.
+pub fn admitSeen(cx: Ctx, topic: []const u8, txid: [32]u8, peer: []const u8) !void {
+    const rec = (try cx.st.pendingRecord(txid)) orelse return;
+    if (rec.get("waiting") == null) return;
+    const ev = try cx.st.store.getValue(cx.a, rec.getCid("event") orelse return error.BadState);
+    for (try textList(cx.a, ev.get("requested"))) |t| {
+        if (!eql(u8, t, topic)) continue;
+        for (try hexList(cx.a, rec.get("waiting"))) |w| try cx.st.want(w, t, peer, txid);
+    }
 }
 
 /// The parents a paused submission of this subject waits on (none: not paused).
@@ -532,7 +562,8 @@ fn unpause(st: *State, txid: [32]u8) !void {
 /// or `{…, error: {code, message}}`.
 pub const Answer = union(enum) {
     accepted,
-    proven: struct { via: ?[]const u8 = null },
+    /// `result`: the chain app's (`block`, `height`): relayed to the submitter as its proof.
+    proven: struct { via: ?[]const u8 = null, result: ?Value = null },
     rejected: []const u8,
     failed: []const u8,
     /// Anything else (a state this engine does not act on): the thread awaits on.
@@ -544,9 +575,137 @@ pub fn answerOf(body: Value) Answer {
     const r = body.get("result") orelse return .other;
     const s = r.getText("state") orelse return .other;
     if (eql(u8, s, "accepted")) return .accepted;
-    if (eql(u8, s, "proven")) return .{ .proven = .{ .via = r.getText("via") } };
+    if (eql(u8, s, "proven")) return .{ .proven = .{ .via = r.getText("via"), .result = r } };
     if (eql(u8, s, "rejected")) return .{ .rejected = r.getText("reason") orelse "rejected" };
     return .other;
+}
+
+// ---------------------------------------------------------------- answers to the submitter (shruggr/skein#112)
+
+/// Whom a submission's answers go to: its `source`'s sender (a message's; an HTTP request's
+/// session identity), in its box, about its request (the message, or the request record).
+pub const Submitter = struct { to: []const u8, box: []const u8, request: []const u8 };
+
+pub fn submitterOf(source: ?Value) ?Submitter {
+    const src = source orelse return null;
+    return .{
+        .to = src.getBytes("sender") orelse return null,
+        .box = src.getText("box") orelse return null,
+        .request = src.getCid("request") orelse return null,
+    };
+}
+
+/// An answer `{fn: "submit", request, replyTo, result}` (skein docs/APPS.md §4) to the submitter,
+/// if the submission has one; the wire sends it when a message can reach it.
+fn answerTo(cx: Ctx, source: ?Value, result: Value) !void {
+    const sub = submitterOf(source) orelse return;
+    const f = cx.wire.answerFn orelse return;
+    try f(cx.wire.ctx, cx.a, sub.to, sub.box, try submitAnswer(cx.a, sub.request, .{ .result = result }));
+}
+
+/// The body of an answer to a submission: `{fn: "submit", request, replyTo, result | error}`.
+pub fn submitAnswer(a: Allocator, request: []const u8, r: union(enum) { result: Value, err: Value }) !Value {
+    return .{ .map = try a.dupe(cbor.Entry, &.{
+        .{ .key = "fn", .value = .{ .text = "submit" } },
+        .{ .key = "request", .value = .{ .cid = request } },
+        .{ .key = "replyTo", .value = .{ .cid = request } },
+        switch (r) {
+            .result => |v| .{ .key = "result", .value = v },
+            .err => |v| .{ .key = "error", .value = v },
+        },
+    }) };
+}
+
+fn steakEntry(a: Allocator, outs: []const u32, retain: []const u32, removed: []const u32) !Value {
+    return .{ .map = try a.dupe(cbor.Entry, &.{
+        .{ .key = "outputsToAdmit", .value = .{ .array = try uints(a, outs) } },
+        .{ .key = "coinsToRetain", .value = .{ .array = try uints(a, retain) } },
+        .{ .key = "coinsRemoved", .value = .{ .array = try uints(a, removed) } },
+    }) };
+}
+
+/// **admitted**: `{txid, state: "admitted", status: "pending" | "proven", steak: {<topic>:
+/// {outputsToAdmit, coinsToRetain, coinsRemoved}}}`.
+fn admittedResult(a: Allocator, txid: [32]u8, status: []const u8, steak: []const cbor.Entry) !Value {
+    return .{ .map = try a.dupe(cbor.Entry, &.{
+        .{ .key = "txid", .value = try hexText(a, txid) },
+        .{ .key = "state", .value = .{ .text = "admitted" } },
+        .{ .key = "status", .value = .{ .text = status } },
+        .{ .key = "steak", .value = .{ .map = try a.dupe(cbor.Entry, steak) } },
+    }) };
+}
+
+fn answerAdmitted(cx: Ctx, source: ?Value, adm: Admission, status: []const u8) !void {
+    if (submitterOf(source) == null) return;
+    var steak: std.ArrayList(cbor.Entry) = .empty;
+    for (adm.topics, adm.applied) |t, ap| try steak.append(cx.a, .{ .key = t, .value = try steakEntry(cx.a, ap.outputs_to_admit, ap.coins_to_retain, ap.coins_removed) });
+    try answerTo(cx, source, try admittedResult(cx.a, adm.txid, status, steak.items));
+}
+
+/// A resubmission of a transaction every requested topic judged before: admitted, its STEAK from
+/// the `applied` records (empty for a topic that took nothing), and its proof if it is proven.
+fn answerJudged(cx: Ctx, source: ?Value, txid: [32]u8, topics: []const []const u8) !void {
+    if (submitterOf(source) == null) return;
+    const a = cx.a;
+    var steak: std.ArrayList(cbor.Entry) = .empty;
+    for (topics) |t| {
+        const rec = (try cx.st.appliedRecord(t, txid)) orelse {
+            try steak.append(a, .{ .key = t, .value = try steakEntry(a, &.{}, &.{}, &.{}) });
+            continue;
+        };
+        try steak.append(a, .{ .key = t, .value = try steakEntry(a, try uintList(a, rec.get("outputsToAdmit")), try uintList(a, rec.get("coinsToRetain")), try uintList(a, rec.get("coinsRemoved"))) });
+    }
+    const proven = (try cx.st.ch.status(txid)) == .proven;
+    try answerTo(cx, source, try admittedResult(a, txid, if (proven) "proven" else "pending", steak.items));
+    if (proven) try answerProof(cx, source, txid, null);
+}
+
+/// **proven**: `{txid, state: "proven", block: <the header's CID>, height}` — the chain app's
+/// answer's (`result`), else the chain state's proof. A reorg's proof is another, a different block.
+fn answerProof(cx: Ctx, source: ?Value, txid: [32]u8, result: ?Value) !void {
+    if (submitterOf(source) == null) return;
+    const a = cx.a;
+    var block: ?[]const u8 = null;
+    var height: ?u64 = null;
+    if (result) |r| {
+        block = r.getCid("block");
+        height = r.getUint("height");
+    }
+    if (block == null) if (try cx.st.ch.proofRecord(txid)) |pr| {
+        block = pr.block;
+        if (c.store.bitcoinHash(pr.block)) |h| if (try cx.st.ch.chain().heightOf(h)) |ht| {
+            height = ht;
+        };
+    };
+    var es: std.ArrayList(cbor.Entry) = .empty;
+    try es.appendSlice(a, &.{
+        .{ .key = "txid", .value = try hexText(a, txid) },
+        .{ .key = "state", .value = .{ .text = "proven" } },
+    });
+    if (block) |b| try es.append(a, .{ .key = "block", .value = .{ .cid = b } });
+    if (height) |h| try es.append(a, .{ .key = "height", .value = .{ .uint = h } });
+    try answerTo(cx, source, .{ .map = es.items });
+}
+
+/// **rejected**: `{txid?, state: "rejected", reason}` (no txid: a BEEF that did not decode).
+fn answerRejected(cx: Ctx, source: ?Value, txid: ?[32]u8, reason: []const u8) !void {
+    if (submitterOf(source) == null) return;
+    var es: std.ArrayList(cbor.Entry) = .empty;
+    if (txid) |t| try es.append(cx.a, .{ .key = "txid", .value = try hexText(cx.a, t) });
+    try es.appendSlice(cx.a, &.{
+        .{ .key = "state", .value = .{ .text = "rejected" } },
+        .{ .key = "reason", .value = .{ .text = reason } },
+    });
+    try answerTo(cx, source, .{ .map = es.items });
+}
+
+/// No topic took the subject (only transactions before it, or it is only wanted): the submitter
+/// hears `rejected`, at once; the items go on.
+const not_admitted = "NotAdmitted: no topic admitted an output or consumed a previous coin";
+
+fn subjectTaken(ev: Value) bool {
+    const js = ev.getArray("topics") orelse return false;
+    return js.len > 0;
 }
 
 /// One transaction admitted in a step: its topics and each one's judgement as recorded.
@@ -569,7 +728,8 @@ pub const Stepped = struct {
     records: []const []const u8 = &.{},
     /// The judgements a rejection removed.
     unapplied: []const state.Unapplied = &.{},
-    /// The watch messages this step sent (a transaction admitted on `accepted`); `watch` the last.
+    /// The watch messages this step sent (a transaction admitted on `accepted`, a proof relayed to a
+    /// submitter); `watch` the last.
     watch: ?[]const u8 = null,
     watches: []const []const u8 = &.{},
     /// The resume messages this step sent (a paused submission's parent came, skein-overlay#1).
@@ -605,15 +765,22 @@ fn pendingOf(rec: Value) !State.Pending {
 /// admitted, up to the first still unanswered: an item is never admitted before the ones before it
 /// in the BEEF are resolved, so its previous coins are those it was judged with. Each one admitted
 /// or rejected resumes the paused submissions waiting on it. It finishes when none of its items is pending.
+///
+/// The submitter (shruggr/skein#112) hears about the subject: admitted (status `pending` on
+/// `accepted`, `proven` at its proof, then the proof), or rejected (a rejection, an error answer).
+/// A subject admitted with a submitter gets a watch either way: its later proofs (a reorg's) and
+/// a later rejection reach the submitter through it.
 pub fn answered(cx: Ctx, ev: Value, ingest: []const u8, ans: Answer) !Stepped {
     const a = cx.a;
     const st = cx.st;
     const subject = try txidOf(ev);
     const subject_hex = &c.header.toHex(subject);
+    const source = ev.get("source");
     var out = Stepped{ .txid = subject, .heard = @tagName(ans) };
     const its = try itemsOf(a, ev);
     var resumes: std.ArrayList([]const u8) = .empty;
     var unapplied: std.ArrayList(state.Unapplied) = .empty;
+    var proof_result: ?Value = null;
     for (its) |it| {
         const rec = (try st.pendingRecord(it.txid)) orelse continue;
         if (!ours(rec, subject_hex) or !eql(u8, rec.getCid("ingest").?, ingest)) continue;
@@ -626,15 +793,20 @@ pub fn answered(cx: Ctx, ev: Value, ingest: []const u8, ans: Answer) !Stepped {
                     if (ans == .proven) p.via = ans.proven.via;
                     try st.putPending(it.txid, p);
                 }
+                if (ans == .proven and it.subject) proof_result = ans.proven.result;
             },
-            .rejected => {
+            .rejected => |why| {
                 try st.dropPending(it.txid);
                 const u = try st.unapply(try calls.servedTopics(a, cx.in), it.txid);
                 try calls.hookRejected(a, cx.caller, cx.in, u);
                 try unapplied.appendSlice(a, u);
                 try resumeWaiters(cx, it.txid, &resumes);
+                if (it.subject and subjectTaken(ev)) try answerRejected(cx, source, it.txid, why);
             },
-            .failed => try st.dropPending(it.txid),
+            .failed => |why| {
+                try st.dropPending(it.txid);
+                if (it.subject and subjectTaken(ev)) try answerRejected(cx, source, it.txid, why);
+            },
             .other => {},
         }
         break;
@@ -655,13 +827,27 @@ pub fn answered(cx: Ctx, ev: Value, ingest: []const u8, ans: Answer) !Stepped {
         const adm = try admitItem(cx, ev, it, beef_cid.?, &records);
         try admissions.append(a, adm);
         if (cx.out) |o| out.published += try gossip.admitted(a, o, st, cx.in, ev, it.txid, it.subject, adm.topics, adm.applied);
-        if (eql(u8, heard, "proven")) {
+        const proven = eql(u8, heard, "proven");
+        // The submitter's answers: the subject's, when a topic took it.
+        const answering = it.subject and subjectTaken(ev) and submitterOf(source) != null;
+        if (answering) {
+            try answerAdmitted(cx, source, adm, if (proven) "proven" else "pending");
+            if (proven) try answerProof(cx, source, it.txid, proof_result);
+        }
+        if (proven) {
             if (rec.getText("via") == null) if (cx.out) |o| {
                 out.published += try gossip.proven(a, o, st, cx.in, it.txid);
             };
-        } else {
-            // Admitted on its acceptance: what the chain app says later goes to a watch.
-            const w = try cx.wire.send(a, calls.appOf(cx.in), try watchBody(a, it.txid, rec.getCid("ingest").?));
+        }
+        if (!proven or answering) {
+            // Admitted on its acceptance: what the chain app says later goes to a watch; and a
+            // submitter's later proofs (a reorg's) after one relayed.
+            const w = try cx.wire.send(a, calls.appOf(cx.in), try watchBody(a, .{
+                .txid = it.txid,
+                .ingest = rec.getCid("ingest").?,
+                .source = if (answering) source else null,
+                .proven = proven,
+            }));
             try watches.append(a, w);
         }
         try resumeWaiters(cx, it.txid, &resumes);
@@ -689,7 +875,7 @@ pub fn answered(cx: Ctx, ev: Value, ingest: []const u8, ans: Answer) !Stepped {
 }
 
 /// `txid` has come (the chain app answered for it: admitted or rejected): each paused submission
-/// waiting on it is sent a `resume` (box `<app>`, to the instance itself).
+/// waiting on it is sent a `resume` (box `<app>`, to the instance itself). Every want for it ends.
 fn resumeWaiters(cx: Ctx, txid: [32]u8, out: *std.ArrayList([]const u8)) !void {
     for (try cx.st.takeWants(txid)) |w| {
         if (!(try cx.st.isPaused(w))) continue;
@@ -697,17 +883,51 @@ fn resumeWaiters(cx: Ctx, txid: [32]u8, out: *std.ArrayList([]const u8)) !void {
     }
 }
 
-/// What a `resume` came to (skein-overlay#1).
+/// What routing a submission came to (a `resume`, a submission by message).
 pub const Resumed = union(enum) {
-    /// Not paused (any more): nothing to do.
+    /// Not paused (any more), or pending already in a submission of its own: nothing to do.
     none,
-    /// Still missing parents: paused again (its wants recorded again; `want` for any new one).
+    /// Missing parents: paused (again) (its wants recorded; the step's want / unwant events).
     paused: Begun,
-    /// Whole now: the submit event to launch the submission's thread on (the pause is dropped).
+    /// Whole: the submit event to launch the submission's thread on (a pause is dropped).
     launch: Value,
-    /// Routed to nothing (refused, taken by no topic, judged before): the pause dropped; why.
+    /// Routed to nothing (refused, taken by no topic, judged before): a pause dropped; why. The
+    /// submitter was answered.
     dropped: []const u8,
 };
+
+/// The route's outcome, acted on in a step (a `resume`, a submission by message): launch, pause,
+/// or answer. Every outcome but a pause or a launch drops a pause of the subject.
+fn settle(cx: Ctx, r: Routed, txid_: ?[32]u8, topics: []const []const u8, source: ?Value) !Resumed {
+    switch (r) {
+        .paused => |p| return .{ .paused = try begin(cx, p.event) },
+        .admit => |x| {
+            try unpauseIf(cx.st, x.txid);
+            if (!subjectTaken(x.event)) try answerRejected(cx, source, x.txid, not_admitted);
+            return .{ .launch = x.event };
+        },
+        .pending => return .none,
+        .refused => |why| {
+            if (txid_) |t| try unpauseIf(cx.st, t);
+            try answerRejected(cx, source, txid_, why);
+            return .{ .dropped = why };
+        },
+        .nothing => |why| {
+            if (txid_) |t| try unpauseIf(cx.st, t);
+            try answerRejected(cx, source, txid_, why);
+            return .{ .dropped = why };
+        },
+        .unchanged => |t| {
+            try unpauseIf(cx.st, t);
+            try answerJudged(cx, source, t, topics);
+            return .{ .dropped = "judged before" };
+        },
+    }
+}
+
+fn unpauseIf(st: *State, txid: [32]u8) !void {
+    if (try st.isPaused(txid)) try unpause(st, txid);
+}
 
 /// A `resume` step: the paused submission of this subject routed again, as the route does, with
 /// its BEEF, the topics requested, its off-chain values and source. Its wants are cleared; paused
@@ -719,63 +939,114 @@ pub fn resumed(cx: Ctx, txid: [32]u8) !Resumed {
     if (rec.get("waiting") == null) return .none;
     const ev = try cx.st.store.getValue(a, rec.getCid("event") orelse return error.BadState);
     const beef = Input.of(ev.get("beef")) orelse return error.BadEvent;
-    const req = ev.getArray("requested") orelse return error.BadEvent;
-    const topics = try a.alloc([]const u8, req.len);
-    for (req, topics) |r, *t| t.* = if (r == .text) r.text else return error.BadEvent;
+    const topics = try textList(a, ev.get("requested"));
     const r = try route(a, cx.caller, cx.st, cx.in, beef, topics, ev.getBytes("offChainValues"), ev.get("source"));
-    switch (r) {
-        .paused => |p| return .{ .paused = try begin(cx, p.event) },
-        .admit => |x| {
-            try unpause(cx.st, txid);
-            return .{ .launch = x.event };
-        },
-        .pending => return .none,
-        .refused => |why| {
-            try unpause(cx.st, txid);
-            return .{ .dropped = why };
-        },
-        .nothing => |why| {
-            try unpause(cx.st, txid);
-            return .{ .dropped = why };
-        },
-        .missing => {
-            try unpause(cx.st, txid);
-            return .{ .dropped = "no peer to ask for its parents" };
-        },
-        .unchanged => {
-            try unpause(cx.st, txid);
-            return .{ .dropped = "judged before" };
-        },
+    return settle(cx, r, txid, topics, ev.get("source"));
+}
+
+/// A submission by message (shruggr/skein#112): `{fn: "submit", args: {beef, topics,
+/// offChainValues?}}` in a box a row routes to the engine — or POST /submit, which carries the same
+/// message. `source` is `{transport, box, sender?, request}`: whom the answers go to. Routed as
+/// any submission: whole, its thread is launched (`launch`); lacking parents, paused (the
+/// submitter hears nothing of it); else answered at once (rejected; or, judged before, admitted).
+/// A `bad-args` error answer for a body that is not that shape.
+pub fn received(cx: Ctx, args: Value, source: Value) !Resumed {
+    const a = cx.a;
+    const beef = Input.of(args.get("beef")) orelse return badArgs(cx, source, "submit: want {beef: bytes, topics: [string], offChainValues?: bytes}");
+    const tv = args.get("topics") orelse return badArgs(cx, source, "submit: want {beef, topics: [string]}");
+    if (tv != .array) return badArgs(cx, source, "submit: topics is a list of strings");
+    const requested = textList(a, tv) catch return badArgs(cx, source, "submit: topics is a list of strings");
+    const topics = try servedOf(a, cx.in, requested);
+    const r = try route(a, cx.caller, cx.st, cx.in, beef, topics, args.getBytes("offChainValues"), source);
+    const txid: ?[32]u8 = switch (r) {
+        .unchanged, .pending => |t| t,
+        .paused => |p| p.txid,
+        .admit => |x| x.txid,
+        .refused, .nothing => null,
+    };
+    if (topics.len == 0) {
+        try answerRejected(cx, source, txid, "no topic requested is served here");
+        return .{ .dropped = "no topic requested is served here" };
     }
+    return settle(cx, r, txid, topics, source);
+}
+
+fn badArgs(cx: Ctx, source: Value, why: []const u8) !Resumed {
+    if (submitterOf(source)) |sub| if (cx.wire.answerFn) |f| try f(cx.wire.ctx, cx.a, sub.to, sub.box, try submitAnswer(cx.a, sub.request, .{ .err = .{ .map = try cx.a.dupe(cbor.Entry, &.{
+        .{ .key = "code", .value = .{ .text = "bad-args" } },
+        .{ .key = "message", .value = .{ .text = why } },
+    }) } }));
+    return .{ .dropped = why };
+}
+
+/// The requested topics this overlay serves, in request order, once each.
+pub fn servedOf(a: Allocator, in: Value, requested: []const []const u8) ![]const []const u8 {
+    const map = try calls.configObject(a, in, "overlayTopics");
+    var out: std.ArrayList([]const u8) = .empty;
+    outer: for (requested) |t| {
+        if (!map.contains(t)) continue;
+        for (out.items) |x| if (eql(u8, x, t)) continue :outer;
+        try out.append(a, t);
+    }
+    return out.items;
 }
 
 /// The watch thread's first step: what the chain state says now (proven, rejected) is acted on at
-/// once; else it awaits the ingest message's answers (`done` false).
-pub fn watchStart(cx: Ctx, txid: [32]u8) !Stepped {
-    var out = Stepped{ .txid = txid };
-    switch (try cx.st.ch.status(txid)) {
+/// once; else it awaits the ingest message's answers (`done` false). A watch after a relayed proof
+/// (`proven`) awaits a later one only.
+pub fn watchStart(cx: Ctx, w: Watch) !Stepped {
+    var out = Stepped{ .txid = w.txid };
+    switch (try cx.st.ch.status(w.txid)) {
         .proven => {
+            if (w.proven) {
+                out.done = false;
+                return out;
+            }
             out.heard = "proven";
-            if (cx.out) |o| out.published += try gossip.proven(cx.a, o, cx.st, cx.in, txid);
+            if (cx.out) |o| out.published += try gossip.proven(cx.a, o, cx.st, cx.in, w.txid);
+            try proofHeard(cx, w, null, &out);
         },
         .rejected => {
             out.heard = "rejected";
-            try unwind(cx, txid, &out);
+            try unwind(cx, w.txid, &out);
+            try answerRejected(cx, w.source, w.txid, try rejectionOf(cx, w.txid));
         },
         .unproven => out.done = false,
     }
     return out;
 }
 
+fn rejectionOf(cx: Ctx, txid: [32]u8) ![]const u8 {
+    const sc = (try cx.st.ch.settlementCid(txid)) orelse return "rejected";
+    return (try cx.st.store.getValue(cx.a, sc)).getText("reason") orelse "rejected";
+}
+
+/// A proof heard by a watch: relayed to the submitter, and — with one to answer — a new watch
+/// (`proven`) for the next (a reorg's), as this one finishes.
+fn proofHeard(cx: Ctx, w: Watch, result: ?Value, out: *Stepped) !void {
+    if (submitterOf(w.source) == null) return;
+    try answerProof(cx, w.source, w.txid, result);
+    const m = try cx.wire.send(cx.a, calls.appOf(cx.in), try watchBody(cx.a, .{ .txid = w.txid, .ingest = w.ingest, .source = w.source, .proven = true }));
+    out.watch = m;
+    out.watches = try cx.a.dupe([]const u8, &.{m});
+}
+
 /// The watch thread stepped with a later answer.
-pub fn watched(cx: Ctx, txid: [32]u8, ans: Answer) !Stepped {
-    var out = Stepped{ .txid = txid, .heard = @tagName(ans) };
+pub fn watched(cx: Ctx, w: Watch, ans: Answer) !Stepped {
+    var out = Stepped{ .txid = w.txid, .heard = @tagName(ans) };
     switch (ans) {
-        .proven => |p| if (p.via == null) if (cx.out) |o| {
-            out.published += try gossip.proven(cx.a, o, cx.st, cx.in, txid);
+        .proven => |p| {
+            // Published once per transaction (a reorg's proof is not published again).
+            if (p.via == null and !w.proven) if (cx.out) |o| {
+                out.published += try gossip.proven(cx.a, o, cx.st, cx.in, w.txid);
+            };
+            try proofHeard(cx, w, p.result, &out);
         },
-        .rejected => try unwind(cx, txid, &out),
-        .failed => {},
+        .rejected => |why| {
+            try unwind(cx, w.txid, &out);
+            try answerRejected(cx, w.source, w.txid, why);
+        },
+        .failed => |why| try answerRejected(cx, w.source, w.txid, why),
         .accepted, .other => out.done = false,
     }
     return out;

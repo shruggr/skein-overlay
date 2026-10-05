@@ -5,7 +5,9 @@
 //!
 //!   POST /submit      fn "submit"   body BEEF, X-Topics (comma list or JSON array),
 //!                                   x-includes-off-chain-values: true → VarInt(len) ‖ BEEF ‖ off-chain values
-//!                                   → the STEAK {topic: {outputsToAdmit, coinsToRetain, coinsRemoved}}
+//!                                   → 200 {id}: delivered (shruggr/skein#112) — the submission is the
+//!                                   message {fn: "submit", args: {beef, topics, offChainValues?}}, its
+//!                                   answers go to the submitter's box, never on this connection
 //!   libp2p:<topic>    fn "submit"   the same submit as a GossipSub message (#57): the message's topic
 //!                                   requested, its body the BEEF → {verdict, admit?} (`gossip` below)
 //!   libp2p:<topic>-admit   fn "peerAdmit"   a peer's verdict (#74, gossip.zig): recorded as a
@@ -23,22 +25,17 @@
 //!   GET  /getDocumentationForLookupServiceProvider?lookupService=…  fn "lookupDocumentation"
 //!
 //! Every request is appended, and the front door's step calls these (#68).
-//! A submit (#50, submit.zig): the handler decodes the BEEF once into
-//! records in the step's write cache, checks SPV over them against the chain
-//! app's headers, and calls each requested topic this overlay serves and
-//! has not judged the transaction for (fn "identify"). A bad BEEF answers
-//! 400; a valid transaction no topic took answers 200 with the empty STEAK
-//! (BRC-22); nothing is admitted. Otherwise it launches the submission's
-//! thread (engine.zig: the BEEF to the chain app, admitted on its answer)
-//! and answers {wait: true}: the request's thread waits on it (#66), and
-//! when it comes to rest the handler is called again (`resolved`) and
-//! answers from the state: the STEAK (each topic's `applied` record); 400
-//! if the chain app rejected it; 503 with Retry-After if it ended with
-//! nothing decided. A BEEF lacking parents (neither in it nor held) answers
-//! 400 naming them (skein-overlay#1: only a submission from a libp2p peer
-//! pauses; a BEEF that is not enough is not admitted). A resubmission judged before answers the STEAK at once;
-//! one while the first is pending awaits that same thread (the pending
-//! record names it) and gets the same answer.
+//! A submit over HTTP (shruggr/skein#112) is a transport for the submission
+//! message: the handler checks only that it is one (X-Topics, a body, the
+//! off-chain framing; else 400), launches the engine on the message
+//! `{fn: "submit", args: {beef, topics, offChainValues?}}` as a message step
+//! would be (args `{body, box: <app>, message: <the request record>, sender?:
+//! <the session's identity>, transport: "http"}`), and answers 200 `{id}`:
+//! the request record's CID, which every answer names (`request`). The
+//! engine routes it (submit.zig `received`) and answers the submitter by
+//! message — admitted (pending), each proof, or rejected — when a message
+//! reaches it; an open route has no caller, so its answers are in the log
+//! only. No STEAK is answered here, and no 503.
 //!
 //! A lookup is a read: the service's program is called (fn "lookup", the
 //! lookup contract, lookup.zig) and its answer shaped for the wire; it
@@ -60,9 +57,6 @@ const Value = cbor.Value;
 const State = state.State;
 const Allocator = std.mem.Allocator;
 const eql = std.mem.eql;
-
-/// The Retry-After a submission still undecided is answered with (whole seconds).
-pub const retry_after = 30;
 
 // ---------------------------------------------------------------- answers
 
@@ -276,130 +270,84 @@ fn served(a: Allocator, requested: []const []const u8, map: std.json.ObjectMap) 
     return out.items;
 }
 
-fn uintsJson(a: Allocator, xs: []const Value) ![]u64 {
-    const out = try a.alloc(u64, xs.len);
-    for (xs, out) |x, *o| o.* = if (x == .uint) x.uint else 0;
-    return out;
-}
-
-const Steak = struct {
-    topics: []const []const u8,
-    entries: []const [3][]const u64,
-
-    pub fn jsonStringify(s: Steak, jw: anytype) !void {
-        try jw.beginObject();
-        for (s.topics, s.entries) |t, e| {
-            try jw.objectField(t);
-            try jw.write(.{ .outputsToAdmit = e[0], .coinsToRetain = e[1], .coinsRemoved = e[2] });
-        }
-        try jw.endObject();
-    }
-};
-
 fn submit(a: Allocator, in: Value, req: Value) !Value {
     if (eql(u8, req.getText("transport") orelse "", "libp2p")) {
         if (req.getText("protocol") != null) return stream(a, in, req);
         return gossip(a, in, req);
     }
-    const th = header(req, "x-topics") orelse return failure(a, 400, "Missing x-topics header");
-    const requested = parseTopics(a, th) catch return failure(a, 400, "Invalid x-topics header: expected a comma-separated list or JSON string array");
+    const sub = switch (try httpSubmission(a, req, calls.appOf(in))) {
+        .refused => |answer| return answer,
+        .message => |m| m,
+    };
+    // The submission message, and the engine launched on it as a message step is (submit.zig `received`).
+    const s = vm.store();
+    const largs = try a.dupe(cbor.Entry, sub.args.map);
+    largs[0].value = .{ .cid = try s.putValue(a, sub.body) };
+    const self = in.getCid("engine") orelse (in.get("programs") orelse return error.BadInput).getCid("overlay") orelse return error.NoOverlayProgram;
+    _ = try vm.launch(a, self, try s.putValue(a, .{ .map = largs }));
+    return sub.answer;
+}
+
+/// POST /submit as a transport for the submission message (shruggr/skein#112): the request is
+/// checked for being one (X-Topics, a body, the off-chain framing; else the 400 answer, `refused`);
+/// then `message`: its `body`, `{fn: "submit", args: {beef, topics, offChainValues?}}`; the `args`
+/// the engine is launched on, as a message step gets them — `{body: <the body's CID, filled in by
+/// the caller>, box: <app>, message: <the request record>, transport: "http", sender?: <the
+/// session's identity>}`; and the `answer`: 200 `{id: <the request record's CID, hex>}`.
+pub fn httpSubmission(a: Allocator, req: Value, app: []const u8) !union(enum) { refused: Value, message: struct { body: Value, args: Value, answer: Value } } {
+    const th = header(req, "x-topics") orelse return .{ .refused = try failure(a, 400, "Missing x-topics header") };
+    const requested = parseTopics(a, th) catch return .{ .refused = try failure(a, 400, "Invalid x-topics header: expected a comma-separated list or JSON string array") };
     // shruggr/skein#121: the kernel's door put the BEEF's pointer record where its bytes were (the row's
     // `filter: "beef"`); bytes are a body it did not take as a BEEF (framed with off-chain values).
-    if (req.getCid("body")) |rc| {
-        const topics = try served(a, requested, try configMap(a, in, "overlayTopics"));
-        var st = try load(a, in);
-        if (req.get("resolved") != null) {
-            const rec = vm.store().getValue(a, rc) catch return failure(a, 400, "Invalid BEEF");
-            return submittedAs(a, &st, c.record.subjectOf(rec) orelse return failure(a, 400, "Invalid BEEF"), topics, untakenSubject(a, req));
-        }
-        return submitRouted(a, in, &st, .{ .record = rc }, topics, null, req);
-    }
-    var body = req.getBytes("body") orelse "";
-    if (body.len == 0) return failure(a, 400, "Missing or empty BEEF body");
+    var beef: Value = undefined;
     var off: ?[]const u8 = null;
-    if (eql(u8, header(req, "x-includes-off-chain-values") orelse "", "true")) {
-        var pos: usize = 0;
-        const n64 = readVarInt(body, &pos) catch return failure(a, 400, "Invalid off-chain values framing");
-        if (n64 > body.len - pos) return failure(a, 400, "Invalid off-chain values framing");
-        const n: usize = @intCast(n64);
-        off = body[pos + n ..];
-        body = body[pos .. pos + n];
+    if (req.getCid("body")) |rc| {
+        beef = .{ .cid = rc };
+    } else {
+        var body = req.getBytes("body") orelse "";
+        if (body.len == 0) return .{ .refused = try failure(a, 400, "Missing or empty BEEF body") };
+        if (eql(u8, header(req, "x-includes-off-chain-values") orelse "", "true")) {
+            var pos: usize = 0;
+            const n64 = readVarInt(body, &pos) catch return .{ .refused = try failure(a, 400, "Invalid off-chain values framing") };
+            if (n64 > body.len - pos) return .{ .refused = try failure(a, 400, "Invalid off-chain values framing") };
+            const n: usize = @intCast(n64);
+            off = body[pos + n ..];
+            body = body[pos .. pos + n];
+        }
+        beef = .{ .bytes = body };
     }
-    const map = try configMap(a, in, "overlayTopics");
-    const topics = try served(a, requested, map);
-    var st = try load(a, in);
-    // Called again (#66): the submission's thread this request waited on has come to rest — the answer is the state's.
-    if (req.get("resolved") != null) {
-        const b = c.beef.parse(a, body) catch return failure(a, 400, "Invalid BEEF");
-        return submittedAs(a, &st, b.subject() orelse return failure(a, 400, "Invalid BEEF"), topics, untakenSubject(a, req));
-    }
-    return submitRouted(a, in, &st, .{ .bytes = body }, topics, off, req);
-}
-
-/// Whether the thread this request waited on (`resolved`, #66) was the submission's thread of an
-/// event whose subject no topic took (skein-overlay#1: only transactions before it): its origin's
-/// `args.event` names no judgement of the subject and is not paused.
-fn untakenSubject(a: Allocator, req: Value) bool {
-    const rs = req.getArray("resolved") orelse return false;
-    const s = vm.store();
-    for (rs) |r| {
-        const origin = s.getValue(a, r.getCid("thread") orelse continue) catch continue;
-        const args = origin.get("args") orelse continue;
-        const ev = s.getValue(a, args.getCid("event") orelse continue) catch continue;
-        if (!eql(u8, ev.getText("kind") orelse "", "submit") or ev.get("waiting") != null) continue;
-        if ((ev.getArray("topics") orelse continue).len == 0 and ev.get("earlier") != null) return true;
-    }
-    return false;
-}
-
-/// The submit's route half (submit.zig `route`) and what follows: verified, judged by the topics
-/// (#50), the submission's thread launched, or the answer now.
-fn submitRouted(a: Allocator, in: Value, st: *State, beef: submit_mod.Input, topics: []const []const u8, off: ?[]const u8, req: Value) !Value {
-    const routed = switch (try submit_mod.route(a, ev_.caller(), st, in, beef, topics, off, try sourceOf(a, req, null))) {
-        .refused => |why| return failure(a, 400, why),
-        // skein-overlay#1: parents neither in the BEEF nor held; over HTTP there is no peer to ask.
-        .missing => |m| return failure(a, 400, try submit_mod.missingMessage(a, m)),
-        .paused => |p| return failure(a, 400, try submit_mod.missingMessage(a, p.waiting)),
-        // Valid but admitted nowhere: BRC-22's answer is 200 with an empty STEAK.
-        .nothing => {
-            const entries = try a.alloc([3][]const u64, topics.len);
-            for (entries) |*e| e.* = .{ &.{}, &.{}, &.{} };
-            return respond(a, 200, "application/json", try jsonOf(a, Steak{ .topics = topics, .entries = entries }));
-        },
-        // Resubmitted, judged already (#57): the answer is the state's, now.
-        .unchanged => |txid| return submitted(a, st, txid, topics),
-        // Resubmitted while the first submission's thread awaits the chain app (#66): this request waits
-        // on that same thread and gets the same answer, from the state, once it comes to rest.
-        .pending => |txid| {
-            const rec = (try st.pendingRecord(txid)) orelse return submitted(a, st, txid, topics);
-            const thread = rec.getCid("thread") orelse return submitted(a, st, txid, topics);
-            vm.awaitRecord(thread) catch return submitted(a, st, txid, topics); // at rest already: the state answers
-            return waiting(a);
-        },
-        .admit => |x| x.event,
-    };
-    // The submission's thread (engine.zig, stepped on the submit record as a `submit` event would be):
-    // launched by this request's step, which waits on it; its answer, when it comes to rest, is the state's.
-    const self = in.getCid("engine") orelse (in.get("programs") orelse return error.BadInput).getCid("overlay") orelse return error.NoOverlayProgram;
-    const ev = try vm.store().putValue(a, routed);
-    const args = try vm.store().putValue(a, .{ .map = try a.dupe(cbor.Entry, &.{
-        .{ .key = "event", .value = .{ .cid = ev } },
-        .{ .key = "box", .value = .{ .text = "submit" } },
-    }) });
-    _ = try vm.launch(a, self, args);
-    return waiting(a);
-}
-
-/// A route handler's "not yet" (#66): it launched, or awaits, the thread its answer depends on.
-fn waiting(a: Allocator) !Value {
-    return .{ .map = try a.dupe(cbor.Entry, &.{.{ .key = "wait", .value = .{ .boolean = true } }}) };
+    const request = req.getCid("request") orelse return error.BadInput;
+    const ts = try a.alloc(Value, requested.len);
+    for (requested, ts) |t, *o| o.* = .{ .text = t };
+    var fargs: std.ArrayList(cbor.Entry) = .empty;
+    try fargs.appendSlice(a, &.{
+        .{ .key = "beef", .value = beef },
+        .{ .key = "topics", .value = .{ .array = ts } },
+    });
+    if (off) |o| try fargs.append(a, .{ .key = "offChainValues", .value = .{ .bytes = o } });
+    var largs: std.ArrayList(cbor.Entry) = .empty;
+    try largs.appendSlice(a, &.{
+        .{ .key = "body", .value = .null },
+        .{ .key = "box", .value = .{ .text = app } },
+        .{ .key = "message", .value = .{ .cid = request } },
+        .{ .key = "transport", .value = .{ .text = "http" } },
+    });
+    if (req.getBytes("caller")) |k| try largs.append(a, .{ .key = "sender", .value = .{ .bytes = k } });
+    return .{ .message = .{
+        .body = .{ .map = try a.dupe(cbor.Entry, &.{
+            .{ .key = "fn", .value = .{ .text = "submit" } },
+            .{ .key = "args", .value = .{ .map = fargs.items } },
+        }) },
+        .args = .{ .map = largs.items },
+        .answer = try respond(a, 200, "application/json", try jsonOf(a, .{ .id = try vm.hexAlloc(a, request) })),
+    } };
 }
 
 /// The same submit, arriving as a GossipSub message on a `libp2p:<topic>` route (#57): the message's
 /// topic is the one requested, its body the BEEF (no off-chain values), and the route's half runs
 /// unchanged. The answer is the libp2p handler contract (skein docs/MESSAGES.md, "libp2p"): accept,
 /// admitting the submit event in box `<app>` (routed after the message's own `p2p` event: the app's
-/// row from `event` launches the same engine thread POST /submit launches), so the verdict goes
+/// row from `event` launches the same engine thread a submission launches), so the verdict goes
 /// back at once — GossipSub's validator waits on nothing further; ignore — no forward, no penalty —
 /// when nothing is new or the BEEF is refused (a refusal may be this instance's missing headers, not
 /// the publisher's fault).
@@ -425,10 +373,9 @@ fn libp2pRouted(a: Allocator, in: Value, st: *State, beef: submit_mod.Input, top
     const routed = switch (try submit_mod.route(a, ev_.caller(), st, in, beef, topics, null, source)) {
         .refused => |why| return verdictOf(a, "ignore", why),
         .nothing => |why| return verdictOf(a, "ignore", why),
-        .missing => return verdictOf(a, "ignore", "parents missing, and no peer to ask"),
         .unchanged => return verdictOf(a, "ignore", "already judged"),
         .pending => return verdictOf(a, "ignore", "already submitted: awaiting the chain app"),
-        .paused => |p| if (try samePause(st, p.txid, p.waiting) and try st.wantsFrom(p.txid, p.waiting, req.getBytes("from") orelse ""))
+        .paused => |p| if (try samePause(st, p.txid, p.waiting) and try st.wantsFrom(p.txid, p.waiting, topics, req.getBytes("from") orelse ""))
             return verdictOf(a, "ignore", "already submitted by this peer: waiting for its parents")
         else
             p.event,
@@ -483,7 +430,7 @@ fn peerAdmit(a: Allocator, in: Value, req: Value) !Value {
     if (!(try configMap(a, in, "overlayTopics")).contains(t)) return verdictOf(a, "ignore", "the topic is not served here");
     const from = req.getBytes("key") orelse return verdictOf(a, "ignore", "no publisher key");
     const m = gossip_mod.parseAdmit(a, req.getBytes("body") orelse "", t) catch |e| return verdictOf(a, "ignore", @errorName(e));
-    return accepting(a, try gossip_mod.peerAdmitRecord(a, t, m, from), calls.appOf(in));
+    return accepting(a, try gossip_mod.peerAdmitRecord(a, t, m, from, req.getBytes("from")), calls.appOf(in));
 }
 
 /// A peer's proof on `libp2p:<topic>-proof` (#74): {txid, blockHash, blockHeight, bump}. The proof-in
@@ -533,53 +480,6 @@ fn samePause(st: *State, txid: [32]u8, wanted: []const [32]u8) !bool {
     if (ws.len != wanted.len) return false;
     for (ws, wanted) |w, x| if (!eql(u8, if (w == .text) w.text else return false, &c.header.toHex(x))) return false;
     return true;
-}
-
-/// After the submission's thread came to rest (#57, #66): still pending (the chain app has not
-/// answered: a 503 with Retry-After — nothing admitted; the client resubmits); the chain app
-/// rejected it → 400 {status: "error", message}; any topic's `applied` record → the STEAK (this
-/// submission's judgement or an earlier one's; a topic that took nothing: empty); the chain holds it
-/// with nothing applied → the empty STEAK; else (an error answer) 503. A STEAK only ever names
-/// outputs of a transaction the chain app accepted, or a mined one.
-///
-/// skein-overlay#1: `untaken`: the thread came to rest
-/// on a submission whose subject no topic took (only transactions before it in the BEEF): with
-/// nothing applied, the empty STEAK (200), as for a submission no topic takes.
-fn submitted(a: Allocator, st: *State, txid: [32]u8, topics: []const []const u8) !Value {
-    return submittedAs(a, st, txid, topics, false);
-}
-
-fn submittedAs(a: Allocator, st: *State, txid: [32]u8, topics: []const []const u8, untaken: bool) !Value {
-    const undecided = struct {
-        fn f(al: Allocator, message: []const u8) !Value {
-            return .{ .map = try al.dupe(cbor.Entry, &.{
-                .{ .key = "status", .value = .{ .uint = 503 } },
-                .{ .key = "type", .value = .{ .text = "application/json" } },
-                .{ .key = "headers", .value = .{ .map = try al.dupe(cbor.Entry, &.{.{ .key = "retry-after", .value = .{ .text = try std.fmt.allocPrint(al, "{d}", .{retry_after}) } }}) } },
-                .{ .key = "body", .value = .{ .bytes = try jsonOf(al, .{ .status = "error", .message = message }) } },
-            }) };
-        }
-    }.f;
-    const not_yet = "Not yet accepted by the network: nothing is admitted until it is. Resubmit after Retry-After seconds.";
-    if (try st.isPending(txid)) return undecided(a, not_yet);
-    if (try st.ch.settlementCid(txid)) |sc| {
-        const rec = try st.store.getValue(a, sc);
-        return failure(a, 400, try std.fmt.allocPrint(a, "Transaction rejected: {s}", .{rec.getText("reason") orelse "rejected"}));
-    }
-    const entries = try a.alloc([3][]const u64, topics.len);
-    var any = false;
-    for (topics, entries) |t, *e| {
-        e.* = .{ &.{}, &.{}, &.{} };
-        const rec = (try st.appliedRecord(t, txid)) orelse continue;
-        any = true;
-        e.* = .{
-            try uintsJson(a, rec.getArray("outputsToAdmit") orelse &.{}),
-            try uintsJson(a, rec.getArray("coinsToRetain") orelse &.{}),
-            try uintsJson(a, rec.getArray("coinsRemoved") orelse &.{}),
-        };
-    }
-    if (!any and !untaken and !(try st.ch.holds(txid))) return undecided(a, not_yet);
-    return respond(a, 200, "application/json", try jsonOf(a, Steak{ .topics = topics, .entries = entries }));
 }
 
 fn lookup(a: Allocator, in: Value, req: Value) !Value {

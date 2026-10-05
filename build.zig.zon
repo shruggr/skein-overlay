@@ -1,6 +1,6 @@
 .{
     .name = .skein_overlay,
-    .version = "0.7.1",
+    .version = "0.7.2",
     .minimum_zig_version = "0.16.0",
     .fingerprint = 0x61cfd392818dcb20,
     .dependencies = .{

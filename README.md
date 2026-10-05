@@ -4,15 +4,19 @@ The overlay services engine for a [skein](https://github.com/shruggr/skein),
 as an app: BRC-22 submit and BRC-24 lookup, served by the instance's own
 front door, with topic managers and lookup services as programs the engine
 calls. It is also a Zig package: an overlay of your own depends on it for
-the topic and lookup contracts. Version **0.7.1**.
+the topic and lookup contracts. Version **0.7.2**.
 
 ## What it is
 
-- **The engine** (`bin/overlay.wasm`): `/submit` decodes the BEEF once,
-  asks the topic managers to judge it by CID, and hands it to the chain app
-  ([shruggr/skein-chain](https://github.com/shruggr/skein-chain), required as
-  `chain/1`) with `ingest`. The submission is admitted on the chain app's
-  first `accepted` or `proven` answer. Nothing persists unless a topic takes
+- **The engine** (`bin/overlay.wasm`): a submission is a message, `{fn:
+  "submit", args: {beef, topics}}`, into the app's box (`POST /submit`
+  carries the same message and answers delivery only). The engine decodes
+  the BEEF once, asks the topic managers to judge it by CID, and hands it to
+  the chain app ([shruggr/skein-chain](https://github.com/shruggr/skein-chain),
+  required as `chain/1`) with `ingest`. It is admitted on the chain app's
+  first `accepted` or `proven` answer. The submitter is answered by message,
+  in its own box: **admitted** (status `pending`, the STEAK per topic), then
+  **every proof**, or **rejected**. Nothing persists unless a topic takes
   it, apart from the request. `/lookup` is a read.
 - **State under its own name.** The engine and its lookup services write
   only `<app>/state`, `<app>/gossip` and `<app>/ls_<service>`; the app record
@@ -37,17 +41,22 @@ They pull in the SDK's `chain` module only.
 first and judges every transaction of the requested topics before the
 subject; each one a topic takes is ingested through the chain app on its
 own and admitted, in order, on its own answer (skein-overlay#1). A
-submission from a libp2p peer whose parent is neither in the BEEF nor held
-pauses: it is noted pending, waiting on those parents, and the engine
-records a want per (parent, peer) — `{event: "want", txid, peer}`, the peer
-that announced it (or something needing it) — for the host to ask that
-peer (shruggr/skein#112); over HTTP such a BEEF is refused, 400, naming the
-parents. A peer answers a want on the stream `/skein/overlay/beef/1.0.0`
-(one Atomic BEEF per frame, the wanted txid its subject; no reply frame),
-routed to `submit` as a submission from that peer; when the parent is in,
-the paused one is routed again. A transaction admitted on `accepted` sends the app itself a
-one-shot `watch`, which waits for `proven` (publishes `-proof`) or
-`rejected` (unwinds). Not built: the decided direction of shruggr/skein#31
+submission whose parent is neither in the BEEF nor held pauses, however it
+came: it is noted pending, waiting on those parents, and the engine records
+a want per (parent, topic, peer?) — `{event: "want", txid, topic, peer?}`
+(shruggr/skein#112). With a peer (a gossip pause: the publisher, and every
+peer whose `-admit` for it was seen, more as admits arrive) the host asks
+that peer on a direct stream; without one (a submission by message or
+HTTP) it asks peers from its mesh for the topic. Each want that ends is
+cleared by `{event: "unwant", txid, topic, peer?}`. A peer answers a want
+on the stream `/skein/overlay/beef/1.0.0` (one Atomic BEEF per frame, the
+wanted txid its subject; no reply frame), routed to `submit` as a
+submission from that peer; when the parent is in, the paused one is routed
+again. The pause is internal: the submitter hears nothing of it. A
+transaction admitted on `accepted` sends the app itself a `watch`, which
+waits for `proven` (publishes `-proof`) or `rejected` (unwinds); with a
+submitter to answer, each proof is relayed and a new watch waits for the
+next (a reorg's). Not built: the decided direction of shruggr/skein#31
 ("Decided 2026-10-02 (night)"): a reference to a transaction is a
 registration for the life of the transaction, and a judgement is re-run
 when the chain state it depended on changes.
@@ -73,7 +82,8 @@ the host's origin. Its endpoints are under it: `POST <base>/submit`
 the listing and documentation routes, all open. The @bsv/sdk
 `TopicBroadcaster` and `LookupResolver` reject a base URL with a path, so
 call the endpoints directly (`POST <base>/submit` with the BEEF and
-`X-Topics`).
+`X-Topics`). `/submit` answers `200 {id}` on delivery, not BRC-22's STEAK:
+the verdict comes later, by message (docs/OVERLAY.md, "Submitting").
 
 ### Write an overlay of your own
 
@@ -150,7 +160,7 @@ The manifest (`etc/app.json`, this repo's own, description left out):
 {
   "kind": "app",
   "name": "overlay",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "programs": {
     "overlay": "bin/overlay.wasm",
     "topic-demo": "bin/topic-demo.wasm",
@@ -166,6 +176,7 @@ The manifest (`etc/app.json`, this repo's own, description left out):
   "requires": ["chain/1"],
   "dispatch": [
     {"address": "overlay", "sender": "$owner", "program": "overlay"},
+    {"address": "", "sender": "*", "program": "overlay", "filter": "beef"},
     {"transport": "http", "address": "/listTopicManagers", "sender": "*", "program": "overlay", "fn": "listTopicManagers"},
     {"transport": "http", "address": "/listLookupServiceProviders", "sender": "*", "program": "overlay", "fn": "listLookupServiceProviders"},
     {"transport": "http", "address": "/getDocumentationForTopicManager", "sender": "*", "program": "overlay", "fn": "topicDocumentation"},
@@ -181,6 +192,11 @@ The manifest (`etc/app.json`, this repo's own, description left out):
   http `/submit` and `/lookup` (open, under `/<app>/`), the libp2p rows
   `<topic>`, `<topic>-admit`, `<topic>-proof`, and box `<app>` from `event`
   and from `$self`. The install prompt reads them all aloud.
+- The row for the app's own box `""` (`<app>`), open to anyone, is where
+  submissions arrive as messages (`{fn: "submit", args: {beef, topics}}`;
+  the door decodes the BEEF, `filter: "beef"`). A `register` / `deregister`
+  in that box is taken from the instance itself only; the owner's go to
+  `overlay` (`<app>/overlay`).
 - The libp2p row `/skein/overlay/beef/1.0.0` is the want-answer stream
   (shruggr/skein#112): a peer the engine wants a parent from answers on
   it, one Atomic BEEF per frame; the door decodes it (`filter: "beef"`)
@@ -254,7 +270,7 @@ Not built: BRC-88 SHIP/SLAP, GASP sync and catch-up from a peer, the
 
 | | |
 |---|---|
-| this app and package | 0.7.1 (tag `v0.7.1`) |
+| this app and package | 0.7.2 (tag `v0.7.2`) |
 | skein-sdk | v0.5.1, by tag URL and hash in `build.zig.zon` (module `chain`; bsvz comes through it) |
 | requires | `chain/1` (shruggr/skein-chain 0.3.0) |
 | skein | log format 8; skein's equivs pin this repo by commit |
@@ -300,6 +316,23 @@ again for what it still lacks. Only a submission from a libp2p peer
 pauses; over HTTP a BEEF lacking parents is refused, 400, naming them. The
 manifest gains the stream row `/skein/overlay/beef/1.0.0` (filter `beef`,
 fn `submit`), where a peer answers a want with one Atomic BEEF per frame.
+
+0.7.2 (shruggr/skein#112, settled 2026-10-05): a submission is a message,
+`{fn: "submit", args: {beef, topics, offChainValues?}}`, into the app's box
+`<app>` (a new row, open to anyone, `filter: "beef"`); `POST /submit`
+carries the same message and answers delivery only, `200 {id}` (the request
+record's CID) — no STEAK on the connection, no 503. The submitter is
+answered by message in the box it wrote to (`{fn: "submit", request,
+replyTo, result}`): `admitted` with status `pending` and the STEAK, then
+each `proven` (a reorg's too), or `rejected`. Every submission missing a
+parent pauses (no 400 over HTTP). The want is `{event: "want", txid, topic,
+peer?}`, one per (txid, topic, peer?): a gossip pause's peers are the
+publisher and every peer whose `-admit` for it was seen (the peer-admit
+record gains `peer`), more as admits arrive; a pause by message or HTTP
+wants with no peer. Each want's end is the event `{event: "unwant", txid,
+topic, peer?}` (the builder's smallest option, David to review). The map
+`wants` is `txid ‖ tp ‖ peer? → [subject]`. A `register` / `deregister` in
+`<app>` is taken from the instance itself only.
 
 ## Contributing
 

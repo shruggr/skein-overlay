@@ -172,10 +172,12 @@ pub fn checkProof(a: Allocator, ch: *Chain, p: Proof, via: []const u8) !union(en
 
 // ---------------------------------------------------------------- what a step publishes
 
-/// Where a submission came from (the submit event's `source`, routes.zig):
-/// {transport, topic? (a libp2p topic), protocol? (a libp2p stream protocol: the answer to a want,
-/// skein-overlay#1), from? (the libp2p peer that published it or sent it on the stream: bytes,
-/// the peer ID's multihash), request: <the request record's CID>}.
+/// Where a submission came from (the submit event's `source`, routes.zig, submit.zig):
+/// {transport: "libp2p" | "mailbox" | "http", topic? (a libp2p topic), protocol? (a libp2p stream
+/// protocol: the answer to a want, skein-overlay#1), from? (the libp2p peer that published it or
+/// sent it on the stream: bytes, the peer ID's multihash), sender?, box? (a submission by message,
+/// or over HTTP on a session: whom its answers go to, and in which box), request: <the message's
+/// or the request record's CID>}.
 pub const Source = struct { transport: []const u8 = "", topic: []const u8 = "", protocol: []const u8 = "", from: ?[]const u8 = null, request: ?[]const u8 = null };
 
 pub fn sourceOf(ev: Value) Source {
@@ -241,16 +243,23 @@ pub fn proven(a: Allocator, out: Out, st: *st_mod.State, in: Value, txid: [32]u8
 // ---------------------------------------------------------------- peers' admits, recorded
 
 /// The peer-admit event the `-admit` route admits (box `<app>`), and the record the engine keeps:
-/// {kind: "peer-admit", topic, txid (hex), from: bytes(33) (the publisher's peer key), outputsToAdmit, coinsToRetain}.
-pub fn peerAdmitRecord(a: Allocator, topic: []const u8, m: Admit, from: []const u8) !Value {
-    return .{ .map = try a.dupe(cbor.Entry, &.{
+/// {kind: "peer-admit", topic, txid (hex), from: bytes(33) (the publisher's peer key), peer?: bytes
+/// (its peer ID's multihash, the message's `from`: whom a want is asked of, shruggr/skein#112),
+/// outputsToAdmit, coinsToRetain}.
+pub fn peerAdmitRecord(a: Allocator, topic: []const u8, m: Admit, from: []const u8, peer: ?[]const u8) !Value {
+    var es: std.ArrayList(cbor.Entry) = .empty;
+    try es.appendSlice(a, &.{
         .{ .key = "kind", .value = .{ .text = "peer-admit" } },
         .{ .key = "topic", .value = .{ .text = topic } },
         .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &c.header.toHex(m.txid)) } },
         .{ .key = "from", .value = .{ .bytes = from } },
+    });
+    if (peer) |p| try es.append(a, .{ .key = "peer", .value = .{ .bytes = p } });
+    try es.appendSlice(a, &.{
         .{ .key = "outputsToAdmit", .value = .{ .array = try uints(a, m.outputs_to_admit) } },
         .{ .key = "coinsToRetain", .value = .{ .array = try uints(a, m.coins_to_retain) } },
-    }) };
+    });
+    return .{ .map = es.items };
 }
 
 /// The gossip state (head `<app>/gossip`): the map `peerAdmits`, key tp ‖ txid ‖ from → the peer-admit record.
@@ -290,6 +299,17 @@ pub const State = struct {
         const out = try self.arena.alloc([]const u8, kvs.len);
         for (kvs, out) |kv, *o| o.* = if (kv.value == .cid) kv.value.cid else return error.BadIndex;
         return out;
+    }
+
+    /// The peers whose `-admit` for `txid` under `topic` was seen: their peer IDs (the records'
+    /// `peer`; a record without one, from before 0.7.2, names none).
+    pub fn peersOf(self: *State, topic: []const u8, txid: [32]u8) ![]const []const u8 {
+        var out: std.ArrayList([]const u8) = .empty;
+        for (try self.admitsOf(topic, txid)) |rc| {
+            const p = (try self.store.getValue(self.arena, rc)).getBytes("peer") orelse continue;
+            try st_mod.addPeer(self.arena, &out, p);
+        }
+        return out.items;
     }
 
     pub fn save(self: *State) ![]const u8 {

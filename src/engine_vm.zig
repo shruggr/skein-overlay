@@ -49,10 +49,31 @@ fn sendImpl(_: *anyopaque, a: Allocator, box: []const u8, body: Value) anyerror!
     return vm.send(a, self_key, box, body);
 }
 
-/// Messages to the instance itself (the input's `self.identity`): looped back by the host.
+var step_in: Value = .null;
+/// The answers to submitters this step made (shruggr/skein#112), for its result record: `{to, box,
+/// body, sent}` — `sent` false when no message reaches `to` (the answer is in the log only).
+pub var answers: std.ArrayList(Value) = .empty;
+
+fn answerImpl(_: *anyopaque, a: Allocator, to: []const u8, box: []const u8, body: Value) anyerror!void {
+    const sent = try reaches(a, step_in, to);
+    var es: std.ArrayList(cbor.Entry) = .empty;
+    try es.appendSlice(a, &.{
+        .{ .key = "to", .value = .{ .bytes = to } },
+        .{ .key = "box", .value = .{ .text = box } },
+    });
+    if (sent) {
+        try es.append(a, .{ .key = "message", .value = .{ .cid = try vm.send(a, to, box, body) } });
+    } else try es.append(a, .{ .key = "body", .value = body });
+    try es.append(a, .{ .key = "sent", .value = .{ .boolean = sent } });
+    try answers.append(a, .{ .map = es.items });
+}
+
+/// Messages to the instance itself (the input's `self.identity`): looped back by the host; and the
+/// answers to submitters, sent when a message reaches them.
 pub fn wire(in: Value) !submit.Wire {
     self_key = vm.selfKey(in) orelse return error.NoIdentity;
-    return .{ .ctx = &dummy, .sendFn = sendImpl };
+    step_in = in;
+    return .{ .ctx = &dummy, .sendFn = sendImpl, .answerFn = answerImpl };
 }
 
 /// The libp2p provider's key: the address book's entry with role `libp2p` (the head `peers`), or null.
@@ -107,6 +128,13 @@ pub fn network(in: Value) !c.chain.Network {
 /// The head the overlay's state lives under: `<app>/state`.
 pub fn stateHead(a: Allocator, in: Value) ![]const u8 {
     return std.fmt.allocPrint(a, "{s}/state", .{calls.appOf(in)});
+}
+
+/// The peers' admits (`<app>/gossip`, read only here): whom a pause's parents are wanted from.
+pub fn gossipState(a: Allocator, in: Value) !*gossip.State {
+    const g = try a.create(gossip.State);
+    g.* = try gossip.State.load(a, vm.store(), try vm.head(a, try gossip.stateHead(a, calls.appOf(in))));
+    return g;
 }
 
 /// The overlay's state (`<app>/state`) over the chain app's (`chain/state`, read only), as the store

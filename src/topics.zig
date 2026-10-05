@@ -172,6 +172,15 @@ pub fn asked(body: Value) Asked {
     return .other;
 }
 
+/// Whether a registration may be taken here (shruggr/skein#112): in the app's own box `<app>` —
+/// open to anyone since 0.7.2, for submissions — only from the instance itself (`self`); in any
+/// other box a row routes to the engine, from whoever that row admits.
+pub fn mayRegister(args: Value, app: []const u8, self: ?[]const u8) bool {
+    if (!eql(u8, answerBox(args, app), app)) return true;
+    const me = self orelse return false;
+    return eql(u8, args.getBytes("sender") orelse "", me);
+}
+
 /// The box a registration's answer goes back in: the one the message came in (the step's
 /// `args.box`), else the app's own.
 pub fn answerBox(args: Value, app: []const u8) []const u8 {
