@@ -1333,7 +1333,7 @@ test "register / deregister (skein #128): the set is the step's app's, the answe
     const programs = try mapOf(a, &.{.{ .key = "topic-demo", .value = .{ .cid = prog } }});
     const app = "amm";
 
-    for ([_][]const u8{ "amm/overlay", "amm" }) |box| {
+    for ([_][]const u8{ "amm/register", "amm" }) |box| {
         const args = try mapOf(a, &.{.{ .key = "box", .value = .{ .text = box } }});
         const reg = try mapOf(a, &.{
             .{ .key = "fn", .value = .{ .text = "register" } },
@@ -2067,29 +2067,32 @@ test "a submission by message is answered once (0.7.4): one `admitted`; the step
     try std.testing.expectEqual(@as(usize, 1), inst.wire_.answers.items.len);
 }
 
-test "one box per function class (skein #128, 0.7.5): register only in `<app>/overlay`, refused in `<app>` and `<app>/submit`; submit in any box, `<app>/submit` too" {
+test "one box per function class (skein #128, 0.7.5, 0.7.7): register only in `<app>/register`, refused in `<app>` and `<app>/submit`; submit in any box, `<app>/submit` too" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
     const me: [33]u8 = .{0x02} ++ .{0x01} ** 32;
     const other: [33]u8 = .{0x02} ++ .{0x02} ** 32;
-    // Accepted in `<app>/overlay`, from whoever its row admits.
-    const owner_box = try mapOf(a, &.{ .{ .key = "box", .value = .{ .text = "amm/overlay" } }, .{ .key = "sender", .value = .{ .bytes = &other } } });
+    // Accepted in `<app>/register` (0.7.7; was `<app>/overlay`), from whoever its row admits.
+    const owner_box = try mapOf(a, &.{ .{ .key = "box", .value = .{ .text = "amm/register" } }, .{ .key = "sender", .value = .{ .bytes = &other } } });
     try std.testing.expect(topics_mod.mayRegister(owner_box, "amm"));
     // Refused in the app's own box, even from the instance itself, and in `<app>/submit`.
-    for ([_][]const u8{ "amm", "amm/submit", "amm/overlayx", "ammx/overlay", "overlay" }) |box| {
+    for ([_][]const u8{ "amm", "amm/submit", "amm/overlay", "amm/registerx", "ammx/register", "register" }) |box| {
         for ([_][]const u8{ &me, &other }) |sender| {
             const args = try mapOf(a, &.{ .{ .key = "box", .value = .{ .text = box } }, .{ .key = "sender", .value = .{ .bytes = sender } } });
             try std.testing.expect(!topics_mod.mayRegister(args, "amm"));
         }
     }
+    // An app named `overlay` (why 0.7.7 renamed the box): `overlay/register` accepted, its own box `overlay` refused.
+    try std.testing.expect(topics_mod.mayRegister(try mapOf(a, &.{.{ .key = "box", .value = .{ .text = "overlay/register" } }}), "overlay"));
+    try std.testing.expect(!topics_mod.mayRegister(try mapOf(a, &.{.{ .key = "box", .value = .{ .text = "overlay" } }}), "overlay"));
     // No box: the app's own, refused.
     try std.testing.expect(!topics_mod.mayRegister(try mapOf(a, &.{}), "amm"));
     const why = try topics_mod.notHere(a, "register", try mapOf(a, &.{.{ .key = "box", .value = .{ .text = "amm/submit" } }}), "amm");
-    try std.testing.expectEqualStrings("register: not taken in box amm/submit; send it in amm/overlay", why);
-    // The manifest's rows: registrations in `overlay` from the owner; submissions in `submit` (0.7.6), open to anyone, the door decoding the BEEF; no open row on the app's own box.
+    try std.testing.expectEqualStrings("register: not taken in box amm/submit; send it in amm/register", why);
+    // The manifest's rows: registrations in `register` from the owner (0.7.7); submissions in `submit` (0.7.6), open to anyone, the door decoding the BEEF; no open row on the app's own box.
     const manifest = @embedFile("etc/app.json");
-    try std.testing.expect(std.mem.indexOf(u8, manifest, "{\"address\": \"overlay\", \"sender\": \"$owner\", \"program\": \"overlay\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "{\"address\": \"register\", \"sender\": \"$owner\", \"program\": \"overlay\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "{\"address\": \"submit\", \"sender\": \"*\", \"program\": \"overlay\", \"filter\": \"beef\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"address\": \"\"") == null);
 

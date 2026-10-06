@@ -4,7 +4,7 @@ The overlay services engine for a [skein](https://github.com/shruggr/skein),
 as an app: BRC-22 submit and BRC-24 lookup, served by the instance's own
 front door, with topic managers and lookup services as programs the engine
 calls. It is also a Zig package: an overlay of your own depends on it for
-the topic and lookup contracts. Version **0.7.6**.
+the topic and lookup contracts. Version **0.7.7**.
 
 ## What it is
 
@@ -160,7 +160,7 @@ The manifest (`etc/app.json`, this repo's own, description left out):
 {
   "kind": "app",
   "name": "overlay",
-  "version": "0.7.6",
+  "version": "0.7.7",
   "programs": {
     "overlay": "bin/overlay.wasm",
     "topic-demo": "bin/topic-demo.wasm",
@@ -175,7 +175,7 @@ The manifest (`etc/app.json`, this repo's own, description left out):
   },
   "requires": ["chain/1"],
   "dispatch": [
-    {"address": "overlay", "sender": "$owner", "program": "overlay"},
+    {"address": "register", "sender": "$owner", "program": "overlay"},
     {"address": "submit", "sender": "*", "program": "overlay", "filter": "beef"},
     {"transport": "http", "address": "/listTopicManagers", "sender": "*", "program": "overlay", "fn": "listTopicManagers"},
     {"transport": "http", "address": "/listLookupServiceProviders", "sender": "*", "program": "overlay", "fn": "listLookupServiceProviders"},
@@ -193,7 +193,7 @@ The manifest (`etc/app.json`, this repo's own, description left out):
   `<topic>`, `<topic>-admit`, `<topic>-proof`, and box `<app>` from `event`
   and from `$self`. The install prompt reads them all aloud.
 - One box per function class (shruggr/skein#128), three boxes:
-  `<app>/submit` for submissions, `<app>/overlay` for registration, `<app>`
+  `<app>/submit` for submissions, `<app>/register` for registration, `<app>`
   for the engine's own events and messages.
 - The row `submit` (`<app>/submit`), open to anyone, is where submissions
   arrive: as messages (`{fn: "submit", args: {beef, topics}}`; the door
@@ -201,7 +201,7 @@ The manifest (`etc/app.json`, this repo's own, description left out):
   `POST /submit` admits (0.7.6). The answers go to the sender in that box.
   An app whose own box `<app>` belongs to another program (skein-amm, say)
   keeps this row as is: both kinds of submission land in `<app>/submit`.
-- The row `overlay` (`<app>/overlay`, from `$owner`) takes `register` /
+- The row `register` (`<app>/register`, from `$owner`) takes `register` /
   `deregister`; they are refused in any other box.
 - The derived rows on `<app>` (from `event`, from `$self`) take the libp2p
   routes' admits (a gossiped or streamed submission's routed event, a
@@ -224,9 +224,9 @@ Topics may be declared in `config.overlay.topics` (an overlay with fixed
 topics, e.g. OpNS's one global topic) or registered at runtime: one call
 per topic. A dynamic overlay (one topic per token, `tm_<txid>`) declares
 none and registers the ones the operator runs. The engine's two functions:
-the owner sends them to the app's `overlay` box (the manifest row
-`{"address": "overlay", "sender": "$owner", "program": "overlay"}`; a
-mailbox address is relative to the app, so installed it is `<app>/overlay`,
+the owner sends them to the app's `register` box (the manifest row
+`{"address": "register", "sender": "$owner", "program": "overlay"}`; a
+mailbox address is relative to the app, so installed it is `<app>/register`,
 shruggr/skein#128):
 
 ```
@@ -244,10 +244,10 @@ door decodes the BEEF as for `/submit`), `<topic>-admit` (`peerAdmit`) and
 `deregister` emits `unsubscribe {topic}` for the three (skein #119): the
 host subscribes and routes by them. Who may call is your manifest's row,
 e.g. the one above (the function is the body's `fn`). The engine takes
-them only in the box `overlay` (`<app>/overlay`, one box per function
-class, shruggr/skein#128, 0.7.5); in any other box — `<app>`,
+them only in the box `register` (`<app>/register`, one box per function
+class, shruggr/skein#128, 0.7.5, 0.7.7); in any other box — `<app>`,
 `<app>/submit` — they are refused with `bad-args` (`register: not taken in
-box <box>; send it in <app>/overlay`), writing and emitting nothing. The
+box <box>; send it in <app>/register`), writing and emitting nothing. The
 answer goes back in the box they came in. A lookup service without a `topics`
 list listens to every topic, declared or registered. docs/OVERLAY.md
 "Register a topic" has the rest.
@@ -281,7 +281,7 @@ Not built: BRC-88 SHIP/SLAP, GASP sync and catch-up from a peer, the
 
 | | |
 |---|---|
-| this app and package | 0.7.6 (tag `v0.7.6`) |
+| this app and package | 0.7.7 (tag `v0.7.7`) |
 | skein-sdk | v0.7.1, by tag URL and hash in `build.zig.zon` (modules `chain` and, for the engine, `sk`; bsvz comes through it) |
 | requires | `chain/1` (shruggr/skein-chain 0.3.0) |
 | skein | log format 8; skein's equivs pin this repo by commit |
@@ -379,7 +379,17 @@ skein install's derived http row `/<app>/submit` is unchanged (only where
 its handler admits moved). The libp2p routes still admit their routed
 `submit` event (and `peer-admit`) into `<app>` through the derived `event`
 row, and the engine's `watch` / `resume` stay there; registration stays in
-`<app>/overlay`.
+`<app>/overlay` (renamed in 0.7.7).
+
+0.7.7: the registration box is `register` (`<app>/register`; was
+`overlay`): the manifest row is `{"address": "register", "sender":
+"$owner", "program": "overlay"}`, named for its function class like
+`submit`. Why: a manifest row whose address equals the app's name is the
+app's own box (shruggr/skein#128), so for an app named `overlay` the row
+`overlay` resolved to `overlay`, not `overlay/overlay`, and 0.7.5's
+register-only-in-`<app>/overlay` refused the owner. An app embedding the
+engine renames its row `overlay` → `register`; the owner sends to
+`<app>/register`.
 
 ## Contributing
 

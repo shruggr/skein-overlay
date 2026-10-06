@@ -29,8 +29,8 @@
 //! the registered set now).
 //!
 //! One box per function class (shruggr/skein#128, 0.6.2; 0.7.5): either
-//! message is taken only in the box the manifest names `overlay` (resolved
-//! `<app>/overlay`), from the row `{address: "overlay", sender: "$owner",
+//! message is taken only in the box the manifest names `register` (resolved
+//! `<app>/register`; 0.7.7, was `overlay`), from the row `{address: "register", sender: "$owner",
 //! program: "overlay"}`; in any other box (the app's own `<app>`,
 //! `<app>/submit`, …) it is refused with `bad-args`, writing and emitting
 //! nothing. `submit` is the other class: taken in any box a row routes to
@@ -175,12 +175,12 @@ pub fn asked(body: Value) Asked {
     return .other;
 }
 
-/// The box, after the app's name, the manifest names for registrations: `overlay`, resolved
-/// `<app>/overlay`.
-pub const register_box = "overlay";
+/// The box, after the app's name, the manifest names for registrations: `register`, resolved
+/// `<app>/register` (0.7.7; was `overlay`, which for an app named `overlay` is the app's own box).
+pub const register_box = "register";
 
 /// Whether a registration may be taken here (one box per function class, shruggr/skein#128,
-/// 0.7.5): only in the box `<app>/overlay`, from whoever the manifest's row for it admits (the
+/// 0.7.5, 0.7.7): only in the box `<app>/register`, from whoever the manifest's row for it admits (the
 /// stock manifest: `$owner`). In any other box — the app's own `<app>`, `<app>/submit`, … — it is
 /// refused (`notHere`), whoever sent it.
 pub fn mayRegister(args: Value, app: []const u8) bool {

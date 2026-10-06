@@ -26,7 +26,7 @@
 //!                             come; it is routed again — its thread launched, paused again, or dropped.
 //!   a peer's admit            the `peer-admit` event the `-admit` route admits (box `<app>`):
 //!                             recorded under `<app>/gossip`.
-//!   register / deregister     a message in the box `<app>/overlay` only (one box per function
+//!   register / deregister     a message in the box `<app>/register` only (one box per function
 //!                             class, shruggr/skein#128, 0.7.5; refused `bad-args` elsewhere),
 //!                             {fn: "register", args: {topic, program}} or {fn: "deregister",
 //!                             args: {topic}}, from whoever that row admits (topics.zig,
@@ -131,7 +131,7 @@ fn answersField(fields: *std.ArrayList(cbor.Entry), a: Allocator) !void {
 }
 
 /// `register {topic, program}` / `deregister {topic}` (topics.zig, shruggr/skein#120): a message in
-/// the box `<app>/overlay` (one box per function class, shruggr/skein#128, 0.7.5), `{fn, args}`, from
+/// the box `<app>/register` (one box per function class, shruggr/skein#128, 0.7.5), `{fn, args}`, from
 /// whoever its row admits; in any other box refused (`bad-args`); the app is the step's. The set written under
 /// `<app>/topics` and the events emitted when it changes; the answer `{fn, request, replyTo,
 /// result: {topic, active} | error: {code, message}}` (skein docs/APPS.md §4) to the sender when a
@@ -212,7 +212,7 @@ fn run(a: Allocator) anyerror!void {
         const body = try s.getValue(a, bc);
         // A submission (shruggr/skein#112): from anyone a row admits, in any box routed here.
         if (eql(u8, body.getText("fn") orelse "", "submit")) return submissionStep(a, step, body, try messageSource(a, step, args));
-        // Register or deregister a topic: taken only in the box `<app>/overlay` (one box per
+        // Register or deregister a topic: taken only in the box `<app>/register` (one box per
         // function class, skein #128, 0.7.5); in any other, refused (`bad-args`).
         switch (topics.asked(body)) {
             .register => return registration(a, step, args, body, "register"),
