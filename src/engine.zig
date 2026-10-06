@@ -24,6 +24,10 @@
 //!   a resume                  the message {fn: "resume", args: {txid}} in box `<app>` from the
 //!                             instance itself (skein-overlay#1): a paused submission's parent has
 //!                             come; it is routed again — its thread launched, paused again, or dropped.
+//!   a wait                    the message {fn: "wait", args: {txid}} in box `<app>` from the
+//!                             instance itself (0.9.1): a POST /submit request waiting on a paused
+//!                             submission — one of its waiters, answered when the pause ends, or
+//!                             answered at once (submit.zig `waitOn`).
 //!   a peer's admit            the `peer-admit` event the `-admit` route admits (box `<app>`):
 //!                             recorded under `<app>/gossip`.
 //!   register / deregister     a message in the box `<app>/register` only (one box per function
@@ -269,6 +273,7 @@ fn run(a: Allocator) anyerror!void {
         if (!eql(u8, args.getBytes("sender") orelse "", me)) return error.NotFromThisInstance;
         const func = body.getText("fn") orelse "";
         if (eql(u8, func, "resume")) return resumeStep(a, step, body.get("args") orelse return error.BadInput);
+        if (eql(u8, func, "wait")) return waitStep(a, step, args, body);
         if (!eql(u8, func, "watch")) return error.UnknownFn;
         watch_args = body.get("args") orelse return error.BadInput;
         op = if (reply == null) "watch" else "watched";
@@ -397,6 +402,34 @@ fn resumeStep(a: Allocator, step: Value, rargs: Value) !void {
     var fields: std.ArrayList(cbor.Entry) = .empty;
     try fields.append(a, .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &c.header.toHex(txid)) } });
     try settled(a, step, &loaded, try submit.resumed(cx, txid), &fields, "resume");
+}
+
+/// `wait {txid}` (0.9.1), a message from the instance itself in the app's box: an HTTP request waiting
+/// on a paused submission (POST /submit, routes.zig). While it is paused the message joins its
+/// waiters, answered when the pause ends; else it is answered now (submit.zig `waitOn`). An answer
+/// to a `wait` (`replyTo`) that found no request awaiting it is routed here too: nothing to do.
+fn waitStep(a: Allocator, step: Value, args: Value, body: Value) !void {
+    const s = vm.store();
+    if (body.get("replyTo") != null) {
+        _ = try vm.finish(a, s, try resultRecord(a, "wait", &.{.{ .key = "outcome", .value = .{ .text = "late" } }}));
+        return;
+    }
+    const wargs = body.get("args") orelse return error.BadInput;
+    const txid = c.header.fromHex(wargs.getText("txid") orelse return error.BadInput) catch return error.BadInput;
+    const w = args.getCid("message") orelse return error.BadInput;
+    var loaded = try ev_.load(a, step);
+    loaded.st.now = @intCast(step.getUint("at") orelse return error.BadInput);
+    const cx = try stepCtx(a, step, &loaded.st);
+    const outcome = try submit.waitOn(cx, txid, w);
+    var fields: std.ArrayList(cbor.Entry) = .empty;
+    try fields.appendSlice(a, &.{
+        .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &c.header.toHex(txid)) } },
+        .{ .key = "outcome", .value = .{ .text = @tagName(outcome) } },
+    });
+    const new_state = try loaded.st.save();
+    if (loaded.head == null or !eql(u8, loaded.head.?, new_state)) try vm.advance(try ev_.stateHead(a, step), new_state);
+    try fields.append(a, .{ .key = "state", .value = .{ .cid = new_state } });
+    _ = try vm.finish(a, s, try resultRecord(a, "wait", fields.items));
 }
 
 /// A submission by message (shruggr/skein#112): `{fn: "submit", args: {beef, topics,

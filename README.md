@@ -4,17 +4,18 @@ The overlay services engine for a [skein](https://github.com/shruggr/skein),
 as an app: BRC-22 submit and BRC-24 lookup, served by the instance's own
 front door, with topic managers and lookup services as programs the engine
 calls. It is also a Zig package: an overlay of your own depends on it for
-the topic and lookup contracts. Version **0.9.0**.
+the topic and lookup contracts. Version **0.9.1**.
 
 ## What it is
 
-- **The engine** (`bin/overlay.wasm`): a submission is a message, `{fn:
-  "submit", args: {beef, topics}}`, into the app's box (`POST /submit`
-  carries the same message and answers delivery only). The engine decodes
+- **The engine** (`bin/overlay.wasm`): two ways to submit. `POST /submit`
+  is BRC-22: the request waits on the submission's thread and answers the
+  STEAK (0.9.1). A submission by message, `{fn: "submit", args: {beef,
+  topics}}`, into the app's box `<app>/submit`, is answered by message. The engine decodes
   the BEEF once, asks the topic managers to judge it by CID, and hands it to
   the chain app ([shruggr/skein-chain](https://github.com/shruggr/skein-chain),
   required as `chain/1`) with `ingest`. It is admitted on the chain app's
-  first `accepted` or `proven` answer. The submitter is answered by message,
+  first `accepted` or `proven` answer. A message's submitter is answered by message,
   in its own box: **admitted** (status `pending`, the STEAK per topic), then
   **every proof**, or **rejected**. Nothing persists unless a topic takes
   it, apart from the request. `/lookup` is a read.
@@ -78,14 +79,16 @@ Its BRC-23 base URL is `https://<handle>.<host>/<app>`; on a host without
 wildcard DNS (local dev) the router also serves it as `/@<handle>/<app>` on
 the host's origin. Its endpoints are under it: `POST <base>/submit`
 (`POST https://alice.skein.nexus/overlay/submit`, or
-`POST http://127.0.0.1:8100/@alice/overlay/submit`), a message route that
-takes a signed request (BRC-104; unsigned, 401), open to any key; and the
+`POST http://127.0.0.1:8100/@alice/overlay/submit`), a route that takes a
+signed request (BRC-104) from any key, or an unsigned one whose BEEF
+validates (skein's front door, shruggr/skein#135); and the
 reads, open to anyone, signed or not: `POST <base>/lookup` and the listing
 and documentation paths (shruggr/skein#135). The @bsv/sdk
 `TopicBroadcaster` and `LookupResolver` reject a base URL with a path, so
 call the endpoints directly (`POST <base>/submit` with the BEEF and
-`X-Topics`). `/submit` answers `200 {id}` on delivery, not BRC-22's STEAK:
-the verdict comes later, by message (docs/OVERLAY.md, "Submitting").
+`X-Topics`). `/submit` answers BRC-22's STEAK once the submission is
+decided (503 + `Retry-After` when nothing is decided within the host's
+bound; resubmit to poll the same flow): docs/OVERLAY.md, "Submitting".
 
 ### Write an overlay of your own
 
@@ -162,7 +165,7 @@ The manifest (`etc/app.json`, this repo's own, description left out):
 {
   "kind": "app",
   "name": "overlay",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "programs": {
     "overlay": "bin/overlay.wasm",
     "topic-demo": "bin/topic-demo.wasm",
@@ -202,18 +205,18 @@ The manifest (`etc/app.json`, this repo's own, description left out):
   only reads. The overlay's reads are `/lookup` (derived) and the four
   listing and documentation paths above (the manifest's own). A **row**
   (`dispatch[]`) is a message route or a box: an `http` row takes a signed
-  request (BRC-104; the stock TopicBroadcaster's plain POST `/submit` gets
-  401), and every row's message is an entry in the log. A read and an http
+  request (BRC-104), and every row's message is an entry in the log. A read and an http
   row never share a path.
 - One box per function class (shruggr/skein#128), three boxes:
   `<app>/submit` for submissions, `<app>/register` for registration, `<app>`
   for the engine's own events and messages.
 - The row `submit` (`<app>/submit`), open to anyone, is where submissions
-  arrive: as messages (`{fn: "submit", args: {beef, topics}}`; the door
-  decodes the BEEF, `filter: "beef"`), and as the `submission` event
-  `POST /submit` admits (0.7.6). The answers go to the sender in that box.
-  An app whose own box `<app>` belongs to another program (skein-amm, say)
-  keeps this row as is: both kinds of submission land in `<app>/submit`.
+  by message arrive (`{fn: "submit", args: {beef, topics}}`; the door
+  decodes the BEEF, `filter: "beef"`). The answers go to the sender in that
+  box. An app whose own box `<app>` belongs to another program (skein-amm,
+  say) keeps this row as is. `POST /submit` (the derived http row) runs in
+  the request's step and waits; its threads and `wait` messages use the
+  derived `<app>` rows.
 - The row `register` (`<app>/register`, from `$owner`) takes `register` /
   `deregister`; they are refused in any other box.
 - The derived rows on `<app>` (from `event`, from `$self`) take the libp2p
@@ -298,7 +301,7 @@ Not built: BRC-88 SHIP/SLAP, GASP sync and catch-up from a peer, the
 
 | | |
 |---|---|
-| this app and package | 0.9.0 (tag `v0.9.0`) |
+| this app and package | 0.9.1 (tag `v0.9.1`) |
 | skein-sdk | v0.7.1, by tag URL and hash in `build.zig.zon` (modules `chain` and, for the engine, `sk`; bsvz comes through it) |
 | requires | `chain/1` (shruggr/skein-chain 0.3.0) |
 | skein | log format 8; skein's equivs pin this repo by commit |
@@ -439,6 +442,21 @@ window}` when a market and `beacon {topic: "<topic>-live", every, body:
 likewise. Nothing extra at a start or re-read. A value that is not an
 integer from 1 000 ms to a day refuses the registration (`bad-args`).
 docs/OVERLAY.md "Market and validator". The manifest's rows are unchanged.
+
+0.9.1: `POST /submit` is BRC-22 and synchronous again (shruggr/skein#112;
+David, 2026-10-07: "the HTTP `/submit` route is BRC-22 or it does not exist; it never returns a different shape").
+The route launches the submission's thread and waits on it (skein's
+wait-on-thread, as 0.7.1 did), answering the STEAK; 400 for a BEEF that
+does not verify or a transaction the chain app rejected; 200 with the empty
+STEAK when no topic takes it; 503 + `Retry-After` when nothing is decided.
+A resubmission is a poll on the same flow: in progress, it waits on the
+same thread; judged, the first submission's STEAK from the state, nothing
+run again. A submission lacking a parent pauses as before, and its requests
+wait for the pause to end (the engine's `wait` message, answered when the
+pause ends); several waiters are all answered. A submission by message into
+`<app>/submit` is unchanged, answered by messages. 0.7.3–0.9.0's
+`submission` event is still stepped (a log written then).
+docs/OVERLAY.md "Submitting". The manifest's rows are unchanged.
 
 ## Contributing
 

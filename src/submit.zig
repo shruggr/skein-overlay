@@ -55,7 +55,9 @@
 //!
 //! shruggr/skein#112 (0.7.2): a submission is a message, `{fn: "submit",
 //! args: {beef, topics, offChainValues?}}`, into a box a row routes to the
-//! engine (`received`); POST /submit carries the same message. Its answers go
+//! engine (`received`); POST /submit is the other path (0.9.1: BRC-22,
+//! synchronous, routes.zig; its requests wait on a pause by `wait`, `waitOn`,
+//! answered when the pause ends). A message submission's answers go
 //! to the sender, in the box it came in (skein docs/APPS.md §4: `{fn:
 //! "submit", request, replyTo, result}`): **admitted** with status `pending`
 //! (the chain app's `accepted`; `proven` when admitted at its proof), the
@@ -465,6 +467,12 @@ pub fn begin(cx: Ctx, ev: Value) !Begun {
     const a = cx.a;
     const txid = try txidOf(ev);
     if (ev.get("waiting") != null) return pause(cx, ev, txid);
+    // A paused submission of this subject taken whole now: its waiters woken (0.9.1) — the ones its
+    // event carries (`settle` took them off the pause), or the pause's own (a libp2p resubmission).
+    if (ev.getArray("wakes")) |ws| for (ws) |w| {
+        _ = try cx.wire.send(cx.a, calls.appOf(cx.in), try wakeBody(cx.a, w.cid, txid));
+    };
+    if (try cx.st.isPaused(txid)) _ = try wakeWaiters(cx, txid);
     try unwantAll(cx.st, txid);
     const beef = Input.of(ev.get("beef")) orelse return error.BadEvent;
     const its = try itemsOf(a, ev);
@@ -512,7 +520,9 @@ fn pause(cx: Ctx, ev: Value, txid: [32]u8) !Begun {
     const none = own == null or had.none;
     try st.unwant(txid, before);
     const ec = try st.store.putValue(a, ev);
-    try st.putPending(txid, .{ .thread = cx.thread, .waiting = waiting, .event = ec });
+    // Paused again: its waiters wait on (0.9.1).
+    const wakes = if (try st.pendingRecord(txid)) |prior| try wakesOf(a, prior) else &.{};
+    try st.putPending(txid, .{ .thread = cx.thread, .waiting = waiting, .event = ec, .wakes = wakes });
     for (waiting) |w| for (topics) |t| {
         if (none) try st.want(w, t, null, txid);
         for (peers.items) |p| try st.want(w, t, p, txid);
@@ -556,6 +566,66 @@ fn unwantAll(st: *State, txid: [32]u8) !void {
 fn unpause(st: *State, txid: [32]u8) !void {
     try unwantAll(st, txid);
     try st.dropPending(txid);
+}
+
+// ---------------------------------------------------------------- waiting on a pause (0.9.1)
+
+/// A paused submission's waiters (`State.Pending.wakes`): the `wait` messages of the HTTP requests
+/// waiting on it.
+pub fn wakesOf(a: Allocator, rec: Value) ![]const []const u8 {
+    const ws = rec.getArray("wakes") orelse return &.{};
+    const out = try a.alloc([]const u8, ws.len);
+    for (ws, out) |w, *o| o.* = if (w == .cid) w.cid else return error.BadState;
+    return out;
+}
+
+/// The message an HTTP request waiting on a paused submission sends the instance itself (box
+/// `<app>`) and awaits (0.9.1): `{fn: "wait", args: {txid (hex)}}`. Its answer wakes the request,
+/// which reads the state again.
+pub fn waitBody(a: Allocator, txid: [32]u8) !Value {
+    return .{ .map = try a.dupe(cbor.Entry, &.{
+        .{ .key = "fn", .value = .{ .text = "wait" } },
+        .{ .key = "args", .value = .{ .map = try a.dupe(cbor.Entry, &.{.{ .key = "txid", .value = try hexText(a, txid) }}) } },
+    }) };
+}
+
+/// The answer to a `wait` message `w`: `{fn: "wait", request: w, replyTo: w, result: {txid}}`, to the
+/// instance itself in box `<app>` (routed by its `replyTo` to the request awaiting it).
+pub fn wakeBody(a: Allocator, w: []const u8, txid: [32]u8) !Value {
+    return .{ .map = try a.dupe(cbor.Entry, &.{
+        .{ .key = "fn", .value = .{ .text = "wait" } },
+        .{ .key = "request", .value = .{ .cid = w } },
+        .{ .key = "replyTo", .value = .{ .cid = w } },
+        .{ .key = "result", .value = .{ .map = try a.dupe(cbor.Entry, &.{.{ .key = "txid", .value = try hexText(a, txid) }}) } },
+    }) };
+}
+
+/// The pause of this subject ends (resumed whole, routed to nothing, judged before): each waiter
+/// answered. → how many.
+fn wakeWaiters(cx: Ctx, txid: [32]u8) !usize {
+    const rec = (try cx.st.pendingRecord(txid)) orelse return 0;
+    const ws = try wakesOf(cx.a, rec);
+    for (ws) |w| _ = try cx.wire.send(cx.a, calls.appOf(cx.in), try wakeBody(cx.a, w, txid));
+    return ws.len;
+}
+
+/// A `wait` message `w` about `txid` (0.9.1), from an HTTP request of the instance: while the
+/// submission is paused, `w` joins its waiters (answered when the pause ends); otherwise it is
+/// answered at once (the request reads the state again: pending in a thread, judged, rejected).
+pub fn waitOn(cx: Ctx, txid: [32]u8, w: []const u8) !enum { waiting, answered } {
+    if (try cx.st.isPaused(txid)) {
+        const rec = (try cx.st.pendingRecord(txid)).?;
+        var p = try pendingOf(rec);
+        p.waiting = try hexList(cx.a, rec.get("waiting"));
+        p.event = rec.getCid("event");
+        const prior = try wakesOf(cx.a, rec);
+        for (prior) |x| if (eql(u8, x, w)) return .waiting;
+        p.wakes = try std.mem.concat(cx.a, []const u8, &.{ prior, &.{w} });
+        try cx.st.putPending(txid, p);
+        return .waiting;
+    }
+    _ = try cx.wire.send(cx.a, calls.appOf(cx.in), try wakeBody(cx.a, w, txid));
+    return .answered;
 }
 
 /// What the chain app said: an answer body `{fn, request, replyTo, result: {txid, tx, state, …}}`
@@ -703,7 +773,7 @@ fn answerRejected(cx: Ctx, source: ?Value, txid: ?[32]u8, reason: []const u8) !v
 /// hears `rejected`, at once; the items go on.
 const not_admitted = "NotAdmitted: no topic admitted an output or consumed a previous coin";
 
-fn subjectTaken(ev: Value) bool {
+pub fn subjectTaken(ev: Value) bool {
     const js = ev.getArray("topics") orelse return false;
     return js.len > 0;
 }
@@ -912,31 +982,48 @@ fn settle(cx: Ctx, r: Routed, txid_: ?[32]u8, topics: []const []const u8, source
     switch (r) {
         .paused => |p| return .{ .paused = try begin(cx, p.event) },
         .admit => |x| {
-            try unpauseIf(cx.st, x.txid);
+            // Its waiters go with the event: the launched thread's first step wakes them, once its
+            // pending record names it (0.9.1).
+            var ev = x.event;
+            if (try cx.st.isPaused(x.txid)) {
+                const wakes = try wakesOf(cx.a, (try cx.st.pendingRecord(x.txid)).?);
+                try unpause(cx.st, x.txid);
+                if (wakes.len > 0) ev = try withWakes(cx.a, ev, wakes);
+            }
             if (!subjectTaken(x.event)) try answerRejected(cx, source, x.txid, not_admitted);
-            return .{ .launch = x.event };
+            return .{ .launch = ev };
         },
         .pending => return .none,
         .refused => |why| {
-            if (txid_) |t| try unpauseIf(cx.st, t);
+            if (txid_) |t| try unpauseIf(cx, t);
             try answerRejected(cx, source, txid_, why);
             return .{ .dropped = why };
         },
         .nothing => |why| {
-            if (txid_) |t| try unpauseIf(cx.st, t);
+            if (txid_) |t| try unpauseIf(cx, t);
             try answerRejected(cx, source, txid_, why);
             return .{ .dropped = why };
         },
         .unchanged => |t| {
-            try unpauseIf(cx.st, t);
+            try unpauseIf(cx, t);
             try answerJudged(cx, source, t, topics);
             return .{ .dropped = "judged before" };
         },
     }
 }
 
-fn unpauseIf(st: *State, txid: [32]u8) !void {
-    if (try st.isPaused(txid)) try unpause(st, txid);
+/// A submit event carrying the waiters of the pause it ends (`wakes`, 0.9.1).
+fn withWakes(a: Allocator, ev: Value, wakes: []const []const u8) !Value {
+    const ws = try a.alloc(Value, wakes.len);
+    for (wakes, ws) |w, *o| o.* = .{ .cid = w };
+    return .{ .map = try std.mem.concat(a, cbor.Entry, &.{ ev.map, &.{.{ .key = "wakes", .value = .{ .array = ws } }} }) };
+}
+
+fn unpauseIf(cx: Ctx, txid: [32]u8) !void {
+    if (try cx.st.isPaused(txid)) {
+        _ = try wakeWaiters(cx, txid);
+        try unpause(cx.st, txid);
+    }
 }
 
 /// A `resume` step: the paused submission of this subject routed again, as the route does, with

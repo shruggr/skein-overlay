@@ -245,6 +245,9 @@ pub const State = struct {
         via: ?[]const u8 = null,
         waiting: []const [32]u8 = &.{},
         event: ?[]const u8 = null,
+        /// A paused submission's waiters (0.9.1): the `wait` messages of the HTTP requests waiting on
+        /// it, each answered (`replyTo`) when the pause ends.
+        wakes: []const []const u8 = &.{},
     };
 
     pub fn putPending(self: *State, txid: [32]u8, p: Pending) !void {
@@ -265,6 +268,11 @@ pub const State = struct {
             try fields.append(a, .{ .key = "waiting", .value = .{ .array = ws } });
         }
         if (p.event) |e| try fields.append(a, .{ .key = "event", .value = .{ .cid = e } });
+        if (p.wakes.len > 0) {
+            const ws = try a.alloc(Value, p.wakes.len);
+            for (p.wakes, ws) |w, *o| o.* = .{ .cid = w };
+            try fields.append(a, .{ .key = "wakes", .value = .{ .array = ws } });
+        }
         try self.map("pending").putLink(&txid, try self.store.putValue(a, .{ .map = fields.items }));
     }
 

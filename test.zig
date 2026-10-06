@@ -406,6 +406,30 @@ const Instance = struct {
         return r;
     }
 
+    /// POST /submit's handler (0.9.1): the first call, or a call again (`again`), over a write cache of its own.
+    fn http(self: *Instance, req: Value, again: bool) !routes.HttpNext {
+        var ovl = Overlay{ .inner = self.ms.store(), .arena = self.a };
+        self.current = ovl.store();
+        defer self.current = self.ms.store();
+        const ch = try state.chainView(self.a, ovl.store(), self.chain_root, .regtest);
+        var st = try state.State.load(self.a, ovl.store(), self.ov_root, ch);
+        st.now = self.now;
+        const sub = (try routes.httpRequest(self.a, req)).ok;
+        const source = try mapOf(self.a, &.{
+            .{ .key = "transport", .value = .{ .text = "http" } },
+            .{ .key = "request", .value = .{ .cid = req.getCid("request").? } },
+        });
+        return if (again) routes.httpAgain(self.a, self.caller(), &st, self.in, sub, source) else routes.httpFirst(self.a, self.caller(), &st, self.in, sub, source);
+    }
+
+    /// A `wait` message's step (0.9.1): `w` about `txid`.
+    fn waitOn(self: *Instance, txid: [32]u8, w: []const u8) !@typeInfo(@typeInfo(@TypeOf(submit.waitOn)).@"fn".return_type.?).error_union.payload {
+        var st = try self.load();
+        const r = try submit.waitOn(self.cx(&st, true), txid, w);
+        self.ov_root = try st.save();
+        return r;
+    }
+
     fn pending(self: *Instance, txid: [32]u8) !bool {
         var st = try self.load();
         return st.isPending(txid);
@@ -1952,7 +1976,125 @@ test "wants {txid, topic, peer?} (shruggr/skein#112): a gossip pause wants the p
     try std.testing.expectEqual(@as(usize, 0), try st.map("wants").count());
 }
 
-test "a submission over HTTP (shruggr/skein#112, 0.7.3; box 0.7.6): the route answers delivery (200 {id}) and admits the submission event into the box `<app>/submit`, launching nothing; the box step routes it; a missing parent pauses with a want of no peer; the parent's arrival clears it" {
+/// A POST /submit request as the front door hands it: X-Topics `tm_demo`, the BEEF, the request record.
+fn httpReq(a: Allocator, bytes: []const u8, name: []const u8) !Value {
+    return mapOf(a, &.{
+        .{ .key = "headers", .value = try mapOf(a, &.{.{ .key = "x-topics", .value = .{ .text = "tm_demo" } }}) },
+        .{ .key = "body", .value = .{ .bytes = bytes } },
+        .{ .key = "request", .value = .{ .cid = try a.dupe(u8, &cbor.cidOf(name)) } },
+    });
+}
+
+/// The answer's status and its JSON body.
+fn httpAnswer(a: Allocator, next: routes.HttpNext) !struct { status: u64, json: std.json.Value, v: Value } {
+    const v = next.answer;
+    return .{ .status = v.getUint("status").?, .json = try std.json.parseFromSliceLeaky(std.json.Value, a, v.getBytes("body").?, .{}), .v = v };
+}
+
+test "POST /submit is BRC-22 and synchronous (0.9.1, shruggr/skein#112, David 2026-10-07): the thread launched and waited on, the STEAK; several waiters on one thread; a resubmission judged before answered from the state, nothing run again; undecided 503 with Retry-After; rejected 400; no topic 200 with the empty STEAK" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = c.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var inst = try Instance.init(a, &ms);
+    const x = try chain3(a, &inst);
+    const parent = try withFund(a, x.f, x.t1);
+
+    // Not a submission, or not a BEEF: 400 at once.
+    const no_topics = try mapOf(a, &.{.{ .key = "body", .value = .{ .bytes = parent } }});
+    try std.testing.expectEqual(@as(u64, 400), (try routes.httpRequest(a, no_topics)).refused.getUint("status").?);
+    const junk = try inst.http(try httpReq(a, "junk", "r0"), false);
+    try std.testing.expectEqual(@as(u64, 400), (try httpAnswer(a, junk)).status);
+
+    // Whole: the submission's thread launched on the submit event; the request waits on it (#66).
+    const first = try inst.http(try httpReq(a, parent, "r1"), false);
+    try std.testing.expect(first == .launch);
+    try std.testing.expectEqualStrings("submit", first.launch.getText("kind").?);
+    try std.testing.expect(first.launch.get("source").?.getCid("request") != null);
+    _ = try inst.begin(first.launch);
+    const thread = cbor.cidOf("the thread"); // the thread the harness steps (Instance.cx)
+    // Called again before a verdict (a deadline, say): the thread carries it — wait on it.
+    const mid = try inst.http(try httpReq(a, parent, "r1"), true);
+    try std.testing.expectEqualSlices(u8, &thread, mid.await_thread);
+    // A second request for the same submission while it is in progress: waits on that same thread.
+    const second = try inst.http(try httpReq(a, parent, "r2"), false);
+    try std.testing.expectEqualSlices(u8, &thread, second.await_thread);
+    const judged = inst.count("identify");
+
+    // The chain app accepts it: admitted; the thread comes to rest and every waiter answers the STEAK.
+    _ = try inst.ingest(parent);
+    _ = try inst.chainStatus(x.t1.txid, "RECEIVED", null);
+    try std.testing.expect((try inst.answer(x.t1.txid, .accepted)).admitted);
+    for ([_][]const u8{ "r1", "r2" }) |r| {
+        const ans = try httpAnswer(a, try inst.http(try httpReq(a, parent, r), true));
+        try std.testing.expectEqual(@as(u64, 200), ans.status);
+        const steak = ans.json.object.get("tm_demo").?.object;
+        try std.testing.expectEqual(@as(usize, 1), steak.get("outputsToAdmit").?.array.items.len);
+        try std.testing.expectEqual(@as(i64, 0), steak.get("outputsToAdmit").?.array.items[0].integer);
+    }
+    // Completed: a resubmission is answered from the state with the first submission's STEAK, nothing re-run.
+    const again = try httpAnswer(a, try inst.http(try httpReq(a, parent, "r3"), false));
+    try std.testing.expectEqual(@as(u64, 200), again.status);
+    try std.testing.expectEqual(@as(usize, 1), again.json.object.get("tm_demo").?.object.get("outputsToAdmit").?.array.items.len);
+    try std.testing.expectEqual(judged, inst.count("identify"));
+
+    // Nothing decided: the thread ended without a verdict (the chain app's error answer) — 503 with Retry-After; nothing launched again.
+    const child = try spend(a, &x.t1.tx, 0, &.{.{ 1, &x.k.token }}, x.k.priv);
+    const child_beef = try atomic(a, child);
+    const c1 = try inst.http(try httpReq(a, child_beef, "r4"), false);
+    try std.testing.expect(c1 == .launch);
+    _ = try inst.begin(c1.launch);
+    _ = try inst.answer(child.txid, .{ .failed = "the chain app could not take it" });
+    const undecided = try httpAnswer(a, try inst.http(try httpReq(a, child_beef, "r4"), true));
+    try std.testing.expectEqual(@as(u64, 503), undecided.status);
+    try std.testing.expectEqualStrings("30", undecided.v.get("headers").?.getText("retry-after").?);
+
+    // Rejected by the chain app: 400.
+    const c2 = try inst.http(try httpReq(a, child_beef, "r5"), false);
+    try std.testing.expect(c2 == .launch);
+    _ = try inst.begin(c2.launch);
+    _ = try inst.ingest(child_beef);
+    _ = try inst.chainStatus(child.txid, "REJECTED", null);
+    _ = try inst.answer(child.txid, .{ .rejected = "REJECTED" });
+    const rejected = try httpAnswer(a, try inst.http(try httpReq(a, child_beef, "r5"), true));
+    try std.testing.expectEqual(@as(u64, 400), rejected.status);
+
+    // Valid, taken by no topic (a plain payment): 200 with the empty STEAK (BRC-22), nothing launched.
+    const pay = try spend(a, &x.t1.tx, 1, &.{.{ 500, &x.k.p2pkh }}, x.k.priv);
+    const none = try httpAnswer(a, try inst.http(try httpReq(a, try atomic(a, pay), "r6"), false));
+    try std.testing.expectEqual(@as(u64, 200), none.status);
+    try std.testing.expectEqual(@as(usize, 0), none.json.object.get("tm_demo").?.object.get("outputsToAdmit").?.array.items.len);
+}
+
+test "POST /submit whose subject no topic takes, only a transaction before it (0.9.1): 200 with the empty STEAK at once, the submit event admitted into the app's box for its thread (nothing launched)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = c.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var inst = try Instance.init(a, &ms);
+    const x = try chain3(a, &inst);
+    const pay = try spend(a, &x.t1.tx, 1, &.{.{ 500, &x.k.p2pkh }}, x.k.priv);
+    const both = try beef.serialize(a, .{ .version = beef.V2, .bumps = x.f.bumps, .entries = try a.dupe(beef.Entry, &.{
+        x.f.entry,
+        .{ .txid = x.t1.txid, .format = .raw, .raw = x.t1.raw, .tx = x.t1.tx },
+        .{ .txid = pay.txid, .format = .raw, .raw = pay.raw, .tx = pay.tx },
+    }) });
+    const next = try inst.http(try httpReq(a, both, "r1"), false);
+    const ans = try httpAnswer(a, next);
+    try std.testing.expectEqual(@as(u64, 200), ans.status);
+    try std.testing.expectEqual(@as(usize, 0), ans.json.object.get("tm_demo").?.object.get("outputsToAdmit").?.array.items.len);
+    const admit = ans.v.getArray("admit").?;
+    try std.testing.expectEqual(@as(usize, 1), admit.len);
+    try std.testing.expectEqualStrings("overlay", admit[0].getText("box").?);
+    const ev = admit[0].get("event").?;
+    try std.testing.expectEqualStrings("submit", ev.getText("kind").?);
+    try std.testing.expectEqual(@as(usize, 0), ev.getArray("topics").?.len);
+    try std.testing.expectEqual(@as(usize, 1), ev.getArray("earlier").?.len);
+}
+
+test "POST /submit on a paused submission (0.9.1): the pause recorded by its thread, the request waits for it to end (`wait`), several waiters; paused again they wait on; the parent comes, the resumed thread wakes them, each waits on it and answers the STEAK" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -1962,61 +2104,111 @@ test "a submission over HTTP (shruggr/skein#112, 0.7.3; box 0.7.6): the route an
     const x = try chain3(a, &inst);
     const child = try atomic(a, x.t2);
 
-    // The route: X-Topics and a body make it a submission; the answer is delivery only.
-    const request = try a.dupe(u8, &cbor.cidOf("the request"));
-    const req = try mapOf(a, &.{
-        .{ .key = "headers", .value = try mapOf(a, &.{.{ .key = "x-topics", .value = .{ .text = "tm_demo" } }}) },
-        .{ .key = "body", .value = .{ .bytes = child } },
-        .{ .key = "request", .value = .{ .cid = request } },
-    });
-    const sub = (try routes.httpSubmission(a, req, "overlay")).admit;
-    try std.testing.expectEqual(@as(u64, 200), sub.answer.getUint("status").?);
-    const id = try std.json.parseFromSliceLeaky(std.json.Value, a, sub.answer.getBytes("body").?, .{});
-    try std.testing.expectEqualStrings(try @import("sk").hexAlloc(a, request), id.object.get("id").?.string);
-    // 0.7.3: no launch (a step that launches waits on it) — the answer admits one event into the submission box `<app>/submit` (0.7.6), and nothing else.
-    try std.testing.expect(sub.answer.get("wait") == null);
-    const admit = sub.answer.getArray("admit").?;
-    try std.testing.expectEqual(@as(usize, 1), admit.len);
-    try std.testing.expectEqualStrings("overlay/submit", admit[0].getText("box").?);
-    const ev = admit[0].get("event").?;
-    try std.testing.expectEqualStrings("submission", ev.getText("kind").?);
-    try std.testing.expect(ev.get("subject") == null); // routed by its box, waking no thread
-    try std.testing.expectEqualStrings("http", ev.getText("transport").?);
-    try std.testing.expectEqualSlices(u8, request, ev.getCid("request").?);
-    try std.testing.expect(ev.get("sender") == null); // an open route: no caller, the answers in the log only
-    const msg = ev.get("body").?;
-    try std.testing.expectEqualStrings("submit", msg.getText("fn").?);
-    try std.testing.expectEqualSlices(u8, child, msg.get("args").?.getBytes("beef").?);
-    try std.testing.expectEqualStrings("tm_demo", msg.get("args").?.getArray("topics").?[0].text);
-    // Not a submission: 400 at once, admitting nothing.
-    const bad = (try routes.httpSubmission(a, try mapOf(a, &.{.{ .key = "request", .value = .{ .cid = request } }}), "overlay")).refused;
-    try std.testing.expectEqual(@as(u64, 400), bad.getUint("status").?);
-    try std.testing.expect(bad.get("admit") == null);
+    // t2 lacks t1: no 400 — the paused event's thread launched (it records the pause and its want of no peer).
+    const first = try inst.http(try httpReq(a, child, "r1"), false);
+    try std.testing.expect(first == .launch);
+    try std.testing.expect(first.launch.get("waiting") != null);
+    _ = try inst.begin(first.launch);
+    try std.testing.expect(inst.begun.paused);
+    try std.testing.expectEqual(@as(usize, 1), inst.begun.wants.len);
+    try expectWant(inst.begun.wants[0], "want", x.t1.txid, null);
+    // That thread at rest, the request waits for the pause to end; so does a second request.
+    const r1 = try inst.http(try httpReq(a, child, "r1"), true);
+    try std.testing.expectEqualSlices(u8, &x.t2.txid, &r1.wait_pause);
+    const r2 = try inst.http(try httpReq(a, child, "r2"), false);
+    try std.testing.expectEqualSlices(u8, &x.t2.txid, &r2.wait_pause);
+    // Their `wait` messages: each joins the pause's waiters (once).
+    const w1 = try a.dupe(u8, &cbor.cidOf("wait 1"));
+    const w2 = try a.dupe(u8, &cbor.cidOf("wait 2"));
+    try std.testing.expectEqualStrings("waiting", @tagName(try inst.waitOn(x.t2.txid, w1)));
+    try std.testing.expectEqualStrings("waiting", @tagName(try inst.waitOn(x.t2.txid, w2)));
+    try std.testing.expectEqualStrings("waiting", @tagName(try inst.waitOn(x.t2.txid, w2)));
+    var st = try inst.load();
+    try std.testing.expectEqual(@as(usize, 2), (try submit.wakesOf(a, (try st.pendingRecord(x.t2.txid)).?)).len);
+    try std.testing.expect(try st.isPaused(x.t2.txid));
+    const waits = submit.waitBody;
+    try std.testing.expectEqualStrings("wait", (try waits(a, x.t2.txid)).getText("fn").?);
 
-    // The engine's step on the admitted event (box `overlay/submit`): the message step's, source from the event.
+    // Routed again while t1 is still missing (a stale resume): paused again, the waiters kept, none answered.
+    const sent0 = inst.wire_.sent.items.len;
+    try std.testing.expect((try inst.resumed(x.t2.txid)) == .paused);
+    st = try inst.load();
+    try std.testing.expectEqual(@as(usize, 2), (try submit.wakesOf(a, (try st.pendingRecord(x.t2.txid)).?)).len);
+    try std.testing.expectEqual(sent0, inst.wire_.sent.items.len);
+
+    // t1 comes: t2 resumed whole; its thread's first step answers both waits (replyTo), once its pending record names it.
+    const parent = try withFund(a, x.f, x.t1);
+    _ = try inst.begin((try inst.route(parent)).admit.event);
+    _ = try inst.ingest(parent);
+    _ = try inst.chainStatus(x.t1.txid, "RECEIVED", null);
+    try std.testing.expectEqual(@as(usize, 1), (try inst.answer(x.t1.txid, .accepted)).resumes.len);
+    const res = try inst.resumed(x.t2.txid);
+    try std.testing.expect(res == .launch);
+    try std.testing.expectEqual(@as(usize, 2), res.launch.getArray("wakes").?.len);
+    const before = inst.wire_.sent.items.len;
+    _ = try inst.begin(res.launch);
+    var woken: usize = 0;
+    for (inst.wire_.sent.items[before..]) |m| {
+        if (!std.mem.eql(u8, m.body.getText("fn") orelse "", "wait")) continue;
+        try std.testing.expectEqualStrings("overlay", m.box);
+        const to = m.body.getCid("replyTo").?;
+        try std.testing.expect(std.mem.eql(u8, to, w1) or std.mem.eql(u8, to, w2));
+        try std.testing.expectEqualStrings(&hdr.toHex(x.t2.txid), m.body.get("result").?.getText("txid").?);
+        woken += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), woken);
+    // Woken, each request waits on the resumed thread, then answers the STEAK.
+    const thread = cbor.cidOf("the thread");
+    try std.testing.expectEqualSlices(u8, &thread, (try inst.http(try httpReq(a, child, "r1"), true)).await_thread);
+    _ = try inst.ingest(child);
+    _ = try inst.chainStatus(x.t2.txid, "RECEIVED", null);
+    try std.testing.expect((try inst.answer(x.t2.txid, .accepted)).admitted);
+    for ([_][]const u8{ "r1", "r2" }) |r| {
+        const ans = try httpAnswer(a, try inst.http(try httpReq(a, child, r), true));
+        try std.testing.expectEqual(@as(u64, 200), ans.status);
+        try std.testing.expectEqual(@as(usize, 1), ans.json.object.get("tm_demo").?.object.get("outputsToAdmit").?.array.items.len);
+    }
+    // A `wait` once the pause is over is answered at once.
+    const late = try a.dupe(u8, &cbor.cidOf("wait 3"));
+    try std.testing.expectEqualStrings("answered", @tagName(try inst.waitOn(x.t2.txid, late)));
+    try std.testing.expectEqualSlices(u8, late, inst.wire_.last().body.getCid("replyTo").?);
+}
+
+test "a submission by message is unchanged by the synchronous route (0.9.1): `<app>/submit` routes it, answered by messages; 0.7.3–0.9.0's POST /submit `submission` event (a log written then) is still stepped as one" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = c.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var inst = try Instance.init(a, &ms);
+    const x = try chain3(a, &inst);
+    const child = try atomic(a, x.t2);
+    const request = try a.dupe(u8, &cbor.cidOf("the request"));
+    const ev = try mapOf(a, &.{
+        .{ .key = "kind", .value = .{ .text = "submission" } },
+        .{ .key = "body", .value = try mapOf(a, &.{
+            .{ .key = "fn", .value = .{ .text = "submit" } },
+            .{ .key = "args", .value = try submitArgs(a, child) },
+        }) },
+        .{ .key = "request", .value = .{ .cid = request } },
+        .{ .key = "transport", .value = .{ .text = "http" } },
+    });
     const m = try submit.submissionOf(a, ev, "overlay/submit");
-    const source = m.source;
-    try std.testing.expectEqualStrings("http", source.getText("transport").?);
-    try std.testing.expectEqualStrings("overlay/submit", source.getText("box").?);
-    try std.testing.expectEqualSlices(u8, request, source.getCid("request").?);
-    // t2 lacks t1 — paused, no 400; one want, no peer.
-    const r = try inst.received(m.body.get("args").?, source);
+    try std.testing.expectEqualStrings("overlay/submit", m.source.getText("box").?);
+    try std.testing.expectEqualSlices(u8, request, m.source.getCid("request").?);
+    // t2 lacks t1 — paused, no 400; one want, no peer; a pause is internal.
+    const r = try inst.received(m.body.get("args").?, m.source);
     try std.testing.expect(r == .paused);
-    try std.testing.expect(try inst.pending(x.t2.txid));
     try std.testing.expectEqual(@as(usize, 1), inst.events.len);
     try expectWant(inst.events[0], "want", x.t1.txid, null);
-    var st = try inst.load();
-    try std.testing.expect(try st.hasWant(x.t1.txid, "tm_demo", null));
-    try std.testing.expectEqual(@as(usize, 0), inst.wire_.answers.items.len); // a pause is internal
-
-    // t1 comes: the want of no peer ends (`unwant`, no peer); t2 resumed and launched.
+    try std.testing.expectEqual(@as(usize, 0), inst.wire_.answers.items.len);
+    // t1 comes: the want ends; t2 resumed and launched.
     const parent = try withFund(a, x.f, x.t1);
     _ = try inst.begin((try inst.route(parent)).admit.event);
     _ = try inst.ingest(parent);
     _ = try inst.chainStatus(x.t1.txid, "RECEIVED", null);
     const got = try inst.answer(x.t1.txid, .accepted);
     try std.testing.expectEqual(@as(usize, 1), got.resumes.len);
-    try std.testing.expectEqual(@as(usize, 1), inst.events.len);
     try expectWant(inst.events[0], "unwant", x.t1.txid, null);
     try std.testing.expect((try inst.resumed(x.t2.txid)) == .launch);
 }
@@ -2227,7 +2419,7 @@ test "one box per function class (skein #128, 0.7.5, 0.7.7): register only in `<
     try std.testing.expectEqualStrings("admitted", ans.body.get("result").?.getText("state").?);
 }
 
-test "one box per function class (skein #128, 0.7.6): POST /submit admits into `<app>/submit`, the box a message submission comes in; the step there launches, the sender answered in that box" {
+test "one box per function class (skein #128, 0.7.6): a message submission comes in `<app>/submit`; the step there launches, the sender answered in that box" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -2246,14 +2438,14 @@ test "one box per function class (skein #128, 0.7.6): POST /submit admits into `
         .{ .key = "caller", .value = .{ .bytes = &bob } },
     });
     try std.testing.expectEqualStrings("amm/submit", try routes.submitBox(a, "amm"));
-    const sub = (try routes.httpSubmission(a, req, "amm")).admit;
-    const admit = sub.answer.getArray("admit").?;
-    try std.testing.expectEqual(@as(usize, 1), admit.len);
-    try std.testing.expectEqualStrings("amm/submit", admit[0].getText("box").?);
-    const ev = admit[0].get("event").?;
-    try std.testing.expectEqualSlices(u8, &bob, ev.getBytes("sender").?);
-    // The engine's step in `amm/submit` (its args.box): the message step's, launched; the sender answered there.
-    const m = try submit.submissionOf(a, ev, admit[0].getText("box").?);
+    _ = req;
+    // A submission by message from bob in `amm/submit` (the source a message step builds).
+    const m = .{ .body = try mapOf(a, &.{ .{ .key = "fn", .value = .{ .text = "submit" } }, .{ .key = "args", .value = try submitArgs(a, parent) } }), .source = try mapOf(a, &.{
+        .{ .key = "transport", .value = .{ .text = "mailbox" } },
+        .{ .key = "box", .value = .{ .text = "amm/submit" } },
+        .{ .key = "sender", .value = .{ .bytes = &bob } },
+        .{ .key = "request", .value = .{ .cid = request } },
+    }) };
     try std.testing.expectEqualStrings("amm/submit", m.source.getText("box").?);
     const r = try inst.received(m.body.get("args").?, m.source);
     try std.testing.expect(r == .launch);

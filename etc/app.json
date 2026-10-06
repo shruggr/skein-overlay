@@ -1,7 +1,7 @@
 {
   "kind": "app",
   "name": "overlay",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "programs": {
     "overlay": "bin/overlay.wasm",
     "topic-demo": "bin/topic-demo.wasm",

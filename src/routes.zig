@@ -5,10 +5,9 @@
 //!
 //!   POST /submit      fn "submit"   body BEEF, X-Topics (comma list or JSON array),
 //!                                   x-includes-off-chain-values: true → VarInt(len) ‖ BEEF ‖ off-chain values
-//!                                   → 200 {id, admit}: delivered (shruggr/skein#112) — the submission is the
-//!                                   message {fn: "submit", args: {beef, topics, offChainValues?}}, admitted
-//!                                   as the `submission` event in box <app>/submit (0.7.3; that box 0.7.6);
-//!                                   its answers go to the submitter's box, never on this connection
+//!                                   → the STEAK {topic: {outputsToAdmit, coinsToRetain, coinsRemoved}}: BRC-22,
+//!                                   synchronous (0.9.1, shruggr/skein#112) — the request waits on the
+//!                                   submission's thread; 503 + Retry-After when nothing is decided
 //!   libp2p:<topic>    fn "submit"   the same submit as a GossipSub message (#57): the message's topic
 //!                                   requested, its body the BEEF → {verdict, admit?} (`gossip` below)
 //!   libp2p:<topic>-admit   fn "peerAdmit"   a peer's verdict (#74, gossip.zig): recorded as a
@@ -26,20 +25,17 @@
 //!   GET  /getDocumentationForLookupServiceProvider?lookupService=…  fn "lookupDocumentation"
 //!
 //! Every request is appended, and the front door's step calls these (#68).
-//! A submit over HTTP (shruggr/skein#112) is a transport for the submission
-//! message: the handler checks only that it is one (X-Topics, a body, the
-//! off-chain framing; else 400) and answers 200 `{id}` — the request
-//! record's CID, which every answer names (`request`) — admitting the
-//! `submission` event `{kind: "submission", body: {fn: "submit", args:
-//! {beef, topics, offChainValues?}}, request, transport: "http", sender?:
-//! <the session's identity>}` into the submission box `<app>/submit` (0.7.3;
-//! that box since 0.7.6, shruggr/skein#128: where a submission by message
-//! comes in). It launches nothing (a step that launches a
-//! thread waits on it): the request ends at once, and the engine's step on
-//! the event routes the submission (submit.zig `received`) and answers the
-//! submitter by message — admitted (pending), each proof, or rejected —
-//! when a message reaches it; an open route has no caller, so its answers
-//! are in the log only. No STEAK is answered here, and no 503.
+//! A submit over HTTP is BRC-22 (0.9.1, shruggr/skein#112, David 2026-10-07: "the HTTP
+//! `/submit` route is BRC-22 or it does not exist"; 0.7.1's route restored): the handler runs the
+//! route's half (submit.zig `route`) and launches the submission's thread, answering {wait:
+//! true}: the request's thread waits on it (#66), and called again (`resolved`) it answers
+//! from the state — the STEAK; 400 if the chain app rejected it; 503 with Retry-After if
+//! nothing is decided (`httpFirst`, `httpAgain`). A bad BEEF answers 400; a valid
+//! transaction no topic took, 200 with the empty STEAK; judged before, the STEAK from the
+//! state, nothing run again; in progress (a resubmission), a wait on its thread. A missing
+//! parent pauses the submission (its thread records the pause); the request then sends the
+//! instance itself `wait {txid}` and awaits it: the engine answers it when the pause ends
+//! (submit.zig `waitOn`), and the request reads the state again.
 //!
 //! A lookup is a read: the service's program is called (fn "lookup", the
 //! lookup contract, lookup.zig) and its answer shaped for the wire; it
@@ -279,69 +275,208 @@ fn submit(a: Allocator, in: Value, req: Value) !Value {
         if (req.getText("protocol") != null) return stream(a, in, req);
         return gossip(a, in, req);
     }
-    return switch (try httpSubmission(a, req, calls.appOf(in))) {
-        .refused => |answer| answer,
-        .admit => |x| x.answer,
+    const sub = switch (try httpRequest(a, req)) {
+        .refused => |answer| return answer,
+        .ok => |x| x,
+    };
+    var st = try load(a, in);
+    const source = try sourceOf(a, req, null);
+    const next = if (httpWoken(req))
+        try httpAgain(a, ev_.caller(), &st, in, sub, source)
+    else
+        try httpFirst(a, ev_.caller(), &st, in, sub, source);
+    switch (next) {
+        .answer => |v| return v,
+        // The submission's thread, launched by this request's step, which waits on it (#66); its
+        // answer, when it comes to rest, is the state's (`httpAgain`).
+        .launch => |ev| {
+            const self = in.getCid("engine") orelse (in.get("programs") orelse return error.BadInput).getCid("overlay") orelse return error.NoOverlayProgram;
+            const ec = try vm.store().putValue(a, ev);
+            const args = try vm.store().putValue(a, .{ .map = try a.dupe(cbor.Entry, &.{
+                .{ .key = "event", .value = .{ .cid = ec } },
+                .{ .key = "box", .value = .{ .text = "submit" } },
+            }) });
+            _ = try vm.launch(a, self, args);
+            return waiting(a);
+        },
+        // In progress in a thread of its own (a resubmission, #66): this request waits on that same
+        // thread. At rest already (the kernel refuses the await): the state answers.
+        .await_thread => |t| {
+            vm.awaitRecord(t) catch return (try steakAnswer(a, &st, try httpSubject(a, &st, sub), try served(a, sub.requested, try configMap(a, in, "overlayTopics")))) orelse undecided(a);
+            return waiting(a);
+        },
+        // Paused on a parent it lacks: this request waits for the pause to end — the message
+        // `wait {txid}` to the instance itself, awaited; the engine answers it when the pause ends.
+        .wait_pause => |txid| {
+            const w = try (try ev_.wire(in)).send(a, calls.appOf(in), try submit_mod.waitBody(a, txid));
+            try vm.awaitRecord(w);
+            return waiting(a);
+        },
+    }
+}
+
+/// The Retry-After (whole seconds) of a 503: a submission still undecided past the host's bound.
+pub const retry_after = 30;
+
+/// POST /submit, read: the topics requested (X-Topics) and the BEEF — the door's pointer record
+/// (shruggr/skein#121, the row's `filter: "beef"`), or bytes (a body framed with off-chain values,
+/// the framing taken off). Not a submission: the 400 answer.
+pub const HttpSubmit = struct { beef: submit_mod.Input, requested: []const []const u8, off: ?[]const u8 = null };
+
+pub fn httpRequest(a: Allocator, req: Value) !union(enum) { refused: Value, ok: HttpSubmit } {
+    const th = header(req, "x-topics") orelse return .{ .refused = try failure(a, 400, "Missing x-topics header") };
+    const requested = parseTopics(a, th) catch return .{ .refused = try failure(a, 400, "Invalid x-topics header: expected a comma-separated list or JSON string array") };
+    if (req.getCid("body")) |rc| return .{ .ok = .{ .beef = .{ .record = rc }, .requested = requested } };
+    var body = req.getBytes("body") orelse "";
+    if (body.len == 0) return .{ .refused = try failure(a, 400, "Missing or empty BEEF body") };
+    var off: ?[]const u8 = null;
+    if (eql(u8, header(req, "x-includes-off-chain-values") orelse "", "true")) {
+        var pos: usize = 0;
+        const n64 = readVarInt(body, &pos) catch return .{ .refused = try failure(a, 400, "Invalid off-chain values framing") };
+        if (n64 > body.len - pos) return .{ .refused = try failure(a, 400, "Invalid off-chain values framing") };
+        const n: usize = @intCast(n64);
+        off = body[pos + n ..];
+        body = body[pos .. pos + n];
+    }
+    return .{ .ok = .{ .beef = .{ .bytes = body }, .requested = requested, .off = off } };
+}
+
+/// What POST /submit's handler does next (0.9.1, shruggr/skein#112, David 2026-10-07: BRC-22,
+/// synchronous): answer now, launch the submission's thread and wait on it, wait on the thread
+/// already carrying it, or wait for its pause to end.
+pub const HttpNext = union(enum) {
+    answer: Value,
+    /// The submit event to launch the submission's thread on (a paused one's records the pause).
+    launch: Value,
+    /// The thread carrying the submission (its pending record's `thread`): await it.
+    await_thread: []const u8,
+    /// The paused submission of this subject: wait for the pause to end (`wait`).
+    wait_pause: [32]u8,
+};
+
+/// Whether the handler is called again (#66): the thread it waited on came to rest (`resolved`),
+/// the answer to its `wait` (`reply`), a deadline (`woke`).
+pub fn httpWoken(req: Value) bool {
+    return req.get("resolved") != null or req.get("reply") != null or req.get("woke") != null;
+}
+
+/// The first call: the route's half (verify, judge), then what it came to. A bad BEEF answers 400;
+/// a valid transaction no topic took, 200 with the empty STEAK (BRC-22); judged before, the STEAK
+/// from the state, nothing run again; in progress, a wait on its thread; paused already, a wait
+/// for the pause to end; whole, its thread launched (a pause, its thread launched to record it).
+/// Only transactions before the subject taken (the subject by no topic): 200 with the empty STEAK
+/// now, the submit event admitted into the app's box for its thread.
+pub fn httpFirst(a: Allocator, caller: calls.Caller, st: *State, in: Value, sub: HttpSubmit, source: Value) !HttpNext {
+    const topics = try served(a, sub.requested, try configMap(a, in, "overlayTopics"));
+    return switch (try submit_mod.route(a, caller, st, in, sub.beef, topics, sub.off, source)) {
+        .refused => |why| .{ .answer = try failure(a, 400, why) },
+        .nothing => .{ .answer = try emptySteak(a, topics) },
+        .unchanged => |t| .{ .answer = (try steakAnswer(a, st, t, topics)) orelse try emptySteak(a, topics) },
+        .pending => |t| try onThread(a, st, t, topics),
+        .paused => |p| if (try st.isPaused(p.txid)) .{ .wait_pause = p.txid } else .{ .launch = p.event },
+        .admit => |x| if (submit_mod.subjectTaken(x.event)) .{ .launch = x.event } else blk: {
+            var answer = try emptySteak(a, topics);
+            answer.map = try std.mem.concat(a, cbor.Entry, &.{ answer.map, &.{.{ .key = "admit", .value = try admitOne(a, x.event, calls.appOf(in)) }} });
+            break :blk .{ .answer = answer };
+        },
     };
 }
 
-/// POST /submit as a transport for the submission message (shruggr/skein#112): the request is
-/// checked for being one (X-Topics, a body, the off-chain framing; else the 400 answer, `refused`);
-/// then `admit`: the `submission` event, `{kind: "submission", body: {fn: "submit", args: {beef,
-/// topics, offChainValues?}}, request: <the request record>, transport: "http", sender?: <the
-/// session's identity>}` (submit.zig `submissionOf`), and the `answer`: 200 `{id: <the request
-/// record's CID, hex>}` admitting that event into the submission box `<app>/submit` (one box per
-/// function class, shruggr/skein#128, 0.7.6: where a submission by message comes in too, so an app
-/// whose own box `<app>` belongs to another program gets both in one box; the stock manifest's
-/// row `{address: "submit", sender: "*", program: "overlay"}` routes it). It launches nothing
-/// (0.7.3): a step that launches a thread waits on it, and the request ends at once; the engine's
-/// step on the event routes the submission, its answers to the sender in that box.
-pub fn httpSubmission(a: Allocator, req: Value, app: []const u8) !union(enum) { refused: Value, admit: struct { event: Value, answer: Value } } {
-    const th = header(req, "x-topics") orelse return .{ .refused = try failure(a, 400, "Missing x-topics header") };
-    const requested = parseTopics(a, th) catch return .{ .refused = try failure(a, 400, "Invalid x-topics header: expected a comma-separated list or JSON string array") };
-    // shruggr/skein#121: the kernel's door put the BEEF's pointer record where its bytes were (the row's
-    // `filter: "beef"`); bytes are a body it did not take as a BEEF (framed with off-chain values).
-    var beef: Value = undefined;
-    var off: ?[]const u8 = null;
-    if (req.getCid("body")) |rc| {
-        beef = .{ .cid = rc };
-    } else {
-        var body = req.getBytes("body") orelse "";
-        if (body.len == 0) return .{ .refused = try failure(a, 400, "Missing or empty BEEF body") };
-        if (eql(u8, header(req, "x-includes-off-chain-values") orelse "", "true")) {
-            var pos: usize = 0;
-            const n64 = readVarInt(body, &pos) catch return .{ .refused = try failure(a, 400, "Invalid off-chain values framing") };
-            if (n64 > body.len - pos) return .{ .refused = try failure(a, 400, "Invalid off-chain values framing") };
-            const n: usize = @intCast(n64);
-            off = body[pos + n ..];
-            body = body[pos .. pos + n];
-        }
-        beef = .{ .bytes = body };
+/// Called again (#66): what the state says now. Judged → the STEAK; in a thread → wait on it;
+/// paused → wait for the pause to end; rejected by the chain app → 400; held, taken by no topic →
+/// the empty STEAK; else the route's answer for what it is now (refused → 400, taken by nothing →
+/// the empty STEAK) or, nothing decided, 503 with Retry-After — the client resubmits, a poll on
+/// the same flow. Nothing is launched again.
+pub fn httpAgain(a: Allocator, caller: calls.Caller, st: *State, in: Value, sub: HttpSubmit, source: Value) !HttpNext {
+    const topics = try served(a, sub.requested, try configMap(a, in, "overlayTopics"));
+    const txid = httpSubject(a, st, sub) catch return .{ .answer = try failure(a, 400, "Invalid BEEF") };
+    if (try steakAnswer(a, st, txid, topics)) |v| return .{ .answer = v };
+    if (try st.isPaused(txid)) return .{ .wait_pause = txid };
+    if (try st.isPending(txid)) return onThread(a, st, txid, topics);
+    if (try st.ch.settlementCid(txid)) |sc| {
+        const rec = try st.store.getValue(a, sc);
+        return .{ .answer = try failure(a, 400, try std.fmt.allocPrint(a, "Transaction rejected: {s}", .{rec.getText("reason") orelse "rejected"})) };
     }
-    const request = req.getCid("request") orelse return error.BadInput;
-    const ts = try a.alloc(Value, requested.len);
-    for (requested, ts) |t, *o| o.* = .{ .text = t };
-    var fargs: std.ArrayList(cbor.Entry) = .empty;
-    try fargs.appendSlice(a, &.{
-        .{ .key = "beef", .value = beef },
-        .{ .key = "topics", .value = .{ .array = ts } },
-    });
-    if (off) |o| try fargs.append(a, .{ .key = "offChainValues", .value = .{ .bytes = o } });
-    var es: std.ArrayList(cbor.Entry) = .empty;
-    try es.appendSlice(a, &.{
-        .{ .key = "kind", .value = .{ .text = "submission" } },
-        .{ .key = "body", .value = .{ .map = try a.dupe(cbor.Entry, &.{
-            .{ .key = "fn", .value = .{ .text = "submit" } },
-            .{ .key = "args", .value = .{ .map = fargs.items } },
-        }) } },
-        .{ .key = "request", .value = .{ .cid = request } },
-        .{ .key = "transport", .value = .{ .text = "http" } },
-    });
-    if (req.getBytes("caller")) |k| try es.append(a, .{ .key = "sender", .value = .{ .bytes = k } });
-    const ev: Value = .{ .map = es.items };
-    var answer = try respond(a, 200, "application/json", try jsonOf(a, .{ .id = try vm.hexAlloc(a, request) }));
-    answer.map = try std.mem.concat(a, cbor.Entry, &.{ answer.map, &.{.{ .key = "admit", .value = try admitOne(a, ev, try submitBox(a, app)) }} });
-    return .{ .admit = .{ .event = ev, .answer = answer } };
+    if (try st.ch.holds(txid)) return .{ .answer = try emptySteak(a, topics) };
+    return switch (try submit_mod.route(a, caller, st, in, sub.beef, topics, sub.off, source)) {
+        .refused => |why| .{ .answer = try failure(a, 400, why) },
+        .nothing => .{ .answer = try emptySteak(a, topics) },
+        .unchanged => |t| .{ .answer = (try steakAnswer(a, st, t, topics)) orelse try emptySteak(a, topics) },
+        else => .{ .answer = try undecided(a) },
+    };
+}
+
+/// The subject of the request's BEEF.
+fn httpSubject(a: Allocator, st: *State, sub: HttpSubmit) ![32]u8 {
+    return switch (sub.beef) {
+        .record => |rc| c.record.subjectOf(try st.store.getValue(a, rc)) orelse error.BadBeef,
+        .bytes => |b| (try c.beef.parse(a, b)).subject() orelse error.BadBeef,
+    };
+}
+
+/// In progress in a thread (its pending record's): wait on it; no thread named → undecided.
+fn onThread(a: Allocator, st: *State, txid: [32]u8, topics: []const []const u8) !HttpNext {
+    const rec = (try st.pendingRecord(txid)) orelse return .{ .answer = (try steakAnswer(a, st, txid, topics)) orelse try undecided(a) };
+    const thread = rec.getCid("thread") orelse return .{ .answer = try undecided(a) };
+    return .{ .await_thread = thread };
+}
+
+/// A route handler's "not yet" (#66): it launched, or awaits, what its answer depends on.
+fn waiting(a: Allocator) !Value {
+    return .{ .map = try a.dupe(cbor.Entry, &.{.{ .key = "wait", .value = .{ .boolean = true } }}) };
+}
+
+/// 503 with Retry-After: nothing decided yet; the client resubmits.
+pub fn undecided(a: Allocator) !Value {
+    return .{ .map = try a.dupe(cbor.Entry, &.{
+        .{ .key = "status", .value = .{ .uint = 503 } },
+        .{ .key = "type", .value = .{ .text = "application/json" } },
+        .{ .key = "headers", .value = .{ .map = try a.dupe(cbor.Entry, &.{.{ .key = "retry-after", .value = .{ .text = try std.fmt.allocPrint(a, "{d}", .{retry_after}) } }}) } },
+        .{ .key = "body", .value = .{ .bytes = try jsonOf(a, .{ .status = "error", .message = "Not yet decided: nothing is admitted until the network accepts it. Resubmit after Retry-After seconds." }) } },
+    }) };
+}
+
+/// BRC-22's STEAK: `{<topic>: {outputsToAdmit, coinsToRetain, coinsRemoved}}`.
+const Steak = struct {
+    topics: []const []const u8,
+    entries: []const [3][]const u64,
+
+    pub fn jsonStringify(s: Steak, jw: anytype) !void {
+        try jw.beginObject();
+        for (s.topics, s.entries) |t, e| {
+            try jw.objectField(t);
+            try jw.write(.{ .outputsToAdmit = e[0], .coinsToRetain = e[1], .coinsRemoved = e[2] });
+        }
+        try jw.endObject();
+    }
+};
+
+/// 200 with the empty STEAK: a valid transaction no topic took (BRC-22).
+fn emptySteak(a: Allocator, topics: []const []const u8) !Value {
+    const entries = try a.alloc([3][]const u64, topics.len);
+    for (entries) |*e| e.* = .{ &.{}, &.{}, &.{} };
+    return respond(a, 200, "application/json", try jsonOf(a, Steak{ .topics = topics, .entries = entries }));
+}
+
+/// 200 with the STEAK from the state (each topic's `applied` record; empty for a topic that took
+/// nothing), or null when no topic has judged it.
+fn steakAnswer(a: Allocator, st: *State, txid: [32]u8, topics: []const []const u8) !?Value {
+    const entries = try a.alloc([3][]const u64, topics.len);
+    var any = false;
+    for (topics, entries) |t, *e| {
+        e.* = .{ &.{}, &.{}, &.{} };
+        const rec = (try st.appliedRecord(t, txid)) orelse continue;
+        any = true;
+        e.* = .{ try uintsJson(a, rec.getArray("outputsToAdmit") orelse &.{}), try uintsJson(a, rec.getArray("coinsToRetain") orelse &.{}), try uintsJson(a, rec.getArray("coinsRemoved") orelse &.{}) };
+    }
+    if (!any) return null;
+    return try respond(a, 200, "application/json", try jsonOf(a, Steak{ .topics = topics, .entries = entries }));
+}
+
+fn uintsJson(a: Allocator, xs: []const Value) ![]u64 {
+    const out = try a.alloc(u64, xs.len);
+    for (xs, out) |x, *o| o.* = if (x == .uint) x.uint else return error.BadState;
+    return out;
 }
 
 /// The box, after the app's name, submissions come in (one box per function class,
