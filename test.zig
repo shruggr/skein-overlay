@@ -1367,6 +1367,112 @@ test "register / deregister (skein #128): the set is the step's app's, the answe
 }
 
 
+test "market and validator (skein #120, 0.9.0): config.overlay.market / .validator drive liveness / beacon on <topic>-live at register, unliveness / unbeacon at deregister; neither, nothing extra" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = c.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    const inst = try Instance.init(a, &ms);
+    const s = ms.store();
+
+    const engine = try s.putValue(a, try mapOf(a, &.{
+        .{ .key = "kind", .value = .{ .text = "program" } },
+        .{ .key = "name", .value = .{ .text = "overlay" } },
+        .{ .key = "app", .value = .{ .text = "overlay" } },
+    }));
+    const genesis_in = try mapOf(a, &.{.{ .key = "defaults", .value = try mapOf(a, &.{
+        .{ .key = "walletNetwork", .value = .{ .text = "regtest" } },
+        // A genesis default the app's config replaces: an app naming no market is no market.
+        .{ .key = "overlayMarket", .value = .{ .text = "{\"window\":5000}" } },
+    }) }});
+    const in = try withThread(a, s, genesis_in, engine);
+    const reg_args = try mapOf(a, &.{
+        .{ .key = "topic", .value = .{ .text = "tm_r" } },
+        .{ .key = "program", .value = .{ .text = "topic-demo" } },
+    });
+    const dereg_args = try mapOf(a, &.{.{ .key = "topic", .value = .{ .text = "tm_r" } }});
+
+    const Case = struct { market: ?u64, validator: ?u64 };
+    for ([_]Case{ .{ .market = 40_000, .validator = null }, .{ .market = null, .validator = 30_000 }, .{ .market = 40_000, .validator = 30_000 }, .{ .market = null, .validator = null } }) |case| {
+        var hm = HeadMap{};
+        var ov: std.ArrayList(cbor.Entry) = .empty;
+        if (case.market) |w| try ov.append(a, .{ .key = "market", .value = try mapOf(a, &.{.{ .key = "window", .value = .{ .uint = w } }}) });
+        if (case.validator) |e| try ov.append(a, .{ .key = "validator", .value = try mapOf(a, &.{.{ .key = "every", .value = .{ .uint = e } }}) });
+        try hm.m.put(a, "overlay/app", try s.putValue(a, try mapOf(a, &.{
+            .{ .key = "kind", .value = .{ .text = "app" } },
+            .{ .key = "name", .value = .{ .text = "overlay" } },
+            .{ .key = "programs", .value = try mapOf(a, &.{
+                .{ .key = "engine", .value = .{ .cid = engine } },
+                .{ .key = "topic-demo", .value = .{ .cid = inst.topic_prog } },
+            }) },
+            .{ .key = "config", .value = try mapOf(a, &.{.{ .key = "overlay", .value = .{ .map = ov.items } }}) },
+        })));
+        const step = try config.resolve(a, s, hm.heads(), in, null);
+        const roles = try config.rolesOf(a, step);
+        try std.testing.expectEqual(case.market, roles.market);
+        try std.testing.expectEqual(case.validator, roles.validator);
+        const programs = step.get("programs").?;
+        const self = try config.selfRole(a, s, step, null);
+
+        // register: the three subscribes, then liveness (a market), then beacon (a validator), on tm_r-live.
+        const reg = (try topics_mod.withRoles(a, try topics_mod.register(a, &.{}, reg_args, programs, self), true, roles)).done;
+        const extra = @as(usize, if (case.market != null) 1 else 0) + @as(usize, if (case.validator != null) 1 else 0);
+        try std.testing.expectEqual(3 + extra, reg.events.len);
+        for (reg.events[0..3]) |ev| try std.testing.expectEqualStrings("subscribe", ev.getText("event").?);
+        var i: usize = 3;
+        if (case.market) |w| {
+            const ev = reg.events[i];
+            i += 1;
+            try std.testing.expectEqual(@as(usize, 3), ev.map.len);
+            try std.testing.expectEqualStrings("liveness", ev.getText("event").?);
+            try std.testing.expectEqualStrings("tm_r-live", ev.getText("topic").?);
+            try std.testing.expectEqual(w, ev.getUint("window").?);
+        }
+        if (case.validator) |e| {
+            const ev = reg.events[i];
+            try std.testing.expectEqual(@as(usize, 4), ev.map.len);
+            try std.testing.expectEqualStrings("beacon", ev.getText("event").?);
+            try std.testing.expectEqualStrings("tm_r-live", ev.getText("topic").?);
+            try std.testing.expectEqual(e, ev.getUint("every").?);
+            try std.testing.expectEqual(@as(usize, 0), ev.getBytes("body").?.len); // the beat needs no body
+        }
+        // Idempotent: registered already, nothing emitted, the roles' events neither.
+        const again = (try topics_mod.withRoles(a, try topics_mod.register(a, reg.list.?, reg_args, programs, self), true, roles)).done;
+        try std.testing.expect(again.list == null and again.events.len == 0);
+        // A refusal stays one.
+        try std.testing.expect(try topics_mod.withRoles(a, try topics_mod.register(a, &.{}, try mapOf(a, &.{}), programs, self), true, roles) == .refused);
+
+        // deregister reverses: the three unsubscribes, then unliveness, then unbeacon.
+        const dereg = (try topics_mod.withRoles(a, try topics_mod.deregister(a, reg.list.?, dereg_args), false, roles)).done;
+        try std.testing.expectEqual(3 + extra, dereg.events.len);
+        i = 3;
+        if (case.market != null) {
+            try std.testing.expectEqualStrings("unliveness", dereg.events[i].getText("event").?);
+            try std.testing.expectEqualStrings("tm_r-live", dereg.events[i].getText("topic").?);
+            try std.testing.expectEqual(@as(usize, 2), dereg.events[i].map.len);
+            i += 1;
+        }
+        if (case.validator != null) {
+            try std.testing.expectEqualStrings("unbeacon", dereg.events[i].getText("event").?);
+            try std.testing.expectEqualStrings("tm_r-live", dereg.events[i].getText("topic").?);
+            try std.testing.expectEqual(@as(usize, 2), dereg.events[i].map.len);
+        }
+        const none = (try topics_mod.withRoles(a, try topics_mod.deregister(a, dereg.list.?, dereg_args), false, roles)).done;
+        try std.testing.expect(none.list == null and none.events.len == 0);
+    }
+
+    // A bad shape, or a window outside 1 000 ms .. a day: error.BadRoles (the engine refuses the registration).
+    for ([_][]const u8{ "{\"window\":10}", "{}", "{\"window\":\"40s\"}", "40000" }) |text| {
+        const bad = try mapOf(a, &.{.{ .key = "defaults", .value = try mapOf(a, &.{.{ .key = "overlayMarket", .value = .{ .text = text } }}) }});
+        try std.testing.expectError(error.BadRoles, config.rolesOf(a, bad));
+    }
+    // A genesis-wired engine reads its defaults as they are.
+    const wired = try config.rolesOf(a, genesis_in);
+    try std.testing.expectEqual(@as(?u64, 5000), wired.market);
+    try std.testing.expectEqual(@as(?u64, null), wired.validator);
+}
+
 /// fund (mined) → t1 (mints a token) → t2 (spends it into a new one), both unproven.
 const Chain3 = struct { k: Keys, f: Fund, t1: Spent, t2: Spent };
 

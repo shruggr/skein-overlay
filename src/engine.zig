@@ -31,7 +31,9 @@
 //!                             {fn: "register", args: {topic, program, seed?}} or {fn: "deregister",
 //!                             args: {topic}}, from whoever that row admits (topics.zig,
 //!                             shruggr/skein#120): the registered set under `<app>/topics`, the
-//!                             subscribe / unsubscribe events; answered {topic, active}; with
+//!                             subscribe / unsubscribe events, and with config.overlay.market /
+//!                             .validator set, liveness / beacon (unliveness / unbeacon) on
+//!                             `<topic>-live` (0.9.0); answered {topic, active}; with
 //!                             `seed` (0.7.8), the held seeds judged under the topic
 //!                             (submit.zig `seed`), answered {…, seeded, missing, untaken?}.
 //!
@@ -145,12 +147,15 @@ fn registration(a: Allocator, step: Value, args: Value, body: Value, func: []con
     const root = try vm.head(a, head);
     const list = try topics.entriesOf(a, if (root) |r| try s.getValue(a, r) else null);
     const fargs: Value = body.get("args") orelse .{ .map = &.{} };
+    const roles: ?topics.Roles = config.rolesOf(a, step) catch null; // error.BadRoles only
     const change: topics.Change = if (!topics.mayRegister(args, calls.appOf(step)))
         .{ .refused = try topics.notHere(a, func, args, calls.appOf(step)) }
+    else if (roles == null)
+        .{ .refused = try std.fmt.allocPrint(a, "{s}: the configuration's roles are config.overlay.market {{window: <ms>}} and config.overlay.validator {{every: <ms>}}, each from 1000 ms to a day", .{func}) }
     else if (eql(u8, func, "register"))
-        try topics.register(a, list, fargs, step.get("programs") orelse return error.BadConfig, try config.selfRole(a, s, step, null))
+        try topics.withRoles(a, try topics.register(a, list, fargs, step.get("programs") orelse return error.BadConfig, try config.selfRole(a, s, step, null)), true, roles.?)
     else
-        try topics.deregister(a, list, fargs);
+        try topics.withRoles(a, try topics.deregister(a, list, fargs), false, roles.?);
     const message = args.getCid("message") orelse return error.BadInput;
     var ans: std.ArrayList(cbor.Entry) = .empty;
     try ans.appendSlice(a, &.{

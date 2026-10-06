@@ -20,6 +20,11 @@
 //!   config.overlay.topics    {<topic>: <role>}                                   (was defaults.overlayTopics)
 //!   config.overlay.lookups   {<service>: <role> | {program: <role>, topics?}}    (was defaults.overlayLookups)
 //!   config.overlay.gossip    {<topic>: bool}                                     (was defaults.overlayGossip)
+//!   config.overlay.market    {window: <ms>}   optional: a market (defaults.overlayMarket; `rolesOf`)
+//!   config.overlay.validator {every: <ms>}    optional: a validator (defaults.overlayValidator)
+//!
+//! The two roles (shruggr/skein#120, David 2026-10-06 evening): registering
+//! a topic is the one act that drives both — topics.zig `withRoles`.
 //!
 //! Beside the declared topics, the engine serves the topics registered at
 //! runtime (shruggr/skein#120; topics.zig): the root record of the head
@@ -60,6 +65,32 @@ pub const Heads = struct {
 
 /// The genesis default each `config.overlay` key replaces.
 const keys = [_][2][]const u8{ .{ "topics", "overlayTopics" }, .{ "lookups", "overlayLookups" }, .{ "gossip", "overlayGossip" } };
+/// The roles' keys (shruggr/skein#120, 2026-10-06 evening), each optional: set only when the app's config names it.
+const role_keys = [_][2][]const u8{ .{ "market", "overlayMarket" }, .{ "validator", "overlayValidator" } };
+
+/// The shortest and longest window or beat the kernel takes (ms; skein docs/MESSAGES.md "Beacons", "Liveness").
+const role_min_ms: u64 = 1000;
+const role_max_ms: u64 = 86_400_000;
+
+/// The engine's roles from its configuration (`defaults.overlayMarket` / `overlayValidator`, JSON
+/// text: an app's `config.overlay.market: {window}` / `config.overlay.validator: {every}`): each
+/// absent, or its ms. Another shape, or a value outside 1 000 ms .. a day: error.BadRoles.
+pub fn rolesOf(a: Allocator, in: Value) error{BadRoles}!topics.Roles {
+    return .{
+        .market = try roleMs(a, in, "overlayMarket", "window"),
+        .validator = try roleMs(a, in, "overlayValidator", "every"),
+    };
+}
+
+fn roleMs(a: Allocator, in: Value, key: []const u8, field: []const u8) error{BadRoles}!?u64 {
+    const text = (if (in.get("defaults")) |d| d.getText(key) else null) orelse return null;
+    const j = std.json.parseFromSliceLeaky(std.json.Value, a, text, .{}) catch return error.BadRoles;
+    if (j == .null) return null;
+    if (j != .object) return error.BadRoles;
+    const v = j.object.get(field) orelse return error.BadRoles;
+    if (v != .integer or v.integer < role_min_ms or v.integer > role_max_ms) return error.BadRoles;
+    return @intCast(v.integer);
+}
 
 /// The engine's own program record: a step's thread's `program`, a route call's `match.program`; null for a host's call.
 pub fn selfProgram(a: Allocator, s: Store, in: Value, arg: ?Value) !?[]const u8 {
@@ -153,11 +184,12 @@ pub fn fromApp(a: Allocator, in: Value, app: Value, self: ?[]const u8) !Value {
     if (ov != .map and ov != .null) return error.BadConfig;
     var defaults: std.ArrayList(cbor.Entry) = .empty;
     if (in.get("defaults")) |d| if (d == .map) for (d.map) |e| {
-        for (keys) |k| {
+        for (keys ++ role_keys) |k| {
             if (eql(u8, e.key, k[1])) break;
         } else try defaults.append(a, e);
     };
     for (keys) |k| try defaults.append(a, .{ .key = k[1], .value = .{ .text = if (ov.get(k[0])) |v| try json(a, v) else "{}" } });
+    for (role_keys) |k| if (ov.get(k[0])) |v| try defaults.append(a, .{ .key = k[1], .value = .{ .text = try json(a, v) } });
     const programs = app.get("programs") orelse return error.BadConfig;
     if (programs != .map) return error.BadConfig;
     var es: std.ArrayList(cbor.Entry) = .empty;

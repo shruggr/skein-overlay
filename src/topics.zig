@@ -28,6 +28,14 @@
 //! emits nothing. The answer is `{topic, active}` (whether the topic is in
 //! the registered set now).
 //!
+//! Market and validator (David, 2026-10-06 evening): with
+//! `config.overlay.market: {window}` set, a register that changes the set
+//! also emits `liveness {topic: <topic>-live, window}`; with
+//! `config.overlay.validator: {every}`, `beacon {topic: <topic>-live, every,
+//! body: <empty>}`. A deregister that changes it emits `unliveness` /
+//! `unbeacon` likewise (`withRoles`). Nothing at a start or re-read: the
+//! intents stand in the log.
+//!
 //! Seeding (0.7.8): `register {topic, program, seed?: [txid hex, …]}` — after
 //! the topic is registered (or found registered with the same program), each
 //! `seed` transaction the chain state holds is judged under that topic alone,
@@ -228,6 +236,52 @@ pub fn notHere(a: Allocator, func: []const u8, args: Value, app: []const u8) ![]
 /// `args.box`), else the app's own.
 pub fn answerBox(args: Value, app: []const u8) []const u8 {
     return args.getText("box") orelse app;
+}
+
+/// The engine's roles (shruggr/skein#120, David 2026-10-06 evening: "a skein runs as a market and/or
+/// a validator by two settings in the engine's configuration"): `config.overlay.market: {window}` and
+/// `config.overlay.validator: {every}`, each in ms, each optional (config.zig `rolesOf`).
+pub const Roles = struct { market: ?u64 = null, validator: ?u64 = null };
+
+/// The topic the roles' events name for an overlay topic: `<topic>-live`.
+pub const live_suffix = "-live";
+
+/// The roles' events for one change, after the subscribes: on register, `liveness {topic:
+/// <topic>-live, window}` when a market and `beacon {topic: <topic>-live, every, body: <empty>}` when
+/// a validator (the beat needs no body: the frame carries the sender's identity key, the gossip
+/// message the peer id); on deregister, `unliveness` / `unbeacon` likewise.
+pub fn roleEvents(a: Allocator, subscribe: bool, topic: []const u8, roles: Roles) ![]const Value {
+    const t: Value = .{ .text = try std.mem.concat(a, u8, &.{ topic, live_suffix }) };
+    var out: std.ArrayList(Value) = .empty;
+    if (roles.market) |window| try out.append(a, .{ .map = if (subscribe) try a.dupe(cbor.Entry, &.{
+        .{ .key = "event", .value = .{ .text = "liveness" } },
+        .{ .key = "topic", .value = t },
+        .{ .key = "window", .value = .{ .uint = window } },
+    }) else try a.dupe(cbor.Entry, &.{
+        .{ .key = "event", .value = .{ .text = "unliveness" } },
+        .{ .key = "topic", .value = t },
+    }) });
+    if (roles.validator) |every| try out.append(a, .{ .map = if (subscribe) try a.dupe(cbor.Entry, &.{
+        .{ .key = "event", .value = .{ .text = "beacon" } },
+        .{ .key = "topic", .value = t },
+        .{ .key = "every", .value = .{ .uint = every } },
+        .{ .key = "body", .value = .{ .bytes = "" } },
+    }) else try a.dupe(cbor.Entry, &.{
+        .{ .key = "event", .value = .{ .text = "unbeacon" } },
+        .{ .key = "topic", .value = t },
+    }) });
+    return out.items;
+}
+
+/// A register's or deregister's change with the roles' events added (`roleEvents`), only when the set
+/// changes: an idempotent one emits nothing, a refusal stays one.
+pub fn withRoles(a: Allocator, change: Change, subscribe: bool, roles: Roles) !Change {
+    if (change != .done or change.done.list == null) return change;
+    var d = change.done;
+    const extra = try roleEvents(a, subscribe, d.answer.getText("topic").?, roles);
+    if (extra.len == 0) return change;
+    d.events = try std.mem.concat(a, Value, &.{ d.events, extra });
+    return .{ .done = d };
 }
 
 /// `deregister {topic}`.

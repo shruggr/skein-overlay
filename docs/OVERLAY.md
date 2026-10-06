@@ -1,4 +1,4 @@
-# Overlay services in the VM (0.8.0)
+# Overlay services in the VM (0.9.0)
 
 An overlay is an app (skein docs/APPS.md §6). It judges transactions with
 its topic managers and indexes them with its lookup services; it does not
@@ -728,6 +728,9 @@ emitted when the set changes:
 |---|---|
 | `register` | `{event: "subscribe", topic: "<topic>", program: <engine's role>, fn: "submit", filter: "beef"}`, the same without `filter` for `<topic>-admit` with `fn: "peerAdmit"` and for `<topic>-proof` with `fn: "peerProof"` |
 | `deregister` | `{event: "unsubscribe", topic}` for `<topic>`, `<topic>-admit`, `<topic>-proof` |
+| `register`, a market | then `{event: "liveness", topic: "<topic>-live", window}` ("Market and validator", below) |
+| `register`, a validator | then `{event: "beacon", topic: "<topic>-live", every, body: <empty bytes>}` |
+| `deregister`, a market / a validator | then `{event: "unliveness", topic: "<topic>-live"}` / `{event: "unbeacon", topic: "<topic>-live"}` |
 
 `program` is the engine's own role in `programs` (`overlay` in this repo's
 manifest) and `fn` its function for that topic: the handler the host routes
@@ -742,6 +745,39 @@ events. A message arriving on a registered topic is handled as on a
 declared one: the routes take the topic from the message and look it up in
 the served set (`<topic>` → `submit`, `<topic>-admit` → `peerAdmit`,
 `<topic>-proof` → `peerProof`).
+
+**Market and validator (0.9.0).** David, 2026-10-06 (shruggr/skein#120):
+"a skein runs as a market and/or a validator by two settings in the engine's configuration (`config.overlay.market: {window}`, `config.overlay.validator: {every}`), and registering a token's topic is the one act that drives both". The engine, on `register`: subscribes the topic and seeds; if
+`market`, emits `liveness {<topic>-live, window}`; if `validator`, emits
+`beacon {<topic>-live, every}` — "the beat needs no body: the frame carries
+the sender's identity key and the gossip message the peer id". "Deregister
+reverses both." The two settings, each optional, in the app's
+configuration beside `topics` and `lookups`:
+
+```json
+"config": {"overlay": {"market": {"window": 40000}, "validator": {"every": 30000}}}
+```
+
+- `market: {window: <ms>}` — this skein keeps who is beating on each
+  registered topic: with the set changed, a `register` also emits
+  `{event: "liveness", topic: "<topic>-live", window}` and the runtime's
+  liveness tool keeps the beats newer than `window`, served at `GET
+  /<app>/.live/<topic>-live` (skein docs/MESSAGES.md "Liveness (#138)").
+- `validator: {every: <ms>}` — this skein beats on each registered topic:
+  a `register` also emits `{event: "beacon", topic: "<topic>-live", every,
+  body: <empty bytes>}` and the node publishes a signed frame every `every`
+  ms (skein docs/MESSAGES.md "Beacons (#126)"; the kernel takes an empty
+  body). The validator program an app ships signs for any registered topic
+  when `validator` is set.
+
+`deregister` emits `unliveness` / `unbeacon` on `<topic>-live` likewise,
+after the three unsubscribes. Only a register or deregister that changes
+the set emits them (an idempotent one emits nothing); a start or a re-read
+of the configuration emits nothing extra — the intents stand in the log, so
+a setting changed later applies to the topics registered after it. Each
+value is an integer from 1 000 ms to a day (the kernel's bounds); another
+shape refuses the register or deregister (`bad-args`), writing and emitting
+nothing (`src/config.zig` `rolesOf`, `src/topics.zig` `withRoles`).
 
 **Result.** Each step keeps a result record and prints its CID:
 

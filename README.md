@@ -4,7 +4,7 @@ The overlay services engine for a [skein](https://github.com/shruggr/skein),
 as an app: BRC-22 submit and BRC-24 lookup, served by the instance's own
 front door, with topic managers and lookup services as programs the engine
 calls. It is also a Zig package: an overlay of your own depends on it for
-the topic and lookup contracts. Version **0.8.0**.
+the topic and lookup contracts. Version **0.9.0**.
 
 ## What it is
 
@@ -162,7 +162,7 @@ The manifest (`etc/app.json`, this repo's own, description left out):
 {
   "kind": "app",
   "name": "overlay",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "programs": {
     "overlay": "bin/overlay.wasm",
     "topic-demo": "bin/topic-demo.wasm",
@@ -262,7 +262,11 @@ class, shruggr/skein#128, 0.7.5, 0.7.7); in any other box — `<app>`,
 `<app>/submit` — they are refused with `bad-args` (`register: not taken in
 box <box>; send it in <app>/register`), writing and emitting nothing. The
 answer goes back in the box they came in. A lookup service without a `topics`
-list listens to every topic, declared or registered. docs/OVERLAY.md
+list listens to every topic, declared or registered. With
+`config.overlay.market: {window}` set, a register also emits `liveness
+{topic: "<topic>-live", window}`; with `config.overlay.validator: {every}`,
+`beacon {topic: "<topic>-live", every, body: <empty>}`; a deregister emits
+`unliveness` / `unbeacon` likewise (0.9.0). docs/OVERLAY.md
 "Register a topic" has the rest.
 
 ## Build and test
@@ -294,7 +298,7 @@ Not built: BRC-88 SHIP/SLAP, GASP sync and catch-up from a peer, the
 
 | | |
 |---|---|
-| this app and package | 0.8.0 (tag `v0.8.0`) |
+| this app and package | 0.9.0 (tag `v0.9.0`) |
 | skein-sdk | v0.7.1, by tag URL and hash in `build.zig.zon` (modules `chain` and, for the engine, `sk`; bsvz comes through it) |
 | requires | `chain/1` (shruggr/skein-chain 0.3.0) |
 | skein | log format 8; skein's equivs pin this repo by commit |
@@ -425,6 +429,16 @@ the rows `submit` and `register` are unchanged. The engine is unchanged:
 its four functions only ever read (the configured programs' `metadata` /
 `documentation`), as `/lookup` did. An app that embeds the engine moves the
 same four rows into its `reads`.
+
+0.9.0: market and validator (shruggr/skein#120, David 2026-10-06 evening:
+"a skein runs as a market and/or a validator by two settings in the engine's configuration (`config.overlay.market: {window}`, `config.overlay.validator: {every}`), and registering a token's topic is the one act that drives both"). Two optional settings: `config.overlay.market: {window: <ms>}` and
+`config.overlay.validator: {every: <ms>}`. A `register` that changes the
+set emits, after its three subscribes, `liveness {topic: "<topic>-live",
+window}` when a market and `beacon {topic: "<topic>-live", every, body:
+<empty>}` when a validator; a `deregister` emits `unliveness` / `unbeacon`
+likewise. Nothing extra at a start or re-read. A value that is not an
+integer from 1 000 ms to a day refuses the registration (`bad-args`).
+docs/OVERLAY.md "Market and validator". The manifest's rows are unchanged.
 
 ## Contributing
 
