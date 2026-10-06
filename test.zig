@@ -2256,3 +2256,28 @@ test "seeding a registered topic (0.7.8): a held seed judged under the new topic
     try std.testing.expectEqualStrings(root.?, inst.ov_root.?);
     try std.testing.expectEqual(@as(usize, 1), (try inst.look(&.{.{ .key = "topic", .value = .{ .text = "tm_seed" } }})).len);
 }
+
+test "the listings and documentation are reads (shruggr/skein#135, 0.8.0): reads[] names them, no http row in dispatch[] (/submit is derived)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const j = try std.json.parseFromSliceLeaky(std.json.Value, a, @embedFile("etc/app.json"), .{});
+    const want = [_][2][]const u8{
+        .{ "/listTopicManagers", "listTopicManagers" },
+        .{ "/listLookupServiceProviders", "listLookupServiceProviders" },
+        .{ "/getDocumentationForTopicManager", "topicDocumentation" },
+        .{ "/getDocumentationForLookupServiceProvider", "lookupDocumentation" },
+    };
+    const reads = j.object.get("reads").?.array.items;
+    try std.testing.expectEqual(want.len, reads.len);
+    for (want, reads) |w, r| {
+        try std.testing.expectEqualStrings(w[0], r.object.get("address").?.string);
+        try std.testing.expectEqualStrings("overlay", r.object.get("program").?.string);
+        try std.testing.expectEqualStrings(w[1], r.object.get("fn").?.string);
+        try std.testing.expect(r.object.get("sender") == null and r.object.get("transport") == null);
+    }
+    for (j.object.get("dispatch").?.array.items) |r| {
+        const t = if (r.object.get("transport")) |x| x.string else "mailbox";
+        try std.testing.expect(!std.mem.eql(u8, t, "http"));
+    }
+}

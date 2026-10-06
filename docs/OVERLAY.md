@@ -1,4 +1,4 @@
-# Overlay services in the VM (0.7.7)
+# Overlay services in the VM (0.8.0)
 
 An overlay is an app (skein docs/APPS.md §6). It judges transactions with
 its topic managers and indexes them with its lookup services; it does not
@@ -570,7 +570,7 @@ wire"). Stepped:
 | a message in box `register`, i.e. `<app>/register` (the manifest's row, from `$owner`; 0.7.7) | `{fn: "register", args: {topic, program}}` or `{fn: "deregister", args: {topic}}` | the registered set under `<app>/topics` and its events ("Register a topic", below); in any other box, refused (`bad-args`) |
 
 One box per function class (shruggr/skein#128, 0.7.5, 0.7.6, 0.7.7): submissions in `<app>/submit` (by message and over HTTP; the engine takes a `submit` in any box a row routes to it, from anyone that row admits), registration in `<app>/register`, the engine's own traffic in `<app>`; `register` / `deregister` only in `<app>/register`, and refused with `bad-args` in every other box, whoever sent them (the instance itself too); any other message from anyone but the instance itself is refused; from the instance itself, only `watch` and `resume`. There is no `lookup`
-box: a lookup is a read: its request is recorded, and it moves nothing.
+box: a lookup is a read (shruggr/skein#135): a call over the current state, no entry, and it moves nothing ("The wire", below).
 
 **Config.** An installed engine reads its configuration from its app
 record (skein #72, #77; `src/config.zig`), at every step and call: the root
@@ -578,7 +578,7 @@ of the head `<app>/app`, `{kind: "app", programs: {<role>: <program
 record>}, config: {overlay: {topics, lookups, gossip?}}, …}`, that
 `skein-host install` wrote. It finds it through its own program record,
 which the install gives `app: <name>`: in a step, the thread's `program`;
-in a route's call, the matched dispatch row's `program` (`match`). The same
+in a route's call or a read's, the matched dispatch row's or read's `program` (`match`). The same
 name is where its heads are (`<name>/state`, …). A reinstall with a changed
 `config.overlay` is read at the next step or call; nothing restarts.
 
@@ -611,12 +611,14 @@ says its own).
 **The wiring is derived from `config.overlay`** (skein docs/APPS.md §6):
 `skein-host install` adds, for each topic, the libp2p rows `<topic>` →
 `submit`, `<topic>-admit` → `peerAdmit`, `<topic>-proof` → `peerProof`
-(sender `*`); the http rows `/submit` and `/lookup` (open, under
-`/<app>/`); and the mailbox rows `<app>` from `event` (the libp2p routes'
-admitted events) and from `$self` (its own watch and resume) — all to the
-role `overlay`. The manifest lists the submission box `submit` (open), the
-registration box `register` (`$owner`), the listing and documentation
-routes, and `requires: ["chain/1"]`: the chain app must be installed.
+(sender `*`); the http row `/submit` (a message route, any key: a signed
+request) and the read `/lookup` (anyone, signed or not), under `/<app>/`;
+and the mailbox rows `<app>` from `event` (the libp2p routes' admitted
+events) and from `$self` (its own watch and resume) — all to the role
+`overlay`. The manifest lists the submission box `submit` (open), the
+registration box `register` (`$owner`), the stream row, the listing and
+documentation **reads** (`reads[]`, 0.8.0), and `requires: ["chain/1"]`:
+the chain app must be installed.
 `POST /submit`'s submission event goes to `<app>/submit` (0.7.6), not
 through the derived `<app>` rows.
 
@@ -908,10 +910,18 @@ outputs too. It answers its metadata and documentation with literals.
 
 ## The wire: the instance's own front door (#40)
 
-The overlay is served by the instance itself: its front door
-(`programs/frontdoor`) matches the request against the dispatch table's
-http rows and calls the engine's handler with it. The rows are open (sender
-`*`), as overlay-express is, and under the app's prefix: the app's BRC-23
+The overlay is served by the instance itself, through its two doors
+(shruggr/skein#135; skein docs/MESSAGES.md "The front door: two doors"):
+
+| door | what it is | the overlay's |
+|---|---|---|
+| **read** (`reads[]`) | the host serves the path as a call of the engine's function over the current state (the front door's fn `read`, the read as the handler's `match`): any method, signed or not (a signed one answered signed on its session), **no entry, nothing logged**; a function that writes fails inside the call | `/lookup` (derived from `config.overlay`), `/listTopicManagers`, `/listLookupServiceProviders`, `/getDocumentationForTopicManager`, `/getDocumentationForLookupServiceProvider` (the manifest's, 0.8.0) |
+| **row** (`dispatch[]`) | a message: an `http` row is a message route — a signed request (BRC-104), verified at the door, appended as an entry and stepped; an unsigned request gets 401 and shakes hands. Mailbox and libp2p rows are boxes and topics | `/submit` (derived, sender `*`: any key, never no key); the boxes `<app>/submit`, `<app>/register`, `<app>` ("Submitting", above: the three boxes); the libp2p rows |
+
+A read and an http row never share a path (the install refuses the clash).
+Before 0.8.0 the listings and documentation were http rows (sender `*`);
+they always only read, so the engine runs them unchanged as reads. The
+paths are under the app's prefix: the app's BRC-23
 base URL is `https://<handle>.<host>/<app>` (on a host without wildcard
 DNS, `/@<handle>/<app>` on the host's origin), and a client calls
 `${baseUrl}/submit` (`POST https://alice.skein.nexus/overlay/submit`). The
@@ -920,12 +930,12 @@ path, so they work only against an overlay served
 at an origin's root (a system tree, below); skein does not use them for
 overlay apps.
 
-| route | fn | | answer |
-|---|---|---|---|
-| `POST /submit` | `submit` | body BEEF (`application/octet-stream`); `X-Topics` a comma list (the SDK's form) or a JSON array; `x-includes-off-chain-values: true` → VarInt(len) ‖ BEEF ‖ values | **200 `{id}`**: delivered — the request record's CID (hex), which the answers name as `request`; 400 `{status: "error", message}` only when it is not a submission (no `X-Topics`, no body, bad framing). The verdict is a message to the submitter ("Submitting", above) |
-| `POST /lookup` | `lookup` | `{service, query}` JSON; `X-Aggregation: yes` | `{type: "output-list", outputs: [{beef: [bytes], outputIndex, context?}]}`, or the compact octet-stream (count, per output txid ‖ index ‖ context, then one BEEF of them all, `state.beefOfMany`); a freeform answer as `{type, result}` |
-| `GET /listTopicManagers`, `/listLookupServiceProviders` | `listTopicManagers`, `listLookupServiceProviders` | | `{name: {name, shortDescription, iconURL?, version?, informationURL?}}`: each configured topic's or service's fn `metadata` |
-| `GET /getDocumentationForTopicManager?manager=`, `/getDocumentationForLookupServiceProvider?lookupService=` | `topicDocumentation`, `lookupDocumentation` | | `text/markdown`: its fn `documentation`; 400 if not configured |
+| path | door | fn | | answer |
+|---|---|---|---|---|
+| `POST /submit` | row | `submit` | body BEEF (`application/octet-stream`); `X-Topics` a comma list (the SDK's form) or a JSON array; `x-includes-off-chain-values: true` → VarInt(len) ‖ BEEF ‖ values | **200 `{id}`**: delivered — the request record's CID (hex), which the answers name as `request`; 400 `{status: "error", message}` only when it is not a submission (no `X-Topics`, no body, bad framing). The verdict is a message to the submitter ("Submitting", above) |
+| `POST /lookup` | read | `lookup` | `{service, query}` JSON; `X-Aggregation: yes` | `{type: "output-list", outputs: [{beef: [bytes], outputIndex, context?}]}`, or the compact octet-stream (count, per output txid ‖ index ‖ context, then one BEEF of them all, `state.beefOfMany`); a freeform answer as `{type, result}` |
+| `GET /listTopicManagers`, `/listLookupServiceProviders` | read | `listTopicManagers`, `listLookupServiceProviders` | | `{name: {name, shortDescription, iconURL?, version?, informationURL?}}`: each configured topic's or service's fn `metadata` |
+| `GET /getDocumentationForTopicManager?manager=`, `/getDocumentationForLookupServiceProvider?lookupService=` | read | `topicDocumentation`, `lookupDocumentation` | | `text/markdown`: its fn `documentation`; 400 if not configured |
 
 **A submit is the one write**, and only when a topic takes the transaction
 (above). Over HTTP it is the submission message on another transport: the
@@ -964,10 +974,12 @@ stream; nothing else answers the sender. An admission from the stream
 publishes its `-admit` verdict but not the BEEF on `<topic>` (its holders
 published it long since).
 
-**A lookup writes nothing.** The handler calls the service's program and
-shapes its answer for the wire. Listings and documentation call the
-programs too (fn `metadata`, fn `documentation`) and read no file; a call
-that fails answers 500.
+**A lookup writes nothing**, and leaves no entry: it is a read. The
+handler calls the service's program and shapes its answer for the wire.
+Listings and documentation call the programs too (fn `metadata`, fn
+`documentation`) and read no file; a call that fails answers 500. Each
+finds the engine's app from the read's `program` (its `match`), as a
+route's call does.
 
 **The STEAK.** It is the `steak` of an `admitted` answer, per topic, with
 exactly the three fields the @bsv/sdk client accepts (`outputsToAdmit`,

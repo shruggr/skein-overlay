@@ -4,7 +4,7 @@ The overlay services engine for a [skein](https://github.com/shruggr/skein),
 as an app: BRC-22 submit and BRC-24 lookup, served by the instance's own
 front door, with topic managers and lookup services as programs the engine
 calls. It is also a Zig package: an overlay of your own depends on it for
-the topic and lookup contracts. Version **0.7.8**.
+the topic and lookup contracts. Version **0.8.0**.
 
 ## What it is
 
@@ -78,8 +78,10 @@ Its BRC-23 base URL is `https://<handle>.<host>/<app>`; on a host without
 wildcard DNS (local dev) the router also serves it as `/@<handle>/<app>` on
 the host's origin. Its endpoints are under it: `POST <base>/submit`
 (`POST https://alice.skein.nexus/overlay/submit`, or
-`POST http://127.0.0.1:8100/@alice/overlay/submit`), `POST <base>/lookup`,
-the listing and documentation routes, all open. The @bsv/sdk
+`POST http://127.0.0.1:8100/@alice/overlay/submit`), a message route that
+takes a signed request (BRC-104; unsigned, 401), open to any key; and the
+reads, open to anyone, signed or not: `POST <base>/lookup` and the listing
+and documentation paths (shruggr/skein#135). The @bsv/sdk
 `TopicBroadcaster` and `LookupResolver` reject a base URL with a path, so
 call the endpoints directly (`POST <base>/submit` with the BEEF and
 `X-Topics`). `/submit` answers `200 {id}` on delivery, not BRC-22's STEAK:
@@ -150,7 +152,7 @@ one with its own index.
 Either may also define `pub fn metadata(a, name) !topic.Metadata` (or
 `lookup.Metadata`: name, shortDescription, iconURL?, version?,
 informationURL?) and `pub fn documentation(a, name) ![]const u8`
-(markdown); the listing and documentation routes call them. Without them it
+(markdown); the listing and documentation reads call them. Without them it
 lists under its configured name with an empty description. Where the text
 comes from (a literal, a file in the tree) is the program's own.
 
@@ -160,7 +162,7 @@ The manifest (`etc/app.json`, this repo's own, description left out):
 {
   "kind": "app",
   "name": "overlay",
-  "version": "0.7.8",
+  "version": "0.8.0",
   "programs": {
     "overlay": "bin/overlay.wasm",
     "topic-demo": "bin/topic-demo.wasm",
@@ -177,11 +179,13 @@ The manifest (`etc/app.json`, this repo's own, description left out):
   "dispatch": [
     {"address": "register", "sender": "$owner", "program": "overlay"},
     {"address": "submit", "sender": "*", "program": "overlay", "filter": "beef"},
-    {"transport": "http", "address": "/listTopicManagers", "sender": "*", "program": "overlay", "fn": "listTopicManagers"},
-    {"transport": "http", "address": "/listLookupServiceProviders", "sender": "*", "program": "overlay", "fn": "listLookupServiceProviders"},
-    {"transport": "http", "address": "/getDocumentationForTopicManager", "sender": "*", "program": "overlay", "fn": "topicDocumentation"},
-    {"transport": "http", "address": "/getDocumentationForLookupServiceProvider", "sender": "*", "program": "overlay", "fn": "lookupDocumentation"},
     {"transport": "libp2p", "address": "/skein/overlay/beef/1.0.0", "sender": "*", "program": "overlay", "fn": "submit", "filter": "beef"}
+  ],
+  "reads": [
+    {"address": "/listTopicManagers", "program": "overlay", "fn": "listTopicManagers"},
+    {"address": "/listLookupServiceProviders", "program": "overlay", "fn": "listLookupServiceProviders"},
+    {"address": "/getDocumentationForTopicManager", "program": "overlay", "fn": "topicDocumentation"},
+    {"address": "/getDocumentationForLookupServiceProvider", "program": "overlay", "fn": "lookupDocumentation"}
   ]
 }
 ```
@@ -189,9 +193,18 @@ The manifest (`etc/app.json`, this repo's own, description left out):
 - `programs.overlay` is the engine: copy `bin/overlay.wasm` from this repo
   into your tree (or `bin/overlay.cid` when the instance already holds it).
 - The rest of the wiring is derived from `config.overlay` by the install:
-  http `/submit` and `/lookup` (open, under `/<app>/`), the libp2p rows
-  `<topic>`, `<topic>-admit`, `<topic>-proof`, and box `<app>` from `event`
-  and from `$self`. The install prompt reads them all aloud.
+  the http row `/submit` and the read `/lookup` (under `/<app>/`), the
+  libp2p rows `<topic>`, `<topic>-admit`, `<topic>-proof`, and box `<app>`
+  from `event` and from `$self`. The install prompt reads them all aloud.
+- Reads and rows (shruggr/skein#135, two doors). A **read** (`reads[]`) is
+  served by the host as a call of the engine's function over the current
+  state: any method, signed or not, no entry, nothing logged; the function
+  only reads. The overlay's reads are `/lookup` (derived) and the four
+  listing and documentation paths above (the manifest's own). A **row**
+  (`dispatch[]`) is a message route or a box: an `http` row takes a signed
+  request (BRC-104; the stock TopicBroadcaster's plain POST `/submit` gets
+  401), and every row's message is an entry in the log. A read and an http
+  row never share a path.
 - One box per function class (shruggr/skein#128), three boxes:
   `<app>/submit` for submissions, `<app>/register` for registration, `<app>`
   for the engine's own events and messages.
@@ -281,7 +294,7 @@ Not built: BRC-88 SHIP/SLAP, GASP sync and catch-up from a peer, the
 
 | | |
 |---|---|
-| this app and package | 0.7.8 (tag `v0.7.8`) |
+| this app and package | 0.8.0 (tag `v0.8.0`) |
 | skein-sdk | v0.7.1, by tag URL and hash in `build.zig.zon` (modules `chain` and, for the engine, `sk`; bsvz comes through it) |
 | requires | `chain/1` (shruggr/skein-chain 0.3.0) |
 | skein | log format 8; skein's equivs pin this repo by commit |
@@ -399,6 +412,19 @@ answer adds `seeded` and `missing` (and `untaken` when a held seed is taken
 by nothing). Idempotent: a seed already admitted under the topic is not
 judged again. docs/OVERLAY.md "Register a topic" has the rest. The manifest's
 rows are unchanged.
+
+0.8.0: the listings and the documentation are reads (shruggr/skein#135,
+two doors): the manifest declares `/listTopicManagers`,
+`/listLookupServiceProviders`, `/getDocumentationForTopicManager` and
+`/getDocumentationForLookupServiceProvider` in `reads[]` (`{address,
+program: "overlay", fn}`) and drops the four `http` rows that served them.
+The host serves each as a call over the current state: any method, signed
+or not, no entry, nothing logged. `/lookup` stays derived (a read);
+`/submit` stays a derived http row (a message route: a signed request), and
+the rows `submit` and `register` are unchanged. The engine is unchanged:
+its four functions only ever read (the configured programs' `metadata` /
+`documentation`), as `/lookup` did. An app that embeds the engine moves the
+same four rows into its `reads`.
 
 ## Contributing
 
