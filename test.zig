@@ -2023,6 +2023,50 @@ test "answers to the submitter's box (shruggr/skein#112): admitted with status p
     try std.testing.expectEqual(before, inst.wire_.answers.items.len);
 }
 
+test "a submission by message is answered once (0.7.4): one `admitted`; the step's wake at its thread's end answers nothing" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = c.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var inst = try Instance.init(a, &ms);
+    const x = try chain3(a, &inst);
+    const alice: [33]u8 = .{0x03} ++ .{0xa1} ** 32;
+    const m1 = try a.dupe(u8, &cbor.cidOf("message 1"));
+    const src1 = try byMessage(a, &alice, m1);
+    const parent = try withFund(a, x.f, x.t1);
+    const args = try submitArgs(a, parent);
+
+    // The message step: the submission's thread launched, nobody answered yet.
+    const r = try inst.received(args, src1);
+    try std.testing.expect(r == .launch);
+    // The thread: begun, ingested, accepted → admitted, answered once.
+    _ = try inst.begin(r.launch);
+    _ = try inst.ingest(parent);
+    _ = try inst.chainStatus(x.t1.txid, "RECEIVED", null);
+    try std.testing.expect((try inst.answer(x.t1.txid, .accepted)).admitted);
+    // The message step again, woken at that thread's end (`resolved`): nothing routed, nothing answered.
+    const first = inst.in;
+    var es: std.ArrayList(cbor.Entry) = .empty;
+    try es.appendSlice(a, first.map);
+    try es.append(a, .{ .key = "resolved", .value = .{ .array = try a.dupe(Value, &.{try mapOf(a, &.{
+        .{ .key = "thread", .value = .{ .cid = try a.dupe(u8, &cbor.cidOf("the submission's thread")) } },
+        .{ .key = "state", .value = .{ .text = "finished" } },
+    })}) } });
+    inst.in = .{ .map = es.items };
+    try std.testing.expect((try inst.received(args, src1)) == .woke);
+    inst.in = first;
+
+    var admitted: usize = 0;
+    for (inst.wire_.answers.items) |ans| {
+        if (ans.body.get("result")) |res| {
+            if (std.mem.eql(u8, res.getText("state") orelse "", "admitted")) admitted += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), admitted);
+    try std.testing.expectEqual(@as(usize, 1), inst.wire_.answers.items.len);
+}
+
 test "the app's own box is open to submissions (0.7.2): a registration there only from the instance itself" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();

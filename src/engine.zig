@@ -411,6 +411,7 @@ fn settled(a: Allocator, step: Value, loaded: anytype, outcome: submit.Resumed, 
             .{ .key = "outcome", .value = .{ .text = "dropped" } },
             .{ .key = "why", .value = .{ .text = why } },
         }),
+        .woke => try fields.append(a, .{ .key = "outcome", .value = .{ .text = "woke" } }),
     }
     const wanted = try emitWants(a, &loaded.st);
     if (wanted > 0) try fields.append(a, .{ .key = "wanted", .value = .{ .uint = wanted } });

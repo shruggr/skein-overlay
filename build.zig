@@ -4,6 +4,7 @@
 // library (skein-sdk `chain`: BEEF, SPV, merkle paths, the record store and
 // the chain app's state, read only; a URL+hash dependency). No chain tracker,
 // no wallet library: the chain state is the chain app's (shruggr/skein-chain).
+// The engine also imports the SDK's `sk` as `skein` (the address book: `peerAt`, `peerOf`).
 //
 // Modules (an app depends on skein-overlay by URL+hash, as on the SDK, and
 // `b.dependency("skein_overlay", .{ .target = t, .optimize = o }).module(name)`):
@@ -20,11 +21,12 @@
 // bsvz comes through the SDK (its lazy URL dependency).
 const std = @import("std");
 
-const Mods = struct { chain: *std.Build.Module, sk: *std.Build.Module, topic: *std.Build.Module, lookup: *std.Build.Module };
+const Mods = struct { chain: *std.Build.Module, sdk: *std.Build.Module, sk: *std.Build.Module, topic: *std.Build.Module, lookup: *std.Build.Module };
 
 /// The contract modules for one target, over the SDK's `chain` for that target.
 fn mods(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, exported: bool) Mods {
-    const chain = b.dependency("skein_sdk", .{ .target = target, .optimize = optimize }).module("chain");
+    const dep = b.dependency("skein_sdk", .{ .target = target, .optimize = optimize });
+    const chain = dep.module("chain");
     const mk = struct {
         fn f(bb: *std.Build, name: []const u8, path: []const u8, t: std.Build.ResolvedTarget, o: std.builtin.OptimizeMode, ex: bool, imps: []const std.Build.Module.Import) *std.Build.Module {
             const opts: std.Build.Module.CreateOptions = .{ .root_source_file = bb.path(path), .target = t, .optimize = o, .imports = imps };
@@ -34,11 +36,11 @@ fn mods(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.O
     const sk = mk(b, "sk", "src/vm.zig", target, optimize, exported, &.{.{ .name = "chain", .module = chain }});
     const topic = mk(b, "topic", "src/topic.zig", target, optimize, exported, &.{ .{ .name = "chain", .module = chain }, .{ .name = "sk", .module = sk } });
     const lookup = mk(b, "lookup", "src/lookup.zig", target, optimize, exported, &.{ .{ .name = "chain", .module = chain }, .{ .name = "sk", .module = sk } });
-    return .{ .chain = chain, .sk = sk, .topic = topic, .lookup = lookup };
+    return .{ .chain = chain, .sdk = dep.module("sk"), .sk = sk, .topic = topic, .lookup = lookup };
 }
 
-fn imports(m: Mods) [4]std.Build.Module.Import {
-    return .{ .{ .name = "chain", .module = m.chain }, .{ .name = "sk", .module = m.sk }, .{ .name = "topic", .module = m.topic }, .{ .name = "lookup", .module = m.lookup } };
+fn imports(m: Mods) [5]std.Build.Module.Import {
+    return .{ .{ .name = "chain", .module = m.chain }, .{ .name = "skein", .module = m.sdk }, .{ .name = "sk", .module = m.sk }, .{ .name = "topic", .module = m.topic }, .{ .name = "lookup", .module = m.lookup } };
 }
 
 pub fn build(b: *std.Build) void {

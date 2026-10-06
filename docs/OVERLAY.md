@@ -1,4 +1,4 @@
-# Overlay services in the VM (0.7.3)
+# Overlay services in the VM (0.7.4)
 
 An overlay is an app (skein docs/APPS.md §6). It judges transactions with
 its topic managers and indexes them with its lookup services; it does not
@@ -78,7 +78,7 @@ zig build bin    # the same, into bin/ (committed)
 zig build test   # the submission flow and the contracts, natively
 ```
 
-The SDK (shruggr/skein-sdk v0.5.1) is a URL+hash dependency in
+The SDK (shruggr/skein-sdk v0.7.1) is a URL+hash dependency in
 `build.zig.zon`; the overlay uses its `chain` module only (BEEF, SPV,
 merkle paths, the store and its maps, and `state`: the chain app's
 records), and bsvz comes through it. No chain tracker and no wallet
@@ -543,10 +543,10 @@ wire"). Stepped:
 
 | launched by | input | does |
 |---|---|---|
-| a message in box `<app>` from anyone (the manifest's row `""`, sender `*`), or the `submission` event POST /submit admits there (0.7.3) | `{fn: "submit", args: {beef, topics, offChainValues?}}`, or `{kind: "submission", body: <that message>, request, transport: "http", sender?}` | a submission (shruggr/skein#112): routed — its thread launched, paused, or answered (`rejected`, or `admitted` for one judged before) |
+| a message in box `<app>` from anyone (the manifest's row `""`, sender `*`), or the `submission` event POST /submit admits there (0.7.3) | `{fn: "submit", args: {beef, topics, offChainValues?}}`, or `{kind: "submission", body: <that message>, request, transport: "http", sender?}` | a submission (shruggr/skein#112): routed — its thread launched, paused, or answered (`rejected`, or `admitted` for one judged before); the step's wake at the end of the thread it launched (`resolved`) answers nothing (0.7.4: the submitter is answered once per state change) |
 | a submission's launch, or the submit event in box `<app>` (the `libp2p:<topic>` route's admit, row from `event`) | `{kind: "submit", …}` | the submission's thread: the ingest message, pending; on each answer (`reply`) admit, reject or await on; the submitter answered |
 | a message in box `<app>` from the instance itself (row from `$self`) | `{fn: "watch", args: {txid, ingest}}` | the watch: the later proof (`-proof`) or rejection (unwound) |
-| a message in box `<app>` from the instance itself (row from `$self`) | `{fn: "resume", args: {txid}}` | a paused submission routed again (skein-overlay#1): its thread launched, paused again, or dropped |
+| a message in box `<app>` from the instance itself (row from `$self`) | `{fn: "resume", args: {txid}}` | a paused submission routed again (skein-overlay#1): its thread launched, paused again, or dropped; its wake at that thread's end, nothing |
 | the `peer-admit` event in box `<app>` (the `-admit` route's admit) | `{kind: "peer-admit", …}` | recorded under `<app>/gossip` ("Gossip", below); nothing admitted; a pause of that transaction wants its parents from that peer too |
 | a message in any box a row routes to the engine (the manifest's: `overlay`, i.e. `<app>/overlay`, from `$owner`; `<app>` too) | `{fn: "register", args: {topic, program}}` or `{fn: "deregister", args: {topic}}` | the registered set under `<app>/topics` and its events ("Register a topic", below) |
 
@@ -927,8 +927,9 @@ a txid and a block hash are hex in display order.
 
 **Publishing.** A message to the libp2p provider, box `publish`, body
 `{topic, body}` (docs/MESSAGES.md, "The providers"), emitted from the step
-and not awaited. With no libp2p provider in the address book nothing is
-published. The raw submission is the submit event's `beef` (the off-chain
+and not awaited. The libp2p provider is the address book's entry at
+(`local`, `libp2p`) (skein-sdk `peerAt`; the address book has no roles,
+shruggr/skein#126); with none, nothing is published. The raw submission is the submit event's `beef` (the off-chain
 values do not travel): from its pointer record, the exact bytes received,
 re-encoded by skein-sdk's `chain.record.beefOf` (#121). A submission that arrived by gossip on `<topic>` is
 not re-published there; a proof that arrived on `<topic>-proof` is not

@@ -4,7 +4,7 @@ The overlay services engine for a [skein](https://github.com/shruggr/skein),
 as an app: BRC-22 submit and BRC-24 lookup, served by the instance's own
 front door, with topic managers and lookup services as programs the engine
 calls. It is also a Zig package: an overlay of your own depends on it for
-the topic and lookup contracts. Version **0.7.3**.
+the topic and lookup contracts. Version **0.7.4**.
 
 ## What it is
 
@@ -160,7 +160,7 @@ The manifest (`etc/app.json`, this repo's own, description left out):
 {
   "kind": "app",
   "name": "overlay",
-  "version": "0.7.3",
+  "version": "0.7.4",
   "programs": {
     "overlay": "bin/overlay.wasm",
     "topic-demo": "bin/topic-demo.wasm",
@@ -270,8 +270,8 @@ Not built: BRC-88 SHIP/SLAP, GASP sync and catch-up from a peer, the
 
 | | |
 |---|---|
-| this app and package | 0.7.3 (tag `v0.7.3`) |
-| skein-sdk | v0.5.1, by tag URL and hash in `build.zig.zon` (module `chain`; bsvz comes through it) |
+| this app and package | 0.7.4 (tag `v0.7.4`) |
+| skein-sdk | v0.7.1, by tag URL and hash in `build.zig.zon` (modules `chain` and, for the engine, `sk`; bsvz comes through it) |
 | requires | `chain/1` (shruggr/skein-chain 0.3.0) |
 | skein | log format 8; skein's equivs pin this repo by commit |
 
@@ -340,6 +340,14 @@ on it, so the request did not end: 500 `ERR_FRONT_DOOR`). It answers `200
 the event `{kind: "submission", body: {fn: "submit", args}, request,
 transport: "http", sender?}`, routed into the app's box as the libp2p route
 admits its submit event; the engine's step on it is the message step's.
+
+0.7.4, on skein-sdk v0.7.1 (the address book has no roles, shruggr/skein#126):
+the libp2p provider is the address book's entry at (`local`, `libp2p`)
+(the SDK's `peerAt`), so gossip out publishes again. A submission by
+message is answered once per state change: the message step's wake at the
+end of the thread it launched (`resolved` in its input) routes nothing and
+answers nothing (outcome `woke`) — before, it answered `admitted` a second
+time, from the state.
 
 ## Contributing
 

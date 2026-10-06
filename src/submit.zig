@@ -894,7 +894,17 @@ pub const Resumed = union(enum) {
     /// Routed to nothing (refused, taken by no topic, judged before): a pause dropped; why. The
     /// submitter was answered.
     dropped: []const u8,
+    /// The step's wake at the end of the submission's thread it launched (`resolved` in its input):
+    /// nothing routed again, nothing answered — that thread answered the submitter.
+    woke,
 };
+
+/// Whether a step is its thread's wake at the end of a thread it launched (docs/VM.md "Waiting on
+/// a thread": `resolved: [{thread, state, result, error}]`), not a new message.
+pub fn woke(in: Value) bool {
+    const r = in.get("resolved") orelse return false;
+    return r == .array and r.array.len > 0;
+}
 
 /// The route's outcome, acted on in a step (a `resume`, a submission by message): launch, pause,
 /// or answer. Every outcome but a pause or a launch drops a pause of the subject.
@@ -934,6 +944,7 @@ fn unpauseIf(st: *State, txid: [32]u8) !void {
 /// again, they are recorded again for what it still lacks, against every peer that announced it or
 /// something needing it by now.
 pub fn resumed(cx: Ctx, txid: [32]u8) !Resumed {
+    if (woke(cx.in)) return .woke;
     const a = cx.a;
     const rec = (try cx.st.pendingRecord(txid)) orelse return .none;
     if (rec.get("waiting") == null) return .none;
@@ -949,8 +960,10 @@ pub fn resumed(cx: Ctx, txid: [32]u8) !Resumed {
 /// message. `source` is `{transport, box, sender?, request}`: whom the answers go to. Routed as
 /// any submission: whole, its thread is launched (`launch`); lacking parents, paused (the
 /// submitter hears nothing of it); else answered at once (rejected; or, judged before, admitted).
-/// A `bad-args` error answer for a body that is not that shape.
+/// A `bad-args` error answer for a body that is not that shape. The step's wake at the end of the
+/// thread it launched answers nothing (`woke`): the submitter is answered once per state change.
 pub fn received(cx: Ctx, args: Value, source: Value) !Resumed {
+    if (woke(cx.in)) return .woke;
     const a = cx.a;
     const beef = Input.of(args.get("beef")) orelse return badArgs(cx, source, "submit: want {beef: bytes, topics: [string], offChainValues?: bytes}");
     const tv = args.get("topics") orelse return badArgs(cx, source, "submit: want {beef, topics: [string]}");

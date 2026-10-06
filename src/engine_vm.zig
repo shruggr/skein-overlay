@@ -7,6 +7,7 @@
 const std = @import("std");
 const c = @import("chain");
 const vm = @import("sk");
+const skein = @import("skein");
 const config = @import("config.zig");
 const calls = @import("calls.zig");
 const gossip = @import("gossip.zig");
@@ -76,29 +77,16 @@ pub fn wire(in: Value) !submit.Wire {
     return .{ .ctx = &dummy, .sendFn = sendImpl, .answerFn = answerImpl };
 }
 
-/// The libp2p provider's key: the address book's entry with role `libp2p` (the head `peers`), or null.
+/// The libp2p provider's key: the address book's entry at ("local", "libp2p") (the SDK's `peerAt`;
+/// the address book has no roles, shruggr/skein#126), or null.
 fn libp2pProvider(a: Allocator) !?[]const u8 {
-    const s = vm.store();
-    const root = (try vm.head(a, "peers")) orelse return null;
-    const list = (try s.getValue(a, root)).getArray("peers") orelse return null;
-    for (list) |x| {
-        const p = try s.getValue(a, x.getCid("peer") orelse continue);
-        if (std.mem.eql(u8, p.getText("role") orelse "", "libp2p")) return p.getBytes("key");
-    }
-    return null;
+    return skein.peerAt(a, "local", "libp2p");
 }
 
 /// Whether a message can reach `key`: the instance itself (looped back), or an entry of the address book.
 pub fn reaches(a: Allocator, in: Value, key: []const u8) !bool {
     if (vm.selfKey(in)) |me| if (std.mem.eql(u8, me, key)) return true;
-    const s = vm.store();
-    const root = (try vm.head(a, "peers")) orelse return false;
-    const list = (try s.getValue(a, root)).getArray("peers") orelse return false;
-    for (list) |x| {
-        const p = try s.getValue(a, x.getCid("peer") orelse continue);
-        if (std.mem.eql(u8, p.getBytes("key") orelse "", key)) return true;
-    }
-    return false;
+    return (try skein.peerOf(a, key)) != null;
 }
 
 var provider_key: []const u8 = "";
