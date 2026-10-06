@@ -1130,3 +1130,104 @@ fn admitItem(cx: Ctx, ev: Value, it: EventItem, beef: []const u8, records: *std.
     }
     return .{ .txid = it.txid, .topics = topics, .applied = applied };
 }
+
+// ---------------------------------------------------------------- seeding a registered topic (0.7.8)
+
+/// What seeding a topic came to: `seeded` the seeds the topic holds now (admitted by this seeding or
+/// before), `missing` the seeds the chain state does not hold (or holds rejected), `untaken` the held
+/// seeds the topic takes nothing of; the transactions admitted, oldest first; the records the
+/// judgements wrote (the step keeps them); the watch messages sent.
+pub const Seeding = struct {
+    seeded: []const [32]u8 = &.{},
+    missing: []const [32]u8 = &.{},
+    untaken: []const [32]u8 = &.{},
+    admissions: []const Admission = &.{},
+    records: []const []const u8 = &.{},
+    watches: []const []const u8 = &.{},
+};
+
+/// Whether the chain state holds `txid` and has not rejected it.
+fn heldLive(st: *State, txid: [32]u8) !bool {
+    return (try st.ch.holds(txid)) and (try st.ch.status(txid)) != .rejected;
+}
+
+/// The seed's held ancestry not yet judged under `topic`, oldest first (parents before children),
+/// ending with the seed: a transaction the topic admitted before is not walked past (its own
+/// ancestry was judged then); `seen` spans the seeds of one registration, each judged once.
+fn heldAncestry(a: Allocator, st: *State, topic: []const u8, root: [32]u8, seen: *std.AutoHashMapUnmanaged([32]u8, void)) ![]const [32]u8 {
+    const Frame = struct { txid: [32]u8, expanded: bool };
+    var stack: std.ArrayList(Frame) = .empty;
+    var order: std.ArrayList([32]u8) = .empty;
+    try stack.append(a, .{ .txid = root, .expanded = false });
+    while (stack.pop()) |f| {
+        if (f.expanded) {
+            try order.append(a, f.txid);
+            continue;
+        }
+        if (seen.contains(f.txid)) continue;
+        try seen.put(a, f.txid, {});
+        if (try st.isApplied(topic, f.txid)) continue;
+        try stack.append(a, .{ .txid = f.txid, .expanded = true });
+        const sub = try state.subjectOf(a, st.store, f.txid);
+        var i = sub.tx.inputs.len;
+        while (i > 0) {
+            i -= 1;
+            const p = sub.tx.inputs[i].previous_outpoint.txid.bytes;
+            if (seen.contains(p) or !(try heldLive(st, p))) continue;
+            try stack.append(a, .{ .txid = p, .expanded = false });
+        }
+    }
+    return order.items;
+}
+
+/// Seed a topic just registered (0.7.8; topics.zig): each seed the chain state holds is judged under
+/// `topic` alone, as a submission of it would be — oldest first over what is held: the seed's held
+/// ancestors, then the seed, each with the previous coins the ones before it left — and admitted at
+/// once from the state (the chain app's gate is passed: it holds the transaction, accepted or
+/// proven): the judgement recorded (`applied`, naming the chain state's Atomic BEEF of it, kept as a
+/// raw block), the listening lookup services' hooks called. One still unproven gets what a
+/// submission admitted on `accepted` gets: an ingest message to the chain app (answered from its
+/// state) and a watch on it, so a later proof or rejection is heard. Nothing is gossiped. `cx.in` is
+/// the configuration with the topic registered. A seed admitted under the topic before is not judged
+/// again; a seed not held is `missing`.
+pub fn seed(cx: Ctx, topic: []const u8, seeds: []const [32]u8) !Seeding {
+    const a = cx.a;
+    const st = cx.st;
+    const served = try calls.configObject(a, cx.in, "overlayTopics");
+    const prog = (try calls.configuredProgram(cx.in, served, topic)) orelse return error.BadConfig;
+    var seen: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
+    var seeded: std.ArrayList([32]u8) = .empty;
+    var missing: std.ArrayList([32]u8) = .empty;
+    var untaken: std.ArrayList([32]u8) = .empty;
+    var admissions: std.ArrayList(Admission) = .empty;
+    var records: std.ArrayList([]const u8) = .empty;
+    var watches: std.ArrayList([]const u8) = .empty;
+    for (seeds) |s_| {
+        if (!(try heldLive(st, s_))) {
+            try missing.append(a, s_);
+            continue;
+        }
+        for (try heldAncestry(a, st, topic, s_, &seen)) |t| {
+            const sub = try state.subjectOf(a, st.store, t);
+            const previous = try st.previousCoins(topic, sub.tx);
+            const ins = identify(a, cx.caller, prog, topic, sub, previous, null) catch continue;
+            state.check(sub.tx, previous, ins) catch continue;
+            if (!state.takes(previous, ins)) continue;
+            const bytes = try state.beefFor(st.ch, t);
+            const ap = st.apply(sub, topic, previous, ins, try state.putRaw(a, st.store, bytes)) catch |e| switch (e) {
+                error.BadInstructions => continue,
+                else => return e,
+            };
+            if (ap.records.len == 0) continue;
+            try records.appendSlice(a, ap.records);
+            try calls.hookAdmitted(a, cx.caller, cx.in, topic, sub, previous, ap);
+            try admissions.append(a, .{ .txid = t, .topics = try a.dupe([]const u8, &.{topic}), .applied = try a.dupe(state.Applied, &.{ap}) });
+            if ((try st.ch.status(t)) != .proven) {
+                const m = try cx.wire.send(a, chain_box, try ingestBody(a, .{ .bytes = bytes }));
+                try watches.append(a, try cx.wire.send(a, calls.appOf(cx.in), try watchBody(a, .{ .txid = t, .ingest = m })));
+            }
+        }
+        try (if (try st.isApplied(topic, s_)) &seeded else &untaken).append(a, s_);
+    }
+    return .{ .seeded = seeded.items, .missing = missing.items, .untaken = untaken.items, .admissions = admissions.items, .records = records.items, .watches = watches.items };
+}

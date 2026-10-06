@@ -2161,3 +2161,98 @@ test "one box per function class (skein #128, 0.7.6): POST /submit admits into `
     try std.testing.expectEqualStrings("admitted", ans.body.get("result").?.getText("state").?);
     try std.testing.expectEqualSlices(u8, request, ans.body.getCid("request").?);
 }
+
+test "seeding a registered topic (0.7.8): a held seed judged under the new topic only, oldest first over its held ancestry, admitted from the state; a seed not held is missing; again, nothing twice" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = c.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var inst = try Instance.init(a, &ms);
+    // The lookup service lists no topics: it listens to every topic, registered ones too.
+    for (inst.in.get("defaults").?.map) |*e| if (std.mem.eql(u8, e.key, "overlayLookups")) {
+        @constCast(e).value = .{ .text = "{\"ls_demo\":{\"program\":\"lookup-demo\"}}" };
+    };
+
+    // The chain app holds fund (mined) → t1 (mints a token) → t2 (moves it), never submitted to this overlay.
+    const x = try chain3(a, &inst);
+    const both = try beef.serialize(a, .{ .version = beef.V2, .bumps = x.f.bumps, .entries = try a.dupe(beef.Entry, &.{
+        x.f.entry,
+        .{ .txid = x.t1.txid, .format = .raw, .raw = x.t1.raw, .tx = x.t1.tx },
+        .{ .txid = x.t2.txid, .format = .raw, .raw = x.t2.raw, .tx = x.t2.tx },
+    }) });
+    _ = try inst.ingest(both);
+    _ = try inst.chainStatus(x.t1.txid, "RECEIVED", null);
+    _ = try inst.chainStatus(x.t2.txid, "RECEIVED", null);
+
+    // register {topic, program, seed}: the set, then the seeds.
+    const programs = inst.in.get("programs").?;
+    const t2_hex = try a.dupe(u8, &hdr.toHex(x.t2.txid));
+    const absent: [32]u8 = .{0xee} ** 32;
+    const absent_hex = try a.dupe(u8, &hdr.toHex(absent));
+    const rargs = try mapOf(a, &.{
+        .{ .key = "topic", .value = .{ .text = "tm_seed" } },
+        .{ .key = "program", .value = .{ .text = "topic-demo" } },
+        .{ .key = "seed", .value = .{ .array = try a.dupe(Value, &.{ .{ .text = t2_hex }, .{ .text = absent_hex }, .{ .text = t2_hex } }) } },
+    });
+    const reg = (try topics_mod.register(a, &.{}, rargs, programs, "overlay")).done;
+    try std.testing.expectEqual(@as(usize, 2), reg.seed.?.len); // each once
+    // A seed that is not a list of txids: refused, nothing written.
+    try std.testing.expect(try topics_mod.register(a, &.{}, try mapOf(a, &.{
+        .{ .key = "topic", .value = .{ .text = "tm_seed" } },
+        .{ .key = "program", .value = .{ .text = "topic-demo" } },
+        .{ .key = "seed", .value = .{ .array = try a.dupe(Value, &.{.{ .text = "zz" }}) } },
+    }), programs, "overlay") == .refused);
+    // No seed: none to judge.
+    try std.testing.expect((try topics_mod.register(a, &.{}, try mapOf(a, &.{
+        .{ .key = "topic", .value = .{ .text = "tm_seed" } },
+        .{ .key = "program", .value = .{ .text = "topic-demo" } },
+    }), programs, "overlay")).done.seed == null);
+
+    const in = try config.withTopics(a, inst.in, reg.list.?);
+    const seedStep = struct {
+        fn run(i: *Instance, cfg: Value, seeds: []const [32]u8) !submit.Seeding {
+            var st = try i.load();
+            var cx_ = i.cx(&st, false);
+            cx_.in = cfg;
+            const sd = try submit.seed(cx_, "tm_seed", seeds);
+            i.ov_root = try st.save();
+            return sd;
+        }
+    }.run;
+    const before_identify = inst.count("identify");
+    const sent_before = inst.wire_.sent.items.len;
+    const sd = try seedStep(&inst, in, reg.seed.?);
+    try std.testing.expectEqual(@as(usize, 1), sd.seeded.len);
+    try std.testing.expectEqualSlices(u8, &x.t2.txid, &sd.seeded[0]);
+    try std.testing.expectEqual(@as(usize, 1), sd.missing.len);
+    try std.testing.expectEqualSlices(u8, &absent, &sd.missing[0]);
+    try std.testing.expectEqual(@as(usize, 0), sd.untaken.len);
+    // Oldest first: fund (taken by nothing), t1 (mints), t2 (moves it) — t1 then t2 admitted.
+    try std.testing.expectEqual(before_identify + 3, inst.count("identify"));
+    try std.testing.expectEqual(@as(usize, 2), sd.admissions.len);
+    try std.testing.expectEqualSlices(u8, &x.t1.txid, &sd.admissions[0].txid);
+    try std.testing.expectEqualSlices(u8, &x.t2.txid, &sd.admissions[1].txid);
+    try std.testing.expectEqualSlices(u32, &.{0}, sd.admissions[1].applied[0].coins_to_retain);
+    // Both unproven: each an ingest to the chain app and a watch, as a submission admitted on `accepted`.
+    try std.testing.expectEqual(@as(usize, 2), sd.watches.len);
+    try std.testing.expectEqual(sent_before + 4, inst.wire_.sent.items.len);
+    try std.testing.expectEqualStrings("chain", inst.wire_.sent.items[sent_before].box);
+    try std.testing.expectEqualStrings("watch", inst.wire_.last().body.getText("fn").?);
+    // Under the new topic only; the lookup sees the token, t1's spent.
+    var st = try inst.load();
+    try std.testing.expect(try st.isApplied("tm_seed", x.t2.txid));
+    try std.testing.expect(!(try st.isApplied("tm_demo", x.t2.txid)));
+    inst.in = in;
+    try std.testing.expectEqual(@as(usize, 1), (try inst.look(&.{.{ .key = "topic", .value = .{ .text = "tm_seed" } }})).len);
+
+    // Again (a second register with the same seed): nothing judged, nothing admitted; still seeded.
+    const root = inst.ov_root;
+    const again = try seedStep(&inst, in, reg.seed.?);
+    try std.testing.expectEqual(before_identify + 3, inst.count("identify"));
+    try std.testing.expectEqual(@as(usize, 0), again.admissions.len);
+    try std.testing.expectEqual(@as(usize, 1), again.seeded.len);
+    try std.testing.expectEqual(@as(usize, 1), again.missing.len);
+    try std.testing.expectEqualStrings(root.?, inst.ov_root.?);
+    try std.testing.expectEqual(@as(usize, 1), (try inst.look(&.{.{ .key = "topic", .value = .{ .text = "tm_seed" } }})).len);
+}

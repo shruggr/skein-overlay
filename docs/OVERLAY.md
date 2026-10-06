@@ -641,10 +641,11 @@ box `<app>/submit` — they are refused, whoever sent them, with `error:
 <app>/register"}`, writing and emitting nothing. The app is the step's,
 never the box's:
 
-- `register {topic, program}` adds `topic` to the registered set, judged by
+- `register {topic, program, seed?}` adds `topic` to the registered set, judged by
   the topic manager `program` (a role in `programs`: the manifest of a
   dynamic overlay lists no topic, so the call names it; an unknown role is
-  refused);
+  refused); `seed` (0.7.8, optional) is a list of txids (hex) to seed the
+  topic with from what the chain state already holds (below);
 - `deregister {topic}` removes it.
 
 Both are idempotent: a topic registered already with the same program, or
@@ -655,6 +656,39 @@ the sender, in the box the message came in, as `{fn, request, replyTo, result}` 
 "bad-args", message}` for a refusal, which writes nothing) when a message
 can reach it (the instance itself, or an address-book entry); the step's
 result record says the same.
+
+**Seeding (0.7.8).** A topic registered after its transactions were made —
+a token's topic `tm_<deploy txid>`, registered once someone wants it served —
+starts empty; `seed` fills it from discovery instead of a resubmission. After
+the set is written (or found with the same program: a repeated register
+seeds too), for each seed txid the chain state holds (`chain/state` `txs`,
+not rejected) the engine runs the same judgement a submission of that
+transaction would get, under the new topic only: oldest first over what is
+held — the seed's held ancestors, then the seed — each with the previous
+coins the ones before it left (`src/submit.zig` `seed`). The chain app's gate
+is passed already (it holds the transaction, accepted or proven), so each
+one a topic takes is admitted at once, from the state, as the "judged
+before" path answers from it: the judgement recorded (`applied`, naming the
+chain state's Atomic BEEF of the transaction, kept as a raw block), the
+listening lookup services' `admitted` / `spent` hooks called. One still
+unproven also gets what a submission admitted on `accepted` gets — an
+ingest message to the chain app (answered from its state) and a `watch` —
+so its proof is heard and a later rejection removes the judgement. Seeded
+admissions are not gossiped. A transaction the topic admitted before is not
+judged again, nor walked past, so a second register with the same seed
+changes nothing. The answer adds:
+
+```
+{topic, active, seeded: [txid…], missing: [txid…], untaken?: [txid…]}
+```
+
+`seeded` the seeds the topic holds now (this time or before), `missing` the
+seeds the chain state does not hold (or holds rejected) — not an error: the
+caller submits those the usual way — and `untaken` the held seeds the topic
+takes nothing of (only when there is one). A `seed` that is not a list of
+txids is refused (`bad-args`), nothing written. The step's result record
+says the same, with `admissions` (each `{txid, steak}`, oldest first),
+`watches` and the overlay's `state`.
 
 Who may call them is the embedding app's manifest: a row for a box of its
 own to the engine, for the sender it chooses; this repo's manifest has the

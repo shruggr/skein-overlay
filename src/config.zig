@@ -98,7 +98,12 @@ pub fn resolve(a: Allocator, s: Store, heads: Heads, in: Value, arg: ?Value) !Va
 /// `defaults.overlayTopics`, each judged by its program unless the config names it already.
 pub fn withRegistered(a: Allocator, s: Store, heads: Heads, in: Value, app: []const u8) !Value {
     const root = (try heads.head(a, try topics.headName(a, app))) orelse return in;
-    const list = try topics.entriesOf(a, try s.getValue(a, root));
+    return withTopics(a, in, try topics.entriesOf(a, try s.getValue(a, root)));
+}
+
+/// `in` with the registered set `list` added (`withRegistered`'s, from a set in hand: a register
+/// step's own, written in that step, 0.7.8).
+pub fn withTopics(a: Allocator, in: Value, list: []const topics.Entry) !Value {
     if (list.len == 0) return in;
     const text = if (in.get("defaults")) |d| d.getText("overlayTopics") orelse "{}" else "{}";
     const j = std.json.parseFromSliceLeaky(std.json.Value, a, text, .{}) catch return error.BadConfig;

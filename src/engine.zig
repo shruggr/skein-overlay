@@ -28,10 +28,12 @@
 //!                             recorded under `<app>/gossip`.
 //!   register / deregister     a message in the box `<app>/register` only (one box per function
 //!                             class, shruggr/skein#128, 0.7.5; refused `bad-args` elsewhere),
-//!                             {fn: "register", args: {topic, program}} or {fn: "deregister",
+//!                             {fn: "register", args: {topic, program, seed?}} or {fn: "deregister",
 //!                             args: {topic}}, from whoever that row admits (topics.zig,
 //!                             shruggr/skein#120): the registered set under `<app>/topics`, the
-//!                             subscribe / unsubscribe events; answered {topic, active}.
+//!                             subscribe / unsubscribe events; answered {topic, active}; with
+//!                             `seed` (0.7.8), the held seeds judged under the topic
+//!                             (submit.zig `seed`), answered {…, seeded, missing, untaken?}.
 //!
 //! The state is the overlay's own, under its app's name (state.zig: `<app>/state`), over the
 //! chain app's (`chain/state`), read only. The topics and lookup services are the app's (#72,
@@ -47,7 +49,8 @@
 //!    admitted?, steak?, unapplied?, watch?, awaiting?, published?, answers?, refs, state}
 //!   {kind: "overlay-result", op: "received" | "resume", txid?, outcome, …, answers?, state}
 //!   {kind: "overlay-result", op: "peer-admit", topic, txid, record, state}
-//!   {kind: "overlay-result", op: "register" | "deregister", topic, active, changed, topics?}
+//!   {kind: "overlay-result", op: "register" | "deregister", topic, active, changed, topics?,
+//!    seeded?, missing?, untaken?, admissions?, watches?, state?}
 //!   {kind: "overlay-result", op, error}                         refused
 const std = @import("std");
 const c = @import("chain");
@@ -171,7 +174,9 @@ fn registration(a: Allocator, step: Value, args: Value, body: Value, func: []con
                 try fields.append(a, .{ .key = "topics", .value = .{ .cid = rc } });
             }
             for (d.events) |ev| _ = try vm.emitEvent(a, ev);
-            try ans.append(a, .{ .key = "result", .value = d.answer });
+            var answer = d.answer;
+            if (d.seed) |seeds| answer = try seeding(a, step, d.list orelse list, answer, seeds, &fields);
+            try ans.append(a, .{ .key = "result", .value = answer });
             try fields.appendSlice(a, &.{
                 .{ .key = "topic", .value = d.answer.get("topic").? },
                 .{ .key = "active", .value = d.answer.get("active").? },
@@ -183,6 +188,41 @@ fn registration(a: Allocator, step: Value, args: Value, body: Value, func: []con
         _ = try vm.send(a, sender, topics.answerBox(args, calls.appOf(step)), .{ .map = ans.items });
     };
     _ = try vm.finish(a, s, try resultRecord(a, func, fields.items));
+}
+
+/// A register's `seed` (0.7.8, submit.zig `seed`): each seed the chain state holds judged under the
+/// topic just registered, with the configuration as it is with the set `list` (the one this step
+/// wrote); the records kept, the state saved. → the answer with `seeded`, `missing` (and `untaken`
+/// when a held seed is taken by nothing); the result record gets them and `state`.
+fn seeding(a: Allocator, step: Value, list: []const topics.Entry, answer: Value, seeds: []const [32]u8, fields: *std.ArrayList(cbor.Entry)) !Value {
+    const topic = answer.getText("topic").?;
+    const in = try config.withTopics(a, step, list);
+    var loaded = try ev_.load(a, in);
+    loaded.st.now = @intCast(step.getUint("at") orelse 0);
+    const cx = submit.Ctx{ .a = a, .caller = ev_.caller(), .wire = try ev_.wire(in), .st = &loaded.st, .in = in };
+    const sd = try submit.seed(cx, topic, seeds);
+    for (sd.records) |r| try vm.keep(r);
+    const new_state = try loaded.st.save();
+    if (loaded.head == null or !eql(u8, loaded.head.?, new_state)) try vm.advance(try ev_.stateHead(a, in), new_state);
+    var out: std.ArrayList(cbor.Entry) = .empty;
+    try out.appendSlice(a, answer.map);
+    try out.appendSlice(a, &.{
+        .{ .key = "seeded", .value = .{ .array = try hexes(a, sd.seeded) } },
+        .{ .key = "missing", .value = .{ .array = try hexes(a, sd.missing) } },
+    });
+    if (sd.untaken.len > 0) try out.append(a, .{ .key = "untaken", .value = .{ .array = try hexes(a, sd.untaken) } });
+    try fields.appendSlice(a, out.items[answer.map.len..]);
+    if (sd.admissions.len > 0) {
+        const xs = try a.alloc(Value, sd.admissions.len);
+        for (sd.admissions, xs) |adm, *x| x.* = .{ .map = try a.dupe(cbor.Entry, &.{
+            .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &c.header.toHex(adm.txid)) } },
+            .{ .key = "steak", .value = try steakOf(a, adm.topics, adm.applied) },
+        }) };
+        try fields.append(a, .{ .key = "admissions", .value = .{ .array = xs } });
+    }
+    if (sd.watches.len > 0) try fields.append(a, .{ .key = "watches", .value = .{ .array = try cids(a, sd.watches) } });
+    try fields.append(a, .{ .key = "state", .value = .{ .cid = new_state } });
+    return .{ .map = out.items };
 }
 
 fn run(a: Allocator) anyerror!void {

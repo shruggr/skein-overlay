@@ -4,7 +4,7 @@ The overlay services engine for a [skein](https://github.com/shruggr/skein),
 as an app: BRC-22 submit and BRC-24 lookup, served by the instance's own
 front door, with topic managers and lookup services as programs the engine
 calls. It is also a Zig package: an overlay of your own depends on it for
-the topic and lookup contracts. Version **0.7.7**.
+the topic and lookup contracts. Version **0.7.8**.
 
 ## What it is
 
@@ -160,7 +160,7 @@ The manifest (`etc/app.json`, this repo's own, description left out):
 {
   "kind": "app",
   "name": "overlay",
-  "version": "0.7.7",
+  "version": "0.7.8",
   "programs": {
     "overlay": "bin/overlay.wasm",
     "topic-demo": "bin/topic-demo.wasm",
@@ -281,7 +281,7 @@ Not built: BRC-88 SHIP/SLAP, GASP sync and catch-up from a peer, the
 
 | | |
 |---|---|
-| this app and package | 0.7.7 (tag `v0.7.7`) |
+| this app and package | 0.7.8 (tag `v0.7.8`) |
 | skein-sdk | v0.7.1, by tag URL and hash in `build.zig.zon` (modules `chain` and, for the engine, `sk`; bsvz comes through it) |
 | requires | `chain/1` (shruggr/skein-chain 0.3.0) |
 | skein | log format 8; skein's equivs pin this repo by commit |
@@ -390,6 +390,15 @@ app's own box (shruggr/skein#128), so for an app named `overlay` the row
 register-only-in-`<app>/overlay` refused the owner. An app embedding the
 engine renames its row `overlay` → `register`; the owner sends to
 `<app>/register`.
+
+0.7.8: `register {topic, program, seed?: [txid…]}` seeds the topic from
+what the chain state already holds: each held seed is judged under the new
+topic only, oldest first over its held ancestry, and admitted from the
+state as a submission of it would be (no resubmission, no wallet); the
+answer adds `seeded` and `missing` (and `untaken` when a held seed is taken
+by nothing). Idempotent: a seed already admitted under the topic is not
+judged again. docs/OVERLAY.md "Register a topic" has the rest. The manifest's
+rows are unchanged.
 
 ## Contributing
 

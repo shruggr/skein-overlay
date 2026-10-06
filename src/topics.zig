@@ -28,6 +28,18 @@
 //! emits nothing. The answer is `{topic, active}` (whether the topic is in
 //! the registered set now).
 //!
+//! Seeding (0.7.8): `register {topic, program, seed?: [txid hex, …]}` — after
+//! the topic is registered (or found registered with the same program), each
+//! `seed` transaction the chain state holds is judged under that topic alone,
+//! as a submission of it would be (submit.zig `seed`): oldest first over what
+//! is held — the seed's held ancestors the topic takes, then the seed — and
+//! admitted from the state, the chain app having it already. The answer adds
+//! `seeded` (the seeds the topic holds now), `missing` (the seeds the chain
+//! state does not hold, or holds rejected) and `untaken` (held, but the topic
+//! takes nothing of them; only when there is one). A seed already admitted
+//! under the topic is not judged again. A `seed` that is not a list of txids
+//! (64 hex digits) is refused, nothing written.
+//!
 //! One box per function class (shruggr/skein#128, 0.6.2; 0.7.5): either
 //! message is taken only in the box the manifest names `register` (resolved
 //! `<app>/register`; 0.7.7, was `overlay`), from the row `{address: "register", sender: "$owner",
@@ -131,8 +143,24 @@ pub fn events(a: Allocator, subscribe: bool, topic: []const u8, self: []const u8
 /// answer. Or why it is refused (nothing written, nothing emitted).
 pub const Change = union(enum) {
     refused: []const u8,
-    done: struct { list: ?[]const Entry, events: []const Value, answer: Value },
+    done: struct { list: ?[]const Entry, events: []const Value, answer: Value, seed: ?[]const [32]u8 = null },
 };
+
+/// A register's `seed` (0.7.8): null when absent; a list of txids (hex), each once, in order. Not
+/// that shape: error.BadSeed.
+pub fn seedOf(a: Allocator, args: Value) !?[]const [32]u8 {
+    const v = args.get("seed") orelse return null;
+    if (v == .null) return null;
+    if (v != .array) return error.BadSeed;
+    var out: std.ArrayList([32]u8) = .empty;
+    outer: for (v.array) |x| {
+        if (x != .text or x.text.len != 64) return error.BadSeed;
+        const t = c.header.fromHex(x.text) catch return error.BadSeed;
+        for (out.items) |y| if (eql(u8, &y, &t)) continue :outer;
+        try out.append(a, t);
+    }
+    return out.items;
+}
 
 fn answerOf(a: Allocator, topic: []const u8, active: bool) !Value {
     return .{ .map = try a.dupe(cbor.Entry, &.{
@@ -145,23 +173,25 @@ fn refused(a: Allocator, comptime fmt: []const u8, args: anytype) !Change {
     return .{ .refused = try std.fmt.allocPrint(a, fmt, args) };
 }
 
-/// `register {topic, program}`: `program` a role in `programs` (the app's roles, or the genesis's);
-/// `self` the engine's own role. An unknown role is refused; so is a topic registered already with
-/// another program (deregister it first).
+/// `register {topic, program, seed?}`: `program` a role in `programs` (the app's roles, or the
+/// genesis's); `self` the engine's own role. An unknown role is refused; so is a topic registered
+/// already with another program (deregister it first), and a `seed` that is not a list of txids.
+/// The seeds (0.7.8) are the engine's to judge once the set is written (`done.seed`).
 pub fn register(a: Allocator, list: []const Entry, args: Value, programs: Value, self: []const u8) !Change {
-    const topic = args.getText("topic") orelse return refused(a, "register: want {{topic, program}}", .{});
-    const program = args.getText("program") orelse return refused(a, "register: want {{topic, program}}", .{});
+    const topic = args.getText("topic") orelse return refused(a, "register: want {{topic, program, seed?}}", .{});
+    const program = args.getText("program") orelse return refused(a, "register: want {{topic, program, seed?}}", .{});
     if (topic.len == 0) return refused(a, "register: the topic is empty", .{});
     if (programs.getCid(program) == null) return refused(a, "register: program {s} is not a role in programs", .{program});
+    const seed = seedOf(a, args) catch return refused(a, "register: seed is a list of txids (64 hex digits)", .{});
     if (find(list, topic)) |e| {
         if (!eql(u8, e.program, program)) return refused(a, "register: {s} is registered with program {s}: deregister it first", .{ topic, e.program });
-        return .{ .done = .{ .list = null, .events = &.{}, .answer = try answerOf(a, topic, true) } };
+        return .{ .done = .{ .list = null, .events = &.{}, .answer = try answerOf(a, topic, true), .seed = seed } };
     }
     const out = try a.alloc(Entry, list.len + 1);
     @memcpy(out[0..list.len], list);
     out[list.len] = .{ .topic = topic, .program = program };
     std.mem.sort(Entry, out, {}, lessThan);
-    return .{ .done = .{ .list = out, .events = try a.dupe(Value, &try events(a, true, topic, self)), .answer = try answerOf(a, topic, true) } };
+    return .{ .done = .{ .list = out, .events = try a.dupe(Value, &try events(a, true, topic, self)), .answer = try answerOf(a, topic, true), .seed = seed } };
 }
 
 /// What a mailbox message asks of the engine, by its body's `fn` alone; where it may be taken is
