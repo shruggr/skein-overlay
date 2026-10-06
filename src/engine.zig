@@ -128,8 +128,8 @@ fn answersField(fields: *std.ArrayList(cbor.Entry), a: Allocator) !void {
 }
 
 /// `register {topic, program}` / `deregister {topic}` (topics.zig, shruggr/skein#120): a message in
-/// any box a row routes to the engine (shruggr/skein#128), `{fn, args}`, from whoever the row admits;
-/// the app is the step's, not the box's. The set written under
+/// the box `<app>/overlay` (one box per function class, shruggr/skein#128, 0.7.5), `{fn, args}`, from
+/// whoever its row admits; in any other box refused (`bad-args`); the app is the step's. The set written under
 /// `<app>/topics` and the events emitted when it changes; the answer `{fn, request, replyTo,
 /// result: {topic, active} | error: {code, message}}` (skein docs/APPS.md §4) to the sender when a
 /// message can reach it. A refusal writes and emits nothing.
@@ -139,7 +139,9 @@ fn registration(a: Allocator, step: Value, args: Value, body: Value, func: []con
     const root = try vm.head(a, head);
     const list = try topics.entriesOf(a, if (root) |r| try s.getValue(a, r) else null);
     const fargs: Value = body.get("args") orelse .{ .map = &.{} };
-    const change = if (eql(u8, func, "register"))
+    const change: topics.Change = if (!topics.mayRegister(args, calls.appOf(step)))
+        .{ .refused = try topics.notHere(a, func, args, calls.appOf(step)) }
+    else if (eql(u8, func, "register"))
         try topics.register(a, list, fargs, step.get("programs") orelse return error.BadConfig, try config.selfRole(a, s, step, null))
     else
         try topics.deregister(a, list, fargs);
@@ -207,12 +209,8 @@ fn run(a: Allocator) anyerror!void {
         const body = try s.getValue(a, bc);
         // A submission (shruggr/skein#112): from anyone a row admits, in any box routed here.
         if (eql(u8, body.getText("fn") orelse "", "submit")) return submissionStep(a, step, body, try messageSource(a, step, args));
-        // Register or deregister a topic, in whatever box a row routed it here (skein #128); in the
-        // app's own box, open to anyone for submissions, from the instance itself only.
-        switch (topics.asked(body)) {
-            .register, .deregister => if (!topics.mayRegister(args, calls.appOf(step), vm.selfKey(step))) return error.NotAdmitted,
-            .other => {},
-        }
+        // Register or deregister a topic: taken only in the box `<app>/overlay` (one box per
+        // function class, skein #128, 0.7.5); in any other, refused (`bad-args`).
         switch (topics.asked(body)) {
             .register => return registration(a, step, args, body, "register"),
             .deregister => return registration(a, step, args, body, "deregister"),

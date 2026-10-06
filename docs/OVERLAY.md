@@ -1,4 +1,4 @@
-# Overlay services in the VM (0.7.4)
+# Overlay services in the VM (0.7.5)
 
 An overlay is an app (skein docs/APPS.md §6). It judges transactions with
 its topic managers and indexes them with its lookup services; it does not
@@ -111,6 +111,20 @@ app's (skein docs/APPS.md §4):
 box:  <app>          (the manifest's row {"address": "", "sender": "*", "program": "overlay", "filter": "beef"})
 body: {fn: "submit", args: {beef: <the BEEF>, topics: [<topic>, …], offChainValues?: bytes}}
 ```
+
+One box per function class (shruggr/skein#128): `submit` is taken in any
+box a row routes to the engine, from whoever that row admits; the answer
+goes back in the box the message came in. An app whose own box `<app>`
+belongs to another program (skein-amm: its box is the AMM's) opens a box
+for submissions to anyone instead:
+
+```json
+{"address": "submit", "sender": "*", "program": "overlay", "filter": "beef"}
+```
+
+— installed, `<app>/submit`. This repo's manifest keeps its `""` / `*` row.
+`register` / `deregister` in a submissions box are refused ("Register a
+topic", below).
 
 The door decodes `args.beef` into its pointer record (`filter: "beef"`,
 shruggr/skein#121). Delivery is the only acknowledgement: nothing answers
@@ -548,9 +562,9 @@ wire"). Stepped:
 | a message in box `<app>` from the instance itself (row from `$self`) | `{fn: "watch", args: {txid, ingest}}` | the watch: the later proof (`-proof`) or rejection (unwound) |
 | a message in box `<app>` from the instance itself (row from `$self`) | `{fn: "resume", args: {txid}}` | a paused submission routed again (skein-overlay#1): its thread launched, paused again, or dropped; its wake at that thread's end, nothing |
 | the `peer-admit` event in box `<app>` (the `-admit` route's admit) | `{kind: "peer-admit", …}` | recorded under `<app>/gossip` ("Gossip", below); nothing admitted; a pause of that transaction wants its parents from that peer too |
-| a message in any box a row routes to the engine (the manifest's: `overlay`, i.e. `<app>/overlay`, from `$owner`; `<app>` too) | `{fn: "register", args: {topic, program}}` or `{fn: "deregister", args: {topic}}` | the registered set under `<app>/topics` and its events ("Register a topic", below) |
+| a message in box `overlay`, i.e. `<app>/overlay` (the manifest's row, from `$owner`) | `{fn: "register", args: {topic, program}}` or `{fn: "deregister", args: {topic}}` | the registered set under `<app>/topics` and its events ("Register a topic", below); in any other box, refused (`bad-args`) |
 
-A `submit` is taken from anyone a row admits; `register` / `deregister` in any box a row routes to the engine but the app's own `<app>`, open to anyone since 0.7.2, where only the instance itself's are taken; any other message from anyone but the instance itself is refused; from the instance itself, only `watch` and `resume`. There is no `lookup`
+One box per function class (shruggr/skein#128, 0.7.5): a `submit` is taken in any box a row routes to the engine (`<app>`, `<app>/submit`, …), from anyone that row admits; `register` / `deregister` only in `<app>/overlay`, and refused with `bad-args` in every other box, whoever sent them (the instance itself too); any other message from anyone but the instance itself is refused; from the instance itself, only `watch` and `resume`. There is no `lookup`
 box: a lookup is a read: its request is recorded, and it moves nothing.
 
 **Config.** An installed engine reads its configuration from its app
@@ -611,8 +625,13 @@ prefixes anywhere: not in the configuration, not in the rows.
 The engine's two functions, a message `{fn, args}` (skein docs/APPS.md §4)
 the owner sends to the app's `overlay` box — installed, `<app>/overlay`: a
 manifest's mailbox address is relative to the app, like its http paths and
-heads (shruggr/skein#128). The engine takes them in any box a row routes to
-it (the app's own `<app>` too); the app is the step's, never the box's:
+heads (shruggr/skein#128). One box per function class (#128, 0.7.5): the
+engine takes them only in that box, the one the manifest names `overlay`;
+in any other box a row routes to it — the app's own `<app>`, a submissions
+box `<app>/submit` — they are refused, whoever sent them, with `error:
+{code: "bad-args", message: "register: not taken in box <box>; send it in
+<app>/overlay"}`, writing and emitting nothing. The app is the step's,
+never the box's:
 
 - `register {topic, program}` adds `topic` to the registered set, judged by
   the topic manager `program` (a role in `programs`: the manifest of a
@@ -637,9 +656,8 @@ owner's:
 {"address": "overlay", "sender": "$owner", "program": "overlay"}
 ```
 
-The install resolves the address to `<app>/overlay`. Until skein's install
-resolves relative mailbox addresses (shruggr/skein#128, landing separately),
-a local run takes it as written: the box `overlay`.
+The install resolves the address to `<app>/overlay`; the engine takes
+registrations in that resolved box only (`src/topics.zig` `mayRegister`).
 
 The function is the body's `fn`: a mailbox row's own `fn` is not handed to
 the program (the kernel launches the row's program on the message), and

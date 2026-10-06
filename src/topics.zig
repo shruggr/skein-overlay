@@ -28,12 +28,14 @@
 //! emits nothing. The answer is `{topic, active}` (whether the topic is in
 //! the registered set now).
 //!
-//! Either message is handled in whatever box a dispatch row delivers it to
-//! the engine's program (shruggr/skein#128, 0.6.2): the app's own box
-//! `<app>`, or another of its boxes, e.g. `<app>/overlay` from the manifest
-//! row `{address: "overlay", sender: "$owner", program: "overlay"}`. The app
-//! is the step's, never the box's; the answer goes back in the box the
-//! message came in.
+//! One box per function class (shruggr/skein#128, 0.6.2; 0.7.5): either
+//! message is taken only in the box the manifest names `overlay` (resolved
+//! `<app>/overlay`), from the row `{address: "overlay", sender: "$owner",
+//! program: "overlay"}`; in any other box (the app's own `<app>`,
+//! `<app>/submit`, …) it is refused with `bad-args`, writing and emitting
+//! nothing. `submit` is the other class: taken in any box a row routes to
+//! the engine. The app is the step's, never the box's; the answer goes back
+//! in the box the message came in.
 //!
 //! The logic, natively testable; engine.zig runs it in a step.
 const std = @import("std");
@@ -161,8 +163,8 @@ pub fn register(a: Allocator, list: []const Entry, args: Value, programs: Value,
     return .{ .done = .{ .list = out, .events = try a.dupe(Value, &try events(a, true, topic, self)), .answer = try answerOf(a, topic, true) } };
 }
 
-/// What a mailbox message asks of the engine, by its body's `fn` alone: the box it came in plays no
-/// part (shruggr/skein#128): `register` / `deregister` in any box a row routes to the engine.
+/// What a mailbox message asks of the engine, by its body's `fn` alone; where it may be taken is
+/// `mayRegister`'s (one box per function class, shruggr/skein#128, 0.7.5).
 pub const Asked = enum { register, deregister, other };
 
 pub fn asked(body: Value) Asked {
@@ -172,13 +174,23 @@ pub fn asked(body: Value) Asked {
     return .other;
 }
 
-/// Whether a registration may be taken here (shruggr/skein#112): in the app's own box `<app>` —
-/// open to anyone since 0.7.2, for submissions — only from the instance itself (`self`); in any
-/// other box a row routes to the engine, from whoever that row admits.
-pub fn mayRegister(args: Value, app: []const u8, self: ?[]const u8) bool {
-    if (!eql(u8, answerBox(args, app), app)) return true;
-    const me = self orelse return false;
-    return eql(u8, args.getBytes("sender") orelse "", me);
+/// The box, after the app's name, the manifest names for registrations: `overlay`, resolved
+/// `<app>/overlay`.
+pub const register_box = "overlay";
+
+/// Whether a registration may be taken here (one box per function class, shruggr/skein#128,
+/// 0.7.5): only in the box `<app>/overlay`, from whoever the manifest's row for it admits (the
+/// stock manifest: `$owner`). In any other box — the app's own `<app>`, `<app>/submit`, … — it is
+/// refused (`notHere`), whoever sent it.
+pub fn mayRegister(args: Value, app: []const u8) bool {
+    const box = args.getText("box") orelse return false;
+    return box.len == app.len + 1 + register_box.len and std.mem.startsWith(u8, box, app) and
+        box[app.len] == '/' and eql(u8, box[app.len + 1 ..], register_box);
+}
+
+/// Why a registration in another box is refused (the answer's `bad-args` message).
+pub fn notHere(a: Allocator, func: []const u8, args: Value, app: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(a, "{s}: not taken in box {s}; send it in {s}/{s}", .{ func, answerBox(args, app), app, register_box });
 }
 
 /// The box a registration's answer goes back in: the one the message came in (the step's

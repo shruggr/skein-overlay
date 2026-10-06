@@ -1322,7 +1322,7 @@ test "register and deregister (skein #120): the set under <app>/topics, the even
     try std.testing.expectEqualStrings("topic-demo", wt.get("tm_demo").?.string);
 }
 
-test "register / deregister in any box a row routes to the engine (skein #128): `<app>/overlay` and `<app>` alike; the app is the step's, the answer in the box it came in" {
+test "register / deregister (skein #128): the set is the step's app's, the answer in the box it came in" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -2067,19 +2067,52 @@ test "a submission by message is answered once (0.7.4): one `admitted`; the step
     try std.testing.expectEqual(@as(usize, 1), inst.wire_.answers.items.len);
 }
 
-test "the app's own box is open to submissions (0.7.2): a registration there only from the instance itself" {
+test "one box per function class (skein #128, 0.7.5): register only in `<app>/overlay`, refused in `<app>` and `<app>/submit`; submit in any box, `<app>/submit` too" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
     const me: [33]u8 = .{0x02} ++ .{0x01} ** 32;
     const other: [33]u8 = .{0x02} ++ .{0x02} ** 32;
-    const in_app = try mapOf(a, &.{ .{ .key = "box", .value = .{ .text = "amm" } }, .{ .key = "sender", .value = .{ .bytes = &other } } });
-    try std.testing.expect(!topics_mod.mayRegister(in_app, "amm", &me));
-    const self_app = try mapOf(a, &.{ .{ .key = "box", .value = .{ .text = "amm" } }, .{ .key = "sender", .value = .{ .bytes = &me } } });
-    try std.testing.expect(topics_mod.mayRegister(self_app, "amm", &me));
+    // Accepted in `<app>/overlay`, from whoever its row admits.
     const owner_box = try mapOf(a, &.{ .{ .key = "box", .value = .{ .text = "amm/overlay" } }, .{ .key = "sender", .value = .{ .bytes = &other } } });
-    try std.testing.expect(topics_mod.mayRegister(owner_box, "amm", &me));
-    // The manifest's row: the app's box, open to anyone, the door decoding the BEEF.
+    try std.testing.expect(topics_mod.mayRegister(owner_box, "amm"));
+    // Refused in the app's own box, even from the instance itself, and in `<app>/submit`.
+    for ([_][]const u8{ "amm", "amm/submit", "amm/overlayx", "ammx/overlay", "overlay" }) |box| {
+        for ([_][]const u8{ &me, &other }) |sender| {
+            const args = try mapOf(a, &.{ .{ .key = "box", .value = .{ .text = box } }, .{ .key = "sender", .value = .{ .bytes = sender } } });
+            try std.testing.expect(!topics_mod.mayRegister(args, "amm"));
+        }
+    }
+    // No box: the app's own, refused.
+    try std.testing.expect(!topics_mod.mayRegister(try mapOf(a, &.{}), "amm"));
+    const why = try topics_mod.notHere(a, "register", try mapOf(a, &.{.{ .key = "box", .value = .{ .text = "amm/submit" } }}), "amm");
+    try std.testing.expectEqualStrings("register: not taken in box amm/submit; send it in amm/overlay", why);
+    // The manifest's rows: registrations in `overlay` from the owner; submissions in the app's box, open to anyone, the door decoding the BEEF.
     const manifest = @embedFile("etc/app.json");
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "{\"address\": \"overlay\", \"sender\": \"$owner\", \"program\": \"overlay\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "{\"address\": \"\", \"sender\": \"*\", \"program\": \"overlay\", \"filter\": \"beef\"}") != null);
+
+    // Submit accepted in `<app>/submit`: launched, the submitter answered in that box.
+    var ms = c.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var inst = try Instance.init(a, &ms);
+    const x = try chain3(a, &inst);
+    const alice: [33]u8 = .{0x03} ++ .{0xa1} ** 32;
+    const m1 = try a.dupe(u8, &cbor.cidOf("message in submit"));
+    const src = try mapOf(a, &.{
+        .{ .key = "transport", .value = .{ .text = "mailbox" } },
+        .{ .key = "box", .value = .{ .text = "overlay/submit" } },
+        .{ .key = "sender", .value = .{ .bytes = &alice } },
+        .{ .key = "request", .value = .{ .cid = m1 } },
+    });
+    const parent = try withFund(a, x.f, x.t1);
+    const r = try inst.received(try submitArgs(a, parent), src);
+    try std.testing.expect(r == .launch);
+    _ = try inst.begin(r.launch);
+    _ = try inst.ingest(parent);
+    _ = try inst.chainStatus(x.t1.txid, "RECEIVED", null);
+    try std.testing.expect((try inst.answer(x.t1.txid, .accepted)).admitted);
+    const ans = inst.wire_.answers.items[0];
+    try std.testing.expectEqualStrings("overlay/submit", ans.box);
+    try std.testing.expectEqualStrings("admitted", ans.body.get("result").?.getText("state").?);
 }

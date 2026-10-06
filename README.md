@@ -4,7 +4,7 @@ The overlay services engine for a [skein](https://github.com/shruggr/skein),
 as an app: BRC-22 submit and BRC-24 lookup, served by the instance's own
 front door, with topic managers and lookup services as programs the engine
 calls. It is also a Zig package: an overlay of your own depends on it for
-the topic and lookup contracts. Version **0.7.4**.
+the topic and lookup contracts. Version **0.7.5**.
 
 ## What it is
 
@@ -160,7 +160,7 @@ The manifest (`etc/app.json`, this repo's own, description left out):
 {
   "kind": "app",
   "name": "overlay",
-  "version": "0.7.4",
+  "version": "0.7.5",
   "programs": {
     "overlay": "bin/overlay.wasm",
     "topic-demo": "bin/topic-demo.wasm",
@@ -194,9 +194,15 @@ The manifest (`etc/app.json`, this repo's own, description left out):
   and from `$self`. The install prompt reads them all aloud.
 - The row for the app's own box `""` (`<app>`), open to anyone, is where
   submissions arrive as messages (`{fn: "submit", args: {beef, topics}}`;
-  the door decodes the BEEF, `filter: "beef"`). A `register` / `deregister`
-  in that box is taken from the instance itself only; the owner's go to
-  `overlay` (`<app>/overlay`).
+  the door decodes the BEEF, `filter: "beef"`). One box per function class
+  (shruggr/skein#128): `submit` is taken in any box a row routes to the
+  engine; `register` / `deregister` only in `overlay` (`<app>/overlay`), and
+  refused anywhere else, this box included.
+- An app whose own box `<app>` belongs to another program (skein-amm, say)
+  opens a box for submissions instead, to anyone:
+  `{"address": "submit", "sender": "*", "program": "overlay", "filter": "beef"}`
+  (`<app>/submit` once installed). The stock manifest keeps its `""` / `*`
+  row.
 - The libp2p row `/skein/overlay/beef/1.0.0` is the want-answer stream
   (shruggr/skein#112): a peer the engine wants a parent from answers on
   it, one Atomic BEEF per frame; the door decodes it (`filter: "beef"`)
@@ -233,11 +239,12 @@ door decodes the BEEF as for `/submit`), `<topic>-admit` (`peerAdmit`) and
 `<topic>-proof` (`peerProof`), `program` the engine's own role;
 `deregister` emits `unsubscribe {topic}` for the three (skein #119): the
 host subscribes and routes by them. Who may call is your manifest's row,
-e.g. the one above (the function is the body's `fn`); the engine takes
-them in any box a row routes to it (`<app>` too) and answers in the box
-they came in. Until skein's install resolves a relative mailbox address
-(shruggr/skein#128, landing separately), a local run takes the address as
-written: the box `overlay`. A lookup service without a `topics`
+e.g. the one above (the function is the body's `fn`). The engine takes
+them only in the box `overlay` (`<app>/overlay`, one box per function
+class, shruggr/skein#128, 0.7.5); in any other box — `<app>`,
+`<app>/submit` — they are refused with `bad-args` (`register: not taken in
+box <box>; send it in <app>/overlay`), writing and emitting nothing. The
+answer goes back in the box they came in. A lookup service without a `topics`
 list listens to every topic, declared or registered. docs/OVERLAY.md
 "Register a topic" has the rest.
 
@@ -270,7 +277,7 @@ Not built: BRC-88 SHIP/SLAP, GASP sync and catch-up from a peer, the
 
 | | |
 |---|---|
-| this app and package | 0.7.4 (tag `v0.7.4`) |
+| this app and package | 0.7.5 (tag `v0.7.5`) |
 | skein-sdk | v0.7.1, by tag URL and hash in `build.zig.zon` (modules `chain` and, for the engine, `sk`; bsvz comes through it) |
 | requires | `chain/1` (shruggr/skein-chain 0.3.0) |
 | skein | log format 8; skein's equivs pin this repo by commit |
@@ -348,6 +355,14 @@ message is answered once per state change: the message step's wake at the
 end of the thread it launched (`resolved` in its input) routes nothing and
 answers nothing (outcome `woke`) — before, it answered `admitted` a second
 time, from the state.
+
+0.7.5: one box per function class (shruggr/skein#128, as decided for
+0.6.2): `register` / `deregister` are taken only in the box the manifest
+names `overlay` (`<app>/overlay`); in any other box, the app's own
+included and whoever sent them, they are refused with `bad-args`. `submit`
+is taken in any box a row routes to the engine, so an app may open
+`{"address": "submit", "sender": "*", "program": "overlay", "filter":
+"beef"}` when its own box belongs to another program.
 
 ## Contributing
 
