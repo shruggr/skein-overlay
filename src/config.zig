@@ -24,7 +24,11 @@
 //!   config.overlay.validator {every: <ms>}    optional: a validator (defaults.overlayValidator)
 //!
 //! The two roles (shruggr/skein#120, David 2026-10-06 evening): registering
-//! a topic is the one act that drives both — topics.zig `withRoles`.
+//! a topic is the one act that drives both — topics.zig `withRoles`. The
+//! manifest's value is only the initial one (David, 2026-10-07: "this
+//! should be a setting that the user is configuring"; 0.9.2): the owner's
+//! switch (`market` / `validator` in `<app>/register`), kept in the record
+//! `<app>/topics`, has precedence once sent (topics.zig `effective`).
 //!
 //! Beside the declared topics, the engine serves the topics registered at
 //! runtime (shruggr/skein#120; topics.zig): the root record of the head
@@ -68,9 +72,8 @@ const keys = [_][2][]const u8{ .{ "topics", "overlayTopics" }, .{ "lookups", "ov
 /// The roles' keys (shruggr/skein#120, 2026-10-06 evening), each optional: set only when the app's config names it.
 const role_keys = [_][2][]const u8{ .{ "market", "overlayMarket" }, .{ "validator", "overlayValidator" } };
 
-/// The shortest and longest window or beat the kernel takes (ms; skein docs/MESSAGES.md "Beacons", "Liveness").
-const role_min_ms: u64 = 1000;
-const role_max_ms: u64 = 86_400_000;
+const role_min_ms = topics.role_min_ms;
+const role_max_ms = topics.role_max_ms;
 
 /// The engine's roles from its configuration (`defaults.overlayMarket` / `overlayValidator`, JSON
 /// text: an app's `config.overlay.market: {window}` / `config.overlay.validator: {every}`): each

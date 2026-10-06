@@ -1,4 +1,4 @@
-# Overlay services in the VM (0.9.1)
+# Overlay services in the VM (0.9.2)
 
 An overlay is an app (skein docs/APPS.md §6). It judges transactions with
 its topic managers and indexes them with its lookup services; it does not
@@ -742,6 +742,7 @@ derives.
 
 ```
 {kind: "overlay-topics", topics: [{topic, program}, …]}     sorted by topic, each once
+                         market?, validator?                  the owner's switches (0.9.2, below)
 ```
 
 read at every step and call with `config.overlay` (`src/config.zig`): each
@@ -760,6 +761,8 @@ emitted when the set changes:
 | `register`, a market | then `{event: "liveness", topic: "<topic>-live", window}` ("Market and validator", below) |
 | `register`, a validator | then `{event: "beacon", topic: "<topic>-live", every, body: <empty bytes>}` |
 | `deregister`, a market / a validator | then `{event: "unliveness", topic: "<topic>-live"}` / `{event: "unbeacon", topic: "<topic>-live"}` |
+| `market {window}` / `validator {every}` (the owner's switch, 0.9.2) | `{event: "liveness", …}` / `{event: "beacon", …}` for every registered topic, when the role in effect changes |
+| `market {off: true}` / `validator {off: true}` | `{event: "unliveness", …}` / `{event: "unbeacon", …}` for every registered topic, when the role was on |
 
 `program` is the engine's own role in `programs` (`overlay` in this repo's
 manifest) and `fn` its function for that topic: the handler the host routes
@@ -807,6 +810,44 @@ a setting changed later applies to the topics registered after it. Each
 value is an integer from 1 000 ms to a day (the kernel's bounds); another
 shape refuses the register or deregister (`bad-args`), writing and emitting
 nothing (`src/config.zig` `rolesOf`, `src/topics.zig` `withRoles`).
+
+**The owner's switch (0.9.2).** David, 2026-10-07: "this shouldn't have
+been a config in the manifest. This should be a setting that the user is
+configuring". The two settings above are only the initial value; the owner
+turns a role on or off by a message to the engine, in the same box as
+`register` (`<app>/register`, the same row; refused `bad-args` in any
+other), with no reinstall:
+
+```
+{fn: "market",    args: {window: <ms>}}   |  {fn: "market",    args: {off: true}}
+{fn: "validator", args: {every: <ms>}}    |  {fn: "validator", args: {off: true}}
+```
+
+The answer (`result`) is the roles in effect after it, each present only
+when on: `{market?: {window}, validator?: {every}}`. The switch is kept on
+the engine's own head, in the set's record `<app>/topics` beside `topics`:
+
+```
+{kind: "overlay-topics", topics: [...], market?: {window} | {off: true}, validator?: {every} | {off: true}}
+```
+
+A role switched has precedence over `config.overlay.market` / `.validator`
+from then on (a reinstall with another value changes nothing for it); a
+role never switched is the manifest's (`src/topics.zig` `effective`).
+Turning a role on — or changing its ms while on — emits `liveness {topic:
+"<topic>-live", window}` / `beacon {topic: "<topic>-live", every, body:
+<empty>}` for every topic already registered (the kernel keys both by
+(app, topic): a new value replaces the old); turning it off emits
+`unliveness` / `unbeacon` for them. `register` / `deregister` keep
+emitting by the roles in effect. Idempotent: the same switch again writes
+and emits nothing; a switch that leaves the role in effect as it was (the
+manifest's value made explicit) is written, so it holds from then on, and
+emits nothing. Declared topics (`config.overlay.topics`) are not
+registered topics: a switch emits for the set under `<app>/topics` only, as
+register does. A value outside 1 000 ms .. a day, or another shape, is
+refused (`bad-args`), nothing written (`src/topics.zig` `switchRole`;
+the step's result record `{op: "market" | "validator", market?, validator?,
+changed, events, topics?}`).
 
 **Result.** Each step keeps a result record and prints its CID:
 

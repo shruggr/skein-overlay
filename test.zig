@@ -1497,6 +1497,117 @@ test "market and validator (skein #120, 0.9.0): config.overlay.market / .validat
     try std.testing.expectEqual(@as(?u64, null), wired.validator);
 }
 
+test "the owner's switch (0.9.2, David 2026-10-07): market / validator on emits for every registered topic, off reverses; over config.overlay; idempotent; kept beside the set" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const list = [_]topics_mod.Entry{ .{ .topic = "tm_a", .program = "topic-demo" }, .{ .topic = "tm_b", .program = "topic-demo" } };
+    const window = try mapOf(a, &.{.{ .key = "window", .value = .{ .uint = 40_000 } }});
+    const every = try mapOf(a, &.{.{ .key = "every", .value = .{ .uint = 30_000 } }});
+    const off = try mapOf(a, &.{.{ .key = "off", .value = .{ .boolean = true } }});
+    const none: topics_mod.Roles = .{};
+
+    try std.testing.expectEqual(topics_mod.Asked.market, topics_mod.asked(try mapOf(a, &.{.{ .key = "fn", .value = .{ .text = "market" } }})));
+    try std.testing.expectEqual(topics_mod.Asked.validator, topics_mod.asked(try mapOf(a, &.{.{ .key = "fn", .value = .{ .text = "validator" } }})));
+
+    // On, with two topics registered: liveness for each on <topic>-live; the answer the roles in effect.
+    const on = (try topics_mod.switchRole(a, &list, .{}, none, .market, window)).done;
+    try std.testing.expectEqual(topics_mod.Switch{ .on = 40_000 }, on.switches.?.market);
+    try std.testing.expectEqual(topics_mod.Switch.unset, on.switches.?.validator);
+    try std.testing.expectEqual(@as(usize, 2), on.events.len);
+    for (on.events, [_][]const u8{ "tm_a-live", "tm_b-live" }) |ev, t| {
+        try std.testing.expectEqualStrings("liveness", ev.getText("event").?);
+        try std.testing.expectEqualStrings(t, ev.getText("topic").?);
+        try std.testing.expectEqual(@as(u64, 40_000), ev.getUint("window").?);
+    }
+    try std.testing.expectEqual(@as(u64, 40_000), on.answer.get("market").?.getUint("window").?);
+    try std.testing.expect(on.answer.get("validator") == null);
+    // Idempotent: the same switch again writes and emits nothing; the answer the same.
+    const again = (try topics_mod.switchRole(a, &list, on.switches.?, none, .market, window)).done;
+    try std.testing.expect(again.switches == null and again.events.len == 0);
+    try std.testing.expectEqual(@as(u64, 40_000), again.answer.get("market").?.getUint("window").?);
+    // A new window replaces (the kernel keys liveness by (app, topic)): liveness again for each.
+    const wider = (try topics_mod.switchRole(a, &list, on.switches.?, none, .market, try mapOf(a, &.{.{ .key = "window", .value = .{ .uint = 60_000 } }}))).done;
+    try std.testing.expectEqual(@as(usize, 2), wider.events.len);
+    try std.testing.expectEqual(@as(u64, 60_000), wider.events[0].getUint("window").?);
+
+    // The validator likewise: beacon for each, the empty body.
+    const v = (try topics_mod.switchRole(a, &list, on.switches.?, none, .validator, every)).done;
+    try std.testing.expectEqual(@as(usize, 2), v.events.len);
+    for (v.events) |ev| {
+        try std.testing.expectEqualStrings("beacon", ev.getText("event").?);
+        try std.testing.expectEqual(@as(u64, 30_000), ev.getUint("every").?);
+        try std.testing.expectEqual(@as(usize, 0), ev.getBytes("body").?.len);
+    }
+    try std.testing.expect(v.answer.get("market") != null and v.answer.get("validator") != null);
+
+    // Off reverses: unliveness for each, the market's switch kept as off; the validator untouched.
+    const down = (try topics_mod.switchRole(a, &list, v.switches.?, none, .market, off)).done;
+    try std.testing.expectEqual(topics_mod.Switch.off, down.switches.?.market);
+    try std.testing.expectEqual(topics_mod.Switch{ .on = 30_000 }, down.switches.?.validator);
+    try std.testing.expectEqual(@as(usize, 2), down.events.len);
+    for (down.events, [_][]const u8{ "tm_a-live", "tm_b-live" }) |ev, t| {
+        try std.testing.expectEqualStrings("unliveness", ev.getText("event").?);
+        try std.testing.expectEqualStrings(t, ev.getText("topic").?);
+        try std.testing.expectEqual(@as(usize, 2), ev.map.len);
+    }
+    try std.testing.expect(down.answer.get("market") == null and down.answer.get("validator") != null);
+    const vdown = (try topics_mod.switchRole(a, &list, down.switches.?, none, .validator, off)).done;
+    for (vdown.events) |ev| try std.testing.expectEqualStrings("unbeacon", ev.getText("event").?);
+    try std.testing.expectEqual(@as(usize, 0), vdown.answer.map.len);
+    // Off when off: nothing.
+    const still = (try topics_mod.switchRole(a, &list, vdown.switches.?, none, .validator, off)).done;
+    try std.testing.expect(still.switches == null and still.events.len == 0);
+
+    // Precedence over the configuration: a manifest market, switched off, is off — unliveness for each;
+    // register / deregister from then on emit by the roles in effect (none for the market).
+    const cfg: topics_mod.Roles = .{ .market = 40_000 };
+    const over = (try topics_mod.switchRole(a, &list, .{}, cfg, .market, off)).done;
+    try std.testing.expectEqual(@as(usize, 2), over.events.len);
+    try std.testing.expectEqualStrings("unliveness", over.events[0].getText("event").?);
+    const eff = topics_mod.effective(over.switches.?, cfg);
+    try std.testing.expectEqual(@as(?u64, null), eff.market);
+    try std.testing.expectEqual(@as(?u64, 40_000), topics_mod.effective(.{}, cfg).market); // never switched: the manifest's
+    var ms = c.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    const prog = try ms.store().putValue(a, try mapOf(a, &.{.{ .key = "kind", .value = .{ .text = "program" } }}));
+    const programs = try mapOf(a, &.{.{ .key = "topic-demo", .value = .{ .cid = prog } }});
+    const reg_args = try mapOf(a, &.{ .{ .key = "topic", .value = .{ .text = "tm_c" } }, .{ .key = "program", .value = .{ .text = "topic-demo" } } });
+    const reg = (try topics_mod.withRoles(a, try topics_mod.register(a, &list, reg_args, programs, "overlay"), true, eff)).done;
+    try std.testing.expectEqual(@as(usize, 3), reg.events.len); // the subscribes only
+    // Switched on at the manifest's own value: written (precedence from then on), nothing emitted.
+    const same = (try topics_mod.switchRole(a, &list, .{}, cfg, .market, window)).done;
+    try std.testing.expect(same.switches != null and same.events.len == 0);
+    // Switched on over a manifest that names none: the switch's value.
+    const reg2 = (try topics_mod.withRoles(a, try topics_mod.register(a, &list, reg_args, programs, "overlay"), true, topics_mod.effective(on.switches.?, none))).done;
+    try std.testing.expectEqualStrings("liveness", reg2.events[3].getText("event").?);
+    // No topic registered: the switch is kept, nothing emitted.
+    const empty = (try topics_mod.switchRole(a, &.{}, .{}, none, .validator, every)).done;
+    try std.testing.expect(empty.switches != null and empty.events.len == 0);
+
+    // Kept beside the set in <app>/topics, read back; a record without them is unswitched.
+    const rec = try topics_mod.recordWith(a, &list, down.switches.?);
+    try std.testing.expectEqualDeep(@as([]const topics_mod.Entry, &list), try topics_mod.entriesOf(a, rec));
+    const back = try topics_mod.switchesOf(rec);
+    try std.testing.expectEqual(topics_mod.Switch.off, back.market);
+    try std.testing.expectEqual(topics_mod.Switch{ .on = 30_000 }, back.validator);
+    try std.testing.expect(rec.get("market").?.get("off").?.boolean);
+    try std.testing.expectEqual(@as(u64, 30_000), rec.get("validator").?.getUint("every").?);
+    const plain = try topics_mod.switchesOf(try topics_mod.recordOf(a, &list));
+    try std.testing.expectEqual(topics_mod.Switch.unset, plain.market);
+    try std.testing.expectEqual(topics_mod.Switch.unset, plain.validator);
+    try std.testing.expectEqual(topics_mod.Switch.unset, (try topics_mod.switchesOf(null)).market);
+
+    // Refused: another shape, a value outside 1 000 ms .. a day, the other role's field, off: false.
+    for ([_]Value{
+        try mapOf(a, &.{.{ .key = "window", .value = .{ .uint = 10 } }}),
+        try mapOf(a, &.{}),
+        every,
+        try mapOf(a, &.{.{ .key = "off", .value = .{ .boolean = false } }}),
+        .{ .text = "on" },
+    }) |bad| try std.testing.expect(try topics_mod.switchRole(a, &list, .{}, none, .market, bad) == .refused);
+}
+
 /// fund (mined) → t1 (mints a token) → t2 (spends it into a new one), both unproven.
 const Chain3 = struct { k: Keys, f: Fund, t1: Spent, t2: Spent };
 

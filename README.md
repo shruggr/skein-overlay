@@ -4,7 +4,7 @@ The overlay services engine for a [skein](https://github.com/shruggr/skein),
 as an app: BRC-22 submit and BRC-24 lookup, served by the instance's own
 front door, with topic managers and lookup services as programs the engine
 calls. It is also a Zig package: an overlay of your own depends on it for
-the topic and lookup contracts. Version **0.9.1**.
+the topic and lookup contracts. Version **0.9.2**.
 
 ## What it is
 
@@ -165,7 +165,7 @@ The manifest (`etc/app.json`, this repo's own, description left out):
 {
   "kind": "app",
   "name": "overlay",
-  "version": "0.9.1",
+  "version": "0.9.2",
   "programs": {
     "overlay": "bin/overlay.wasm",
     "topic-demo": "bin/topic-demo.wasm",
@@ -269,7 +269,10 @@ list listens to every topic, declared or registered. With
 `config.overlay.market: {window}` set, a register also emits `liveness
 {topic: "<topic>-live", window}`; with `config.overlay.validator: {every}`,
 `beacon {topic: "<topic>-live", every, body: <empty>}`; a deregister emits
-`unliveness` / `unbeacon` likewise (0.9.0). docs/OVERLAY.md
+`unliveness` / `unbeacon` likewise (0.9.0). Those two settings are only
+the initial value: the owner switches a role in the same box, `{fn:
+"market", args: {window} | {off: true}}` / `{fn: "validator", args: {every}
+| {off: true}}`, answered `{market?, validator?}` (0.9.2). docs/OVERLAY.md
 "Register a topic" has the rest.
 
 ## Build and test
@@ -301,7 +304,7 @@ Not built: BRC-88 SHIP/SLAP, GASP sync and catch-up from a peer, the
 
 | | |
 |---|---|
-| this app and package | 0.9.1 (tag `v0.9.1`) |
+| this app and package | 0.9.2 (tag `v0.9.2`) |
 | skein-sdk | v0.7.1, by tag URL and hash in `build.zig.zon` (modules `chain` and, for the engine, `sk`; bsvz comes through it) |
 | requires | `chain/1` (shruggr/skein-chain 0.3.0) |
 | skein | log format 8; skein's equivs pin this repo by commit |
@@ -457,6 +460,20 @@ pause ends); several waiters are all answered. A submission by message into
 `<app>/submit` is unchanged, answered by messages. 0.7.3–0.9.0's
 `submission` event is still stepped (a log written then).
 docs/OVERLAY.md "Submitting". The manifest's rows are unchanged.
+
+0.9.2: the roles are the owner's switch (David, 2026-10-07: "this
+shouldn't have been a config in the manifest. This should be a setting
+that the user is configuring"). The owner sends, in `<app>/register` (the
+`register` row), `{fn: "market", args: {window: <ms>}}` or `{fn: "market",
+args: {off: true}}`, and `{fn: "validator", args: {every: <ms>}}` or `{fn:
+"validator", args: {off: true}}`; no reinstall. The answer is the roles in
+effect, `{market?: {window}, validator?: {every}}`. The switch is kept in
+the set's record `<app>/topics` beside `topics` and has precedence over
+`config.overlay.market` / `.validator` from then on (the manifest sets the
+initial value; never switched, the manifest's). On emits `liveness` /
+`beacon` for every registered topic, off `unliveness` / `unbeacon`;
+`register` / `deregister` emit by the roles in effect. Idempotent.
+docs/OVERLAY.md "Market and validator". The manifest's rows are unchanged.
 
 ## Contributing
 

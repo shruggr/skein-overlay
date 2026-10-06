@@ -40,6 +40,13 @@
 //!                             `<topic>-live` (0.9.0); answered {topic, active}; with
 //!                             `seed` (0.7.8), the held seeds judged under the topic
 //!                             (submit.zig `seed`), answered {…, seeded, missing, untaken?}.
+//!   market / validator        the owner's switch of a role (0.9.2, David 2026-10-07), in the box
+//!                             `<app>/register` only: {fn: "market", args: {window} | {off: true}}
+//!                             or {fn: "validator", args: {every} | {off: true}}; kept in the
+//!                             record `<app>/topics` beside the set, over config.overlay.market /
+//!                             .validator from then on; liveness / beacon (on) or unliveness /
+//!                             unbeacon (off) for every registered topic; answered
+//!                             {market?: {window}, validator?: {every}}, the roles in effect.
 //!
 //! The state is the overlay's own, under its app's name (state.zig: `<app>/state`), over the
 //! chain app's (`chain/state`), read only. The topics and lookup services are the app's (#72,
@@ -57,6 +64,8 @@
 //!   {kind: "overlay-result", op: "peer-admit", topic, txid, record, state}
 //!   {kind: "overlay-result", op: "register" | "deregister", topic, active, changed, topics?,
 //!    seeded?, missing?, untaken?, admissions?, watches?, state?}
+//!   {kind: "overlay-result", op: "market" | "validator", market?, validator?, changed, events,
+//!    topics?}
 //!   {kind: "overlay-result", op, error}                         refused
 const std = @import("std");
 const c = @import("chain");
@@ -149,9 +158,12 @@ fn registration(a: Allocator, step: Value, args: Value, body: Value, func: []con
     const s = vm.store();
     const head = try topics.headName(a, calls.appOf(step));
     const root = try vm.head(a, head);
-    const list = try topics.entriesOf(a, if (root) |r| try s.getValue(a, r) else null);
+    const rec: ?Value = if (root) |r| try s.getValue(a, r) else null;
+    const list = try topics.entriesOf(a, rec);
+    const switches = try topics.switchesOf(rec);
     const fargs: Value = body.get("args") orelse .{ .map = &.{} };
-    const roles: ?topics.Roles = config.rolesOf(a, step) catch null; // error.BadRoles only
+    // The roles in effect: the owner's switches (0.9.2) over config.overlay.market / .validator.
+    const roles: ?topics.Roles = if (config.rolesOf(a, step)) |cfg| topics.effective(switches, cfg) else |_| null; // error.BadRoles only
     const change: topics.Change = if (!topics.mayRegister(args, calls.appOf(step)))
         .{ .refused = try topics.notHere(a, func, args, calls.appOf(step)) }
     else if (roles == null)
@@ -178,7 +190,7 @@ fn registration(a: Allocator, step: Value, args: Value, body: Value, func: []con
         },
         .done => |d| {
             if (d.list) |l| {
-                const rc = try s.putValue(a, try topics.recordOf(a, l));
+                const rc = try s.putValue(a, try topics.recordWith(a, l, switches));
                 try vm.advance(head, rc);
                 try fields.append(a, .{ .key = "topics", .value = .{ .cid = rc } });
             }
@@ -190,6 +202,65 @@ fn registration(a: Allocator, step: Value, args: Value, body: Value, func: []con
                 .{ .key = "topic", .value = d.answer.get("topic").? },
                 .{ .key = "active", .value = d.answer.get("active").? },
                 .{ .key = "changed", .value = .{ .boolean = d.list != null } },
+            });
+        },
+    }
+    if (args.getBytes("sender")) |sender| if (try ev_.reaches(a, step, sender)) {
+        _ = try vm.send(a, sender, topics.answerBox(args, calls.appOf(step)), .{ .map = ans.items });
+    };
+    _ = try vm.finish(a, s, try resultRecord(a, func, fields.items));
+}
+
+/// `market {window} | {off: true}` / `validator {every} | {off: true}` (0.9.2, David 2026-10-07: "this
+/// should be a setting that the user is configuring"): the owner's switch of a role, in the box
+/// `<app>/register` only, like register. The switch kept in the set's record `<app>/topics` beside
+/// `topics` (topics.zig `recordWith`), with precedence over config.overlay.market / .validator from
+/// then on; the role's events for every topic registered (topics.zig `switchRole`); the answer
+/// `{market?: {window}, validator?: {every}}`, the roles in effect. A refusal writes and emits nothing.
+fn switching(a: Allocator, step: Value, args: Value, body: Value, role: topics.Role) !void {
+    const s = vm.store();
+    const func = @tagName(role);
+    const head = try topics.headName(a, calls.appOf(step));
+    const root = try vm.head(a, head);
+    const rec: ?Value = if (root) |r| try s.getValue(a, r) else null;
+    const list = try topics.entriesOf(a, rec);
+    const switches = try topics.switchesOf(rec);
+    const fargs: Value = body.get("args") orelse .{ .map = &.{} };
+    const cfg: ?topics.Roles = config.rolesOf(a, step) catch null; // error.BadRoles only
+    const change: topics.SwitchChange = if (!topics.mayRegister(args, calls.appOf(step)))
+        .{ .refused = try topics.notHere(a, func, args, calls.appOf(step)) }
+    else if (cfg == null)
+        .{ .refused = try std.fmt.allocPrint(a, "{s}: the configuration's roles are config.overlay.market {{window: <ms>}} and config.overlay.validator {{every: <ms>}}, each from 1000 ms to a day", .{func}) }
+    else
+        try topics.switchRole(a, list, switches, cfg.?, role, fargs);
+    const message = args.getCid("message") orelse return error.BadInput;
+    var ans: std.ArrayList(cbor.Entry) = .empty;
+    try ans.appendSlice(a, &.{
+        .{ .key = "fn", .value = .{ .text = func } },
+        .{ .key = "request", .value = .{ .cid = message } },
+        .{ .key = "replyTo", .value = .{ .cid = message } },
+    });
+    var fields: std.ArrayList(cbor.Entry) = .empty;
+    switch (change) {
+        .refused => |why| {
+            try ans.append(a, .{ .key = "error", .value = .{ .map = try a.dupe(cbor.Entry, &.{
+                .{ .key = "code", .value = .{ .text = "bad-args" } },
+                .{ .key = "message", .value = .{ .text = why } },
+            }) } });
+            try fields.append(a, .{ .key = "error", .value = .{ .text = why } });
+        },
+        .done => |d| {
+            if (d.switches) |sw| {
+                const rc = try s.putValue(a, try topics.recordWith(a, list, sw));
+                try vm.advance(head, rc);
+                try fields.append(a, .{ .key = "topics", .value = .{ .cid = rc } });
+            }
+            for (d.events) |ev| _ = try vm.emitEvent(a, ev);
+            try ans.append(a, .{ .key = "result", .value = d.answer });
+            try fields.appendSlice(a, d.answer.map);
+            try fields.appendSlice(a, &.{
+                .{ .key = "changed", .value = .{ .boolean = d.switches != null } },
+                .{ .key = "events", .value = .{ .uint = d.events.len } },
             });
         },
     }
@@ -266,6 +337,8 @@ fn run(a: Allocator) anyerror!void {
         switch (topics.asked(body)) {
             .register => return registration(a, step, args, body, "register"),
             .deregister => return registration(a, step, args, body, "deregister"),
+            .market => return switching(a, step, args, body, .market),
+            .validator => return switching(a, step, args, body, .validator),
             .other => {},
         }
         // Any other message in the app's box: from the instance itself (its own watch, a resume), nothing else.

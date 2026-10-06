@@ -36,6 +36,18 @@
 //! `unbeacon` likewise (`withRoles`). Nothing at a start or re-read: the
 //! intents stand in the log.
 //!
+//! The owner's switch (David, 2026-10-07: "this shouldn't have been a config
+//! in the manifest. This should be a setting that the user is configuring";
+//! 0.9.2): `market {window} | {off: true}` and `validator {every} | {off:
+//! true}`, taken where register is, kept in this same record beside
+//! `topics`:
+//!
+//!   {kind: "overlay-topics", topics: [...], market?: {window} | {off: true}, validator?: {every} | {off: true}}
+//!
+//! A role switched has precedence over the manifest's value (`effective`);
+//! one never switched is the manifest's. Turned on, `liveness` / `beacon` for
+//! every registered topic; off, `unliveness` / `unbeacon` (`switchRole`).
+//!
 //! Seeding (0.7.8): `register {topic, program, seed?: [txid hex, …]}` — after
 //! the topic is registered (or found registered with the same program), each
 //! `seed` transaction the chain state holds is judged under that topic alone,
@@ -92,17 +104,28 @@ pub fn entriesOf(a: Allocator, rec: ?Value) ![]const Entry {
     return out;
 }
 
-/// The set's record.
+/// The set's record, with no switch set (`recordWith`).
 pub fn recordOf(a: Allocator, list: []const Entry) !Value {
+    return recordWith(a, list, .{});
+}
+
+/// The set's record with the owner's switches (0.9.2): `market: {window} | {off: true}` and
+/// `validator: {every} | {off: true}` beside `topics`, each only once switched.
+pub fn recordWith(a: Allocator, list: []const Entry, sw: Switches) !Value {
     const ts = try a.alloc(Value, list.len);
     for (list, ts) |e, *v| v.* = .{ .map = try a.dupe(cbor.Entry, &.{
         .{ .key = "topic", .value = .{ .text = e.topic } },
         .{ .key = "program", .value = .{ .text = e.program } },
     }) };
-    return .{ .map = try a.dupe(cbor.Entry, &.{
+    var es: std.ArrayList(cbor.Entry) = .empty;
+    try es.appendSlice(a, &.{
         .{ .key = "kind", .value = .{ .text = record_kind } },
         .{ .key = "topics", .value = .{ .array = ts } },
-    }) };
+    });
+    inline for (.{ Role.market, Role.validator }) |r| {
+        if (try switchValue(a, sw.get(r), r)) |v| try es.append(a, .{ .key = @tagName(r), .value = v });
+    }
+    return .{ .map = es.items };
 }
 
 fn find(list: []const Entry, topic: []const u8) ?Entry {
@@ -204,12 +227,14 @@ pub fn register(a: Allocator, list: []const Entry, args: Value, programs: Value,
 
 /// What a mailbox message asks of the engine, by its body's `fn` alone; where it may be taken is
 /// `mayRegister`'s (one box per function class, shruggr/skein#128, 0.7.5).
-pub const Asked = enum { register, deregister, other };
+pub const Asked = enum { register, deregister, market, validator, other };
 
 pub fn asked(body: Value) Asked {
     const f = body.getText("fn") orelse return .other;
     if (eql(u8, f, "register")) return .register;
     if (eql(u8, f, "deregister")) return .deregister;
+    if (eql(u8, f, "market")) return .market;
+    if (eql(u8, f, "validator")) return .validator;
     return .other;
 }
 
@@ -291,4 +316,139 @@ pub fn deregister(a: Allocator, list: []const Entry, args: Value) !Change {
     var out: std.ArrayList(Entry) = .empty;
     for (list) |e| if (!eql(u8, e.topic, topic)) try out.append(a, e);
     return .{ .done = .{ .list = out.items, .events = try a.dupe(Value, &try events(a, false, topic, "")), .answer = try answerOf(a, topic, false) } };
+}
+
+/// The owner's switches (David, 2026-10-07: "this shouldn't have been a config in the manifest. This
+/// should be a setting that the user is configuring"; 0.9.2). Each role is switched by an owner's
+/// message in `<app>/register` — `market {window}` / `market {off: true}`, `validator {every}` /
+/// `validator {off: true}` — and kept in the set's record `<app>/topics` beside `topics`. A switch,
+/// once sent, has precedence over `config.overlay.market` / `.validator` (the manifest's: the initial
+/// value); `unset` is the manifest's.
+pub const Role = enum { market, validator };
+
+/// One role's switch: never sent (the manifest decides), off, or on with its ms.
+pub const Switch = union(enum) { unset, off, on: u64 };
+
+pub const Switches = struct {
+    market: Switch = .unset,
+    validator: Switch = .unset,
+
+    pub fn get(self: Switches, r: Role) Switch {
+        return switch (r) {
+            .market => self.market,
+            .validator => self.validator,
+        };
+    }
+
+    pub fn set(self: *Switches, r: Role, v: Switch) void {
+        switch (r) {
+            .market => self.market = v,
+            .validator => self.validator = v,
+        }
+    }
+};
+
+/// The field of a role's switch and of its `config.overlay` value: market `window`, validator `every`.
+pub fn fieldOf(r: Role) []const u8 {
+    return switch (r) {
+        .market => "window",
+        .validator => "every",
+    };
+}
+
+/// The shortest and longest window or beat the kernel takes (ms; skein docs/MESSAGES.md "Beacons", "Liveness").
+pub const role_min_ms: u64 = 1000;
+pub const role_max_ms: u64 = 86_400_000;
+
+fn switchValue(a: Allocator, sw: Switch, r: Role) !?Value {
+    return switch (sw) {
+        .unset => null,
+        .off => .{ .map = try a.dupe(cbor.Entry, &.{.{ .key = "off", .value = .{ .boolean = true } }}) },
+        .on => |ms| .{ .map = try a.dupe(cbor.Entry, &.{.{ .key = fieldOf(r), .value = .{ .uint = ms } }}) },
+    };
+}
+
+/// The switches a set record holds (null: no set yet, none switched).
+pub fn switchesOf(rec: ?Value) !Switches {
+    const r = rec orelse return .{};
+    var out: Switches = .{};
+    inline for (.{ Role.market, Role.validator }) |role| {
+        if (r.get(@tagName(role))) |v| out.set(role, parseSwitch(v, role) catch return error.BadTopicSet);
+    }
+    return out;
+}
+
+/// `{off: true}` → off; `{window: <ms>}` (market) / `{every: <ms>}` (validator), 1 000 ms .. a day → on.
+/// Anything else: error.BadSwitch.
+pub fn parseSwitch(v: Value, r: Role) error{BadSwitch}!Switch {
+    if (v != .map) return error.BadSwitch;
+    if (v.get("off")) |off| {
+        if (off != .boolean or !off.boolean or v.map.len != 1) return error.BadSwitch;
+        return .off;
+    }
+    const ms = v.getUint(fieldOf(r)) orelse return error.BadSwitch;
+    if (v.map.len != 1 or ms < role_min_ms or ms > role_max_ms) return error.BadSwitch;
+    return .{ .on = ms };
+}
+
+/// The roles in effect: a switch sent has precedence; `unset` is the configuration's.
+pub fn effective(sw: Switches, cfg: Roles) Roles {
+    const pick = struct {
+        fn f(s: Switch, c_: ?u64) ?u64 {
+            return switch (s) {
+                .unset => c_,
+                .off => null,
+                .on => |ms| ms,
+            };
+        }
+    }.f;
+    return .{ .market = pick(sw.market, cfg.market), .validator = pick(sw.validator, cfg.validator) };
+}
+
+/// The answer to a switch (and the roles as the owner reads them): `{market?: {window}, validator?:
+/// {every}}`, the roles in effect, each present only when on.
+pub fn rolesAnswer(a: Allocator, roles: Roles) !Value {
+    var es: std.ArrayList(cbor.Entry) = .empty;
+    if (roles.market) |w| try es.append(a, .{ .key = "market", .value = .{ .map = try a.dupe(cbor.Entry, &.{.{ .key = "window", .value = .{ .uint = w } }}) } });
+    if (roles.validator) |e| try es.append(a, .{ .key = "validator", .value = .{ .map = try a.dupe(cbor.Entry, &.{.{ .key = "every", .value = .{ .uint = e } }}) } });
+    return .{ .map = es.items };
+}
+
+/// What a switch does: the switches to write (null: unchanged), the events to emit, the answer
+/// (`rolesAnswer`, after it). Or why it is refused (nothing written, nothing emitted).
+pub const SwitchChange = union(enum) {
+    refused: []const u8,
+    done: struct { switches: ?Switches, events: []const Value, answer: Value },
+};
+
+/// `market {window} | {off: true}` / `validator {every} | {off: true}` (0.9.2): the role `r` switched
+/// for the registered set `list`. Turned on (or its ms changed), `liveness` / `beacon` for every
+/// topic registered (the kernel keys them by (app, topic): a new ms replaces the old); turned off,
+/// `unliveness` / `unbeacon` for them. Idempotent: the same switch again writes and emits nothing; a
+/// switch that leaves the role in effect as it was (the manifest's value made explicit) is written
+/// (it has precedence from then on) and emits nothing.
+pub fn switchRole(a: Allocator, list: []const Entry, sw: Switches, cfg: Roles, r: Role, args: Value) !SwitchChange {
+    const want = parseSwitch(args, r) catch return .{ .refused = try std.fmt.allocPrint(a, "{s}: want {{{s}: <ms>}} (1000 ms to a day) or {{off: true}}", .{ @tagName(r), fieldOf(r) }) };
+    const before = effective(sw, cfg);
+    var next = sw;
+    next.set(r, want);
+    const after = effective(next, cfg);
+    const same = std.meta.eql(sw.get(r), want);
+    var evs: std.ArrayList(Value) = .empty;
+    const was = switch (r) {
+        .market => before.market,
+        .validator => before.validator,
+    };
+    const now = switch (r) {
+        .market => after.market,
+        .validator => after.validator,
+    };
+    if (!std.meta.eql(was, now)) {
+        const only: Roles = switch (r) {
+            .market => .{ .market = now orelse was },
+            .validator => .{ .validator = now orelse was },
+        };
+        for (list) |e| try evs.appendSlice(a, try roleEvents(a, now != null, e.topic, only));
+    }
+    return .{ .done = .{ .switches = if (same) null else next, .events = evs.items, .answer = try rolesAnswer(a, after) } };
 }
