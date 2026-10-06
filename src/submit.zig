@@ -984,7 +984,8 @@ pub fn received(cx: Ctx, args: Value, source: Value) !Resumed {
     return settle(cx, r, txid, topics, source);
 }
 
-/// The submission event POST /submit admits into box `<app>` (0.7.3: the route launches nothing):
+/// The submission event POST /submit admits into box `<app>/submit` (0.7.3: the route launches
+/// nothing; the box since 0.7.6, one box per function class, shruggr/skein#128):
 /// `{kind: "submission", body: {fn: "submit", args: {beef, topics, offChainValues?}}, request:
 /// <the request record>, transport: "http", sender?: <the session's identity>}`. Its step is the
 /// message step's (`received`): `body` the message, `source` `{transport, box: <the box it was

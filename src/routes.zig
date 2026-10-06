@@ -7,8 +7,8 @@
 //!                                   x-includes-off-chain-values: true → VarInt(len) ‖ BEEF ‖ off-chain values
 //!                                   → 200 {id, admit}: delivered (shruggr/skein#112) — the submission is the
 //!                                   message {fn: "submit", args: {beef, topics, offChainValues?}}, admitted
-//!                                   as the `submission` event in box <app> (0.7.3); its answers go to the
-//!                                   submitter's box, never on this connection
+//!                                   as the `submission` event in box <app>/submit (0.7.3; that box 0.7.6);
+//!                                   its answers go to the submitter's box, never on this connection
 //!   libp2p:<topic>    fn "submit"   the same submit as a GossipSub message (#57): the message's topic
 //!                                   requested, its body the BEEF → {verdict, admit?} (`gossip` below)
 //!   libp2p:<topic>-admit   fn "peerAdmit"   a peer's verdict (#74, gossip.zig): recorded as a
@@ -32,8 +32,9 @@
 //! record's CID, which every answer names (`request`) — admitting the
 //! `submission` event `{kind: "submission", body: {fn: "submit", args:
 //! {beef, topics, offChainValues?}}, request, transport: "http", sender?:
-//! <the session's identity>}` into box `<app>` (0.7.3), as the libp2p route
-//! admits its submit event. It launches nothing (a step that launches a
+//! <the session's identity>}` into the submission box `<app>/submit` (0.7.3;
+//! that box since 0.7.6, shruggr/skein#128: where a submission by message
+//! comes in). It launches nothing (a step that launches a
 //! thread waits on it): the request ends at once, and the engine's step on
 //! the event routes the submission (submit.zig `received`) and answers the
 //! submitter by message — admitted (pending), each proof, or rejected —
@@ -289,9 +290,12 @@ fn submit(a: Allocator, in: Value, req: Value) !Value {
 /// then `admit`: the `submission` event, `{kind: "submission", body: {fn: "submit", args: {beef,
 /// topics, offChainValues?}}, request: <the request record>, transport: "http", sender?: <the
 /// session's identity>}` (submit.zig `submissionOf`), and the `answer`: 200 `{id: <the request
-/// record's CID, hex>}` admitting that event into box `<app>`, as the libp2p route admits its
-/// submit event (`accepting`). It launches nothing (0.7.3): a step that launches a thread waits
-/// on it, and the request ends at once; the engine's step on the event routes the submission.
+/// record's CID, hex>}` admitting that event into the submission box `<app>/submit` (one box per
+/// function class, shruggr/skein#128, 0.7.6: where a submission by message comes in too, so an app
+/// whose own box `<app>` belongs to another program gets both in one box; the stock manifest's
+/// row `{address: "submit", sender: "*", program: "overlay"}` routes it). It launches nothing
+/// (0.7.3): a step that launches a thread waits on it, and the request ends at once; the engine's
+/// step on the event routes the submission, its answers to the sender in that box.
 pub fn httpSubmission(a: Allocator, req: Value, app: []const u8) !union(enum) { refused: Value, admit: struct { event: Value, answer: Value } } {
     const th = header(req, "x-topics") orelse return .{ .refused = try failure(a, 400, "Missing x-topics header") };
     const requested = parseTopics(a, th) catch return .{ .refused = try failure(a, 400, "Invalid x-topics header: expected a comma-separated list or JSON string array") };
@@ -336,8 +340,17 @@ pub fn httpSubmission(a: Allocator, req: Value, app: []const u8) !union(enum) { 
     if (req.getBytes("caller")) |k| try es.append(a, .{ .key = "sender", .value = .{ .bytes = k } });
     const ev: Value = .{ .map = es.items };
     var answer = try respond(a, 200, "application/json", try jsonOf(a, .{ .id = try vm.hexAlloc(a, request) }));
-    answer.map = try std.mem.concat(a, cbor.Entry, &.{ answer.map, &.{.{ .key = "admit", .value = try admitOne(a, ev, app) }} });
+    answer.map = try std.mem.concat(a, cbor.Entry, &.{ answer.map, &.{.{ .key = "admit", .value = try admitOne(a, ev, try submitBox(a, app)) }} });
     return .{ .admit = .{ .event = ev, .answer = answer } };
+}
+
+/// The box, after the app's name, submissions come in (one box per function class,
+/// shruggr/skein#128, 0.7.6): `submit`, resolved `<app>/submit`.
+pub const submit_box = "submit";
+
+/// `<app>/submit`: where POST /submit admits its submission event.
+pub fn submitBox(a: Allocator, app: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(a, "{s}/{s}", .{ app, submit_box });
 }
 
 /// The same submit, arriving as a GossipSub message on a `libp2p:<topic>` route (#57): the message's

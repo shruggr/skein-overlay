@@ -1846,7 +1846,7 @@ test "wants {txid, topic, peer?} (shruggr/skein#112): a gossip pause wants the p
     try std.testing.expectEqual(@as(usize, 0), try st.map("wants").count());
 }
 
-test "a submission over HTTP (shruggr/skein#112, 0.7.3): the route answers delivery (200 {id}) and admits the submission event into the app's box, launching nothing; the box step routes it; a missing parent pauses with a want of no peer; the parent's arrival clears it" {
+test "a submission over HTTP (shruggr/skein#112, 0.7.3; box 0.7.6): the route answers delivery (200 {id}) and admits the submission event into the box `<app>/submit`, launching nothing; the box step routes it; a missing parent pauses with a want of no peer; the parent's arrival clears it" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -1867,11 +1867,11 @@ test "a submission over HTTP (shruggr/skein#112, 0.7.3): the route answers deliv
     try std.testing.expectEqual(@as(u64, 200), sub.answer.getUint("status").?);
     const id = try std.json.parseFromSliceLeaky(std.json.Value, a, sub.answer.getBytes("body").?, .{});
     try std.testing.expectEqualStrings(try @import("sk").hexAlloc(a, request), id.object.get("id").?.string);
-    // 0.7.3: no launch (a step that launches waits on it) — the answer admits one event into the app's box, and nothing else.
+    // 0.7.3: no launch (a step that launches waits on it) — the answer admits one event into the submission box `<app>/submit` (0.7.6), and nothing else.
     try std.testing.expect(sub.answer.get("wait") == null);
     const admit = sub.answer.getArray("admit").?;
     try std.testing.expectEqual(@as(usize, 1), admit.len);
-    try std.testing.expectEqualStrings("overlay", admit[0].getText("box").?);
+    try std.testing.expectEqualStrings("overlay/submit", admit[0].getText("box").?);
     const ev = admit[0].get("event").?;
     try std.testing.expectEqualStrings("submission", ev.getText("kind").?);
     try std.testing.expect(ev.get("subject") == null); // routed by its box, waking no thread
@@ -1887,11 +1887,11 @@ test "a submission over HTTP (shruggr/skein#112, 0.7.3): the route answers deliv
     try std.testing.expectEqual(@as(u64, 400), bad.getUint("status").?);
     try std.testing.expect(bad.get("admit") == null);
 
-    // The engine's step on the admitted event (box `overlay`): the message step's, source from the event.
-    const m = try submit.submissionOf(a, ev, "overlay");
+    // The engine's step on the admitted event (box `overlay/submit`): the message step's, source from the event.
+    const m = try submit.submissionOf(a, ev, "overlay/submit");
     const source = m.source;
     try std.testing.expectEqualStrings("http", source.getText("transport").?);
-    try std.testing.expectEqualStrings("overlay", source.getText("box").?);
+    try std.testing.expectEqualStrings("overlay/submit", source.getText("box").?);
     try std.testing.expectEqualSlices(u8, request, source.getCid("request").?);
     // t2 lacks t1 — paused, no 400; one want, no peer.
     const r = try inst.received(m.body.get("args").?, source);
@@ -2087,10 +2087,11 @@ test "one box per function class (skein #128, 0.7.5): register only in `<app>/ov
     try std.testing.expect(!topics_mod.mayRegister(try mapOf(a, &.{}), "amm"));
     const why = try topics_mod.notHere(a, "register", try mapOf(a, &.{.{ .key = "box", .value = .{ .text = "amm/submit" } }}), "amm");
     try std.testing.expectEqualStrings("register: not taken in box amm/submit; send it in amm/overlay", why);
-    // The manifest's rows: registrations in `overlay` from the owner; submissions in the app's box, open to anyone, the door decoding the BEEF.
+    // The manifest's rows: registrations in `overlay` from the owner; submissions in `submit` (0.7.6), open to anyone, the door decoding the BEEF; no open row on the app's own box.
     const manifest = @embedFile("etc/app.json");
     try std.testing.expect(std.mem.indexOf(u8, manifest, "{\"address\": \"overlay\", \"sender\": \"$owner\", \"program\": \"overlay\"}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, manifest, "{\"address\": \"\", \"sender\": \"*\", \"program\": \"overlay\", \"filter\": \"beef\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "{\"address\": \"submit\", \"sender\": \"*\", \"program\": \"overlay\", \"filter\": \"beef\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"address\": \"\"") == null);
 
     // Submit accepted in `<app>/submit`: launched, the submitter answered in that box.
     var ms = c.store.MemStore.init(std.testing.allocator);
@@ -2115,4 +2116,45 @@ test "one box per function class (skein #128, 0.7.5): register only in `<app>/ov
     const ans = inst.wire_.answers.items[0];
     try std.testing.expectEqualStrings("overlay/submit", ans.box);
     try std.testing.expectEqualStrings("admitted", ans.body.get("result").?.getText("state").?);
+}
+
+test "one box per function class (skein #128, 0.7.6): POST /submit admits into `<app>/submit`, the box a message submission comes in; the step there launches, the sender answered in that box" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = c.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var inst = try Instance.init(a, &ms);
+    const x = try chain3(a, &inst);
+    const parent = try withFund(a, x.f, x.t1);
+    const bob: [33]u8 = .{0x03} ++ .{0xb0} ** 32;
+    // An app whose own box is another program's (skein-amm): the HTTP submission still lands in `amm/submit`.
+    const request = try a.dupe(u8, &cbor.cidOf("an http submission"));
+    const req = try mapOf(a, &.{
+        .{ .key = "headers", .value = try mapOf(a, &.{.{ .key = "x-topics", .value = .{ .text = "tm_demo" } }}) },
+        .{ .key = "body", .value = .{ .bytes = parent } },
+        .{ .key = "request", .value = .{ .cid = request } },
+        .{ .key = "caller", .value = .{ .bytes = &bob } },
+    });
+    try std.testing.expectEqualStrings("amm/submit", try routes.submitBox(a, "amm"));
+    const sub = (try routes.httpSubmission(a, req, "amm")).admit;
+    const admit = sub.answer.getArray("admit").?;
+    try std.testing.expectEqual(@as(usize, 1), admit.len);
+    try std.testing.expectEqualStrings("amm/submit", admit[0].getText("box").?);
+    const ev = admit[0].get("event").?;
+    try std.testing.expectEqualSlices(u8, &bob, ev.getBytes("sender").?);
+    // The engine's step in `amm/submit` (its args.box): the message step's, launched; the sender answered there.
+    const m = try submit.submissionOf(a, ev, admit[0].getText("box").?);
+    try std.testing.expectEqualStrings("amm/submit", m.source.getText("box").?);
+    const r = try inst.received(m.body.get("args").?, m.source);
+    try std.testing.expect(r == .launch);
+    _ = try inst.begin(r.launch);
+    _ = try inst.ingest(parent);
+    _ = try inst.chainStatus(x.t1.txid, "RECEIVED", null);
+    try std.testing.expect((try inst.answer(x.t1.txid, .accepted)).admitted);
+    const ans = inst.wire_.answers.items[0];
+    try std.testing.expectEqualSlices(u8, &bob, ans.to);
+    try std.testing.expectEqualStrings("amm/submit", ans.box);
+    try std.testing.expectEqualStrings("admitted", ans.body.get("result").?.getText("state").?);
+    try std.testing.expectEqualSlices(u8, request, ans.body.getCid("request").?);
 }

@@ -3,11 +3,13 @@
 //! submit, lookup, the listings and documentation); stepped, it is:
 //!
 //!   a submission              the message {fn: "submit", args: {beef, topics, offChainValues?}} in
-//!                             a box a row routes to the engine (the app's own `<app>`, open to
-//!                             anyone), or the `submission` event POST /submit admits into box
-//!                             `<app>` carrying the same message (shruggr/skein#112; 0.7.3): routed —
-//!                             its thread launched, paused, or answered at once; its answers go to
-//!                             the sender (submit.zig `received`).
+//!                             a box a row routes to the engine (the stock manifest's: the
+//!                             submission box `<app>/submit`, open to anyone), or the `submission`
+//!                             event POST /submit admits into that same box `<app>/submit`
+//!                             carrying the same message (shruggr/skein#112; 0.7.3; the box 0.7.6,
+//!                             one box per function class, #128): routed — its thread launched,
+//!                             paused, or answered at once; its answers go to the sender, in the
+//!                             box it came in (submit.zig `received`).
 //!   the submission's thread   launched by a submission (args {event, box: "submit"}), or by the
 //!                             submit event the `libp2p:<topic>` route admits (box `<app>`, row
 //!                             from `event`): first step `begin` — the BEEF to the chain app (a
@@ -24,11 +26,12 @@
 //!                             come; it is routed again — its thread launched, paused again, or dropped.
 //!   a peer's admit            the `peer-admit` event the `-admit` route admits (box `<app>`):
 //!                             recorded under `<app>/gossip`.
-//!   register / deregister     a message in any box a row routes to the engine (`<app>`, or e.g.
-//!                             `<app>/overlay`, shruggr/skein#128), {fn: "register", args: {topic,
-//!                             program}} or {fn: "deregister", args: {topic}}, from whoever that row
-//!                             admits (topics.zig, shruggr/skein#120): the registered set under
-//!                             `<app>/topics`, the subscribe / unsubscribe events; answered {topic, active}.
+//!   register / deregister     a message in the box `<app>/overlay` only (one box per function
+//!                             class, shruggr/skein#128, 0.7.5; refused `bad-args` elsewhere),
+//!                             {fn: "register", args: {topic, program}} or {fn: "deregister",
+//!                             args: {topic}}, from whoever that row admits (topics.zig,
+//!                             shruggr/skein#120): the registered set under `<app>/topics`, the
+//!                             subscribe / unsubscribe events; answered {topic, active}.
 //!
 //! The state is the overlay's own, under its app's name (state.zig: `<app>/state`), over the
 //! chain app's (`chain/state`), read only. The topics and lookup services are the app's (#72,
@@ -353,7 +356,7 @@ fn resumeStep(a: Allocator, step: Value, rargs: Value) !void {
 
 /// A submission by message (shruggr/skein#112): `{fn: "submit", args: {beef, topics,
 /// offChainValues?}}` from anyone a row admits — or POST /submit's `submission` event in box
-/// `<app>` (0.7.3, submit.zig `submissionOf`), which carries the same message. Its source names
+/// `<app>/submit` (0.7.3; that box 0.7.6; submit.zig `submissionOf`), which carries the same message. Its source names
 /// whom the answers go to: the sender, in the box it came in, about the message (submit.zig
 /// `received`).
 fn submissionStep(a: Allocator, step: Value, body: Value, source: Value) !void {

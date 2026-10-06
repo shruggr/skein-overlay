@@ -34,7 +34,8 @@
 //! program: "overlay"}`; in any other box (the app's own `<app>`,
 //! `<app>/submit`, …) it is refused with `bad-args`, writing and emitting
 //! nothing. `submit` is the other class: taken in any box a row routes to
-//! the engine. The app is the step's, never the box's; the answer goes back
+//! the engine — the stock manifest's `<app>/submit`, where POST /submit
+//! admits its submission event too (0.7.6). The app is the step's, never the box's; the answer goes back
 //! in the box the message came in.
 //!
 //! The logic, natively testable; engine.zig runs it in a step.

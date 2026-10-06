@@ -4,7 +4,7 @@ The overlay services engine for a [skein](https://github.com/shruggr/skein),
 as an app: BRC-22 submit and BRC-24 lookup, served by the instance's own
 front door, with topic managers and lookup services as programs the engine
 calls. It is also a Zig package: an overlay of your own depends on it for
-the topic and lookup contracts. Version **0.7.5**.
+the topic and lookup contracts. Version **0.7.6**.
 
 ## What it is
 
@@ -160,7 +160,7 @@ The manifest (`etc/app.json`, this repo's own, description left out):
 {
   "kind": "app",
   "name": "overlay",
-  "version": "0.7.5",
+  "version": "0.7.6",
   "programs": {
     "overlay": "bin/overlay.wasm",
     "topic-demo": "bin/topic-demo.wasm",
@@ -176,7 +176,7 @@ The manifest (`etc/app.json`, this repo's own, description left out):
   "requires": ["chain/1"],
   "dispatch": [
     {"address": "overlay", "sender": "$owner", "program": "overlay"},
-    {"address": "", "sender": "*", "program": "overlay", "filter": "beef"},
+    {"address": "submit", "sender": "*", "program": "overlay", "filter": "beef"},
     {"transport": "http", "address": "/listTopicManagers", "sender": "*", "program": "overlay", "fn": "listTopicManagers"},
     {"transport": "http", "address": "/listLookupServiceProviders", "sender": "*", "program": "overlay", "fn": "listLookupServiceProviders"},
     {"transport": "http", "address": "/getDocumentationForTopicManager", "sender": "*", "program": "overlay", "fn": "topicDocumentation"},
@@ -192,17 +192,21 @@ The manifest (`etc/app.json`, this repo's own, description left out):
   http `/submit` and `/lookup` (open, under `/<app>/`), the libp2p rows
   `<topic>`, `<topic>-admit`, `<topic>-proof`, and box `<app>` from `event`
   and from `$self`. The install prompt reads them all aloud.
-- The row for the app's own box `""` (`<app>`), open to anyone, is where
-  submissions arrive as messages (`{fn: "submit", args: {beef, topics}}`;
-  the door decodes the BEEF, `filter: "beef"`). One box per function class
-  (shruggr/skein#128): `submit` is taken in any box a row routes to the
-  engine; `register` / `deregister` only in `overlay` (`<app>/overlay`), and
-  refused anywhere else, this box included.
-- An app whose own box `<app>` belongs to another program (skein-amm, say)
-  opens a box for submissions instead, to anyone:
-  `{"address": "submit", "sender": "*", "program": "overlay", "filter": "beef"}`
-  (`<app>/submit` once installed). The stock manifest keeps its `""` / `*`
-  row.
+- One box per function class (shruggr/skein#128), three boxes:
+  `<app>/submit` for submissions, `<app>/overlay` for registration, `<app>`
+  for the engine's own events and messages.
+- The row `submit` (`<app>/submit`), open to anyone, is where submissions
+  arrive: as messages (`{fn: "submit", args: {beef, topics}}`; the door
+  decodes the BEEF, `filter: "beef"`), and as the `submission` event
+  `POST /submit` admits (0.7.6). The answers go to the sender in that box.
+  An app whose own box `<app>` belongs to another program (skein-amm, say)
+  keeps this row as is: both kinds of submission land in `<app>/submit`.
+- The row `overlay` (`<app>/overlay`, from `$owner`) takes `register` /
+  `deregister`; they are refused in any other box.
+- The derived rows on `<app>` (from `event`, from `$self`) take the libp2p
+  routes' admits (a gossiped or streamed submission's routed event, a
+  peer's admit) and the engine's own `watch` and `resume`; no row opens
+  `<app>` to anyone.
 - The libp2p row `/skein/overlay/beef/1.0.0` is the want-answer stream
   (shruggr/skein#112): a peer the engine wants a parent from answers on
   it, one Atomic BEEF per frame; the door decodes it (`filter: "beef"`)
@@ -277,7 +281,7 @@ Not built: BRC-88 SHIP/SLAP, GASP sync and catch-up from a peer, the
 
 | | |
 |---|---|
-| this app and package | 0.7.5 (tag `v0.7.5`) |
+| this app and package | 0.7.6 (tag `v0.7.6`) |
 | skein-sdk | v0.7.1, by tag URL and hash in `build.zig.zon` (modules `chain` and, for the engine, `sk`; bsvz comes through it) |
 | requires | `chain/1` (shruggr/skein-chain 0.3.0) |
 | skein | log format 8; skein's equivs pin this repo by commit |
@@ -363,6 +367,19 @@ included and whoever sent them, they are refused with `bad-args`. `submit`
 is taken in any box a row routes to the engine, so an app may open
 `{"address": "submit", "sender": "*", "program": "overlay", "filter":
 "beef"}` when its own box belongs to another program.
+
+0.7.6: one box per function class, completed (shruggr/skein#128): the
+submission box is `<app>/submit` everywhere. The stock manifest's
+submission row is `{"address": "submit", "sender": "*", "program":
+"overlay", "filter": "beef"}` (was `""`, the app's own box), and `POST
+/submit` admits its `submission` event into `<app>/submit` (was `<app>`),
+so an app whose own box belongs to another program gets HTTP and message
+submissions in one box; the answers go to the sender in that box. The
+skein install's derived http row `/<app>/submit` is unchanged (only where
+its handler admits moved). The libp2p routes still admit their routed
+`submit` event (and `peer-admit`) into `<app>` through the derived `event`
+row, and the engine's `watch` / `resume` stay there; registration stays in
+`<app>/overlay`.
 
 ## Contributing
 

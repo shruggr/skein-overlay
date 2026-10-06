@@ -1,4 +1,4 @@
-# Overlay services in the VM (0.7.5)
+# Overlay services in the VM (0.7.6)
 
 An overlay is an app (skein docs/APPS.md §6). It judges transactions with
 its topic managers and indexes them with its lookup services; it does not
@@ -10,8 +10,9 @@ asks the chain app to take a transaction; what the chain app answers
 (accepted, proven, rejected) is the overlay's gate.
 
 **A submission is a message** (shruggr/skein#112): `{fn: "submit", args:
-{beef, topics}}` into the overlay's box; `POST /submit` carries the same
-message and answers its delivery only. The submitter hears the verdict
+{beef, topics}}` into the overlay's submission box `<app>/submit`; `POST
+/submit` carries the same message into the same box and answers its
+delivery only. The submitter hears the verdict
 later, by message to its own box — **admitted** (status `pending`), then
 **every proof**, or **rejected** — as Arcade answers a broadcast: nothing
 holds a request open ("Submitting", below).
@@ -104,27 +105,30 @@ Paths below that are not this repo's (`docs/*.md`, `programs/frontdoor`,
 
 ## Submitting (shruggr/skein#112)
 
-A submission is a message into the overlay's box, a function call as any
-app's (skein docs/APPS.md §4):
+A submission is a message into the overlay's submission box, a function
+call as any app's (skein docs/APPS.md §4):
 
 ```
-box:  <app>          (the manifest's row {"address": "", "sender": "*", "program": "overlay", "filter": "beef"})
+box:  <app>/submit   (the manifest's row {"address": "submit", "sender": "*", "program": "overlay", "filter": "beef"})
 body: {fn: "submit", args: {beef: <the BEEF>, topics: [<topic>, …], offChainValues?: bytes}}
 ```
 
-One box per function class (shruggr/skein#128): `submit` is taken in any
-box a row routes to the engine, from whoever that row admits; the answer
-goes back in the box the message came in. An app whose own box `<app>`
-belongs to another program (skein-amm: its box is the AMM's) opens a box
-for submissions to anyone instead:
+**One box per function class** (shruggr/skein#128; 0.7.5 register, 0.7.6
+submit). An overlay app has three boxes, each for one class:
 
-```json
-{"address": "submit", "sender": "*", "program": "overlay", "filter": "beef"}
-```
+| box | row (stock manifest) | takes |
+|---|---|---|
+| `<app>/submit` | `{"address": "submit", "sender": "*", "program": "overlay", "filter": "beef"}` | **submissions**: the `submit` message from anyone, and the `submission` event `POST /submit` admits |
+| `<app>/overlay` | `{"address": "overlay", "sender": "$owner", "program": "overlay"}` | **registration**: `register` / `deregister` from the owner; refused (`bad-args`) in any other box ("Register a topic", below) |
+| `<app>` | derived by the install: from `event` and from `$self` | **the engine's own traffic**: the libp2p routes' admits (a gossiped or streamed submission's routed `submit` event, a peer's `peer-admit`), its own `watch` and `resume` |
 
-— installed, `<app>/submit`. This repo's manifest keeps its `""` / `*` row.
-`register` / `deregister` in a submissions box are refused ("Register a
-topic", below).
+So an app whose own box `<app>` belongs to another program (skein-amm: its
+box is the AMM's) takes submissions — by message and over HTTP — in the
+same box, `<app>/submit`, as this repo's does. The engine still takes a
+`submit` in any box a row routes to it, from whoever that row admits; the
+answer goes back in the box the message came in. Before 0.7.6 the stock
+manifest's submission row was `""` (the app's own box) and `POST /submit`
+admitted into `<app>`.
 
 The door decodes `args.beef` into its pointer record (`filter: "beef"`,
 shruggr/skein#121). Delivery is the only acknowledgement: nothing answers
@@ -140,11 +144,12 @@ that the request is a submission (`X-Topics`, a body, the off-chain
 framing; else 400), builds the message `{fn: "submit", args: {beef, topics,
 offChainValues?}}` and answers **200 `{id}`**, the request record's CID
 (hex): the `request` every answer names, with `admit: [{event, box:
-<app>}]` — the event `{kind: "submission", body: <the message>, request:
-<the request record>, transport: "http", sender?: <the BRC-104 session's
-identity>}`, routed into the app's own box like a delivered message (the
-manifest's row `""`, sender `*`), as the `libp2p:<topic>` route admits its
-submit event. The route launches nothing (0.7.3: a step that launches a
+<app>/submit}]` — the event `{kind: "submission", body: <the message>,
+request: <the request record>, transport: "http", sender?: <the BRC-104
+session's identity>}`, routed into the submission box like a delivered
+message (the manifest's row `submit`, sender `*`, which takes events too;
+0.7.6 — before, the app's own box `<app>`). The skein install's derived http
+row `/<app>/submit` is unchanged: only where its handler admits moved. The route launches nothing (0.7.3: a step that launches a
 thread waits on it, so the request would not end): the request ends at
 once, and the engine's step on the event is the message step's — the same
 route's half, the same thread. No
@@ -157,7 +162,7 @@ session, the @bsv/sdk `TopicBroadcaster`'s way) gets delivery only, its
 answers in the instance's log, and reads the outcome with a lookup.
 
 **The answers** go to the sender, in the box it wrote to (`/submit`: the
-app's box `<app>`), when a message can reach it (the instance itself, an
+submission box `<app>/submit`), when a message can reach it (the instance itself, an
 address-book entry); otherwise they are in the step's result record only
 (`answers: [{to, box, body | message, sent}]`). Each is
 
@@ -197,7 +202,7 @@ a registration for the life of the transaction.)
 ## A submission, from the wire to the state (#50)
 
 **Decoded at the door** (shruggr/skein#121). The submit rows (`/<app>/submit`,
-the app's box `<app>`, and the libp2p `<topic>`) name `filter: "beef"`. Before the request's
+the submission box `<app>/submit`, and the libp2p `<topic>`) name `filter: "beef"`. Before the request's
 entry is written, the kernel's door decodes the BEEF in its body (V1, V2,
 Atomic or Outpoint; the subject is the Atomic or Outpoint one's, or else
 the last) — each transaction stored once as its `bitcoin-tx` block (its
@@ -557,14 +562,14 @@ wire"). Stepped:
 
 | launched by | input | does |
 |---|---|---|
-| a message in box `<app>` from anyone (the manifest's row `""`, sender `*`), or the `submission` event POST /submit admits there (0.7.3) | `{fn: "submit", args: {beef, topics, offChainValues?}}`, or `{kind: "submission", body: <that message>, request, transport: "http", sender?}` | a submission (shruggr/skein#112): routed — its thread launched, paused, or answered (`rejected`, or `admitted` for one judged before); the step's wake at the end of the thread it launched (`resolved`) answers nothing (0.7.4: the submitter is answered once per state change) |
+| a message in box `<app>/submit` from anyone (the manifest's row `submit`, sender `*`), or the `submission` event POST /submit admits there (0.7.3; that box 0.7.6) | `{fn: "submit", args: {beef, topics, offChainValues?}}`, or `{kind: "submission", body: <that message>, request, transport: "http", sender?}` | a submission (shruggr/skein#112): routed — its thread launched, paused, or answered (`rejected`, or `admitted` for one judged before); the step's wake at the end of the thread it launched (`resolved`) answers nothing (0.7.4: the submitter is answered once per state change) |
 | a submission's launch, or the submit event in box `<app>` (the `libp2p:<topic>` route's admit, row from `event`) | `{kind: "submit", …}` | the submission's thread: the ingest message, pending; on each answer (`reply`) admit, reject or await on; the submitter answered |
 | a message in box `<app>` from the instance itself (row from `$self`) | `{fn: "watch", args: {txid, ingest}}` | the watch: the later proof (`-proof`) or rejection (unwound) |
 | a message in box `<app>` from the instance itself (row from `$self`) | `{fn: "resume", args: {txid}}` | a paused submission routed again (skein-overlay#1): its thread launched, paused again, or dropped; its wake at that thread's end, nothing |
 | the `peer-admit` event in box `<app>` (the `-admit` route's admit) | `{kind: "peer-admit", …}` | recorded under `<app>/gossip` ("Gossip", below); nothing admitted; a pause of that transaction wants its parents from that peer too |
 | a message in box `overlay`, i.e. `<app>/overlay` (the manifest's row, from `$owner`) | `{fn: "register", args: {topic, program}}` or `{fn: "deregister", args: {topic}}` | the registered set under `<app>/topics` and its events ("Register a topic", below); in any other box, refused (`bad-args`) |
 
-One box per function class (shruggr/skein#128, 0.7.5): a `submit` is taken in any box a row routes to the engine (`<app>`, `<app>/submit`, …), from anyone that row admits; `register` / `deregister` only in `<app>/overlay`, and refused with `bad-args` in every other box, whoever sent them (the instance itself too); any other message from anyone but the instance itself is refused; from the instance itself, only `watch` and `resume`. There is no `lookup`
+One box per function class (shruggr/skein#128, 0.7.5, 0.7.6): submissions in `<app>/submit` (by message and over HTTP; the engine takes a `submit` in any box a row routes to it, from anyone that row admits), registration in `<app>/overlay`, the engine's own traffic in `<app>`; `register` / `deregister` only in `<app>/overlay`, and refused with `bad-args` in every other box, whoever sent them (the instance itself too); any other message from anyone but the instance itself is refused; from the instance itself, only `watch` and `resume`. There is no `lookup`
 box: a lookup is a read: its request is recorded, and it moves nothing.
 
 **Config.** An installed engine reads its configuration from its app
@@ -607,10 +612,13 @@ says its own).
 `skein-host install` adds, for each topic, the libp2p rows `<topic>` →
 `submit`, `<topic>-admit` → `peerAdmit`, `<topic>-proof` → `peerProof`
 (sender `*`); the http rows `/submit` and `/lookup` (open, under
-`/<app>/`); and the mailbox rows `<app>` from `event` (the routes'
-admitted events) and from `$self` (its own watch) — all to the role
-`overlay`. The manifest lists the listing and documentation routes and
-`requires: ["chain/1"]`: the chain app must be installed.
+`/<app>/`); and the mailbox rows `<app>` from `event` (the libp2p routes'
+admitted events) and from `$self` (its own watch and resume) — all to the
+role `overlay`. The manifest lists the submission box `submit` (open), the
+registration box `overlay` (`$owner`), the listing and documentation
+routes, and `requires: ["chain/1"]`: the chain app must be installed.
+`POST /submit`'s submission event goes to `<app>/submit` (0.7.6), not
+through the derived `<app>` rows.
 
 ### Register a topic (shruggr/skein#120)
 
@@ -627,7 +635,7 @@ the owner sends to the app's `overlay` box — installed, `<app>/overlay`: a
 manifest's mailbox address is relative to the app, like its http paths and
 heads (shruggr/skein#128). One box per function class (#128, 0.7.5): the
 engine takes them only in that box, the one the manifest names `overlay`;
-in any other box a row routes to it — the app's own `<app>`, a submissions
+in any other box a row routes to it — the app's own `<app>`, the submission
 box `<app>/submit` — they are refused, whoever sent them, with `error:
 {code: "bad-args", message: "register: not taken in box <box>; send it in
 <app>/overlay"}`, writing and emitting nothing. The app is the step's,
@@ -887,8 +895,8 @@ overlay apps.
 
 **A submit is the one write**, and only when a topic takes the transaction
 (above). Over HTTP it is the submission message on another transport: the
-route admits `{fn: "submit", args}` into box `<app>` as the `submission`
-event (above), and answers its delivery. **BRC-22's synchronous STEAK is not
+route admits `{fn: "submit", args}` into the submission box `<app>/submit`
+as the `submission` event (above; 0.7.6), and answers its delivery. **BRC-22's synchronous STEAK is not
 answered on `/submit`** (shruggr/skein#112): a client takes the verdict from its box (a message, or `/submit` over a BRC-104
 session), or reads what was admitted with a lookup.
 
