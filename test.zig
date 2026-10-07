@@ -1088,6 +1088,18 @@ test "the configuration (skein #72, #79): an installed engine's config.overlay f
     const called = try config.resolve(a, s, hm.heads(), genesis_in, arg);
     try std.testing.expectEqual(@as(usize, 2), (try calls.configObject(a, called, "overlayTopics")).count());
 
+    // A read route's filter (shruggr/skein#143: /lookup, the listings): the route names no program,
+    // only its app; the app record's config, the engine its role `overlay`.
+    const read_arg = try mapOf(a, &.{.{ .key = "match", .value = try mapOf(a, &.{
+        .{ .key = "transport", .value = .{ .text = "http" } },
+        .{ .key = "address", .value = .{ .text = "/amm/lookup" } },
+        .{ .key = "app", .value = .{ .text = "amm" } },
+    }) }});
+    const read = try config.resolve(a, s, hm.heads(), genesis_in, read_arg);
+    try std.testing.expectEqualStrings("amm", calls.appOf(read));
+    try std.testing.expectEqual(@as(usize, 1), (try calls.configObject(a, read, "overlayTopics")).count());
+    try std.testing.expectEqualSlices(u8, amm_engine, read.getCid("engine").?);
+
     // A genesis-wired engine (its record names no app), or a host's call: the genesis defaults; its name the program's.
     const wired = try config.resolve(a, s, hm.heads(), try withThread(a, s, genesis_in, genesis_engine), null);
     try std.testing.expect((try calls.configObject(a, wired, "overlayTopics")).contains("tm_genesis"));
@@ -1920,9 +1932,10 @@ test "wants by (txid, topic, peer) (shruggr/skein#112): each gossiping peer its 
     try std.testing.expectEqual(@as(usize, 2), try st.map("wants").count());
     try std.testing.expect(try st.hasWant(x.t1.txid, "tm_demo", pa) and try st.hasWant(x.t1.txid, "tm_demo", pb));
 
-    // The stream row is in the manifest.
-    const manifest = @embedFile("etc/app.json");
-    try std.testing.expect(std.mem.indexOf(u8, manifest, "{\"transport\": \"libp2p\", \"address\": \"/skein/overlay/beef/1.0.0\", \"sender\": \"*\", \"program\": \"overlay\", \"fn\": \"submit\", \"filter\": \"beef\"}") != null);
+    // The stream's route is in the manifest (shruggr/skein#143): kernel.beef, then overlay.submit.
+    const stream_route = (try manifestRoute(a, "libp2p", "/skein/overlay/beef/1.0.0")).?;
+    try std.testing.expectEqualStrings("overlay.submit", stream_route.get("handler").?.string);
+    try expectFilters(stream_route, &.{"kernel.beef"});
 
     // B answers on the stream: t1's Atomic BEEF, routed with the topics its waiter requested, as from B.
     const pbeef = try atomicWithFund(a, x.f, x.t1);
@@ -2499,11 +2512,21 @@ test "one box per function class (skein #128, 0.7.5, 0.7.7): register only in `<
     try std.testing.expect(!topics_mod.mayRegister(try mapOf(a, &.{}), "amm"));
     const why = try topics_mod.notHere(a, "register", try mapOf(a, &.{.{ .key = "box", .value = .{ .text = "amm/submit" } }}), "amm");
     try std.testing.expectEqualStrings("register: not taken in box amm/submit; send it in amm/register", why);
-    // The manifest's rows: registrations in `register` from the owner (0.7.7); submissions in `submit` (0.7.6), open to anyone, the door decoding the BEEF; no open row on the app's own box.
-    const manifest = @embedFile("etc/app.json");
-    try std.testing.expect(std.mem.indexOf(u8, manifest, "{\"address\": \"register\", \"sender\": \"$owner\", \"program\": \"overlay\"}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, manifest, "{\"address\": \"submit\", \"sender\": \"*\", \"program\": \"overlay\", \"filter\": \"beef\"}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"address\": \"\"") == null);
+    // The manifest's routes (shruggr/skein#143): registrations in `register`, the handler
+    // overlay.register gated by root (with the switches); submissions in `submit` (0.7.6), anyone
+    // whose BEEF validates (kernel.beef); no route of its own on the app's box (the derived ones).
+    const reg = (try manifestRoute(a, "mailbox", "register")).?;
+    try std.testing.expectEqualStrings("overlay.register", reg.get("handler").?.string);
+    try std.testing.expect(reg.get("filters") == null);
+    const sub = (try manifestRoute(a, "mailbox", "submit")).?;
+    try std.testing.expectEqualStrings("overlay.submit", sub.get("handler").?.string);
+    try expectFilters(sub, &.{"kernel.beef"});
+    try std.testing.expect((try manifestRoute(a, "mailbox", "")) == null);
+    const mj = try std.json.parseFromSliceLeaky(std.json.Value, a, @embedFile("etc/app.json"), .{});
+    const gated = mj.object.get("roles").?.object.get("root").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), gated.len);
+    for ([_][]const u8{ "register", "market", "validator" }, gated) |w, g| try std.testing.expectEqualStrings(w, g.string);
+    try std.testing.expect(mj.object.get("dispatch") == null and mj.object.get("reads") == null);
 
     // Submit accepted in `<app>/submit`: launched, the submitter answered in that box.
     var ms = c.store.MemStore.init(std.testing.allocator);
@@ -2666,7 +2689,7 @@ test "seeding a registered topic (0.7.8): a held seed judged under the new topic
     try std.testing.expectEqual(@as(usize, 1), (try inst.look(&.{.{ .key = "topic", .value = .{ .text = "tm_seed" } }})).len);
 }
 
-test "the listings and documentation are reads (shruggr/skein#135, 0.8.0): reads[] names them, no http row in dispatch[] (/submit is derived)" {
+test "the listings and documentation are read routes (shruggr/skein#143, 0.10.0): an http route with no handler, its filter the engine's function" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -2677,16 +2700,45 @@ test "the listings and documentation are reads (shruggr/skein#135, 0.8.0): reads
         .{ "/getDocumentationForTopicManager", "topicDocumentation" },
         .{ "/getDocumentationForLookupServiceProvider", "lookupDocumentation" },
     };
-    const reads = j.object.get("reads").?.array.items;
-    try std.testing.expectEqual(want.len, reads.len);
-    for (want, reads) |w, r| {
-        try std.testing.expectEqualStrings(w[0], r.object.get("address").?.string);
-        try std.testing.expectEqualStrings("overlay", r.object.get("program").?.string);
-        try std.testing.expectEqualStrings(w[1], r.object.get("fn").?.string);
-        try std.testing.expect(r.object.get("sender") == null and r.object.get("transport") == null);
+    const filters = j.object.get("filters").?.object;
+    for (want) |w| {
+        const r = (try manifestRoute(a, "http", w[0])).?;
+        try std.testing.expect(r.get("handler") == null);
+        try expectFilters(r, &.{w[1]});
+        try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "overlay.{s}", .{w[1]}), filters.get(w[1]).?.string);
     }
-    for (j.object.get("dispatch").?.array.items) |r| {
+    // /submit and /lookup are derived (config.overlay), not the manifest's; `lookup` the derived filter.
+    try std.testing.expect((try manifestRoute(a, "http", "/submit")) == null);
+    try std.testing.expect((try manifestRoute(a, "http", "/lookup")) == null);
+    try std.testing.expect(filters.get("lookup") == null);
+}
+
+test "a read called as a filter answers {answer: <the http answer>}; a plain call the http answer (shruggr/skein#143)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const http = try mapOf(a, &.{ .{ .key = "status", .value = .{ .uint = 200 } }, .{ .key = "type", .value = .{ .text = "application/json" } }, .{ .key = "body", .value = .{ .bytes = "{}" } } });
+    try std.testing.expect(routes.isFilter(try mapOf(a, &.{ .{ .key = "kind", .value = .{ .text = "call" } }, .{ .key = "filter", .value = .{ .boolean = true } } })));
+    try std.testing.expect(!routes.isFilter(try mapOf(a, &.{.{ .key = "kind", .value = .{ .text = "call" } }})));
+    const ans = try routes.asFilterAnswer(a, http);
+    try std.testing.expectEqual(@as(usize, 1), ans.map.len);
+    try std.testing.expectEqual(@as(u64, 200), ans.get("answer").?.getUint("status").?);
+    try std.testing.expectEqualStrings("{}", ans.get("answer").?.getBytes("body").?);
+}
+
+/// The manifest's route at (transport, address) — transport absent is mailbox — or null.
+fn manifestRoute(a: Allocator, transport: []const u8, address: []const u8) !?std.json.ObjectMap {
+    const j = try std.json.parseFromSliceLeaky(std.json.Value, a, @embedFile("etc/app.json"), .{});
+    for (j.object.get("routes").?.array.items) |r| {
+        try std.testing.expect(r.object.get("sender") == null and r.object.get("program") == null);
         const t = if (r.object.get("transport")) |x| x.string else "mailbox";
-        try std.testing.expect(!std.mem.eql(u8, t, "http"));
+        if (std.mem.eql(u8, t, transport) and std.mem.eql(u8, r.object.get("address").?.string, address)) return r.object;
     }
+    return null;
+}
+
+fn expectFilters(r: std.json.ObjectMap, want: []const []const u8) !void {
+    const fs = r.get("filters").?.array.items;
+    try std.testing.expectEqual(want.len, fs.len);
+    for (want, fs) |w, f| try std.testing.expectEqualStrings(w, f.string);
 }

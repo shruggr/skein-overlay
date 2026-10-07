@@ -122,10 +122,31 @@ pub fn appName(a: Allocator, s: Store, program: ?[]const u8) ![]const u8 {
 /// The input as the engine reads its configuration: from its app record if it has one (`fromApp`),
 /// else as it is — with `app`, the name its heads are under.
 pub fn resolve(a: Allocator, s: Store, heads: Heads, in: Value, arg: ?Value) !Value {
+    // A read route's filter (shruggr/skein#143: /lookup, the listings, the documentation): the route
+    // names no program, only its `app`; the engine is that app's role `overlay`.
+    if (try matchedApp(a, heads, s, in, arg)) |m| return withApp(a, try withRegistered(a, s, heads, try fromApp(a, in, m.app, m.engine), m.name), m.name);
     const self = try selfProgram(a, s, in, arg);
     const name = try appName(a, s, self);
     const base = if (try appRecord(a, s, heads, self)) |app| try fromApp(a, in, app, self) else in;
     return withApp(a, try withRegistered(a, s, heads, base, name), name);
+}
+
+/// The engine's role in an app's `programs` (skein src/host/manifest.ts: an overlay app's engine is the role `overlay`).
+pub const engine_role = "overlay";
+
+/// A call whose route names no program (a read route: its filters answer, shruggr/skein#143) but
+/// its `app`: that app's record, name and engine (its role `overlay`); null for a step, a call
+/// whose route names its program, or no app record.
+pub fn matchedApp(a: Allocator, heads: Heads, s: Store, in: Value, arg: ?Value) !?struct { app: Value, name: []const u8, engine: ?[]const u8 } {
+    if (in.getCid("thread") != null) return null;
+    const m = (arg orelse return null).get("match") orelse return null;
+    if (m.getCid("program") != null) return null;
+    const name = m.getText("app") orelse return null;
+    const root = (try heads.head(a, try std.fmt.allocPrint(a, "{s}/app", .{name}))) orelse return null;
+    const app = try s.getValue(a, root);
+    if (!eql(u8, app.getText("kind") orelse "", "app")) return null;
+    const engine = if (app.get("programs")) |ps| ps.getCid(engine_role) else null;
+    return .{ .app = app, .name = name, .engine = engine };
 }
 
 /// `in` with the registered topics (the head `<app>/topics`, topics.zig) added to

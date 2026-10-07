@@ -256,7 +256,20 @@ pub fn call(a: Allocator, call_in: Value) !void {
         try documentation(a, in, "overlayLookups", (try param(a, arg, "lookupService")) orelse "", "Lookup service")
     else
         return error.UnknownFunction;
-    try vm.answer(a, out);
+    // A read route's filter (shruggr/skein#143: /lookup, the listings, the documentation): the
+    // http answer as the filter's `{answer: …}` (the request ends there; nothing is logged).
+    try vm.answer(a, if (isFilter(call_in)) try asFilterAnswer(a, out) else out);
+}
+
+/// Whether this call is a filter's: the input's `filter: true` (skein docs/APPS.md §2 "Filters").
+pub fn isFilter(in: Value) bool {
+    const f = in.get("filter") orelse return false;
+    return f == .boolean and f.boolean;
+}
+
+/// An http answer `{status, type, body}` as a filter's `{answer: {status, type, body}}`.
+pub fn asFilterAnswer(a: Allocator, http: Value) !Value {
+    return .{ .map = try a.dupe(cbor.Entry, &.{.{ .key = "answer", .value = http }}) };
 }
 
 /// The requested topics this instance serves, in request order, once each.
