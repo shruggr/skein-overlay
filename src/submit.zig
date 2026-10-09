@@ -141,29 +141,41 @@ pub const Routed = union(enum) {
 /// in the walk's order (skein-overlay#1): each is ingested on its own and admitted on its own answer.
 pub const Item = struct { txid: [32]u8, judged: []const Judged, subject: bool };
 
-/// A submission's BEEF (shruggr/skein#121): the pointer record the kernel's door wrote — its CID;
-/// the transactions and BUMPs are blocks in the store already, every BUMP checked against the
-/// chain state's headers at the door — or the bytes (a body framed with off-chain values, whose
-/// leading bytes are no BEEF pattern; a host with no door), decoded and checked here as before.
+/// A submission's BEEF: the envelope the kernel's door put where the bytes were (shruggr/skein#121,
+/// #146: `{form, beef: <pointer record CID>, subject?, vout?}` — the transactions and BUMPs are
+/// blocks in the store already, every BUMP checked against the chain state's headers at the door;
+/// the pointer record is the BEEF alone, the envelope beside it) — or the bytes (a body framed with
+/// off-chain values, whose leading bytes are no BEEF pattern; a gossip message's `beef`, inside
+/// its dag-cbor body, which the door does not reach; a host with no door), decoded and checked here
+/// as before.
 pub const Input = union(enum) {
-    record: []const u8,
+    envelope: Value,
     bytes: []const u8,
 
-    /// The value the submit event and the ingest message carry: the record's link, or the bytes.
+    /// The value the submit event and the ingest message carry: the envelope, or the bytes.
     pub fn value(self: Input) Value {
         return switch (self) {
-            .record => |c_| .{ .cid = c_ },
+            .envelope => |e| e,
             .bytes => |b| .{ .bytes = b },
         };
     }
 
-    /// An event's or a message's `beef` field read back.
+    /// An event's or a message's `beef` field read back: an envelope, or bytes.
     pub fn of(v: ?Value) ?Input {
         const x = v orelse return null;
         return switch (x) {
-            .cid => |c_| .{ .record = c_ },
+            .map => if (c.record.envelopeOf(x) != null) .{ .envelope = x } else null,
             .bytes => |b| .{ .bytes = b },
             else => null,
+        };
+    }
+
+    /// The bytes as received: an envelope's exact wire bytes (skein-sdk `chain.record.wireOf`: its
+    /// prefix, then the BEEF its pointer record stands for), or the bytes.
+    pub fn wire(self: Input, a: Allocator, s: c.store.Store) ![]const u8 {
+        return switch (self) {
+            .envelope => |e| c.record.wireOf(a, s, e),
+            .bytes => |b| b,
         };
     }
 };
@@ -183,7 +195,7 @@ pub const Input = union(enum) {
 /// event; so is one a paused submission wants, judged or not, so that the chain app holds it.
 pub fn route(a: Allocator, caller: calls.Caller, st: *State, in: Value, beef: Input, topics: []const []const u8, off: ?[]const u8, source: ?Value) !Routed {
     const d = switch (beef) {
-        .record => |rc| state.decodeRecord(a, st.store, rc),
+        .envelope => |e| state.decodeRecord(a, st.store, e),
         .bytes => |b| state.decode(a, st.store, b),
     } catch |e| return .{ .refused = @errorName(e) };
     const missing = state.missingParents(a, st.ch, d) catch |e| return .{ .refused = @errorName(e) };
@@ -194,7 +206,7 @@ pub fn route(a: Allocator, caller: calls.Caller, st: *State, in: Value, beef: In
         if (all) return .{ .unchanged = d.subject };
         return .{ .paused = .{ .event = try pausedEvent(a, d.subject, beef, topics, missing, off, source), .txid = d.subject, .waiting = missing } };
     }
-    const sub = state.verifyDecoded(a, st.store, st.ch, d, beef == .record) catch |e| switch (e) {
+    const sub = state.verifyDecoded(a, st.store, st.ch, d, beef == .envelope) catch |e| switch (e) {
         // A known-rejected transaction is a valid request that admits nothing (answered `rejected`).
         error.TransactionRejected => return .{ .nothing = @errorName(e) },
         else => return .{ .refused = @errorName(e) },
@@ -482,10 +494,7 @@ pub fn begin(cx: Ctx, ev: Value) !Begun {
     for (its) |it| {
         has_subject = has_subject or it.subject;
         const b: Input = if (it.subject) beef else blk: {
-            if (bytes == null) bytes = switch (beef) {
-                .record => |rc| try c.record.beefOf(a, cx.st.store, rc),
-                .bytes => |x| x,
-            };
+            if (bytes == null) bytes = try beef.wire(a, cx.st.store);
             break :blk .{ .bytes = try state.atomicFor(a, bytes.?, it.txid) };
         };
         const m = try cx.wire.send(a, chain_box, try ingestBody(a, b));
@@ -868,7 +877,7 @@ pub fn answered(cx: Ctx, ev: Value, ingest: []const u8, ans: Answer) !Stepped {
             .rejected => |why| {
                 try st.dropPending(it.txid);
                 const u = try st.unapply(try calls.servedTopics(a, cx.in), it.txid);
-                try calls.hookRejected(a, cx.caller, cx.in, u);
+                try calls.hookRejected(a, cx.caller, cx.in, u, &cx.st.lookup_beats);
                 try unapplied.appendSlice(a, u);
                 try resumeWaiters(cx, it.txid, &resumes);
                 if (it.subject and subjectTaken(ev)) try answerRejected(cx, source, it.txid, why);
@@ -1173,14 +1182,16 @@ pub fn watched(cx: Ctx, w: Watch, ans: Answer) !Stepped {
 /// Rejected: each served topic's judgement of it removed, their lookup services told.
 fn unwind(cx: Ctx, txid: [32]u8, out: *Stepped) !void {
     out.unapplied = try cx.st.unapply(try calls.servedTopics(cx.a, cx.in), txid);
-    try calls.hookRejected(cx.a, cx.caller, cx.in, out.unapplied);
+    try calls.hookRejected(cx.a, cx.caller, cx.in, out.unapplied, &cx.st.lookup_beats);
 }
 
 /// The submission's BEEF as handed, named by each `applied` record (for internalizing;
-/// skein-overlay#3): its pointer record, or the raw block of the bytes.
+/// skein-overlay#3): the door's envelope as a block of its own (dag-cbor `{form, beef: <pointer
+/// record>, subject?, vout?}`, shruggr/skein#146; `wireOf` gives the bytes back), or the raw block
+/// of the bytes.
 fn beefCid(cx: Ctx, ev: Value) ![]const u8 {
     return switch (Input.of(ev.get("beef")) orelse return error.BadEvent) {
-        .record => |rc| rc,
+        .envelope => |e| try cx.st.store.putValue(cx.a, e),
         .bytes => |b| try state.putRaw(cx.a, cx.st.store, b),
     };
 }
@@ -1213,7 +1224,7 @@ fn admitItem(cx: Ctx, ev: Value, it: EventItem, beef: []const u8, records: *std.
         };
         if (ap.records.len == 0) continue;
         try records.appendSlice(a, ap.records);
-        try calls.hookAdmitted(a, cx.caller, cx.in, t.*, sub, previous, ap.*);
+        try calls.hookAdmitted(a, cx.caller, cx.in, t.*, sub, previous, ap.*, &cx.st.lookup_beats);
     }
     return .{ .txid = it.txid, .topics = topics, .applied = applied };
 }
@@ -1307,7 +1318,7 @@ pub fn seed(cx: Ctx, topic: []const u8, seeds: []const [32]u8) !Seeding {
             };
             if (ap.records.len == 0) continue;
             try records.appendSlice(a, ap.records);
-            try calls.hookAdmitted(a, cx.caller, cx.in, topic, sub, previous, ap);
+            try calls.hookAdmitted(a, cx.caller, cx.in, topic, sub, previous, ap, &cx.st.lookup_beats);
             try admissions.append(a, .{ .txid = t, .topics = try a.dupe([]const u8, &.{topic}), .applied = try a.dupe(state.Applied, &.{ap}) });
             if ((try st.ch.status(t)) != .proven) {
                 const m = try cx.wire.send(a, chain_box, try ingestBody(a, .{ .bytes = bytes }));

@@ -14,7 +14,18 @@
 //!   fn "spent"     {kind: "lookup-hook", app, service, topic, outpoint: {tx: <CID>, vout}, spendingTx: <CID>}
 //!   fn "rejected"  {kind: "lookup-hook", app, service, topic, tx: <CID>}
 //!
-//! (each may be a no-op), and answers queries from them — a read (#40): the
+//! (each may be a no-op). A hook answers `{kind: "lookup-hooked", fn, beats?:
+//! {<service>: bytes}}`: `beats` (0.12.0), when the hook changed what a
+//! service it serves says on its beat (`Service.beat`), the new body per
+//! service name — the engine re-declares that service's beacon on
+//! `<service>-live` with it (a registered service; topics.zig `beatEvents`).
+//! The body at the declaration (`registerLookup`) is fn "beat"'s:
+//!
+//!   fn "beat"      {kind: "lookup-beat", app, service, program}  →  {kind: "lookup-beat", body: bytes}
+//!
+//! (`Spec.beat`; none: an empty body). What the body says is the service's
+//! own (David, 2026-10-09: "A lookup's beat body is the lookup program's
+//! own"). The service answers queries from its maps — a read (#40): the
 //! `/lookup` route calls fn "lookup" with
 //!
 //!   {kind: "lookup-call", app, service, query}          (query: the client's JSON as dag-cbor)
@@ -110,6 +121,17 @@ pub const Service = struct {
     names: []const []const u8,
     maps: *c.store.Maps,
     m: []Map,
+    /// The beat bodies a hook set (`beat`), in order: the hook's answer carries them (0.12.0).
+    beats: std.ArrayList(Beat) = .empty,
+
+    pub const Beat = struct { service: []const u8, body: []const u8 };
+
+    /// A hook's word that `service` (a name this program serves) now beats `body` on
+    /// `<service>-live` (0.12.0): the engine re-declares its beacon (a later one for the same name
+    /// replaces it).
+    pub fn beat(self: *Service, service: []const u8, body: []const u8) !void {
+        try self.beats.append(self.arena, .{ .service = try self.arena.dupe(u8, service), .body = try self.arena.dupe(u8, body) });
+    }
 
     /// `name` both the called name and the index (one name, one index).
     pub fn load(a: Allocator, s: Store, name: []const u8, names: []const []const u8, state: ?[]const u8) !Service {
@@ -210,6 +232,9 @@ pub const Spec = struct {
     admitted: ?*const fn (a: Allocator, svc: *Service, topic: []const u8, tx: Tx, outputs_to_admit: []const u32, coins_retained: []const u32) anyerror!void = null,
     spent: ?*const fn (a: Allocator, svc: *Service, topic: []const u8, outpoint: Outpoint, spending: Tx) anyerror!void = null,
     rejected: ?*const fn (a: Allocator, svc: *Service, topic: []const u8, tx: Tx) anyerror!void = null,
+    /// fn "beat" (0.12.0): the body the service (`svc.name`) beats on `<service>-live` when its beacon
+    /// is declared. Null: an empty body.
+    beat: ?*const fn (a: Allocator, svc: *Service) anyerror![]const u8 = null,
 };
 
 fn uintList(a: Allocator, v: ?Value) ![]u32 {
@@ -288,16 +313,30 @@ pub fn handle(a: Allocator, spec: Spec, s: Store, network: c.chain.Network, stat
         var ch = try Chain.load(a, s, chain, net);
         return .{ .answer = try answerRecord(a, spec, &svc, &ch, arg) };
     }
+    if (std.mem.eql(u8, func, "beat")) {
+        if (!std.mem.eql(u8, arg.getText("kind") orelse "", "lookup-beat")) return error.BadArgs;
+        const body: []const u8 = if (spec.beat) |f| try f(a, &svc) else "";
+        return .{ .answer = .{ .map = try a.dupe(cbor.Entry, &.{
+            .{ .key = "kind", .value = .{ .text = "lookup-beat" } },
+            .{ .key = "body", .value = .{ .bytes = body } },
+        }) } };
+    }
     try hook(a, spec, &svc, func, arg);
-    const done: Value = .{ .map = try a.dupe(cbor.Entry, &.{
+    var es: std.ArrayList(cbor.Entry) = .empty;
+    try es.appendSlice(a, &.{
         .{ .key = "kind", .value = .{ .text = "lookup-hooked" } },
         .{ .key = "fn", .value = .{ .text = func } },
-    }) };
-    return .{ .answer = done, .state = if (svc.dirty()) try svc.save() else null };
+    });
+    if (svc.beats.items.len > 0) {
+        const bs = try a.alloc(cbor.Entry, svc.beats.items.len);
+        for (svc.beats.items, bs) |b, *o| o.* = .{ .key = b.service, .value = .{ .bytes = b.body } };
+        try es.append(a, .{ .key = "beats", .value = .{ .map = bs } });
+    }
+    return .{ .answer = .{ .map = es.items }, .state = if (svc.dirty()) try svc.save() else null };
 }
 
 /// The program's main: a call — fn "lookup" (a read), fn "metadata" or
-/// "documentation" (the service's own, else the default), or a hook (in a
+/// "documentation" (the service's own, else the default), fn "beat" (its beat body), or a hook (in a
 /// step: the program's index `<app>/<index>` advances when its maps changed
 /// — a head under its own app's name, so the kernel lets it).
 pub fn main(comptime spec: Spec) u8 {

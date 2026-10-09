@@ -4,7 +4,7 @@ The overlay services engine for a [skein](https://github.com/shruggr/skein),
 as an app: BRC-22 submit and BRC-24 lookup, served by the instance's own
 front door, with topic managers and lookup services as programs the engine
 calls. It is also a Zig package: an overlay of your own depends on it for
-the topic and lookup contracts. Version **0.11.0**.
+the topic and lookup contracts. Version **0.12.0**.
 
 ## What it is
 
@@ -23,8 +23,15 @@ the topic and lookup contracts. Version **0.11.0**.
   only `<app>/state`, `<app>/gossip`, `<app>/topics`, `<app>/lookups` and
   each lookup program's index `<app>/ls_<…>`; the app record is `<app>/app`. The chain state is the chain app's `chain/state`, read by
   CID. Two overlay apps on one instance share the chain and nothing else.
-- **Gossip** over libp2p, per topic: `<topic>` (the raw submission),
-  `<topic>-admit`, `<topic>-proof`.
+- **Gossip** over libp2p, per topic (0.12.0, David 2026-10-09): `<topic>`,
+  one mesh for two kinds of dag-cbor message, `{kind: "submit", beef}` (the
+  raw submission) and `{kind: "admit", txid, topics}` (the verdict);
+  `<topic>-proof` (the proofs) on its own; `<topic>-live` the beats, the
+  runtime's liveness tool (unlogged).
+- **Beats** (0.12.0): every skein is a market and a validator, always. Each
+  registered topic beats on `<topic>-live` with its view digest, and each
+  registered lookup service on `<service>-live` with a body its program
+  gives ("Beats" below).
 - **The examples**: `tm_demo` (`bin/topic-demo.wasm`) and `ls_demo`
   (`bin/lookup-demo.wasm`).
 
@@ -46,7 +53,7 @@ submission whose parent is neither in the BEEF nor held pauses, however it
 came: it is noted pending, waiting on those parents, and the engine records
 a want per (parent, topic, peer?) — `{event: "want", txid, topic, peer?}`
 (shruggr/skein#112). With a peer (a gossip pause: the publisher, and every
-peer whose `-admit` for it was seen, more as admits arrive) the host asks
+peer whose `admit` for it was seen, more as admits arrive) the host asks
 that peer on a direct stream; without one (a submission by message or
 HTTP) it asks peers from its mesh for the topic. Each want that ends is
 cleared by `{event: "unwant", txid, topic, peer?}`. A peer answers a want
@@ -166,7 +173,7 @@ The manifest (`etc/app.json`, this repo's own, description left out):
 {
   "kind": "app",
   "name": "overlay",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "programs": {
     "overlay": "bin/overlay.wasm",
     "topic-demo": "bin/topic-demo.wasm",
@@ -186,7 +193,7 @@ The manifest (`etc/app.json`, this repo's own, description left out):
     "topicDocumentation": "overlay.topicDocumentation",
     "lookupDocumentation": "overlay.lookupDocumentation"
   },
-  "roles": { "root": ["register", "registerLookup", "deregisterLookup", "market", "validator"] },
+  "roles": { "root": ["register", "registerLookup", "deregisterLookup"] },
   "routes": [
     {"address": "register", "handler": "overlay.register"},
     {"address": "submit", "filters": ["kernel.beef"], "handler": "overlay.submit"},
@@ -212,6 +219,9 @@ handler, and no sender; who may run a function is `roles`.
   `filters` as `overlay.lookup` unless the manifest names its own), the
   libp2p routes `<topic>` (`kernel.beef`), `<topic>-admit`, `<topic>-proof`,
   and the app's box `<app>` twice, an `event` route and a `mailbox` route.
+  (skein's install still derives `<topic>-admit` for a declared topic; since
+  0.12.0 nothing publishes there — the verdicts are `admit` messages on
+  `<topic>` — and a message that arrives there is read as one.)
   The install prompt reads them all aloud, marked derived.
 - Read routes (shruggr/skein#143). An http route with no handler is a
   **read**: its filters answer and nothing is logged. The overlay's reads
@@ -231,8 +241,9 @@ handler, and no sender; who may run a function is `roles`.
   request's step and waits; its threads and `wait` messages use the derived
   `<app>` routes.
 - The route `register` (`<app>/register`, handler `overlay.register`) takes
-  `register` / `deregister` and the `market` / `validator` switches; they
-  are refused in any other box. `roles: {root: ["register", …]}` gates it:
+  `register` / `deregister` and `registerLookup` / `deregisterLookup`; they
+  are refused in any other box. (The `market` / `validator` switches of
+  0.9.2 are gone, 0.12.0.) `roles: {root: ["register", …]}` gates it:
   only a key holding root runs it (a message from any other key is
   recorded and runs nothing). Root may grant the function to others with
   an app role of its own; the manifest declares none.
@@ -274,11 +285,15 @@ Both are idempotent and answer `{topic, active}`; an unknown role is
 refused. The set is the engine's own head `<app>/topics` (`{kind:
 "overlay-topics", topics: [{topic, program}]}`), served beside the declared
 topics from the next step or call. `register` emits `subscribe {topic,
-program, fn, filter?}` for `<topic>` (`submit`, `filter: "beef"`: the
-door decodes the BEEF as for `/submit`), `<topic>-admit` (`peerAdmit`) and
-`<topic>-proof` (`peerProof`), `program` the engine's own role;
-`deregister` emits `unsubscribe {topic}` for the three (skein #119): the
-host subscribes and routes by them. Who may call is your manifest's
+program, fn}` for `<topic>` (`submit`: one mesh, two kinds of message,
+`{kind: "submit", beef}` and `{kind: "admit", txid, topics}`, the function
+reads the kind) and `<topic>-proof` (`peerProof`), `program` the engine's
+own role, no door filter (the bodies are dag-cbor: a `submit` message's
+BEEF is inside it, where the door does not look, and the engine decodes
+and checks it itself, as for a body framed with off-chain values);
+`deregister` emits `unsubscribe {topic}` for the two (skein #119): the
+host subscribes and routes by them. Until 0.12.0 the verdicts had a third
+topic, `<topic>-admit` (`peerAdmit`). Who may call is your manifest's
 `roles` for the route's handler `register` (the function the engine runs
 is the body's `fn`). The engine takes
 them only in the box `register` (`<app>/register`, one box per function
@@ -286,15 +301,57 @@ class, shruggr/skein#128, 0.7.5, 0.7.7); in any other box — `<app>`,
 `<app>/submit` — they are refused with `bad-args` (`register: not taken in
 box <box>; send it in <app>/register`), writing and emitting nothing. The
 answer goes back in the box they came in. A lookup service without a `topics`
-list listens to every topic, declared or registered. With
-`config.overlay.market: {window}` set, a register also emits `liveness
-{topic: "<topic>-live", window}`; with `config.overlay.validator: {every}`,
-`beacon {topic: "<topic>-live", every, body: <empty>}`; a deregister emits
-`unliveness` / `unbeacon` likewise (0.9.0). Those two settings are only
-the initial value: root switches a role in the same box, `{fn:
-"market", args: {window} | {off: true}}` / `{fn: "validator", args: {every}
-| {off: true}}`, answered `{market?, validator?}` (0.9.2). docs/OVERLAY.md
-"Register a topic" has the rest.
+list listens to every topic, declared or registered. Every skein is a
+market and a validator, always (0.12.0, David 2026-10-09): a register also
+emits `liveness {topic: "<topic>-live", window}` and `beacon {topic:
+"<topic>-live", every, body}` (the body below); a deregister emits
+`unliveness` and `unbeacon`. `window` and `every` are
+`config.overlay.market: {window}` and `config.overlay.validator: {every}`,
+else 40 000 and 30 000 ms; neither can be turned off (the owner's switch
+of 0.9.2, `{fn: "market" | "validator"}`, is gone, and with it the switch
+kept in `<app>/topics`). docs/OVERLAY.md "Register a topic" has the rest.
+
+### Beats
+
+Beats are libp2p service discovery (David, 2026-10-09: they replace
+SHIP/SLAP on the libp2p network; they are not SHIP/SLAP, and no SHIP/SLAP ad
+is published p2p). Every topic manager and every lookup service the engine
+runs as registered beats on its own topic, named after itself:
+`<topic>-live`, `<service>-live`.
+
+- **A topic's body** is dag-cbor `{view: {count, digest}}`, the topic's
+  **view digest**: `count` the topic's admitted-and-unspent outputs, and
+  `digest` (32 bytes) the sum mod 2^256 of `sha256(txid ‖ vout)` over them
+  (txid 32 bytes in internal byte order, vout 4 bytes little-endian, each
+  hash read as a big-endian number; written big-endian). Order-independent:
+  folded in when the topic admits an output, out when it is spent (a
+  previous coin a transaction the topic admits consumes); a rejection takes
+  its transaction's outputs out and gives the coins it consumed back. Kept
+  incrementally in the topic's state record (`<app>/state`, map `views`),
+  read in one lookup: no sort, no log read. An empty topic: count 0, 32
+  zero bytes. Two peers holding the same outputs in a topic beat the same
+  view.
+- **Updating a beat** is re-declaring the beacon: the host publishes the
+  declared body and reads no state at beat time, and an app's new `beacon
+  {topic, every, body}` for the same topic replaces its previous one (skein
+  `src/host/p2p.ts`); a receiver's liveness tool keeps the latest beat per
+  sender. So a step that changes a registered topic's view (an admission, a
+  rejection, a register's seeds) emits `beacon` again with the new body:
+  one logged event per change.
+- **A lookup service's body** is the lookup program's own. `registerLookup`
+  declares the beacon on `<service>-live` with the body its program's fn
+  `beat` answers (`Spec.beat`; a program without one beats an empty body),
+  and `deregisterLookup` ends it. A hook (`admitted`, `spent`, `rejected`)
+  updates it by answering `{beats: {<service>: bytes}}` (`Service.beat` in
+  the hook): the engine re-declares that registered service's beacon.
+- Not yet in the topic's body (stopped, 0.12.0): `terms` (the validator's
+  fee and the market's minimum commission) and `origin`. The engine is
+  generic and the terms are the app's (the AMM's `config.amm.ammValidator`;
+  no configuration names a market's minimum commission yet), and the origin
+  is a host fact the engine does not know. Which configuration the engine
+  reads them from is undecided.
+- A topic or service declared in `config.overlay` (not registered) does not
+  beat, as before.
 
 ### Register a lookup service
 
@@ -367,10 +424,10 @@ docs/OVERLAY.md "Not built"), GASP sync and catch-up from a peer, the
 
 | | |
 |---|---|
-| this app and package | 0.11.0 (tag `v0.11.0`) |
-| skein-sdk | v0.7.1, by tag URL and hash in `build.zig.zon` (modules `chain` and, for the engine, `sk`; bsvz comes through it) |
+| this app and package | 0.12.0 (tag `v0.12.0`) |
+| skein-sdk | v0.11.0, by tag URL and hash in `build.zig.zon` (modules `chain` and, for the engine, `sk`; bsvz comes through it) |
 | requires | `chain/1` (shruggr/skein-chain 0.3.0) |
-| skein | log format 9, the routes / filters / roles manifest (shruggr/skein#143); skein's equivs pin this repo by commit |
+| skein | log format 10, the BEEF envelope beside the pointer record (shruggr/skein#146); the routes / filters / roles manifest (shruggr/skein#143); skein's equivs pin this repo by commit |
 
 0.3.0 moved the state under `<app>/…`, made the chain app's answer the gate
 and exported the modules (shruggr/skein#79).
@@ -570,6 +627,24 @@ the engine finds its app from a root read route's filter `<app>.lookup`
 origin's root (README "Root routes"). The manifest's roles list the two
 new functions. BRC-88 SHIP/SLAP ads: not built (stopped; docs/OVERLAY.md
 "Not built").
+
+0.12.0: on skein-sdk v0.11.0 (shruggr/skein#146, log format 10), gossip
+topics and beats (David, 2026-10-09). The door puts the BEEF's envelope
+`{form, beef: <pointer record>, subject?, vout?}` where the bytes were, the
+pointer record the BEEF alone: `submit.Input` is the envelope or bytes, a
+submission's subject the envelope's (`record.subjectOf`), the bytes as
+received `record.wireOf` (gossip, the cut Atomic BEEFs), and the
+`applied` record's `beef` the envelope as a block of its own (it links the
+record; `wireOf` gives the bytes). Gossip: `<topic>` carries submit and
+admit as two message kinds (one mesh), `<topic>-proof` and `<topic>-live`
+stay separate; a register subscribes `<topic>` and `<topic>-proof` (no
+`-admit`, no door filter). Every skein is a market and a validator,
+always: the `market` / `validator` switch functions and their stored state
+are removed; a register starts liveness and the beacon at
+`config.overlay.market` / `.validator`'s ms, else 40 000 / 30 000. Beats:
+the topic's view digest in the state (`views`), its beat body re-declared
+when it changes; lookup services beat on `<service>-live` with their
+program's body (fn `beat`; a hook's `beats`). README "Beats".
 
 ## Contributing
 

@@ -9,6 +9,9 @@
 //!
 //!   {kind: "overlay-topics", topics: [{topic, program}, …]}     sorted by topic, each once
 //!
+//! (0.9.2 to 0.11.0 kept the owner's `market` / `validator` switches beside
+//! `topics`; 0.12.0 neither writes nor reads them.)
+//!
 //! `program` is the role in `programs` (the app's) whose topic manager
 //! judges the topic: a dynamic overlay's manifest lists no topics, so the
 //! caller names it. config.zig reads the set at every step and call and
@@ -16,37 +19,50 @@
 //! topic keeps its own program).
 //!
 //! `register {topic, program}` adds it and emits the skein #119 events
-//! `subscribe {topic, program, fn, filter?}` for `<topic>` (fn `submit`,
-//! `filter: "beef"`: the body is the submission's BEEF, decoded at the
-//! kernel's door as for the `/submit` row, skein #121), `<topic>-admit`
-//! (`peerAdmit`) and `<topic>-proof` (`peerProof`; dag-cbor bodies, no
-//! filter), where
+//! `subscribe {topic, program, fn}` for `<topic>` (fn `submit`: one mesh,
+//! two kinds of message, `submit` and `admit`, David 2026-10-09; gossip.zig)
+//! and `<topic>-proof` (`peerProof`), dag-cbor bodies, no filter (the door
+//! does not look inside a dag-cbor body: a `submit` message's BEEF is the
+//! engine's to decode), where
 //! `program` is the engine's own role (the handler the kernel routes the
 //! topic's messages to); `deregister {topic}` removes it and emits
-//! `unsubscribe {topic}` for the three. Both are idempotent: a topic already
+//! `unsubscribe {topic}` for the two. Until 0.12.0 a third, `<topic>-admit`
+//! (`peerAdmit`), carried the verdicts. Both are idempotent: a topic already
 //! registered with the same program, or not registered, changes nothing and
 //! emits nothing. The answer is `{topic, active}` (whether the topic is in
 //! the registered set now).
 //!
-//! Market and validator (David, 2026-10-06 evening): with
-//! `config.overlay.market: {window}` set, a register that changes the set
-//! also emits `liveness {topic: <topic>-live, window}`; with
-//! `config.overlay.validator: {every}`, `beacon {topic: <topic>-live, every,
-//! body: <empty>}`. A deregister that changes it emits `unliveness` /
-//! `unbeacon` likewise (`withRoles`). Nothing at a start or re-read: the
-//! intents stand in the log.
+//! Market and validator, always (David, 2026-10-09: "every skein is
+//! marketplace AND validator from install, always"; 0.12.0 removed the
+//! owner's `market` / `validator` switch of 0.9.2 and its stored state): a
+//! register that changes the set also emits `liveness {topic: <topic>-live,
+//! window}` and `beacon {topic: <topic>-live, every, body}`; a deregister that
+//! changes it emits `unliveness` and `unbeacon` (`withRoles`). `window` and
+//! `every` are `config.overlay.market: {window}` and `config.overlay.validator:
+//! {every}`, else 40 000 and 30 000 ms (config.zig `rolesOf`): defaults, never
+//! off. Nothing at a start or re-read: the intents stand in the log.
 //!
-//! The owner's switch (David, 2026-10-07: "this shouldn't have been a config
-//! in the manifest. This should be a setting that the user is configuring";
-//! 0.9.2): `market {window} | {off: true}` and `validator {every} | {off:
-//! true}`, taken where register is, kept in this same record beside
-//! `topics`:
+//! The beat (0.12.0, David 2026-10-09: "beats ARE libp2p service discovery;
+//! they replace SHIP/SLAP on the libp2p network" — not SHIP/SLAP, and no
+//! SHIP/SLAP ad is published p2p). A topic's beat body is dag-cbor
 //!
-//!   {kind: "overlay-topics", topics: [...], market?: {window} | {off: true}, validator?: {every} | {off: true}}
+//!   {view: {count: uint, digest: bytes(32)}}
 //!
-//! A role switched has precedence over the manifest's value (`effective`);
-//! one never switched is the manifest's. Turned on, `liveness` / `beacon` for
-//! every registered topic; off, `unliveness` / `unbeacon` (`switchRole`).
+//! the topic's VIEW DIGEST (state.zig `View`: its admitted-and-unspent
+//! outputs, counted and summed), kept in the topic's state record and put in
+//! the body when the beacon is declared (`beatBody`). The host publishes the
+//! declared body and reads no state at beat time, so the engine re-declares
+//! the beacon when the view changes (on admit and spend): an app's new
+//! `beacon {topic, every, body}` replaces its previous one (skein
+//! src/host/p2p.ts), and a receiver's liveness tool keeps the latest beat per
+//! sender — one logged event per change (`beatEvents`). (`terms` and `origin`
+//! are not in it yet: see README "Beats".)
+//!
+//! Each registered lookup service beats too, on `<service>-live` (lookups.zig;
+//! `registerLookup` declares its beacon, `deregisterLookup` ends it, every
+//! `every` ms as the topics), its body the lookup program's own:
+//! fn "beat" answers it at the declaration, and a hook's answer may carry a
+//! new one (`{beats: {<service>: bytes}}`, lookup.zig).
 //!
 //! Seeding (0.7.8): `register {topic, program, seed?: [txid hex, …]}` — after
 //! the topic is registered (or found registered with the same program), each
@@ -73,6 +89,7 @@
 //! The logic, natively testable; engine.zig runs it in a step.
 const std = @import("std");
 const c = @import("chain");
+const st_mod = @import("state.zig");
 
 const cbor = c.cbor;
 const Value = cbor.Value;
@@ -104,14 +121,8 @@ pub fn entriesOf(a: Allocator, rec: ?Value) ![]const Entry {
     return out;
 }
 
-/// The set's record, with no switch set (`recordWith`).
+/// The set's record.
 pub fn recordOf(a: Allocator, list: []const Entry) !Value {
-    return recordWith(a, list, .{});
-}
-
-/// The set's record with the owner's switches (0.9.2): `market: {window} | {off: true}` and
-/// `validator: {every} | {off: true}` beside `topics`, each only once switched.
-pub fn recordWith(a: Allocator, list: []const Entry, sw: Switches) !Value {
     const ts = try a.alloc(Value, list.len);
     for (list, ts) |e, *v| v.* = .{ .map = try a.dupe(cbor.Entry, &.{
         .{ .key = "topic", .value = .{ .text = e.topic } },
@@ -122,9 +133,6 @@ pub fn recordWith(a: Allocator, list: []const Entry, sw: Switches) !Value {
         .{ .key = "kind", .value = .{ .text = record_kind } },
         .{ .key = "topics", .value = .{ .array = ts } },
     });
-    inline for (.{ Role.market, Role.validator }) |r| {
-        if (try switchValue(a, sw.get(r), r)) |v| try es.append(a, .{ .key = @tagName(r), .value = v });
-    }
     return .{ .map = es.items };
 }
 
@@ -137,16 +145,17 @@ fn lessThan(_: void, x: Entry, y: Entry) bool {
     return std.mem.order(u8, x.topic, y.topic) == .lt;
 }
 
-/// The three GossipSub topics of one overlay topic, the engine's function for each (routes.zig), and
-/// the door's filter for its body: `beef` for `<topic>` (the submission's BEEF), none for the
-/// dag-cbor `-admit` / `-proof` bodies.
+/// The GossipSub topics an overlay topic is subscribed on, and the engine's function for each
+/// (routes.zig; 0.12.0, David 2026-10-09): `<topic>` one mesh for both kinds, `submit` and `admit`
+/// (the function reads the kind), and `<topic>-proof` its own (people waiting on a proof do not track
+/// admittance). Dag-cbor bodies, no door filter. (`<topic>-live`, the liveness topic, is the runtime's
+/// beacon and liveness tool: `roleEvents`.)
 pub const gossip_topics = [_]struct { suffix: []const u8, func: []const u8, filter: ?[]const u8 = null }{
-    .{ .suffix = "", .func = "submit", .filter = "beef" },
-    .{ .suffix = "-admit", .func = "peerAdmit" },
+    .{ .suffix = "", .func = "submit" },
     .{ .suffix = "-proof", .func = "peerProof" },
 };
 
-/// The events of one change: `subscribe {topic, program: <self>, fn, filter?}` for each of the three
+/// The events of one change: `subscribe {topic, program: <self>, fn, filter?}` for each of the
 /// topics (register), or `unsubscribe {topic}` (deregister).
 pub fn events(a: Allocator, subscribe: bool, topic: []const u8, self: []const u8) ![gossip_topics.len]Value {
     var out: [gossip_topics.len]Value = undefined;
@@ -228,7 +237,7 @@ pub fn register(a: Allocator, list: []const Entry, args: Value, programs: Value,
 /// What a mailbox message asks of the engine, by its body's `fn` alone; where it may be taken is
 /// `mayRegister`'s (one box per function class, shruggr/skein#128, 0.7.5). `registerLookup` /
 /// `deregisterLookup` (0.11.0, lookups.zig) are taken where `register` is.
-pub const Asked = enum { register, deregister, registerLookup, deregisterLookup, market, validator, other };
+pub const Asked = enum { register, deregister, registerLookup, deregisterLookup, other };
 
 pub fn asked(body: Value) Asked {
     const f = body.getText("fn") orelse return .other;
@@ -236,8 +245,6 @@ pub fn asked(body: Value) Asked {
     if (eql(u8, f, "deregister")) return .deregister;
     if (eql(u8, f, "registerLookup")) return .registerLookup;
     if (eql(u8, f, "deregisterLookup")) return .deregisterLookup;
-    if (eql(u8, f, "market")) return .market;
-    if (eql(u8, f, "validator")) return .validator;
     return .other;
 }
 
@@ -266,50 +273,96 @@ pub fn answerBox(args: Value, app: []const u8) []const u8 {
     return args.getText("box") orelse app;
 }
 
-/// The engine's roles (shruggr/skein#120, David 2026-10-06 evening: "a skein runs as a market and/or
-/// a validator by two settings in the engine's configuration"): `config.overlay.market: {window}` and
-/// `config.overlay.validator: {every}`, each in ms, each optional (config.zig `rolesOf`).
-pub const Roles = struct { market: ?u64 = null, validator: ?u64 = null };
+/// The engine's roles (shruggr/skein#120; 0.12.0, David 2026-10-09: "every skein is marketplace AND
+/// validator from install, always"): the market's liveness window and the validator's beat, in ms —
+/// `config.overlay.market: {window}` and `config.overlay.validator: {every}`, else the defaults
+/// (config.zig `rolesOf`).
+pub const Roles = struct { market: u64 = default_window_ms, validator: u64 = default_every_ms };
 
 /// The topic the roles' events name for an overlay topic: `<topic>-live`.
 pub const live_suffix = "-live";
 
 /// The roles' events for one change, after the subscribes: on register, `liveness {topic:
-/// <topic>-live, window}` when a market and `beacon {topic: <topic>-live, every, body: <empty>}` when
-/// a validator (the beat needs no body: the frame carries the sender's identity key, the gossip
-/// message the peer id); on deregister, `unliveness` / `unbeacon` likewise.
-pub fn roleEvents(a: Allocator, subscribe: bool, topic: []const u8, roles: Roles) ![]const Value {
+/// <topic>-live, window}` (the market) and `beacon {topic: <topic>-live, every, body}` (the
+/// validator; `body` the topic's beat body, `beatBody`: the frame carries the sender's identity key,
+/// the gossip message the peer id); on deregister, `unliveness` and `unbeacon`.
+pub fn roleEvents(a: Allocator, subscribe: bool, topic: []const u8, roles: Roles, body: []const u8) ![]const Value {
     const t: Value = .{ .text = try std.mem.concat(a, u8, &.{ topic, live_suffix }) };
     var out: std.ArrayList(Value) = .empty;
-    if (roles.market) |window| try out.append(a, .{ .map = if (subscribe) try a.dupe(cbor.Entry, &.{
+    try out.append(a, .{ .map = if (subscribe) try a.dupe(cbor.Entry, &.{
         .{ .key = "event", .value = .{ .text = "liveness" } },
         .{ .key = "topic", .value = t },
-        .{ .key = "window", .value = .{ .uint = window } },
+        .{ .key = "window", .value = .{ .uint = roles.market } },
     }) else try a.dupe(cbor.Entry, &.{
         .{ .key = "event", .value = .{ .text = "unliveness" } },
         .{ .key = "topic", .value = t },
     }) });
-    if (roles.validator) |every| try out.append(a, .{ .map = if (subscribe) try a.dupe(cbor.Entry, &.{
-        .{ .key = "event", .value = .{ .text = "beacon" } },
-        .{ .key = "topic", .value = t },
-        .{ .key = "every", .value = .{ .uint = every } },
-        .{ .key = "body", .value = .{ .bytes = "" } },
-    }) else try a.dupe(cbor.Entry, &.{
-        .{ .key = "event", .value = .{ .text = "unbeacon" } },
-        .{ .key = "topic", .value = t },
-    }) });
+    try out.append(a, if (subscribe) try beaconEvent(a, topic, roles.validator, body) else try unbeaconEvent(a, topic));
     return out.items;
 }
 
+/// `beacon {topic: <name>-live, every, body}`: declared, or re-declared with a new body (an app's
+/// new beacon for the same topic replaces its previous one).
+pub fn beaconEvent(a: Allocator, name: []const u8, every: u64, body: []const u8) !Value {
+    return .{ .map = try a.dupe(cbor.Entry, &.{
+        .{ .key = "event", .value = .{ .text = "beacon" } },
+        .{ .key = "topic", .value = .{ .text = try std.mem.concat(a, u8, &.{ name, live_suffix }) } },
+        .{ .key = "every", .value = .{ .uint = every } },
+        .{ .key = "body", .value = .{ .bytes = body } },
+    }) };
+}
+
+/// `unbeacon {topic: <name>-live}`.
+pub fn unbeaconEvent(a: Allocator, name: []const u8) !Value {
+    return .{ .map = try a.dupe(cbor.Entry, &.{
+        .{ .key = "event", .value = .{ .text = "unbeacon" } },
+        .{ .key = "topic", .value = .{ .text = try std.mem.concat(a, u8, &.{ name, live_suffix }) } },
+    }) };
+}
+
+/// A topic's beat body (0.12.0): dag-cbor `{view: {count, digest}}`, the topic's view digest
+/// (state.zig `View`).
+pub fn beatBody(a: Allocator, v: st_mod.View) ![]const u8 {
+    return cbor.encode(a, .{ .map = try a.dupe(cbor.Entry, &.{.{ .key = "view", .value = .{ .map = try a.dupe(cbor.Entry, &.{
+        .{ .key = "count", .value = .{ .uint = v.count } },
+        .{ .key = "digest", .value = .{ .bytes = try a.dupe(u8, &v.digest) } },
+    }) } }}) });
+}
+
 /// A register's or deregister's change with the roles' events added (`roleEvents`), only when the set
-/// changes: an idempotent one emits nothing, a refusal stays one.
-pub fn withRoles(a: Allocator, change: Change, subscribe: bool, roles: Roles) !Change {
+/// changes: an idempotent one emits nothing, a refusal stays one. `body`: the topic's beat body.
+pub fn withRoles(a: Allocator, change: Change, subscribe: bool, roles: Roles, body: []const u8) !Change {
     if (change != .done or change.done.list == null) return change;
     var d = change.done;
-    const extra = try roleEvents(a, subscribe, d.answer.getText("topic").?, roles);
+    const extra = try roleEvents(a, subscribe, d.answer.getText("topic").?, roles, body);
     if (extra.len == 0) return change;
     d.events = try std.mem.concat(a, Value, &.{ d.events, extra });
     return .{ .done = d };
+}
+
+/// The beacons a step re-declares (0.12.0), each beating every `every` ms: one per registered topic
+/// whose view the step changed (`changes`, state.zig `viewChanges`: the body over its view now), then
+/// one per registered lookup service a hook gave a new body (`lookup_beats`, the last one per
+/// service). Nothing for a topic or service not registered (`topics`, `services`).
+pub fn beatEvents(a: Allocator, every: u64, topics: []const Entry, services: []const []const u8, changes: []const st_mod.ViewChange, lookup_beats: []const st_mod.LookupBeat) ![]const Value {
+    const ms = every;
+    var out: std.ArrayList(Value) = .empty;
+    for (changes) |ch| {
+        if (find(topics, ch.topic) == null) continue;
+        try out.append(a, try beaconEvent(a, ch.topic, ms, try beatBody(a, ch.now)));
+    }
+    for (lookup_beats, 0..) |lb, i| {
+        const registered = for (services) |x| {
+            if (eql(u8, x, lb.service)) break true;
+        } else false;
+        if (!registered) continue;
+        const later = for (lookup_beats[i + 1 ..]) |y| {
+            if (eql(u8, y.service, lb.service)) break true;
+        } else false;
+        if (later) continue;
+        try out.append(a, try beaconEvent(a, lb.service, ms, lb.body));
+    }
+    return out.items;
 }
 
 /// `deregister {topic}`.
@@ -321,137 +374,12 @@ pub fn deregister(a: Allocator, list: []const Entry, args: Value) !Change {
     return .{ .done = .{ .list = out.items, .events = try a.dupe(Value, &try events(a, false, topic, "")), .answer = try answerOf(a, topic, false) } };
 }
 
-/// The owner's switches (David, 2026-10-07: "this shouldn't have been a config in the manifest. This
-/// should be a setting that the user is configuring"; 0.9.2). Each role is switched by an owner's
-/// message in `<app>/register` — `market {window}` / `market {off: true}`, `validator {every}` /
-/// `validator {off: true}` — and kept in the set's record `<app>/topics` beside `topics`. A switch,
-/// once sent, has precedence over `config.overlay.market` / `.validator` (the manifest's: the initial
-/// value); `unset` is the manifest's.
-pub const Role = enum { market, validator };
-
-/// One role's switch: never sent (the manifest decides), off, or on with its ms.
-pub const Switch = union(enum) { unset, off, on: u64 };
-
-pub const Switches = struct {
-    market: Switch = .unset,
-    validator: Switch = .unset,
-
-    pub fn get(self: Switches, r: Role) Switch {
-        return switch (r) {
-            .market => self.market,
-            .validator => self.validator,
-        };
-    }
-
-    pub fn set(self: *Switches, r: Role, v: Switch) void {
-        switch (r) {
-            .market => self.market = v,
-            .validator => self.validator = v,
-        }
-    }
-};
-
-/// The field of a role's switch and of its `config.overlay` value: market `window`, validator `every`.
-pub fn fieldOf(r: Role) []const u8 {
-    return switch (r) {
-        .market => "window",
-        .validator => "every",
-    };
-}
-
 /// The shortest and longest window or beat the kernel takes (ms; skein docs/MESSAGES.md "Beacons", "Liveness").
 pub const role_min_ms: u64 = 1000;
 pub const role_max_ms: u64 = 86_400_000;
 
-fn switchValue(a: Allocator, sw: Switch, r: Role) !?Value {
-    return switch (sw) {
-        .unset => null,
-        .off => .{ .map = try a.dupe(cbor.Entry, &.{.{ .key = "off", .value = .{ .boolean = true } }}) },
-        .on => |ms| .{ .map = try a.dupe(cbor.Entry, &.{.{ .key = fieldOf(r), .value = .{ .uint = ms } }}) },
-    };
-}
-
-/// The switches a set record holds (null: no set yet, none switched).
-pub fn switchesOf(rec: ?Value) !Switches {
-    const r = rec orelse return .{};
-    var out: Switches = .{};
-    inline for (.{ Role.market, Role.validator }) |role| {
-        if (r.get(@tagName(role))) |v| out.set(role, parseSwitch(v, role) catch return error.BadTopicSet);
-    }
-    return out;
-}
-
-/// `{off: true}` → off; `{window: <ms>}` (market) / `{every: <ms>}` (validator), 1 000 ms .. a day → on.
-/// Anything else: error.BadSwitch.
-pub fn parseSwitch(v: Value, r: Role) error{BadSwitch}!Switch {
-    if (v != .map) return error.BadSwitch;
-    if (v.get("off")) |off| {
-        if (off != .boolean or !off.boolean or v.map.len != 1) return error.BadSwitch;
-        return .off;
-    }
-    const ms = v.getUint(fieldOf(r)) orelse return error.BadSwitch;
-    if (v.map.len != 1 or ms < role_min_ms or ms > role_max_ms) return error.BadSwitch;
-    return .{ .on = ms };
-}
-
-/// The roles in effect: a switch sent has precedence; `unset` is the configuration's.
-pub fn effective(sw: Switches, cfg: Roles) Roles {
-    const pick = struct {
-        fn f(s: Switch, c_: ?u64) ?u64 {
-            return switch (s) {
-                .unset => c_,
-                .off => null,
-                .on => |ms| ms,
-            };
-        }
-    }.f;
-    return .{ .market = pick(sw.market, cfg.market), .validator = pick(sw.validator, cfg.validator) };
-}
-
-/// The answer to a switch (and the roles as the owner reads them): `{market?: {window}, validator?:
-/// {every}}`, the roles in effect, each present only when on.
-pub fn rolesAnswer(a: Allocator, roles: Roles) !Value {
-    var es: std.ArrayList(cbor.Entry) = .empty;
-    if (roles.market) |w| try es.append(a, .{ .key = "market", .value = .{ .map = try a.dupe(cbor.Entry, &.{.{ .key = "window", .value = .{ .uint = w } }}) } });
-    if (roles.validator) |e| try es.append(a, .{ .key = "validator", .value = .{ .map = try a.dupe(cbor.Entry, &.{.{ .key = "every", .value = .{ .uint = e } }}) } });
-    return .{ .map = es.items };
-}
-
-/// What a switch does: the switches to write (null: unchanged), the events to emit, the answer
-/// (`rolesAnswer`, after it). Or why it is refused (nothing written, nothing emitted).
-pub const SwitchChange = union(enum) {
-    refused: []const u8,
-    done: struct { switches: ?Switches, events: []const Value, answer: Value },
-};
-
-/// `market {window} | {off: true}` / `validator {every} | {off: true}` (0.9.2): the role `r` switched
-/// for the registered set `list`. Turned on (or its ms changed), `liveness` / `beacon` for every
-/// topic registered (the kernel keys them by (app, topic): a new ms replaces the old); turned off,
-/// `unliveness` / `unbeacon` for them. Idempotent: the same switch again writes and emits nothing; a
-/// switch that leaves the role in effect as it was (the manifest's value made explicit) is written
-/// (it has precedence from then on) and emits nothing.
-pub fn switchRole(a: Allocator, list: []const Entry, sw: Switches, cfg: Roles, r: Role, args: Value) !SwitchChange {
-    const want = parseSwitch(args, r) catch return .{ .refused = try std.fmt.allocPrint(a, "{s}: want {{{s}: <ms>}} (1000 ms to a day) or {{off: true}}", .{ @tagName(r), fieldOf(r) }) };
-    const before = effective(sw, cfg);
-    var next = sw;
-    next.set(r, want);
-    const after = effective(next, cfg);
-    const same = std.meta.eql(sw.get(r), want);
-    var evs: std.ArrayList(Value) = .empty;
-    const was = switch (r) {
-        .market => before.market,
-        .validator => before.validator,
-    };
-    const now = switch (r) {
-        .market => after.market,
-        .validator => after.validator,
-    };
-    if (!std.meta.eql(was, now)) {
-        const only: Roles = switch (r) {
-            .market => .{ .market = now orelse was },
-            .validator => .{ .validator = now orelse was },
-        };
-        for (list) |e| try evs.appendSlice(a, try roleEvents(a, now != null, e.topic, only));
-    }
-    return .{ .done = .{ .switches = if (same) null else next, .events = evs.items, .answer = try rolesAnswer(a, after) } };
-}
+/// The window and the beat when the configuration names none (0.12.0): a liveness window of 40 s,
+/// a beat every 30 s (the values the owner's switch on the Mandala tokens page asked for, until
+/// 0.12.0 removed the switch).
+pub const default_window_ms: u64 = 40_000;
+pub const default_every_ms: u64 = 30_000;

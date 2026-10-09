@@ -139,38 +139,61 @@ fn hookArg(a: Allocator, in: Value, l: Listener, topic: []const u8, rest: []cons
     return .{ .map = es.items };
 }
 
+/// The beat bodies a hook's answer carries (`{beats: {<service>: bytes}}`, lookup.zig, 0.12.0), onto
+/// `out` in order. Anything else in `beats` is passed over.
+pub fn beatsOf(a: Allocator, answer: Value, out: *std.ArrayList(st.LookupBeat)) !void {
+    const bs = answer.get("beats") orelse return;
+    if (bs != .map) return;
+    for (bs.map) |e| if (e.value == .bytes) try out.append(a, .{ .service = e.key, .body = e.value.bytes });
+}
+
 /// A topic admitted a transaction (in the step that recorded it): each of its lookup programs'
 /// (once each, `hookTargets`) `admitted(topic, tx, outputsToAdmit, coinsRetained)`, then
-/// `spent(topic, outpoint, spendingTx)` for each previous coin it consumed.
-pub fn hookAdmitted(a: Allocator, caller: Caller, in: Value, topic: []const u8, sub: st.Subject, previous: []const u32, applied: st.Applied) !void {
+/// `spent(topic, outpoint, spendingTx)` for each previous coin it consumed. The beat bodies the
+/// hooks answer go onto `beats` (0.12.0).
+pub fn hookAdmitted(a: Allocator, caller: Caller, in: Value, topic: []const u8, sub: st.Subject, previous: []const u32, applied: st.Applied, beats: *std.ArrayList(st.LookupBeat)) !void {
     for (try hookTargets(a, in, topic)) |l| {
-        _ = try caller.call(a, l.program, "admitted", try hookArg(a, in, l, topic, &.{
+        try beatsOf(a, try caller.call(a, l.program, "admitted", try hookArg(a, in, l, topic, &.{
             .{ .key = "tx", .value = .{ .cid = sub.cid } },
             .{ .key = "outputsToAdmit", .value = .{ .array = try uints(a, applied.outputs_to_admit) } },
             .{ .key = "coinsRetained", .value = .{ .array = try uints(a, applied.coins_to_retain) } },
-        }));
+        })), beats);
         for (previous) |p| {
             const in_ = sub.tx.inputs[p];
-            _ = try caller.call(a, l.program, "spent", try hookArg(a, in, l, topic, &.{
+            try beatsOf(a, try caller.call(a, l.program, "spent", try hookArg(a, in, l, topic, &.{
                 .{ .key = "outpoint", .value = .{ .map = try a.dupe(cbor.Entry, &.{
                     .{ .key = "tx", .value = .{ .cid = try a.dupe(u8, &store_mod.hashCid(.tx, in_.previous_outpoint.txid.bytes)) } },
                     .{ .key = "vout", .value = .{ .uint = in_.previous_outpoint.index } },
                 }) } },
                 .{ .key = "spendingTx", .value = .{ .cid = sub.cid } },
-            }));
+            })), beats);
         }
     }
 }
 
 /// The judgements a rejection removed (`State.unapply`): each topic's lookup programs' (once each,
-/// `hookTargets`) `rejected(topic, tx)`.
-pub fn hookRejected(a: Allocator, caller: Caller, in: Value, gone: []const st.Unapplied) !void {
+/// `hookTargets`) `rejected(topic, tx)`. The beat bodies the hooks answer go onto `beats` (0.12.0).
+pub fn hookRejected(a: Allocator, caller: Caller, in: Value, gone: []const st.Unapplied, beats: *std.ArrayList(st.LookupBeat)) !void {
     for (gone) |g| {
         const tc = try a.dupe(u8, &store_mod.hashCid(.tx, g.txid));
         for (try hookTargets(a, in, g.topic)) |l| {
-            _ = try caller.call(a, l.program, "rejected", try hookArg(a, in, l, g.topic, &.{.{ .key = "tx", .value = .{ .cid = tc } }}));
+            try beatsOf(a, try caller.call(a, l.program, "rejected", try hookArg(a, in, l, g.topic, &.{.{ .key = "tx", .value = .{ .cid = tc } }})), beats);
         }
     }
+}
+
+/// A lookup service's beat body at its beacon's declaration (0.12.0): its program's fn "beat"
+/// (`{kind: "lookup-beat", app, service, program}` → `{body: bytes}`, lookup.zig). A program that
+/// answers none (one built before 0.12.0) beats an empty body.
+pub fn lookupBeat(a: Allocator, caller: Caller, in: Value, service: []const u8, role: []const u8) ![]const u8 {
+    const program = (programNamed(in, role) catch return "") orelse return "";
+    const ans = caller.call(a, program, "beat", .{ .map = try a.dupe(cbor.Entry, &.{
+        .{ .key = "kind", .value = .{ .text = "lookup-beat" } },
+        .{ .key = "app", .value = .{ .text = appOf(in) } },
+        .{ .key = "service", .value = .{ .text = service } },
+        .{ .key = "program", .value = .{ .text = role } },
+    }) }) catch return "";
+    return ans.getBytes("body") orelse "";
 }
 
 /// A lookup-call's argument for `service` (the `/lookup` route's): `query` the client's JSON as

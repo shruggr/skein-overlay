@@ -10,13 +10,14 @@
 //!
 //! The record, the root of `<app>/state`:
 //!
-//!   {kind: "overlay-state", maps: {admitted, applied, pending, wants}}
+//!   {kind: "overlay-state", maps: {admitted, applied, pending, wants, views}}
 //!
 //! The maps (keys bytes, ordered bytewise; `tp` = len ‖ topic):
 //!   admitted   tp ‖ txid ‖ vout → admittance record {kind: "admitted", topic, txid, vout, script, satoshis, admittedAt, tx, refs}
 //!   applied    tp ‖ txid → applied record {kind: "applied", topic, txid, outputsToAdmit, coinsToRetain, coinsRemoved, at, tx, beef, refs}
-//!                (beef: the submission's BEEF as the overlay was handed it — its pointer record
-//!                 (shruggr/skein#121), or the raw block of the bytes — for internalizing; a
+//!                (beef: the submission's BEEF as the overlay was handed it — the door's envelope
+//!                 {form, beef: <pointer record>, subject?, vout?} as a block (shruggr/skein#121,
+//!                 #146), or the raw block of the bytes — for internalizing; a
 //!                 lookup's BEEF is the chain state's, `beefFor`)
 //!   pending    txid → {kind: "submission", txid, thread?, submission, ingest?, heard?, via?, waiting?, event?}
 //!                a transaction of a submission handed to the chain app and not yet admitted (or
@@ -30,6 +31,18 @@
 //!                to be asked of `peer` (the libp2p peer ID's multihash, a gossip message's
 //!                `from`), which announced one of them or something needing it; no peer (a
 //!                submission by message or HTTP): the host asks peers from its mesh for the topic
+//!   views      tp → bytes(40): count (8 bytes, big-endian) ‖ digest (32 bytes)   the topic's VIEW
+//!                DIGEST (0.12.0, David 2026-10-09): `count` the topic's admitted-and-unspent
+//!                outputs, `digest` an order-independent running digest of them — each outpoint's
+//!                hash `sha256(txid (32 bytes, internal byte order) ‖ vout (4 bytes, little-endian))`,
+//!                read as a 256-bit big-endian number, ADDED mod 2^256 when the topic admits the
+//!                output and SUBTRACTED when it is spent; written as 32 bytes big-endian (`View`).
+//!                Kept incrementally as the topic admits and spends (`apply`, `unapply`): read in
+//!                one lookup, no sort, no log read. "Spent" is the topic's own view of it: a
+//!                previous coin a transaction the topic admits consumes (BRC-22), retained or not;
+//!                a rejection (`unapply`) takes its transaction's outputs out and gives the coins
+//!                it consumed back. An empty topic: count 0, digest 32 zero bytes. The beat body
+//!                on `<topic>-live` carries it (topics.zig `beatBody`).
 //!
 //! Nothing here is derived from the chain: whether an admitted output is
 //! spent is the chain state's `spent` (the first held spender that is not
@@ -63,7 +76,58 @@ pub const Network = c.chain.Network;
 /// The head the chain state lives under: the chain app's (its name is `chain`).
 pub const chain_head = "chain/state";
 
-pub const map_names = [_][]const u8{ "admitted", "applied", "pending", "wants" };
+pub const map_names = [_][]const u8{ "admitted", "applied", "pending", "wants", "views" };
+
+/// A topic's view digest (the map `views`, 0.12.0): how many outputs the topic holds admitted and
+/// unspent, and the sum (mod 2^256) of their outpoints' hashes (`outpointHash`). Two topics holding
+/// the same outputs have the same view, whatever order they were admitted and spent in.
+pub const View = struct {
+    count: u64 = 0,
+    digest: [32]u8 = .{0} ** 32,
+
+    pub fn eql(x: View, y: View) bool {
+        return x.count == y.count and std.mem.eql(u8, &x.digest, &y.digest);
+    }
+
+    /// The output `(txid, vout)` folded in (`in`: admitted) or out (spent).
+    pub fn fold(self: *View, txid: [32]u8, vout: u32, in: bool) void {
+        const h = std.mem.readInt(u256, &outpointHash(txid, vout), .big);
+        const d = std.mem.readInt(u256, &self.digest, .big);
+        std.mem.writeInt(u256, &self.digest, if (in) d +% h else d -% h, .big);
+        if (in) self.count += 1 else self.count -|= 1;
+    }
+
+    pub fn bytes(self: View) [40]u8 {
+        var out: [40]u8 = undefined;
+        std.mem.writeInt(u64, out[0..8], self.count, .big);
+        @memcpy(out[8..], &self.digest);
+        return out;
+    }
+
+    pub fn parse(b: []const u8) !View {
+        if (b.len != 40) return error.BadIndex;
+        return .{ .count = std.mem.readInt(u64, b[0..8], .big), .digest = b[8..40].* };
+    }
+};
+
+/// An outpoint's hash in the view digest: sha256(txid (32 bytes, internal byte order) ‖ vout (4
+/// bytes, little-endian)) — the outpoint as a Bitcoin input serializes it.
+pub fn outpointHash(txid: [32]u8, vout: u32) [32]u8 {
+    var buf: [36]u8 = undefined;
+    @memcpy(buf[0..32], &txid);
+    std.mem.writeInt(u32, buf[32..36], vout, .little);
+    var out: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&buf, &out, .{});
+    return out;
+}
+
+/// A topic whose view a step changed: what it was before the step, and what it is now.
+pub const ViewChange = struct { topic: []const u8, before: View, now: View };
+
+/// A lookup service's beat body, as a hook of its program answered it (`{beats: {<service>:
+/// bytes}}`, calls.zig): the engine re-declares the beacon on `<service>-live` with it (topics.zig
+/// `beatEvents`).
+pub const LookupBeat = struct { service: []const u8, body: []const u8 };
 
 /// What a topic's judgement came to (the STEAK's entry for it).
 pub const Applied = struct {
@@ -192,6 +256,10 @@ pub const State = struct {
     now: i64 = 0,
     /// The wants this step touched, and whether each stood before (`wantEvents`).
     want_log: std.ArrayList(struct { key: []const u8, stood: bool }) = .empty,
+    /// The topics whose view this step touched, and each one's view before its first touch (`viewChanges`).
+    view_log: std.ArrayList(struct { topic: []const u8, before: View }) = .empty,
+    /// The lookup beat bodies this step's hooks answered, in order (`LookupBeat`).
+    lookup_beats: std.ArrayList(LookupBeat) = .empty,
 
     /// The state the record names (null: a new one), over the chain state `ch`.
     pub fn load(arena: Allocator, s: Store, state: ?[]const u8, ch: *Chain) !State {
@@ -497,7 +565,8 @@ pub const State = struct {
     /// admitted output as an admittance record, the judgement in `applied`. `previous` is
     /// `previousCoins` for this topic, taken before any judgement of this step. A transaction the
     /// topic judged before is a dupe: nothing is written. `beef`: the submission's BEEF (its CID:
-    /// the pointer record, or the raw block of the bytes, `putRaw`), named by the applied record.
+    /// the door's envelope as a block, shruggr/skein#146, or the raw block of the bytes, `putRaw`),
+    /// named by the applied record.
     pub fn apply(self: *State, sub: Subject, t: []const u8, previous: []const u32, ins: Instructions, beef: []const u8) !Applied {
         const a = self.arena;
         if (try self.isApplied(t, sub.txid)) return .{ .dupe = true };
@@ -509,6 +578,12 @@ pub const State = struct {
         const tp = try topicPrefix(a, t);
         const txid_hex = try a.dupe(u8, &hdr.toHex(sub.txid));
         var records: std.ArrayList([]const u8) = .empty;
+        // The view (0.12.0): each previous coin it consumes out (retained or not: spent), each output it admits in.
+        var v = try self.touchView(t);
+        for (previous) |p| {
+            const po = sub.tx.inputs[p].previous_outpoint;
+            if (try self.counted(t, po.txid.bytes, po.index)) v.fold(po.txid.bytes, po.index, false);
+        }
         const sorted = try a.dupe(u32, ins.outputs_to_admit);
         std.mem.sort(u32, sorted, {}, std.sort.asc(u32));
         for (sorted) |vout| {
@@ -526,7 +601,9 @@ pub const State = struct {
             }) });
             try self.map("admitted").putLink(try cat(a, &.{ tp, &store_mod.outpointKey(sub.txid, vout) }), rec);
             try records.append(a, rec);
+            v.fold(sub.txid, vout, true);
         }
+        try self.putView(t, v);
         const retained = try a.dupe(u32, ins.coins_to_retain);
         std.mem.sort(u32, retained, {}, std.sort.asc(u32));
         const applied = try self.store.putValue(a, .{ .map = try a.dupe(cbor.Entry, &.{
@@ -548,15 +625,75 @@ pub const State = struct {
 
     /// The chain app answered `rejected` for `txid`: each of `topics` that judged it loses the
     /// judgement and the outputs it admitted. → the judgements removed (their lookup services are told).
+    /// The view (0.12.0): the outputs it admitted (those still counted) out, then the coins it
+    /// consumed back in (those still admitted and consumed by no other judgement of the topic).
     pub fn unapply(self: *State, topics: []const []const u8, txid: [32]u8) ![]Unapplied {
         const a = self.arena;
         var out: std.ArrayList(Unapplied) = .empty;
         for (topics) |t| {
             const tp = try topicPrefix(a, t);
             const key = try cat(a, &.{ tp, &txid });
-            if (!(try self.map("applied").remove(key))) continue;
+            const rc = (try self.map("applied").link(key)) orelse continue;
+            var v = try self.touchView(t);
+            for (try self.map("admitted").prefixed(key)) |kv| {
+                const o = try store_mod.outpointOf(kv.key[tp.len..]);
+                if (try self.counted(t, o.txid, o.vout)) v.fold(o.txid, o.vout, false);
+            }
+            _ = try self.map("applied").remove(key);
             for (try self.map("admitted").prefixed(key)) |kv| _ = try self.map("admitted").remove(kv.key);
+            const rec = try self.record(rc);
+            const raw = self.store.get(a, rec.getCid("tx") orelse return error.BadRecord) catch return error.BadRecord;
+            const tx = Transaction.parse(a, raw) catch return error.BadRecord;
+            for ([_][]const u8{ "coinsToRetain", "coinsRemoved" }) |field| for (rec.getArray(field) orelse &.{}) |x| {
+                if (x != .uint or x.uint >= tx.inputs.len) return error.BadRecord;
+                const po = tx.inputs[@intCast(x.uint)].previous_outpoint;
+                if (try self.counted(t, po.txid.bytes, po.index)) v.fold(po.txid.bytes, po.index, true);
+            };
+            try self.putView(t, v);
             try out.append(a, .{ .topic = t, .txid = txid });
+        }
+        return out.items;
+    }
+
+    // ------------------------------------------------------------ the view digest (0.12.0)
+
+    /// The topic's view as the state holds it (never touched: empty).
+    pub fn view(self: *State, t: []const u8) !View {
+        const v = (try self.map("views").get(try topicPrefix(self.arena, t))) orelse return .{};
+        return View.parse(if (v == .bytes) v.bytes else return error.BadIndex);
+    }
+
+    fn putView(self: *State, t: []const u8, v: View) !void {
+        const b = v.bytes();
+        try self.map("views").put(try topicPrefix(self.arena, t), .{ .bytes = try self.arena.dupe(u8, &b) });
+    }
+
+    /// The topic's view, noted in the step's journal (its value before the step's first touch).
+    fn touchView(self: *State, t: []const u8) !View {
+        const v = try self.view(t);
+        for (self.view_log.items) |x| if (std.mem.eql(u8, x.topic, t)) return v;
+        try self.view_log.append(self.arena, .{ .topic = try self.arena.dupe(u8, t), .before = v });
+        return v;
+    }
+
+    /// Whether the output is in the topic's view: admitted under it, and consumed by no transaction
+    /// the topic has a judgement of (its `applied`).
+    fn counted(self: *State, t: []const u8, txid: [32]u8, vout: u32) !bool {
+        const a = self.arena;
+        const tp = try topicPrefix(a, t);
+        const op = store_mod.outpointKey(txid, vout);
+        if (!(try self.map("admitted").has(try cat(a, &.{ tp, &op })))) return false;
+        for (try self.ch.spendersOf(op)) |sp| if (try self.map("applied").has(try cat(a, &.{ tp, &sp }))) return false;
+        return true;
+    }
+
+    /// The topics whose view this step changed (before ≠ now), in the order first touched.
+    pub fn viewChanges(self: *State) ![]ViewChange {
+        var out: std.ArrayList(ViewChange) = .empty;
+        for (self.view_log.items) |x| {
+            const now = try self.view(x.topic);
+            if (now.eql(x.before)) continue;
+            try out.append(self.arena, .{ .topic = x.topic, .before = x.before, .now = now });
         }
         return out.items;
     }
@@ -708,14 +845,18 @@ pub fn decode(a: Allocator, s: Store, bytes: []const u8) !Decoded {
     return .{ .subject = subject, .txs = txs.items, .nodes = nodes.items, .bumps = bumps.items, .proven = proven.items, .txid_only = txid_only.items };
 }
 
-/// A submission the kernel's door decoded (shruggr/skein#121): its pointer record, read. The
-/// transactions are blocks in the store already; every BUMP was checked against the chain state's
-/// headers at the door, so `proven` names the transactions its BUMPs prove (the record's `proves`)
-/// and nothing is proven again (`verifyDecoded`'s `door`). A txid-only subject is refused.
-pub fn decodeRecord(a: Allocator, s: Store, rc: []const u8) !Decoded {
-    const rec = s.getValue(a, rc) catch return error.InvalidBeef;
+/// A submission the kernel's door decoded (shruggr/skein#121, #146): its envelope `{form, beef:
+/// <pointer record>, subject?, vout?}` and the pointer record it names, read. The transactions are
+/// blocks in the store already; every BUMP was checked against the chain state's headers at the
+/// door, so `proven` names the transactions its BUMPs prove (the record's `proves`) and nothing is
+/// proven again (`verifyDecoded`'s `door`). The subject is the envelope's (an Atomic, Outpoint or
+/// Subject BEEF), else the record's last transaction (skein-sdk `record.subjectOf`). A txid-only
+/// subject is refused.
+pub fn decodeRecord(a: Allocator, s: Store, envelope: Value) !Decoded {
+    const env = c.record.envelopeOf(envelope) orelse return error.InvalidBeef;
+    const rec = s.getValue(a, env.beef) catch return error.InvalidBeef;
     if (!c.record.isRecord(rec)) return error.InvalidBeef;
-    const subject = c.record.subjectOf(rec) orelse return error.InvalidBeef;
+    const subject = c.record.subjectOf(env, rec) orelse return error.InvalidBeef;
     const tv = rec.getArray("txs") orelse return error.InvalidBeef;
     const marks = rec.getArray("marks") orelse return error.InvalidBeef;
     if (marks.len != tv.len) return error.InvalidBeef;

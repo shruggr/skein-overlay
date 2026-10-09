@@ -20,15 +20,14 @@
 //!   config.overlay.topics    {<topic>: <role>}                                   (was defaults.overlayTopics)
 //!   config.overlay.lookups   {<service>: <role> | {program: <role>, topics?}}    (was defaults.overlayLookups)
 //!   config.overlay.gossip    {<topic>: bool}                                     (was defaults.overlayGossip)
-//!   config.overlay.market    {window: <ms>}   optional: a market (defaults.overlayMarket; `rolesOf`)
-//!   config.overlay.validator {every: <ms>}    optional: a validator (defaults.overlayValidator)
+//!   config.overlay.market    {window: <ms>}   optional: the market's liveness window (defaults.overlayMarket; `rolesOf`)
+//!   config.overlay.validator {every: <ms>}    optional: the validator's beat (defaults.overlayValidator)
 //!
-//! The two roles (shruggr/skein#120, David 2026-10-06 evening): registering
-//! a topic is the one act that drives both — topics.zig `withRoles`. The
-//! manifest's value is only the initial one (David, 2026-10-07: "this
-//! should be a setting that the user is configuring"; 0.9.2): the owner's
-//! switch (`market` / `validator` in `<app>/register`), kept in the record
-//! `<app>/topics`, has precedence once sent (topics.zig `effective`).
+//! The two roles (shruggr/skein#120; 0.12.0, David 2026-10-09: "every skein
+//! is marketplace AND validator from install, always"): registering a topic
+//! is the one act that drives both — topics.zig `withRoles`. The values are
+//! the configuration's, else 40 000 ms and 30 000 ms; neither can be off (the
+//! owner's switch of 0.9.2 is gone).
 //!
 //! Beside the declared topics, the engine serves the topics registered at
 //! runtime (shruggr/skein#120; topics.zig): the root record of the head
@@ -89,12 +88,13 @@ const role_min_ms = topics.role_min_ms;
 const role_max_ms = topics.role_max_ms;
 
 /// The engine's roles from its configuration (`defaults.overlayMarket` / `overlayValidator`, JSON
-/// text: an app's `config.overlay.market: {window}` / `config.overlay.validator: {every}`): each
-/// absent, or its ms. Another shape, or a value outside 1 000 ms .. a day: error.BadRoles.
+/// text: an app's `config.overlay.market: {window}` / `config.overlay.validator: {every}`): each its
+/// ms, absent the default (topics.zig `default_window_ms`, `default_every_ms`; 0.12.0: always a
+/// market and a validator). Another shape, or a value outside 1 000 ms .. a day: error.BadRoles.
 pub fn rolesOf(a: Allocator, in: Value) error{BadRoles}!topics.Roles {
     return .{
-        .market = try roleMs(a, in, "overlayMarket", "window"),
-        .validator = try roleMs(a, in, "overlayValidator", "every"),
+        .market = (try roleMs(a, in, "overlayMarket", "window")) orelse topics.default_window_ms,
+        .validator = (try roleMs(a, in, "overlayValidator", "every")) orelse topics.default_every_ms,
     };
 }
 

@@ -8,10 +8,12 @@
 //!                                   → the STEAK {topic: {outputsToAdmit, coinsToRetain, coinsRemoved}}: BRC-22,
 //!                                   synchronous (0.9.1, shruggr/skein#112) — the request waits on the
 //!                                   submission's thread; 503 + Retry-After when nothing is decided
-//!   libp2p:<topic>    fn "submit"   the same submit as a GossipSub message (#57): the message's topic
-//!                                   requested, its body the BEEF → {verdict, admit?} (`gossip` below)
-//!   libp2p:<topic>-admit   fn "peerAdmit"   a peer's verdict (#74, gossip.zig): recorded as a
-//!                                           `peer-admit` record, never admitting → {verdict, admit?}
+//!   libp2p:<topic>    fn "submit"   one mesh, two kinds (0.12.0; `gossip` below, gossip.zig): {kind: "submit",
+//!                                   beef} the same submit as a GossipSub message (#57), the message's topic
+//!                                   requested; {kind: "admit", txid, topics} a peer's verdict (#74), recorded
+//!                                   as a `peer-admit` record, never admitting → {verdict, admit?}
+//!   libp2p:<topic>-admit   fn "peerAdmit"   a peer's verdict on its own topic, before 0.12.0: read
+//!                                           as an `admit` message is
 //!   libp2p:<topic>-proof   fn "peerProof"   a peer's proof (#74): checked against the chain state,
 //!                                           admitted as the `proof` event in box `chain` → {verdict, admit?}
 //!   libp2p:/skein/overlay/beef/1.0.0   fn "submit"   a direct stream (skein-overlay#1, shruggr/skein#112):
@@ -331,15 +333,15 @@ fn submit(a: Allocator, in: Value, req: Value) !Value {
 /// The Retry-After (whole seconds) of a 503: a submission still undecided past the host's bound.
 pub const retry_after = 30;
 
-/// POST /submit, read: the topics requested (X-Topics) and the BEEF — the door's pointer record
-/// (shruggr/skein#121, the row's `filter: "beef"`), or bytes (a body framed with off-chain values,
+/// POST /submit, read: the topics requested (X-Topics) and the BEEF — the door's envelope
+/// (shruggr/skein#121, #146, the route's `kernel.beef`), or bytes (a body framed with off-chain values,
 /// the framing taken off). Not a submission: the 400 answer.
 pub const HttpSubmit = struct { beef: submit_mod.Input, requested: []const []const u8, off: ?[]const u8 = null };
 
 pub fn httpRequest(a: Allocator, req: Value) !union(enum) { refused: Value, ok: HttpSubmit } {
     const th = header(req, "x-topics") orelse return .{ .refused = try failure(a, 400, "Missing x-topics header") };
     const requested = parseTopics(a, th) catch return .{ .refused = try failure(a, 400, "Invalid x-topics header: expected a comma-separated list or JSON string array") };
-    if (req.getCid("body")) |rc| return .{ .ok = .{ .beef = .{ .record = rc }, .requested = requested } };
+    if (submit_mod.Input.of(req.get("body"))) |i| if (i == .envelope) return .{ .ok = .{ .beef = i, .requested = requested } };
     var body = req.getBytes("body") orelse "";
     if (body.len == 0) return .{ .refused = try failure(a, 400, "Missing or empty BEEF body") };
     var off: ?[]const u8 = null;
@@ -422,9 +424,16 @@ pub fn httpAgain(a: Allocator, caller: calls.Caller, st: *State, in: Value, sub:
 /// The subject of the request's BEEF.
 fn httpSubject(a: Allocator, st: *State, sub: HttpSubmit) ![32]u8 {
     return switch (sub.beef) {
-        .record => |rc| c.record.subjectOf(try st.store.getValue(a, rc)) orelse error.BadBeef,
+        .envelope => |e| try envelopeSubject(a, st.store, e),
         .bytes => |b| (try c.beef.parse(a, b)).subject() orelse error.BadBeef,
     };
+}
+
+/// The subject of the door's envelope (shruggr/skein#146): the envelope's, else the pointer
+/// record's last transaction (skein-sdk `record.subjectOf`).
+fn envelopeSubject(a: Allocator, s: c.store.Store, envelope: Value) ![32]u8 {
+    const e = c.record.envelopeOf(envelope) orelse return error.BadBeef;
+    return c.record.subjectOf(e, try s.getValue(a, e.beef)) orelse error.BadBeef;
 }
 
 /// In progress in a thread (its pending record's): wait on it; no thread named → undecided.
@@ -501,27 +510,38 @@ pub fn submitBox(a: Allocator, app: []const u8) ![]const u8 {
     return std.fmt.allocPrint(a, "{s}/{s}", .{ app, submit_box });
 }
 
-/// The same submit, arriving as a GossipSub message on a `libp2p:<topic>` route (#57): the message's
-/// topic is the one requested, its body the BEEF (no off-chain values), and the route's half runs
-/// unchanged. The answer is the libp2p handler contract (skein docs/MESSAGES.md, "libp2p"): accept,
-/// admitting the submit event in box `<app>` (routed after the message's own `p2p` event: the app's
-/// row from `event` launches the same engine thread a submission launches), so the verdict goes
-/// back at once — GossipSub's validator waits on nothing further; ignore — no forward, no penalty —
-/// when nothing is new or the BEEF is refused (a refusal may be this instance's missing headers, not
-/// the publisher's fault).
+/// A GossipSub message on `libp2p:<topic>` (#57; one mesh, two kinds since 0.12.0, David
+/// 2026-10-09; gossip.zig): its dag-cbor body's `kind` says which.
 ///
-/// The topic is the message's; it is served when the configuration names it: declared
-/// (`config.overlay.topics`) or registered (`<app>/topics`, config.zig adds them), as for
-/// `peerAdmit` and `peerProof`.
+///   submit  {kind: "submit", beef: bytes}: the same submit, the message's topic the one requested,
+///           its `beef` the BEEF (no off-chain values; inside the body, so the engine decodes and
+///           checks it itself, submit.zig `Input.bytes`), and the route's half runs unchanged. The
+///           answer is the libp2p handler contract (skein docs/MESSAGES.md, "libp2p"): accept,
+///           admitting the submit event in box `<app>` (routed after the message's own `p2p` event:
+///           the app's row from `event` launches the same engine thread a submission launches), so
+///           the verdict goes back at once — GossipSub's validator waits on nothing further;
+///           ignore — no forward, no penalty — when nothing is new or the BEEF is refused (a
+///           refusal may be this instance's missing headers, not the publisher's fault).
+///   admit   {kind: "admit", txid, topics}: a peer's verdict, recorded as `peerAdmit` records one
+///           arriving on `<topic>-admit` (before 0.12.0).
+///
+/// Anything else (not dag-cbor, no or another kind) is ignored. The topic is the message's; it is
+/// served when the configuration names it: declared (`config.overlay.topics`) or registered
+/// (`<app>/topics`, config.zig adds them), as for `peerProof`.
 fn gossip(a: Allocator, in: Value, req: Value) !Value {
     const t = req.getText("topic") orelse return verdictOf(a, "ignore", "not a topic message");
-    // shruggr/skein#121: the door's pointer record (the row's `filter: "beef"`), or the bytes as received.
-    const beef: submit_mod.Input = if (req.getCid("body")) |rc| .{ .record = rc } else .{ .bytes = req.getBytes("body") orelse "" };
-    if (beef == .bytes and beef.bytes.len == 0) return verdictOf(a, "ignore", "Missing or empty BEEF body");
+    const body = req.getBytes("body") orelse "";
+    if (body.len == 0) return verdictOf(a, "ignore", "Missing or empty body");
+    const m = gossip_mod.messageOf(a, body) catch return verdictOf(a, "ignore", "not a submit or admit message (dag-cbor {kind: \"submit\" | \"admit\", …})");
     const topics = try served(a, &.{t}, try configMap(a, in, "overlayTopics"));
     if (topics.len == 0) return verdictOf(a, "ignore", "the topic is not served here");
-    var st = try load(a, in);
-    return libp2pRouted(a, in, &st, beef, topics, try sourceOf(a, req, t), req);
+    switch (m) {
+        .admit => |b| return admitOf(a, in, req, t, b),
+        .submit => |b| {
+            var st = try load(a, in);
+            return libp2pRouted(a, in, &st, .{ .bytes = b }, topics, try sourceOf(a, req, t), req);
+        },
+    }
 }
 
 /// The route's half for a libp2p submission (a topic message, a stream frame) → its verdict.
@@ -548,12 +568,13 @@ fn libp2pRouted(a: Allocator, in: Value, st: *State, beef: submit_mod.Input, top
 /// it requested (`wantedTopics`); it may itself pause and want. Not wanted here: ignore. The answer
 /// is the route's verdict as for a topic message (no reply frame: no `body`).
 fn stream(a: Allocator, in: Value, req: Value) !Value {
-    const beef: submit_mod.Input = if (req.getCid("body")) |rc| .{ .record = rc } else .{ .bytes = req.getBytes("body") orelse "" };
+    // shruggr/skein#146: the door's envelope (the route's `kernel.beef`), or the bytes as received.
+    const beef: submit_mod.Input = submit_mod.Input.of(req.get("body")) orelse .{ .bytes = "" };
     if (beef == .bytes and beef.bytes.len == 0) return verdictOf(a, "ignore", "Missing or empty BEEF body");
     const subject = switch (beef) {
-        .record => |rc| c.record.subjectOf(vm.store().getValue(a, rc) catch return verdictOf(a, "ignore", "Invalid BEEF")),
-        .bytes => |b| (c.beef.parse(a, b) catch return verdictOf(a, "ignore", "Invalid BEEF")).subject(),
-    } orelse return verdictOf(a, "ignore", "Invalid BEEF: no subject");
+        .envelope => |e| envelopeSubject(a, vm.store(), e) catch return verdictOf(a, "ignore", "Invalid BEEF"),
+        .bytes => |b| (c.beef.parse(a, b) catch return verdictOf(a, "ignore", "Invalid BEEF")).subject() orelse return verdictOf(a, "ignore", "Invalid BEEF: no subject"),
+    };
     var st = try load(a, in);
     const topics = try served(a, try submit_mod.wantedTopics(a, &st, subject), try configMap(a, in, "overlayTopics"));
     if (topics.len == 0) return verdictOf(a, "ignore", "not wanted here");
@@ -577,17 +598,23 @@ fn sourceOf(a: Allocator, req: Value, topic: ?[]const u8) !Value {
     return .{ .map = es.items };
 }
 
-/// A peer's verdict on `libp2p:<topic>-admit` (#74): {txid, topics: {<topic>: {outputsToAdmit,
-/// coinsToRetain}}}. Never admits anything: accept admits a `peer-admit` event (box `<app>`) the
-/// engine records under the head `<app>/gossip` (gossip.zig), a read for a lookup or a UI. Ignore
-/// when the topic is not served here or the body is not that shape.
+/// A peer's verdict on `libp2p:<topic>-admit` (#74; before 0.12.0 — now an `admit` message on
+/// `<topic>`, `gossip`): {txid, topics: {<topic>: {outputsToAdmit, coinsToRetain}}}. Read as one on
+/// `<topic>` is (`admitOf`). Ignore when not an `-admit` topic.
 fn peerAdmit(a: Allocator, in: Value, req: Value) !Value {
     if (!eql(u8, req.getText("transport") orelse "", "libp2p")) return failure(a, 400, "peerAdmit takes libp2p topic messages");
     const gt = req.getText("topic") orelse return verdictOf(a, "ignore", "not a topic message");
     const t = gossip_mod.baseOf(gt, gossip_mod.admit_suffix) orelse return verdictOf(a, "ignore", "not an -admit topic");
+    return admitOf(a, in, req, t, req.getBytes("body") orelse "");
+}
+
+/// A peer's verdict for `t` (#74). Never admits anything: accept admits a `peer-admit` event (box
+/// `<app>`) the engine records under the head `<app>/gossip` (gossip.zig), a read for a lookup or
+/// a UI. Ignore when the topic is not served here or the body is not that shape.
+fn admitOf(a: Allocator, in: Value, req: Value, t: []const u8, body: []const u8) !Value {
     if (!(try configMap(a, in, "overlayTopics")).contains(t)) return verdictOf(a, "ignore", "the topic is not served here");
     const from = req.getBytes("key") orelse return verdictOf(a, "ignore", "no publisher key");
-    const m = gossip_mod.parseAdmit(a, req.getBytes("body") orelse "", t) catch |e| return verdictOf(a, "ignore", @errorName(e));
+    const m = gossip_mod.parseAdmit(a, body, t) catch |e| return verdictOf(a, "ignore", @errorName(e));
     return accepting(a, try gossip_mod.peerAdmitRecord(a, t, m, from, req.getBytes("from")), calls.appOf(in));
 }
 

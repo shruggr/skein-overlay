@@ -28,31 +28,32 @@
 //!                             instance itself (0.9.1): a POST /submit request waiting on a paused
 //!                             submission — one of its waiters, answered when the pause ends, or
 //!                             answered at once (submit.zig `waitOn`).
-//!   a peer's admit            the `peer-admit` event the `-admit` route admits (box `<app>`):
-//!                             recorded under `<app>/gossip`.
+//!   a peer's admit            the `peer-admit` event an `admit` message on `<topic>` (or one on a
+//!                             `-admit` route, before 0.12.0) admits (box `<app>`): recorded under
+//!                             `<app>/gossip`.
 //!   register / deregister     a message in the box `<app>/register` only (one box per function
 //!                             class, shruggr/skein#128, 0.7.5; refused `bad-args` elsewhere),
 //!                             {fn: "register", args: {topic, program, seed?}} or {fn: "deregister",
 //!                             args: {topic}}, from whoever that row admits (topics.zig,
 //!                             shruggr/skein#120): the registered set under `<app>/topics`, the
-//!                             subscribe / unsubscribe events, and with config.overlay.market /
-//!                             .validator set, liveness / beacon (unliveness / unbeacon) on
-//!                             `<topic>-live` (0.9.0); answered {topic, active}; with
+//!                             subscribe / unsubscribe events, and liveness / beacon (unliveness /
+//!                             unbeacon) on `<topic>-live` (0.9.0; always, 0.12.0: the beat body
+//!                             the topic's view digest); answered {topic, active}; with
 //!                             `seed` (0.7.8), the held seeds judged under the topic
 //!                             (submit.zig `seed`), answered {…, seeded, missing, untaken?}.
 //!   registerLookup /          a message in the box `<app>/register` only, as register (0.11.0, David
 //!   deregisterLookup          2026-10-08: "separate registration calls"): {fn: "registerLookup", args:
 //!                             {service, program, topics?}} or {fn: "deregisterLookup", args:
 //!                             {service}} (lookups.zig): the registered set under `<app>/lookups`,
-//!                             served as config.overlay.lookups is; no events; answered
-//!                             {service, active}.
-//!   market / validator        the owner's switch of a role (0.9.2, David 2026-10-07), in the box
-//!                             `<app>/register` only: {fn: "market", args: {window} | {off: true}}
-//!                             or {fn: "validator", args: {every} | {off: true}}; kept in the
-//!                             record `<app>/topics` beside the set, over config.overlay.market /
-//!                             .validator from then on; liveness / beacon (on) or unliveness /
-//!                             unbeacon (off) for every registered topic; answered
-//!                             {market?: {window}, validator?: {every}}, the roles in effect.
+//!                             served as config.overlay.lookups is; a beacon on `<service>-live`
+//!                             (0.12.0: its body the lookup program's fn "beat"), unbeacon on
+//!                             deregister; answered {service, active}.
+//!
+//! The market / validator switch (0.9.2) is gone (0.12.0, David 2026-10-09: "every skein is
+//! marketplace AND validator from install, always"): a message {fn: "market" | "validator"} is
+//! no function of the engine. A step that changes a registered topic's view digest (an admission,
+//! a rejection, a seed) re-declares its beacon with the new body, and one whose lookup hooks
+//! answered new beat bodies re-declares those services' beacons (topics.zig `beatEvents`).
 //!
 //! The state is the overlay's own, under its app's name (state.zig: `<app>/state`), over the
 //! chain app's (`chain/state`), read only. The topics and lookup services are the app's (#72,
@@ -66,15 +67,13 @@
 //! Every step keeps its result record and prints its CID:
 //!
 //!   {kind: "overlay-result", op: "submit" | "answer" | "watch" | "watched", txid, ingest?, heard?,
-//!    admitted?, steak?, unapplied?, watch?, awaiting?, published?, answers?, refs, state}
+//!    admitted?, steak?, unapplied?, watch?, awaiting?, published?, beats?, answers?, refs, state}
 //!   {kind: "overlay-result", op: "received" | "resume", txid?, outcome, …, answers?, state}
 //!   {kind: "overlay-result", op: "peer-admit", topic, txid, record, state}
 //!   {kind: "overlay-result", op: "register" | "deregister", topic, active, changed, topics?,
 //!    seeded?, missing?, untaken?, admissions?, watches?, state?}
 //!   {kind: "overlay-result", op: "registerLookup" | "deregisterLookup", service, active, changed,
 //!    lookups?}
-//!   {kind: "overlay-result", op: "market" | "validator", market?, validator?, changed, events,
-//!    topics?}
 //!   {kind: "overlay-result", op, error}                         refused
 const std = @import("std");
 const c = @import("chain");
@@ -153,9 +152,44 @@ fn emitWants(a: Allocator, st: *@import("state.zig").State) !usize {
     return evs.len;
 }
 
+/// The beacons the step re-declares (0.12.0, topics.zig `beatEvents`): each registered topic whose
+/// view digest it changed, each registered lookup service its hooks gave a new body; emitted. → how
+/// many.
+fn emitBeats(a: Allocator, step: Value, st: *@import("state.zig").State) !usize {
+    const changes = try st.viewChanges();
+    if (changes.len == 0 and st.lookup_beats.items.len == 0) return 0;
+    const s = vm.store();
+    const app = calls.appOf(step);
+    const troot = try vm.head(a, try topics.headName(a, app));
+    const tl = try topics.entriesOf(a, if (troot) |r| try s.getValue(a, r) else null);
+    const services = try lookupNames(a, step);
+    const roles = config.rolesOf(a, step) catch return 0; // a bad configuration: registering is refused
+    const evs = try topics.beatEvents(a, roles.validator, tl, services, changes, st.lookup_beats.items);
+    for (evs) |e| _ = try vm.emitEvent(a, e);
+    return evs.len;
+}
+
+/// The registered lookup services' names (`<app>/lookups`).
+fn lookupNames(a: Allocator, step: Value) ![]const []const u8 {
+    const root = try vm.head(a, try lookups.headName(a, calls.appOf(step)));
+    const ll = try lookups.entriesOf(a, if (root) |r| try vm.store().getValue(a, r) else null);
+    const out = try a.alloc([]const u8, ll.len);
+    for (ll, out) |l, *o| o.* = l.service;
+    return out;
+}
+
 /// The answers to submitters this step made, for its result record (shruggr/skein#112).
 fn answersField(fields: *std.ArrayList(cbor.Entry), a: Allocator) !void {
     if (ev_.answers.items.len > 0) try fields.append(a, .{ .key = "answers", .value = .{ .array = ev_.answers.items } });
+}
+
+/// A topic's beat body as the state holds its view now (0.12.0, topics.zig `beatBody`): the
+/// register's `topic` (none: the empty view).
+fn topicBeat(a: Allocator, step: Value, fargs: Value) ![]const u8 {
+    const t = fargs.getText("topic") orelse return topics.beatBody(a, .{});
+    if (t.len == 0) return topics.beatBody(a, .{});
+    var loaded = try ev_.load(a, step);
+    return topics.beatBody(a, try loaded.st.view(t));
 }
 
 /// `register {topic, program}` / `deregister {topic}` (topics.zig, shruggr/skein#120): a message in
@@ -170,18 +204,17 @@ fn registration(a: Allocator, step: Value, args: Value, body: Value, func: []con
     const root = try vm.head(a, head);
     const rec: ?Value = if (root) |r| try s.getValue(a, r) else null;
     const list = try topics.entriesOf(a, rec);
-    const switches = try topics.switchesOf(rec);
     const fargs: Value = body.get("args") orelse .{ .map = &.{} };
-    // The roles in effect: the owner's switches (0.9.2) over config.overlay.market / .validator.
-    const roles: ?topics.Roles = if (config.rolesOf(a, step)) |cfg| topics.effective(switches, cfg) else |_| null; // error.BadRoles only
+    // The roles: always a market and a validator (0.12.0), at config.overlay.market / .validator's ms or the defaults.
+    const roles: ?topics.Roles = config.rolesOf(a, step) catch null; // error.BadRoles only
     const change: topics.Change = if (!topics.mayRegister(args, calls.appOf(step)))
         .{ .refused = try topics.notHere(a, func, args, calls.appOf(step)) }
     else if (roles == null)
         .{ .refused = try std.fmt.allocPrint(a, "{s}: the configuration's roles are config.overlay.market {{window: <ms>}} and config.overlay.validator {{every: <ms>}}, each from 1000 ms to a day", .{func}) }
     else if (eql(u8, func, "register"))
-        try topics.withRoles(a, try topics.register(a, list, fargs, step.get("programs") orelse return error.BadConfig, try config.selfRole(a, s, step, null)), true, roles.?)
+        try topics.withRoles(a, try topics.register(a, list, fargs, step.get("programs") orelse return error.BadConfig, try config.selfRole(a, s, step, null)), true, roles.?, try topicBeat(a, step, fargs))
     else
-        try topics.withRoles(a, try topics.deregister(a, list, fargs), false, roles.?);
+        try topics.withRoles(a, try topics.deregister(a, list, fargs), false, roles.?, "");
     const message = args.getCid("message") orelse return error.BadInput;
     var ans: std.ArrayList(cbor.Entry) = .empty;
     try ans.appendSlice(a, &.{
@@ -200,13 +233,13 @@ fn registration(a: Allocator, step: Value, args: Value, body: Value, func: []con
         },
         .done => |d| {
             if (d.list) |l| {
-                const rc = try s.putValue(a, try topics.recordWith(a, l, switches));
+                const rc = try s.putValue(a, try topics.recordOf(a, l));
                 try vm.advance(head, rc);
                 try fields.append(a, .{ .key = "topics", .value = .{ .cid = rc } });
             }
             for (d.events) |ev| _ = try vm.emitEvent(a, ev);
             var answer = d.answer;
-            if (d.seed) |seeds| answer = try seeding(a, step, d.list orelse list, answer, seeds, &fields);
+            if (d.seed) |seeds| answer = try seeding(a, step, d.list orelse list, answer, seeds, &fields, roles.?);
             try ans.append(a, .{ .key = "result", .value = answer });
             try fields.appendSlice(a, &.{
                 .{ .key = "topic", .value = d.answer.get("topic").? },
@@ -223,17 +256,21 @@ fn registration(a: Allocator, step: Value, args: Value, body: Value, func: []con
 
 /// `registerLookup {service, program, topics?}` / `deregisterLookup {service}` (0.11.0, lookups.zig):
 /// a message in the box `<app>/register`, as register (refused `bad-args` elsewhere). The set written
-/// under `<app>/lookups` when it changes; no events; the answer `{fn, request, replyTo, result:
-/// {service, active} | error: {code, message}}` to the sender when a message can reach it. A refusal
-/// writes nothing.
+/// under `<app>/lookups` when it changes, and (0.12.0) the service's beacon on `<service>-live`
+/// declared (its body the program's fn "beat", calls.zig `lookupBeat`) or ended; the answer `{fn,
+/// request, replyTo, result: {service, active} | error: {code, message}}` to the sender when a
+/// message can reach it. A refusal writes and emits nothing.
 fn lookupRegistration(a: Allocator, step: Value, args: Value, body: Value, func: []const u8) !void {
     const s = vm.store();
     const head = try lookups.headName(a, calls.appOf(step));
     const root = try vm.head(a, head);
     const list = try lookups.entriesOf(a, if (root) |r| try s.getValue(a, r) else null);
     const fargs: Value = body.get("args") orelse .{ .map = &.{} };
+    const roles: ?topics.Roles = config.rolesOf(a, step) catch null; // error.BadRoles only
     const change: lookups.Change = if (!topics.mayRegister(args, calls.appOf(step)))
         .{ .refused = try topics.notHere(a, func, args, calls.appOf(step)) }
+    else if (roles == null)
+        .{ .refused = try std.fmt.allocPrint(a, "{s}: the configuration's roles are config.overlay.market {{window: <ms>}} and config.overlay.validator {{every: <ms>}}, each from 1000 ms to a day", .{func}) }
     else if (eql(u8, func, "registerLookup"))
         try lookups.register(a, list, fargs, step.get("programs") orelse return error.BadConfig)
     else
@@ -259,6 +296,12 @@ fn lookupRegistration(a: Allocator, step: Value, args: Value, body: Value, func:
                 const rc = try s.putValue(a, try lookups.recordOf(a, l));
                 try vm.advance(head, rc);
                 try fields.append(a, .{ .key = "lookups", .value = .{ .cid = rc } });
+                const service = d.answer.getText("service").?;
+                const ev = if (eql(u8, func, "registerLookup"))
+                    try topics.beaconEvent(a, service, roles.?.validator, try calls.lookupBeat(a, ev_.caller(), try config.withLookups(a, step, l), service, fargs.getText("program") orelse ""))
+                else
+                    try topics.unbeaconEvent(a, service);
+                _ = try vm.emitEvent(a, ev);
             }
             try ans.append(a, .{ .key = "result", .value = d.answer });
             try fields.appendSlice(a, &.{
@@ -274,70 +317,11 @@ fn lookupRegistration(a: Allocator, step: Value, args: Value, body: Value, func:
     _ = try vm.finish(a, s, try resultRecord(a, func, fields.items));
 }
 
-/// `market {window} | {off: true}` / `validator {every} | {off: true}` (0.9.2, David 2026-10-07: "this
-/// should be a setting that the user is configuring"): the owner's switch of a role, in the box
-/// `<app>/register` only, like register. The switch kept in the set's record `<app>/topics` beside
-/// `topics` (topics.zig `recordWith`), with precedence over config.overlay.market / .validator from
-/// then on; the role's events for every topic registered (topics.zig `switchRole`); the answer
-/// `{market?: {window}, validator?: {every}}`, the roles in effect. A refusal writes and emits nothing.
-fn switching(a: Allocator, step: Value, args: Value, body: Value, role: topics.Role) !void {
-    const s = vm.store();
-    const func = @tagName(role);
-    const head = try topics.headName(a, calls.appOf(step));
-    const root = try vm.head(a, head);
-    const rec: ?Value = if (root) |r| try s.getValue(a, r) else null;
-    const list = try topics.entriesOf(a, rec);
-    const switches = try topics.switchesOf(rec);
-    const fargs: Value = body.get("args") orelse .{ .map = &.{} };
-    const cfg: ?topics.Roles = config.rolesOf(a, step) catch null; // error.BadRoles only
-    const change: topics.SwitchChange = if (!topics.mayRegister(args, calls.appOf(step)))
-        .{ .refused = try topics.notHere(a, func, args, calls.appOf(step)) }
-    else if (cfg == null)
-        .{ .refused = try std.fmt.allocPrint(a, "{s}: the configuration's roles are config.overlay.market {{window: <ms>}} and config.overlay.validator {{every: <ms>}}, each from 1000 ms to a day", .{func}) }
-    else
-        try topics.switchRole(a, list, switches, cfg.?, role, fargs);
-    const message = args.getCid("message") orelse return error.BadInput;
-    var ans: std.ArrayList(cbor.Entry) = .empty;
-    try ans.appendSlice(a, &.{
-        .{ .key = "fn", .value = .{ .text = func } },
-        .{ .key = "request", .value = .{ .cid = message } },
-        .{ .key = "replyTo", .value = .{ .cid = message } },
-    });
-    var fields: std.ArrayList(cbor.Entry) = .empty;
-    switch (change) {
-        .refused => |why| {
-            try ans.append(a, .{ .key = "error", .value = .{ .map = try a.dupe(cbor.Entry, &.{
-                .{ .key = "code", .value = .{ .text = "bad-args" } },
-                .{ .key = "message", .value = .{ .text = why } },
-            }) } });
-            try fields.append(a, .{ .key = "error", .value = .{ .text = why } });
-        },
-        .done => |d| {
-            if (d.switches) |sw| {
-                const rc = try s.putValue(a, try topics.recordWith(a, list, sw));
-                try vm.advance(head, rc);
-                try fields.append(a, .{ .key = "topics", .value = .{ .cid = rc } });
-            }
-            for (d.events) |ev| _ = try vm.emitEvent(a, ev);
-            try ans.append(a, .{ .key = "result", .value = d.answer });
-            try fields.appendSlice(a, d.answer.map);
-            try fields.appendSlice(a, &.{
-                .{ .key = "changed", .value = .{ .boolean = d.switches != null } },
-                .{ .key = "events", .value = .{ .uint = d.events.len } },
-            });
-        },
-    }
-    if (args.getBytes("sender")) |sender| if (try ev_.reaches(a, step, sender)) {
-        _ = try vm.send(a, sender, topics.answerBox(args, calls.appOf(step)), .{ .map = ans.items });
-    };
-    _ = try vm.finish(a, s, try resultRecord(a, func, fields.items));
-}
-
 /// A register's `seed` (0.7.8, submit.zig `seed`): each seed the chain state holds judged under the
 /// topic just registered, with the configuration as it is with the set `list` (the one this step
 /// wrote); the records kept, the state saved. → the answer with `seeded`, `missing` (and `untaken`
 /// when a held seed is taken by nothing); the result record gets them and `state`.
-fn seeding(a: Allocator, step: Value, list: []const topics.Entry, answer: Value, seeds: []const [32]u8, fields: *std.ArrayList(cbor.Entry)) !Value {
+fn seeding(a: Allocator, step: Value, list: []const topics.Entry, answer: Value, seeds: []const [32]u8, fields: *std.ArrayList(cbor.Entry), roles: topics.Roles) !Value {
     const topic = answer.getText("topic").?;
     const in = try config.withTopics(a, step, list);
     var loaded = try ev_.load(a, in);
@@ -345,6 +329,10 @@ fn seeding(a: Allocator, step: Value, list: []const topics.Entry, answer: Value,
     const cx = submit.Ctx{ .a = a, .caller = ev_.caller(), .wire = try ev_.wire(in), .st = &loaded.st, .in = in };
     const sd = try submit.seed(cx, topic, seeds);
     for (sd.records) |r| try vm.keep(r);
+    // The view the seeds changed: the beacons re-declared (0.12.0), over the set this step wrote.
+    const beats = try topics.beatEvents(a, roles.validator, list, try lookupNames(a, step), try loaded.st.viewChanges(), loaded.st.lookup_beats.items);
+    for (beats) |e| _ = try vm.emitEvent(a, e);
+    if (beats.len > 0) try fields.append(a, .{ .key = "beats", .value = .{ .uint = beats.len } });
     const new_state = try loaded.st.save();
     if (loaded.head == null or !eql(u8, loaded.head.?, new_state)) try vm.advance(try ev_.stateHead(a, in), new_state);
     var out: std.ArrayList(cbor.Entry) = .empty;
@@ -402,8 +390,6 @@ fn run(a: Allocator) anyerror!void {
             .deregister => return registration(a, step, args, body, "deregister"),
             .registerLookup => return lookupRegistration(a, step, args, body, "registerLookup"),
             .deregisterLookup => return lookupRegistration(a, step, args, body, "deregisterLookup"),
-            .market => return switching(a, step, args, body, .market),
-            .validator => return switching(a, step, args, body, .validator),
             .other => {},
         }
         // Any other message in the app's box: from the instance itself (its own watch, a resume), nothing else.
@@ -498,6 +484,8 @@ fn run(a: Allocator) anyerror!void {
     }
     const wanted = try emitWants(a, st);
     if (wanted > 0 and !eql(u8, op, "submit")) try fields.append(a, .{ .key = "wanted", .value = .{ .uint = wanted } });
+    const beats = try emitBeats(a, step, st);
+    if (beats > 0) try fields.append(a, .{ .key = "beats", .value = .{ .uint = beats } });
     try answersField(&fields, a);
 
     const new_state = try st.save();
@@ -632,6 +620,8 @@ fn settled(a: Allocator, step: Value, loaded: anytype, outcome: submit.Resumed, 
     }
     const wanted = try emitWants(a, &loaded.st);
     if (wanted > 0) try fields.append(a, .{ .key = "wanted", .value = .{ .uint = wanted } });
+    const beats = try emitBeats(a, step, &loaded.st);
+    if (beats > 0) try fields.append(a, .{ .key = "beats", .value = .{ .uint = beats } });
     try answersField(fields, a);
     const new_state = try loaded.st.save();
     if (loaded.head == null or !eql(u8, loaded.head.?, new_state)) try vm.advance(try ev_.stateHead(a, step), new_state);

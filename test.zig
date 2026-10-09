@@ -225,6 +225,9 @@ const Instance = struct {
     begun: submit.Begun = .{},
     /// The last step's want / unwant events (state.zig `wantEvents`, shruggr/skein#112).
     events: []const Value = &.{},
+    /// The view changes (0.12.0) and lookup beats of the last thread or watch step.
+    view_changes: []const state.ViewChange = &.{},
+    lookup_beats: []const state.LookupBeat = &.{},
     /// The peers' admits (`<app>/gossip`), when a test sets them.
     gossip_: ?*gossip.State = null,
 
@@ -310,9 +313,10 @@ const Instance = struct {
     fn routeFrom(self: *Instance, bytes: []const u8, source: ?Value) !submit.Routed {
         return self.routeWith(.{ .bytes = bytes }, source);
     }
-    /// The kernel's door wrote the BEEF's pointer record (skein #121): the handler gets its CID.
-    fn routeRecord(self: *Instance, rc: []const u8) !submit.Routed {
-        return self.routeWith(.{ .record = rc }, null);
+    /// The kernel's door wrote the BEEF's pointer record and put its envelope where the bytes were
+    /// (skein #121, #146): the handler gets the envelope.
+    fn routeEnvelope(self: *Instance, env: Value) !submit.Routed {
+        return self.routeWith(.{ .envelope = env }, null);
     }
     fn routeWith(self: *Instance, input: submit.Input, source: ?Value) !submit.Routed {
         var ovl = Overlay{ .inner = self.ms.store(), .arena = self.a };
@@ -356,6 +360,8 @@ const Instance = struct {
         var st = try self.load();
         const done = try submit.answered(self.cx(&st, true), t.ev, t.ingest, ans);
         self.events = try st.wantEvents();
+        self.view_changes = try st.viewChanges();
+        self.lookup_beats = st.lookup_beats.items;
         self.ov_root = try st.save();
         return done;
     }
@@ -376,6 +382,8 @@ const Instance = struct {
     fn watchedOf(self: *Instance, w: submit.Watch, ans: submit.Answer) !submit.Stepped {
         var st = try self.load();
         const done = try submit.watched(self.cx(&st, true), w, ans);
+        self.view_changes = try st.viewChanges();
+        self.lookup_beats = st.lookup_beats.items;
         self.ov_root = try st.save();
         return done;
     }
@@ -598,6 +606,8 @@ test "the submission flow: parse once, persist only on admission, a lookup servi
         const in_topic = try st.inTopic("tm_demo", true);
         try std.testing.expectEqual(@as(usize, 1), in_topic.len);
         try std.testing.expect(!in_topic[0].spent);
+        // The view digest (0.12.0): T1's token folded in.
+        try std.testing.expect((try st.view("tm_demo")).eql(viewOf(&.{.{ t1.txid, 0 }})));
     }
 
     // ------------------------------------------------ T2 spends the token into a new one: `spent`
@@ -615,6 +625,11 @@ test "the submission flow: parse once, persist only on admission, a lookup servi
         try std.testing.expectEqualSlices(u8, &t2.txid, &sp.txid);
         try std.testing.expect(sp.retained and sp.judged);
         try std.testing.expectEqual(@as(usize, 1), (try st.inTopic("tm_demo", false)).len);
+        // The view digest: T1's token out (spent; retained, but spent), T2's in; the step's change.
+        try std.testing.expect((try st.view("tm_demo")).eql(viewOf(&.{.{ t2.txid, 0 }})));
+        try std.testing.expectEqual(@as(usize, 1), inst.view_changes.len);
+        try std.testing.expectEqualStrings("tm_demo", inst.view_changes[0].topic);
+        try std.testing.expect(inst.view_changes[0].before.eql(viewOf(&.{.{ t1.txid, 0 }})));
     }
 
     // ------------------------------------------------ T2 rejected later (its watch hears it): `rejected`, T1's token live again
@@ -632,6 +647,9 @@ test "the submission flow: parse once, persist only on admission, a lookup servi
         try std.testing.expectEqualSlices(u8, &t1.txid, &(try subjectOf(a, live[0])));
         var st = try inst.load();
         try std.testing.expect((try st.spender("tm_demo", t1.txid, 0)) == null);
+        // The view digest: T2's token out, T1's back in — the same view as before T2.
+        try std.testing.expect((try st.view("tm_demo")).eql(viewOf(&.{.{ t1.txid, 0 }})));
+        try std.testing.expectEqual(@as(usize, 1), inst.view_changes.len);
         // Resubmitting it admits nothing (200, empty STEAK).
         try std.testing.expectEqualStrings("TransactionRejected", (try inst.route(try atomic(a, t2))).nothing);
     }
@@ -645,7 +663,19 @@ test "the submission flow: parse once, persist only on admission, a lookup servi
         try std.testing.expectEqualSlices(u32, &.{0}, done.applied[0].coins_removed);
         try std.testing.expectEqual(@as(usize, 2), inst.count("spent"));
         try std.testing.expectEqual(@as(usize, 0), try inst.lookTopic());
+        // The view digest: empty again — count 0, the digest 32 zero bytes.
+        var st = try inst.load();
+        const v = try st.view("tm_demo");
+        try std.testing.expectEqual(@as(u64, 0), v.count);
+        try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 32), &v.digest);
     }
+}
+
+/// The view (0.12.0) of a topic holding exactly `ops` (txid, vout), folded in that order.
+fn viewOf(ops: []const struct { [32]u8, u32 }) state.View {
+    var v: state.View = .{};
+    for (ops) |o| v.fold(o[0], o[1], true);
+    return v;
 }
 
 test "the gate (#73, the chain app's answer): admitted on the first of accepted or proven; rejected, failed, a later rejection, proven at once" {
@@ -676,11 +706,15 @@ test "the gate (#73, the chain app's answer): admitted on the first of accepted 
         const ok = try inst.answer(ta.txid, .accepted);
         try std.testing.expect(ok.admitted);
         try std.testing.expectEqual(@as(usize, 1), try inst.lookTopic());
-        // Gossip: the BEEF on tm_demo, the verdict on tm_demo-admit; no proof yet.
+        // Gossip, both on tm_demo (0.12.0: one mesh, two kinds): the BEEF as a `submit` message, then
+        // the verdict as an `admit` message; no proof yet.
         try std.testing.expectEqual(@as(usize, 2), ok.published);
         try std.testing.expectEqualStrings("tm_demo", inst.out_.sent.items[0].topic);
-        try std.testing.expectEqualSlices(u8, bytes, inst.out_.sent.items[0].body);
-        try std.testing.expectEqualStrings("tm_demo-admit", inst.out_.sent.items[1].topic);
+        try std.testing.expectEqualSlices(u8, try gossip.submitBody(a, bytes), inst.out_.sent.items[0].body);
+        try std.testing.expectEqualSlices(u8, bytes, (try gossip.messageOf(a, inst.out_.sent.items[0].body)).submit);
+        try std.testing.expectEqualStrings("tm_demo", inst.out_.sent.items[1].topic);
+        try std.testing.expectEqualSlices(u8, try gossip.admitBody(a, ta.txid, "tm_demo", &.{0}, &.{}), inst.out_.sent.items[1].body);
+        try std.testing.expect((try gossip.messageOf(a, inst.out_.sent.items[1].body)) == .admit);
         // Its watch: the chain state says unproven — it awaits; accepted again — still awaits; the proof — `-proof`.
         try std.testing.expect(!(try inst.watchStart(ta.txid)).done);
         try std.testing.expect(!(try inst.watched(ta.txid, .accepted)).done);
@@ -748,7 +782,8 @@ test "the gate (#73, the chain app's answer): admitted on the first of accepted 
         const done = try inst.answer(td.txid, .{ .proven = .{ .via = "libp2p:tm_demo-proof" } });
         try std.testing.expect(done.admitted);
         try std.testing.expectEqual(pubs + 2, inst.out_.sent.items.len);
-        try std.testing.expectEqualStrings("tm_demo-admit", inst.out_.sent.items[pubs + 1].topic);
+        try std.testing.expectEqualStrings("tm_demo", inst.out_.sent.items[pubs + 1].topic);
+        try std.testing.expect((try gossip.messageOf(a, inst.out_.sent.items[pubs + 1].body)) == .admit);
     }
 
     // ------------------------------------------------ (e) an error answer: nothing admitted, no longer pending; a later watch on a rejection unwinds
@@ -861,7 +896,7 @@ fn withDefault(a: Allocator, in: Value, key: []const u8, value: []const u8) !Val
     return .{ .map = es };
 }
 
-test "gossip (#74): the three topics' shapes; what an admission publishes; a peer's proof checked against the chain state; a late duplicate judged once" {
+test "gossip (#74; 0.12.0): submit and admit two kinds on <topic>, the proof on <topic>-proof — the shapes; what an admission publishes; a peer's proof checked against the chain state; a late duplicate judged once" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -876,8 +911,34 @@ test "gossip (#74): the three topics' shapes; what an admission publishes; a pee
     {
         const txid: [32]u8 = .{0xab} ** 32;
         const ad = try cbor.decode(a, try gossip.admitBody(a, txid, "tm_demo", &.{ 0, 2 }, &.{1}));
-        try std.testing.expectEqual(@as(usize, 2), ad.map.len);
+        try std.testing.expectEqual(@as(usize, 3), ad.map.len);
+        try std.testing.expectEqualStrings("admit", ad.getText("kind").?);
         try std.testing.expectEqualStrings(&hdr.toHex(txid), ad.getText("txid").?);
+        // The submit kind: {kind: "submit", beef: bytes}.
+        const sb = try cbor.decode(a, try gossip.submitBody(a, "\x01\x00\xbe\xefBEEF"));
+        try std.testing.expectEqual(@as(usize, 2), sb.map.len);
+        try std.testing.expectEqualStrings("submit", sb.getText("kind").?);
+        try std.testing.expectEqualStrings("\x01\x00\xbe\xefBEEF", sb.getBytes("beef").?);
+        // One topic, two kinds, told apart by `kind` alone; anything else is no message of it.
+        try std.testing.expectEqualStrings("\x01\x00\xbe\xefBEEF", (try gossip.messageOf(a, try gossip.submitBody(a, "\x01\x00\xbe\xefBEEF"))).submit);
+        const am = try gossip.messageOf(a, try gossip.admitBody(a, txid, "tm_demo", &.{ 0, 2 }, &.{1}));
+        try std.testing.expectEqualSlices(u32, &.{ 0, 2 }, (try gossip.parseAdmit(a, am.admit, "tm_demo")).outputs_to_admit);
+        for ([_][]const u8{
+            "\x01\x00\xbe\xef", // a raw BEEF (the <topic> body before 0.12.0): no kind
+            try cbor.encode(a, try mapOf(a, &.{.{ .key = "kind", .value = .{ .text = "proof" } }})),
+            try cbor.encode(a, try mapOf(a, &.{.{ .key = "kind", .value = .{ .text = "submit" } }})), // no beef
+            try cbor.encode(a, try mapOf(a, &.{ .{ .key = "kind", .value = .{ .text = "submit" } }, .{ .key = "beef", .value = .{ .bytes = "" } } })),
+            try cbor.encode(a, try mapOf(a, &.{.{ .key = "txid", .value = .{ .text = "ab" } }})), // no kind
+        }) |bad| try std.testing.expectError(error.BadMessage, gossip.messageOf(a, bad));
+        // An `-admit` body from before 0.12.0 (no kind) still reads as a verdict where it is routed.
+        const old = try cbor.encode(a, try mapOf(a, &.{
+            .{ .key = "txid", .value = .{ .text = &hdr.toHex(txid) } },
+            .{ .key = "topics", .value = try mapOf(a, &.{.{ .key = "tm_demo", .value = try mapOf(a, &.{
+                .{ .key = "outputsToAdmit", .value = .{ .array = &.{.{ .uint = 1 }} } },
+                .{ .key = "coinsToRetain", .value = .{ .array = &.{} } },
+            }) }}) },
+        }));
+        try std.testing.expectEqualSlices(u32, &.{1}, (try gossip.parseAdmit(a, old, "tm_demo")).outputs_to_admit);
         const e = ad.get("topics").?.get("tm_demo").?;
         try std.testing.expectEqual(@as(usize, 2), e.map.len);
         const back = try gossip.parseAdmit(a, try gossip.admitBody(a, txid, "tm_demo", &.{ 0, 2 }, &.{1}), "tm_demo");
@@ -934,9 +995,9 @@ test "gossip (#74): the three topics' shapes; what an admission publishes; a pee
         _ = try inst.chainStatus(tb.txid, "MINED", good.getBytes("path").?);
         const ok = try inst.answer(tb.txid, .{ .proven = .{ .via = "libp2p:tm_demo-proof" } });
         try std.testing.expect(ok.admitted);
-        // Only `tm_demo-admit`: the submission came by gossip on `tm_demo`, the proof by gossip on `-proof`.
+        // Only the verdict (an `admit` message on `tm_demo`): the submission came by gossip on `tm_demo`, the proof by gossip on `-proof`.
         try std.testing.expectEqual(@as(usize, 1), ok.published);
-        try std.testing.expectEqualStrings("tm_demo-admit", inst.out_.sent.items[inst.out_.sent.items.len - 1].topic);
+        try std.testing.expectEqualStrings("tm_demo", inst.out_.sent.items[inst.out_.sent.items.len - 1].topic);
         try std.testing.expectEqualSlices(u8, try gossip.admitBody(a, tb.txid, "tm_demo", &.{0}, &.{}), inst.out_.sent.items[inst.out_.sent.items.len - 1].body);
         // Now proven in that block: a peer's copy is ignored.
         ch = try inst.chain();
@@ -1123,10 +1184,11 @@ test "the configuration (skein #72, #79): an installed engine's config.overlay f
     try std.testing.expect(!now_topics.contains("tm_demo") and now_topics.contains("tm_two"));
 }
 
-/// The pointer record the kernel's door would write for `wire` (skein kernel-zig/src/beef.zig
-/// `record`), its blocks put: each transaction under its txid, each BUMP's bytes as a raw block,
-/// and every BUMP proving what it holds (the door checked it against chain/state).
-fn pointerOf(a: Allocator, s: Store, wire: []const u8) ![]const u8 {
+/// The envelope the kernel's door would put where `wire` was (skein kernel-zig/src/beef.zig
+/// `envelope`, #146: {form, beef: <pointer record>, subject?, vout?}) beside the pointer record it
+/// writes (`record`, the BEEF alone), its blocks put: each transaction under its txid, each BUMP's
+/// bytes as a raw block, and every BUMP proving what it holds (the door checked it against chain/state).
+fn pointerOf(a: Allocator, s: Store, wire: []const u8) !Value {
     const b = try beef.parse(a, wire);
     const txs = try a.alloc(Value, b.entries.len);
     const marks = try a.alloc(Value, b.entries.len);
@@ -1156,18 +1218,23 @@ fn pointerOf(a: Allocator, s: Store, wire: []const u8) ![]const u8 {
             .{ .key = "proves", .value = .{ .array = proves.items } },
         }) };
     }
-    return s.putValue(a, .{ .map = try a.dupe(cbor.Entry, &.{
+    const rc = try s.putValue(a, .{ .map = try a.dupe(cbor.Entry, &.{
         .{ .key = "kind", .value = .{ .text = "beef" } },
-        .{ .key = "form", .value = .{ .text = if (b.atomic != null) "atomic" else "beef" } },
         .{ .key = "version", .value = .{ .uint = if (b.version == beef.V1) 1 else 2 } },
-        .{ .key = "subject", .value = .{ .cid = try a.dupe(u8, &c.store.hashCid(.tx, b.subject().?)) } },
         .{ .key = "txs", .value = .{ .array = txs } },
         .{ .key = "marks", .value = .{ .array = marks } },
         .{ .key = "bumps", .value = .{ .array = bumps } },
     }) });
+    var es: std.ArrayList(cbor.Entry) = .empty;
+    try es.appendSlice(a, &.{
+        .{ .key = "form", .value = .{ .text = if (b.atomic != null) "atomic" else "beef" } },
+        .{ .key = "beef", .value = .{ .cid = rc } },
+    });
+    if (b.atomic) |t| try es.append(a, .{ .key = "subject", .value = .{ .cid = try a.dupe(u8, &c.store.hashCid(.tx, t)) } });
+    return .{ .map = es.items };
 }
 
-test "a submission by its pointer record (skein #121): read, not parsed or proven again; the event and the ingest carry its CID; beefOf gives the bytes back" {
+test "a submission by the door's envelope (skein #121, #146): read, not parsed or proven again; the event and the ingest carry the envelope; wireOf gives the bytes back" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -1179,25 +1246,29 @@ test "a submission by its pointer record (skein #121): read, not parsed or prove
     try inst.headers(&.{&f.h1});
     const t1 = try spend(a, &f.tx, 0, &.{ .{ 1, &k.token }, .{ 9_000, &k.p2pkh } }, k.priv);
     const wire = try withFund(a, f, t1);
-    const rc = try pointerOf(a, ms.store(), wire);
+    const env = try pointerOf(a, ms.store(), wire);
+    const rc = env.getCid("beef").?;
     const parses = beef.parses;
-    const r = try inst.routeRecord(rc);
+    const r = try inst.routeEnvelope(env);
     try std.testing.expectEqual(parses, beef.parses);
     const ev = r.admit.event;
-    try std.testing.expectEqualSlices(u8, rc, ev.getCid("beef").?);
+    try std.testing.expectEqualSlices(u8, rc, ev.get("beef").?.getCid("beef").?);
+    try std.testing.expectEqualStrings("beef", ev.get("beef").?.getText("form").?);
     try std.testing.expect(ev.getBytes("beef") == null);
     _ = try inst.begin(ev);
     const sent = inst.wire_.last();
     try std.testing.expectEqualStrings("ingest", sent.body.getText("fn").?);
-    try std.testing.expectEqualSlices(u8, rc, sent.body.get("args").?.getCid("beef").?);
-    // The bytes the chain app and the gossip read back: exactly the submitted BEEF.
+    try std.testing.expectEqualSlices(u8, rc, sent.body.get("args").?.get("beef").?.getCid("beef").?);
+    // The bytes the chain app and the gossip read back: exactly the submitted BEEF (a bare BEEF:
+    // the envelope adds nothing, and the record alone is the same bytes).
+    try std.testing.expectEqualSlices(u8, wire, try c.record.wireOf(a, ms.store(), env));
     try std.testing.expectEqualSlices(u8, wire, try c.record.beefOf(a, ms.store(), rc));
-    // A record of something else: refused.
+    // An envelope over a record of something else: refused.
     const junk = try ms.store().putValue(a, .{ .map = try a.dupe(cbor.Entry, &.{.{ .key = "kind", .value = .{ .text = "other" } }}) });
-    try std.testing.expectEqualStrings("InvalidBeef", (try inst.routeRecord(junk)).refused);
+    try std.testing.expectEqualStrings("InvalidBeef", (try inst.routeEnvelope(try mapOf(a, &.{ .{ .key = "form", .value = .{ .text = "beef" } }, .{ .key = "beef", .value = .{ .cid = junk } } }))).refused);
 }
 
-test "the applied record names the submission's BEEF as handed (#3): its pointer record, or the raw block of the bytes" {
+test "the applied record names the submission's BEEF as handed (#3): the door's envelope as a block, or the raw block of the bytes" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -1207,19 +1278,20 @@ test "the applied record names the submission's BEEF as handed (#3): its pointer
     const k = try keys(0x42);
     const f = try fund(a, 0x55, 2, &k.p2pkh);
     try inst.headers(&.{&f.h1});
-    // By its pointer record: the record's CID.
+    // By the door's envelope: the envelope as a block (it links the pointer record).
     const t1 = try spend(a, &f.tx, 0, &.{.{ 1, &k.token }}, k.priv);
     const w1 = try withFund(a, f, t1);
-    const rc = try pointerOf(a, ms.store(), w1);
+    const env = try pointerOf(a, ms.store(), w1);
     {
-        const r = try inst.routeRecord(rc);
+        const r = try inst.routeEnvelope(env);
         _ = try inst.begin(r.admit.event);
         _ = try inst.ingest(w1);
         try std.testing.expectEqual(Chain.Outcome.accepted, try inst.chainStatus(t1.txid, "RECEIVED", null));
         const done = try inst.answer(t1.txid, .accepted);
         try std.testing.expect(done.admitted);
         var st = try inst.load();
-        try std.testing.expectEqualSlices(u8, rc, (try st.appliedRecord("tm_demo", t1.txid)).?.getCid("beef").?);
+        const ec = (try st.appliedRecord("tm_demo", t1.txid)).?.getCid("beef").?;
+        try std.testing.expectEqualSlices(u8, w1, try c.record.wireOf(a, ms.store(), try ms.store().getValue(a, ec)));
     }
     // As bytes: a raw block of exactly the bytes received.
     const t2 = try spend(a, &f.tx, 1, &.{.{ 1, &k.token }}, k.priv);
@@ -1277,19 +1349,20 @@ test "register and deregister (skein #120): the set under <app>/topics, the even
         }
     }.of;
 
-    // register: the set, the three subscribes with the engine's role and its function for each;
-    // `filter: "beef"` on `<topic>` only (its body is the BEEF; `-admit` / `-proof` are dag-cbor).
+    // register: the set, the two subscribes with the engine's role and its function for each (0.12.0,
+    // David 2026-10-09): `<topic>` one mesh for submit and admit (fn submit reads the kind), `<topic>-proof`
+    // its own; no `<topic>-admit`; no door filter (dag-cbor bodies). (`<topic>-live` is the roles':
+    // liveness and beacon, the runtime's, never subscribed here.)
     const reg = (try topics_mod.register(a, &.{}, try args(a, "tm_reg", "topic-demo"), programs, self)).done;
     try std.testing.expectEqual(@as(usize, 1), reg.list.?.len);
     try std.testing.expectEqualStrings("topic-demo", reg.list.?[0].program);
     try std.testing.expect(reg.answer.get("active").?.boolean);
     try std.testing.expectEqualStrings("tm_reg", reg.answer.getText("topic").?);
-    const want = [_][2][]const u8{ .{ "tm_reg", "submit" }, .{ "tm_reg-admit", "peerAdmit" }, .{ "tm_reg-proof", "peerProof" } };
-    const want_filter = [_]?[]const u8{ "beef", null, null };
-    try std.testing.expectEqual(@as(usize, 3), reg.events.len);
-    for (reg.events, want, want_filter) |ev, w, wf| {
-        try std.testing.expectEqual(@as(usize, if (wf == null) 4 else 5), ev.map.len);
-        if (wf) |f| try std.testing.expectEqualStrings(f, ev.getText("filter").?) else try std.testing.expect(ev.get("filter") == null);
+    const want = [_][2][]const u8{ .{ "tm_reg", "submit" }, .{ "tm_reg-proof", "peerProof" } };
+    try std.testing.expectEqual(@as(usize, 2), reg.events.len);
+    for (reg.events, want) |ev, w| {
+        try std.testing.expectEqual(@as(usize, 4), ev.map.len);
+        try std.testing.expect(ev.get("filter") == null);
         try std.testing.expectEqualStrings("subscribe", ev.getText("event").?);
         try std.testing.expectEqualStrings(w[0], ev.getText("topic").?);
         try std.testing.expectEqualStrings("engine", ev.getText("program").?);
@@ -1331,8 +1404,9 @@ test "register and deregister (skein #120): the set under <app>/topics, the even
     try std.testing.expect(try st.isApplied("tm_reg", tok.txid));
     try std.testing.expectEqual(@as(usize, 1), (try inst.look(&.{.{ .key = "topic", .value = .{ .text = "tm_reg" } }})).len);
 
-    // deregister: the set without it, three unsubscribes {event, topic}; again, nothing.
+    // deregister: the set without it, two unsubscribes {event, topic}; again, nothing.
     const dereg = (try topics_mod.deregister(a, reg.list.?, try args(a, "tm_reg", null))).done;
+    try std.testing.expectEqual(@as(usize, 2), dereg.events.len);
     try std.testing.expectEqual(@as(usize, 0), dereg.list.?.len);
     try std.testing.expect(!dereg.answer.get("active").?.boolean);
     for (dereg.events, want) |ev, w| {
@@ -1403,7 +1477,7 @@ test "register / deregister (skein #128): the set is the step's app's, the answe
 }
 
 
-test "market and validator (skein #120, 0.9.0): config.overlay.market / .validator drive liveness / beacon on <topic>-live at register, unliveness / unbeacon at deregister; neither, nothing extra" {
+test "market and validator, always (0.12.0, David 2026-10-09): liveness and beacon on <topic>-live at every register, unliveness and unbeacon at deregister; config.overlay's ms, else the defaults; no switch" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -1419,7 +1493,7 @@ test "market and validator (skein #120, 0.9.0): config.overlay.market / .validat
     }));
     const genesis_in = try mapOf(a, &.{.{ .key = "defaults", .value = try mapOf(a, &.{
         .{ .key = "walletNetwork", .value = .{ .text = "regtest" } },
-        // A genesis default the app's config replaces: an app naming no market is no market.
+        // A genesis default the app's config replaces: an app naming no market has the default window.
         .{ .key = "overlayMarket", .value = .{ .text = "{\"window\":5000}" } },
     }) }});
     const in = try withThread(a, s, genesis_in, engine);
@@ -1428,9 +1502,10 @@ test "market and validator (skein #120, 0.9.0): config.overlay.market / .validat
         .{ .key = "program", .value = .{ .text = "topic-demo" } },
     });
     const dereg_args = try mapOf(a, &.{.{ .key = "topic", .value = .{ .text = "tm_r" } }});
+    const body = try topics_mod.beatBody(a, .{});
 
     const Case = struct { market: ?u64, validator: ?u64 };
-    for ([_]Case{ .{ .market = 40_000, .validator = null }, .{ .market = null, .validator = 30_000 }, .{ .market = 40_000, .validator = 30_000 }, .{ .market = null, .validator = null } }) |case| {
+    for ([_]Case{ .{ .market = 60_000, .validator = null }, .{ .market = null, .validator = 20_000 }, .{ .market = 60_000, .validator = 20_000 }, .{ .market = null, .validator = null } }) |case| {
         var hm = HeadMap{};
         var ov: std.ArrayList(cbor.Entry) = .empty;
         if (case.market) |w| try ov.append(a, .{ .key = "market", .value = try mapOf(a, &.{.{ .key = "window", .value = .{ .uint = w } }}) });
@@ -1446,178 +1521,208 @@ test "market and validator (skein #120, 0.9.0): config.overlay.market / .validat
         })));
         const step = try config.resolve(a, s, hm.heads(), in, null);
         const roles = try config.rolesOf(a, step);
-        try std.testing.expectEqual(case.market, roles.market);
-        try std.testing.expectEqual(case.validator, roles.validator);
+        const window = case.market orelse topics_mod.default_window_ms;
+        const every = case.validator orelse topics_mod.default_every_ms;
+        try std.testing.expectEqual(window, roles.market);
+        try std.testing.expectEqual(every, roles.validator);
         const programs = step.get("programs").?;
         const self = try config.selfRole(a, s, step, null);
 
-        // register: the three subscribes, then liveness (a market), then beacon (a validator), on tm_r-live.
-        const reg = (try topics_mod.withRoles(a, try topics_mod.register(a, &.{}, reg_args, programs, self), true, roles)).done;
-        const extra = @as(usize, if (case.market != null) 1 else 0) + @as(usize, if (case.validator != null) 1 else 0);
-        try std.testing.expectEqual(3 + extra, reg.events.len);
-        for (reg.events[0..3]) |ev| try std.testing.expectEqualStrings("subscribe", ev.getText("event").?);
-        var i: usize = 3;
-        if (case.market) |w| {
-            const ev = reg.events[i];
-            i += 1;
-            try std.testing.expectEqual(@as(usize, 3), ev.map.len);
-            try std.testing.expectEqualStrings("liveness", ev.getText("event").?);
-            try std.testing.expectEqualStrings("tm_r-live", ev.getText("topic").?);
-            try std.testing.expectEqual(w, ev.getUint("window").?);
-        }
-        if (case.validator) |e| {
-            const ev = reg.events[i];
-            try std.testing.expectEqual(@as(usize, 4), ev.map.len);
-            try std.testing.expectEqualStrings("beacon", ev.getText("event").?);
-            try std.testing.expectEqualStrings("tm_r-live", ev.getText("topic").?);
-            try std.testing.expectEqual(e, ev.getUint("every").?);
-            try std.testing.expectEqual(@as(usize, 0), ev.getBytes("body").?.len); // the beat needs no body
-        }
+        // register: the two subscribes, then liveness (the market), then beacon (the validator) on
+        // tm_r-live, its body the topic's beat body.
+        const reg = (try topics_mod.withRoles(a, try topics_mod.register(a, &.{}, reg_args, programs, self), true, roles, body)).done;
+        try std.testing.expectEqual(@as(usize, 4), reg.events.len);
+        for (reg.events[0..2]) |ev| try std.testing.expectEqualStrings("subscribe", ev.getText("event").?);
+        const live = reg.events[2];
+        try std.testing.expectEqual(@as(usize, 3), live.map.len);
+        try std.testing.expectEqualStrings("liveness", live.getText("event").?);
+        try std.testing.expectEqualStrings("tm_r-live", live.getText("topic").?);
+        try std.testing.expectEqual(window, live.getUint("window").?);
+        const beat = reg.events[3];
+        try std.testing.expectEqual(@as(usize, 4), beat.map.len);
+        try std.testing.expectEqualStrings("beacon", beat.getText("event").?);
+        try std.testing.expectEqualStrings("tm_r-live", beat.getText("topic").?);
+        try std.testing.expectEqual(every, beat.getUint("every").?);
+        try std.testing.expectEqualSlices(u8, body, beat.getBytes("body").?);
         // Idempotent: registered already, nothing emitted, the roles' events neither.
-        const again = (try topics_mod.withRoles(a, try topics_mod.register(a, reg.list.?, reg_args, programs, self), true, roles)).done;
+        const again = (try topics_mod.withRoles(a, try topics_mod.register(a, reg.list.?, reg_args, programs, self), true, roles, body)).done;
         try std.testing.expect(again.list == null and again.events.len == 0);
         // A refusal stays one.
-        try std.testing.expect(try topics_mod.withRoles(a, try topics_mod.register(a, &.{}, try mapOf(a, &.{}), programs, self), true, roles) == .refused);
+        try std.testing.expect(try topics_mod.withRoles(a, try topics_mod.register(a, &.{}, try mapOf(a, &.{}), programs, self), true, roles, body) == .refused);
 
-        // deregister reverses: the three unsubscribes, then unliveness, then unbeacon.
-        const dereg = (try topics_mod.withRoles(a, try topics_mod.deregister(a, reg.list.?, dereg_args), false, roles)).done;
-        try std.testing.expectEqual(3 + extra, dereg.events.len);
-        i = 3;
-        if (case.market != null) {
-            try std.testing.expectEqualStrings("unliveness", dereg.events[i].getText("event").?);
-            try std.testing.expectEqualStrings("tm_r-live", dereg.events[i].getText("topic").?);
-            try std.testing.expectEqual(@as(usize, 2), dereg.events[i].map.len);
-            i += 1;
-        }
-        if (case.validator != null) {
-            try std.testing.expectEqualStrings("unbeacon", dereg.events[i].getText("event").?);
-            try std.testing.expectEqualStrings("tm_r-live", dereg.events[i].getText("topic").?);
-            try std.testing.expectEqual(@as(usize, 2), dereg.events[i].map.len);
-        }
-        const none = (try topics_mod.withRoles(a, try topics_mod.deregister(a, dereg.list.?, dereg_args), false, roles)).done;
+        // deregister reverses: the two unsubscribes, then unliveness, then unbeacon.
+        const dereg = (try topics_mod.withRoles(a, try topics_mod.deregister(a, reg.list.?, dereg_args), false, roles, "")).done;
+        try std.testing.expectEqual(@as(usize, 4), dereg.events.len);
+        try std.testing.expectEqualStrings("unliveness", dereg.events[2].getText("event").?);
+        try std.testing.expectEqualStrings("tm_r-live", dereg.events[2].getText("topic").?);
+        try std.testing.expectEqual(@as(usize, 2), dereg.events[2].map.len);
+        try std.testing.expectEqualStrings("unbeacon", dereg.events[3].getText("event").?);
+        try std.testing.expectEqualStrings("tm_r-live", dereg.events[3].getText("topic").?);
+        try std.testing.expectEqual(@as(usize, 2), dereg.events[3].map.len);
+        const none = (try topics_mod.withRoles(a, try topics_mod.deregister(a, dereg.list.?, dereg_args), false, roles, "")).done;
         try std.testing.expect(none.list == null and none.events.len == 0);
     }
 
     // A bad shape, or a window outside 1 000 ms .. a day: error.BadRoles (the engine refuses the registration).
-    for ([_][]const u8{ "{\"window\":10}", "{}", "{\"window\":\"40s\"}", "40000" }) |text| {
+    for ([_][]const u8{ "{\"window\":10}", "{}", "{\"window\":\"40s\"}", "40000", "{\"off\":true}" }) |text| {
         const bad = try mapOf(a, &.{.{ .key = "defaults", .value = try mapOf(a, &.{.{ .key = "overlayMarket", .value = .{ .text = text } }}) }});
         try std.testing.expectError(error.BadRoles, config.rolesOf(a, bad));
     }
-    // A genesis-wired engine reads its defaults as they are.
+    // A genesis-wired engine reads its defaults as they are; what they name not, the default.
     const wired = try config.rolesOf(a, genesis_in);
-    try std.testing.expectEqual(@as(?u64, 5000), wired.market);
-    try std.testing.expectEqual(@as(?u64, null), wired.validator);
+    try std.testing.expectEqual(@as(u64, 5000), wired.market);
+    try std.testing.expectEqual(topics_mod.default_every_ms, wired.validator);
+
+    // No switch: `market` and `validator` are no function of the engine (0.9.2's switch is gone), and
+    // a set's record carries the topics alone.
+    try std.testing.expectEqual(topics_mod.Asked.other, topics_mod.asked(try mapOf(a, &.{.{ .key = "fn", .value = .{ .text = "market" } }})));
+    try std.testing.expectEqual(topics_mod.Asked.other, topics_mod.asked(try mapOf(a, &.{.{ .key = "fn", .value = .{ .text = "validator" } }})));
+    const rec = try topics_mod.recordOf(a, &.{.{ .topic = "tm_a", .program = "topic-demo" }});
+    try std.testing.expectEqual(@as(usize, 2), rec.map.len);
 }
 
-test "the owner's switch (0.9.2, David 2026-10-07): market / validator on emits for every registered topic, off reverses; over config.overlay; idempotent; kept beside the set" {
+test "the view digest (0.12.0, David 2026-10-09): count and an order-independent sum of outpoint hashes; admit folds in, spend folds out; the beat body; re-declared on change" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    const list = [_]topics_mod.Entry{ .{ .topic = "tm_a", .program = "topic-demo" }, .{ .topic = "tm_b", .program = "topic-demo" } };
-    const window = try mapOf(a, &.{.{ .key = "window", .value = .{ .uint = 40_000 } }});
-    const every = try mapOf(a, &.{.{ .key = "every", .value = .{ .uint = 30_000 } }});
-    const off = try mapOf(a, &.{.{ .key = "off", .value = .{ .boolean = true } }});
-    const none: topics_mod.Roles = .{};
+    const t1: [32]u8 = .{0x11} ** 32;
+    const t2: [32]u8 = .{0x22} ** 32;
+    const t3: [32]u8 = .{0x33} ** 32;
 
-    try std.testing.expectEqual(topics_mod.Asked.market, topics_mod.asked(try mapOf(a, &.{.{ .key = "fn", .value = .{ .text = "market" } }})));
-    try std.testing.expectEqual(topics_mod.Asked.validator, topics_mod.asked(try mapOf(a, &.{.{ .key = "fn", .value = .{ .text = "validator" } }})));
+    // An outpoint's hash: sha256(txid ‖ vout as 4 bytes little-endian).
+    var pre: [36]u8 = undefined;
+    @memcpy(pre[0..32], &t1);
+    @memcpy(pre[32..36], &[_]u8{ 7, 0, 0, 0 });
+    var want: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&pre, &want, .{});
+    try std.testing.expectEqualSlices(u8, &want, &state.outpointHash(t1, 7));
 
-    // On, with two topics registered: liveness for each on <topic>-live; the answer the roles in effect.
-    const on = (try topics_mod.switchRole(a, &list, .{}, none, .market, window)).done;
-    try std.testing.expectEqual(topics_mod.Switch{ .on = 40_000 }, on.switches.?.market);
-    try std.testing.expectEqual(topics_mod.Switch.unset, on.switches.?.validator);
-    try std.testing.expectEqual(@as(usize, 2), on.events.len);
-    for (on.events, [_][]const u8{ "tm_a-live", "tm_b-live" }) |ev, t| {
-        try std.testing.expectEqualStrings("liveness", ev.getText("event").?);
-        try std.testing.expectEqualStrings(t, ev.getText("topic").?);
-        try std.testing.expectEqual(@as(u64, 40_000), ev.getUint("window").?);
-    }
-    try std.testing.expectEqual(@as(u64, 40_000), on.answer.get("market").?.getUint("window").?);
-    try std.testing.expect(on.answer.get("validator") == null);
-    // Idempotent: the same switch again writes and emits nothing; the answer the same.
-    const again = (try topics_mod.switchRole(a, &list, on.switches.?, none, .market, window)).done;
-    try std.testing.expect(again.switches == null and again.events.len == 0);
-    try std.testing.expectEqual(@as(u64, 40_000), again.answer.get("market").?.getUint("window").?);
-    // A new window replaces (the kernel keys liveness by (app, topic)): liveness again for each.
-    const wider = (try topics_mod.switchRole(a, &list, on.switches.?, none, .market, try mapOf(a, &.{.{ .key = "window", .value = .{ .uint = 60_000 } }}))).done;
-    try std.testing.expectEqual(@as(usize, 2), wider.events.len);
-    try std.testing.expectEqual(@as(u64, 60_000), wider.events[0].getUint("window").?);
+    // Order independence: the same outputs in any order of admission give the same view.
+    const ops = [_]struct { [32]u8, u32 }{ .{ t1, 0 }, .{ t2, 1 }, .{ t3, 2 }, .{ t1, 3 } };
+    const x = viewOf(&ops);
+    const y = viewOf(&.{ ops[3], ops[1], ops[0], ops[2] });
+    try std.testing.expect(x.eql(y));
+    try std.testing.expectEqual(@as(u64, 4), x.count);
+    // The digest is the sum mod 2^256 of the hashes (big-endian), not their concatenation or XOR.
+    var sum: u256 = 0;
+    for (ops) |o| sum +%= std.mem.readInt(u256, &state.outpointHash(o[0], o[1]), .big);
+    var sb: [32]u8 = undefined;
+    std.mem.writeInt(u256, &sb, sum, .big);
+    try std.testing.expectEqualSlices(u8, &sb, &x.digest);
+    // Spend folds out: interleaved admits and spends land where the remaining outputs alone do.
+    var z: state.View = .{};
+    z.fold(t2, 1, true);
+    z.fold(t1, 0, true);
+    z.fold(t2, 1, false);
+    z.fold(t3, 2, true);
+    z.fold(t1, 3, true);
+    try std.testing.expect(z.eql(viewOf(&.{ .{ t3, 2 }, .{ t1, 0 }, .{ t1, 3 } })));
+    z.fold(t1, 0, false);
+    z.fold(t1, 3, false);
+    z.fold(t3, 2, false);
+    try std.testing.expect(z.eql(.{}));
+    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 32), &z.digest);
+    // Kept as 40 bytes: count (big-endian) ‖ digest.
+    try std.testing.expect((try state.View.parse(&x.bytes())).eql(x));
+    try std.testing.expectError(error.BadIndex, state.View.parse("short"));
 
-    // The validator likewise: beacon for each, the empty body.
-    const v = (try topics_mod.switchRole(a, &list, on.switches.?, none, .validator, every)).done;
-    try std.testing.expectEqual(@as(usize, 2), v.events.len);
-    for (v.events) |ev| {
-        try std.testing.expectEqualStrings("beacon", ev.getText("event").?);
-        try std.testing.expectEqual(@as(u64, 30_000), ev.getUint("every").?);
-        try std.testing.expectEqual(@as(usize, 0), ev.getBytes("body").?.len);
-    }
-    try std.testing.expect(v.answer.get("market") != null and v.answer.get("validator") != null);
+    // The beat body: dag-cbor {view: {count, digest}}.
+    const body = try cbor.decode(a, try topics_mod.beatBody(a, x));
+    try std.testing.expectEqual(@as(usize, 1), body.map.len);
+    try std.testing.expectEqual(@as(u64, 4), body.get("view").?.getUint("count").?);
+    try std.testing.expectEqualSlices(u8, &x.digest, body.get("view").?.getBytes("digest").?);
 
-    // Off reverses: unliveness for each, the market's switch kept as off; the validator untouched.
-    const down = (try topics_mod.switchRole(a, &list, v.switches.?, none, .market, off)).done;
-    try std.testing.expectEqual(topics_mod.Switch.off, down.switches.?.market);
-    try std.testing.expectEqual(topics_mod.Switch{ .on = 30_000 }, down.switches.?.validator);
-    try std.testing.expectEqual(@as(usize, 2), down.events.len);
-    for (down.events, [_][]const u8{ "tm_a-live", "tm_b-live" }) |ev, t| {
-        try std.testing.expectEqualStrings("unliveness", ev.getText("event").?);
-        try std.testing.expectEqualStrings(t, ev.getText("topic").?);
-        try std.testing.expectEqual(@as(usize, 2), ev.map.len);
-    }
-    try std.testing.expect(down.answer.get("market") == null and down.answer.get("validator") != null);
-    const vdown = (try topics_mod.switchRole(a, &list, down.switches.?, none, .validator, off)).done;
-    for (vdown.events) |ev| try std.testing.expectEqualStrings("unbeacon", ev.getText("event").?);
-    try std.testing.expectEqual(@as(usize, 0), vdown.answer.map.len);
-    // Off when off: nothing.
-    const still = (try topics_mod.switchRole(a, &list, vdown.switches.?, none, .validator, off)).done;
-    try std.testing.expect(still.switches == null and still.events.len == 0);
+    // Re-declared on change (an app's new beacon for the same topic replaces its previous one): one
+    // beacon per registered topic whose view changed, with the body over its view now; a topic not
+    // registered (a declared one), none.
+    const list = [_]topics_mod.Entry{.{ .topic = "tm_a", .program = "topic-demo" }};
+    const changes = [_]state.ViewChange{
+        .{ .topic = "tm_a", .before = .{}, .now = x },
+        .{ .topic = "tm_declared", .before = .{}, .now = x },
+    };
+    const evs = try topics_mod.beatEvents(a, 30_000, &list, &.{}, &changes, &.{});
+    try std.testing.expectEqual(@as(usize, 1), evs.len);
+    try std.testing.expectEqualStrings("beacon", evs[0].getText("event").?);
+    try std.testing.expectEqualStrings("tm_a-live", evs[0].getText("topic").?);
+    try std.testing.expectEqual(@as(u64, 30_000), evs[0].getUint("every").?);
+    try std.testing.expectEqualSlices(u8, try topics_mod.beatBody(a, x), evs[0].getBytes("body").?);
+}
 
-    // Precedence over the configuration: a manifest market, switched off, is off — unliveness for each;
-    // register / deregister from then on emit by the roles in effect (none for the market).
-    const cfg: topics_mod.Roles = .{ .market = 40_000 };
-    const over = (try topics_mod.switchRole(a, &list, .{}, cfg, .market, off)).done;
-    try std.testing.expectEqual(@as(usize, 2), over.events.len);
-    try std.testing.expectEqualStrings("unliveness", over.events[0].getText("event").?);
-    const eff = topics_mod.effective(over.switches.?, cfg);
-    try std.testing.expectEqual(@as(?u64, null), eff.market);
-    try std.testing.expectEqual(@as(?u64, 40_000), topics_mod.effective(.{}, cfg).market); // never switched: the manifest's
+test "lookup beats (0.12.0, David 2026-10-09): <service>-live for each registered lookup service; the body the program's own — fn beat at the declaration, a hook's answer to update it" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
     var ms = c.store.MemStore.init(std.testing.allocator);
     defer ms.deinit();
-    const prog = try ms.store().putValue(a, try mapOf(a, &.{.{ .key = "kind", .value = .{ .text = "program" } }}));
-    const programs = try mapOf(a, &.{.{ .key = "topic-demo", .value = .{ .cid = prog } }});
-    const reg_args = try mapOf(a, &.{ .{ .key = "topic", .value = .{ .text = "tm_c" } }, .{ .key = "program", .value = .{ .text = "topic-demo" } } });
-    const reg = (try topics_mod.withRoles(a, try topics_mod.register(a, &list, reg_args, programs, "overlay"), true, eff)).done;
-    try std.testing.expectEqual(@as(usize, 3), reg.events.len); // the subscribes only
-    // Switched on at the manifest's own value: written (precedence from then on), nothing emitted.
-    const same = (try topics_mod.switchRole(a, &list, .{}, cfg, .market, window)).done;
-    try std.testing.expect(same.switches != null and same.events.len == 0);
-    // Switched on over a manifest that names none: the switch's value.
-    const reg2 = (try topics_mod.withRoles(a, try topics_mod.register(a, &list, reg_args, programs, "overlay"), true, topics_mod.effective(on.switches.?, none))).done;
-    try std.testing.expectEqualStrings("liveness", reg2.events[3].getText("event").?);
-    // No topic registered: the switch is kept, nothing emitted.
-    const empty = (try topics_mod.switchRole(a, &.{}, .{}, none, .validator, every)).done;
-    try std.testing.expect(empty.switches != null and empty.events.len == 0);
+    const s = ms.store();
 
-    // Kept beside the set in <app>/topics, read back; a record without them is unswitched.
-    const rec = try topics_mod.recordWith(a, &list, down.switches.?);
-    try std.testing.expectEqualDeep(@as([]const topics_mod.Entry, &list), try topics_mod.entriesOf(a, rec));
-    const back = try topics_mod.switchesOf(rec);
-    try std.testing.expectEqual(topics_mod.Switch.off, back.market);
-    try std.testing.expectEqual(topics_mod.Switch{ .on = 30_000 }, back.validator);
-    try std.testing.expect(rec.get("market").?.get("off").?.boolean);
-    try std.testing.expectEqual(@as(u64, 30_000), rec.get("validator").?.getUint("every").?);
-    const plain = try topics_mod.switchesOf(try topics_mod.recordOf(a, &list));
-    try std.testing.expectEqual(topics_mod.Switch.unset, plain.market);
-    try std.testing.expectEqual(topics_mod.Switch.unset, plain.validator);
-    try std.testing.expectEqual(topics_mod.Switch.unset, (try topics_mod.switchesOf(null)).market);
+    // A lookup program with a beat and a hook that updates it.
+    const P = struct {
+        fn answer(_: Allocator, _: *lookup.Service, _: *lookup.Chain, _: Value) anyerror!lookup.Answer {
+            return .{ .output_list = &.{} };
+        }
+        fn beat(_: Allocator, svc: *lookup.Service) anyerror![]const u8 {
+            return if (std.mem.eql(u8, svc.name, "ls_x")) "price 1" else "";
+        }
+        fn rejected(_: Allocator, svc: *lookup.Service, _: []const u8, _: lookup.Tx) anyerror!void {
+            try svc.beat("ls_x", "price 2");
+            try svc.beat("ls_y", "price 3");
+        }
+    };
+    const spec: lookup.Spec = .{ .maps = &.{"m"}, .answer = P.answer, .beat = P.beat, .rejected = P.rejected };
+    const beat_arg = try mapOf(a, &.{
+        .{ .key = "kind", .value = .{ .text = "lookup-beat" } },
+        .{ .key = "app", .value = .{ .text = "amm" } },
+        .{ .key = "service", .value = .{ .text = "ls_x" } },
+        .{ .key = "program", .value = .{ .text = "x-lookup" } },
+    });
+    const h = try lookup.handle(a, spec, s, .regtest, null, null, "beat", beat_arg);
+    try std.testing.expectEqualStrings("lookup-beat", h.answer.getText("kind").?);
+    try std.testing.expectEqualStrings("price 1", h.answer.getBytes("body").?);
+    // A program with no beat: the empty body.
+    const plain: lookup.Spec = .{ .maps = &.{"m"}, .answer = P.answer };
+    try std.testing.expectEqualStrings("", (try lookup.handle(a, plain, s, .regtest, null, null, "beat", beat_arg)).answer.getBytes("body").?);
 
-    // Refused: another shape, a value outside 1 000 ms .. a day, the other role's field, off: false.
-    for ([_]Value{
-        try mapOf(a, &.{.{ .key = "window", .value = .{ .uint = 10 } }}),
-        try mapOf(a, &.{}),
-        every,
-        try mapOf(a, &.{.{ .key = "off", .value = .{ .boolean = false } }}),
-        .{ .text = "on" },
-    }) |bad| try std.testing.expect(try topics_mod.switchRole(a, &list, .{}, none, .market, bad) == .refused);
+    // A hook's answer carries the new bodies by service; calls.zig reads them in order.
+    var raw_tx: [10]u8 = .{ 1, 0, 0, 0, 0, 0, 0, 0, 0, 0 }; // version 1, no inputs, no outputs, locktime 0
+    var h1: [32]u8 = undefined;
+    var h2: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&raw_tx, &h1, .{});
+    std.crypto.hash.sha2.Sha256.hash(&h1, &h2, .{});
+    const tc = try a.dupe(u8, &c.store.hashCid(.tx, h2));
+    try s.putBlock(tc, &raw_tx);
+    const hooked = try lookup.handle(a, spec, s, .regtest, null, null, "rejected", try mapOf(a, &.{
+        .{ .key = "kind", .value = .{ .text = "lookup-hook" } },
+        .{ .key = "app", .value = .{ .text = "amm" } },
+        .{ .key = "service", .value = .{ .text = "ls_x" } },
+        .{ .key = "program", .value = .{ .text = "x-lookup" } },
+        .{ .key = "topic", .value = .{ .text = "tm_a" } },
+        .{ .key = "tx", .value = .{ .cid = tc } },
+    }));
+    var got: std.ArrayList(state.LookupBeat) = .empty;
+    try calls.beatsOf(a, hooked.answer, &got);
+    try std.testing.expectEqual(@as(usize, 2), got.items.len);
+    try std.testing.expectEqualStrings("ls_x", got.items[0].service);
+    try std.testing.expectEqualStrings("price 2", got.items[0].body);
+    // A hook that sets none: no `beats`.
+    var none: std.ArrayList(state.LookupBeat) = .empty;
+    try calls.beatsOf(a, try mapOf(a, &.{.{ .key = "kind", .value = .{ .text = "lookup-hooked" } }}), &none);
+    try std.testing.expectEqual(@as(usize, 0), none.items.len);
+
+    // Re-declared: a beacon on <service>-live for each registered service given a body (the last per
+    // service), none for an unregistered one.
+    const later = [_]state.LookupBeat{ got.items[0], got.items[1], .{ .service = "ls_x", .body = "price 4" } };
+    const evs = try topics_mod.beatEvents(a, 30_000, &.{}, &.{"ls_x"}, &.{}, &later);
+    try std.testing.expectEqual(@as(usize, 1), evs.len);
+    try std.testing.expectEqualStrings("ls_x-live", evs[0].getText("topic").?);
+    try std.testing.expectEqualStrings("price 4", evs[0].getBytes("body").?);
+    // Declared and ended with the registration: beacon / unbeacon on <service>-live.
+    const b = try topics_mod.beaconEvent(a, "ls_x", 30_000, "price 1");
+    try std.testing.expectEqualStrings("ls_x-live", b.getText("topic").?);
+    try std.testing.expectEqualStrings("price 1", b.getBytes("body").?);
+    const u = try topics_mod.unbeaconEvent(a, "ls_x");
+    try std.testing.expectEqualStrings("unbeacon", u.getText("event").?);
+    try std.testing.expectEqualStrings("ls_x-live", u.getText("topic").?);
 }
 
 /// fund (mined) → t1 (mints a token) → t2 (spends it into a new one), both unproven.
@@ -1951,7 +2056,7 @@ test "wants by (txid, topic, peer) (shruggr/skein#112): each gossiping peer its 
     _ = try inst.chainStatus(x.t1.txid, "RECEIVED", null);
     const got = try inst.answer(x.t1.txid, .accepted);
     try std.testing.expect(got.admitted and got.done);
-    // Its verdict on tm_demo-admit; the BEEF itself not published again (it came on a stream).
+    // Its verdict (an `admit` message on tm_demo); the BEEF itself not published again (it came on a stream).
     try std.testing.expectEqual(@as(usize, 1), got.published);
     try std.testing.expectEqual(@as(usize, 1), got.resumes.len);
     st = try inst.load();
@@ -2524,9 +2629,10 @@ test "one box per function class (skein #128, 0.7.5, 0.7.7): register only in `<
     try std.testing.expect((try manifestRoute(a, "mailbox", "")) == null);
     const mj = try std.json.parseFromSliceLeaky(std.json.Value, a, @embedFile("etc/app.json"), .{});
     const gated = mj.object.get("roles").?.object.get("root").?.array.items;
-    // The lookup registrations (0.11.0) listed beside register: the same route, the same gate.
-    try std.testing.expectEqual(@as(usize, 5), gated.len);
-    for ([_][]const u8{ "register", "registerLookup", "deregisterLookup", "market", "validator" }, gated) |w, g| try std.testing.expectEqualStrings(w, g.string);
+    // The lookup registrations (0.11.0) listed beside register: the same route, the same gate; no
+    // `market` / `validator` (0.12.0: always both, no switch).
+    try std.testing.expectEqual(@as(usize, 3), gated.len);
+    for ([_][]const u8{ "register", "registerLookup", "deregisterLookup" }, gated) |w, g| try std.testing.expectEqualStrings(w, g.string);
     try std.testing.expect(mj.object.get("dispatch") == null and mj.object.get("reads") == null);
 
     // Submit accepted in `<app>/submit`: launched, the submitter answered in that box.
