@@ -4,7 +4,7 @@ The overlay services engine for a [skein](https://github.com/shruggr/skein),
 as an app: BRC-22 submit and BRC-24 lookup, served by the instance's own
 front door, with topic managers and lookup services as programs the engine
 calls. It is also a Zig package: an overlay of your own depends on it for
-the topic and lookup contracts. Version **0.10.0**.
+the topic and lookup contracts. Version **0.11.0**.
 
 ## What it is
 
@@ -20,8 +20,8 @@ the topic and lookup contracts. Version **0.10.0**.
   **every proof**, or **rejected**. Nothing persists unless a topic takes
   it, apart from the request. `/lookup` is a read.
 - **State under its own name.** The engine and its lookup services write
-  only `<app>/state`, `<app>/gossip` and `<app>/ls_<service>`; the app record
-  is `<app>/app`. The chain state is the chain app's `chain/state`, read by
+  only `<app>/state`, `<app>/gossip`, `<app>/topics`, `<app>/lookups` and
+  each lookup program's index `<app>/ls_<…>`; the app record is `<app>/app`. The chain state is the chain app's `chain/state`, read by
   CID. Two overlay apps on one instance share the chain and nothing else.
 - **Gossip** over libp2p, per topic: `<topic>` (the raw submission),
   `<topic>-admit`, `<topic>-proof`.
@@ -86,7 +86,8 @@ reads, open to anyone, signed or not: `POST <base>/lookup` and the listing
 and documentation paths (shruggr/skein#135). The @bsv/sdk
 `TopicBroadcaster` and `LookupResolver` reject a base URL with a path, so
 call the endpoints directly (`POST <base>/submit` with the BEEF and
-`X-Topics`). `/submit` answers BRC-22's STEAK once the submission is
+`X-Topics`), or have root add the two root routes that answer them at
+the origin's root ("Root routes", below). `/submit` answers BRC-22's STEAK once the submission is
 decided (503 + `Retry-After` when nothing is decided within the host's
 bound; resubmit to poll the same flow): docs/OVERLAY.md, "Submitting".
 
@@ -165,7 +166,7 @@ The manifest (`etc/app.json`, this repo's own, description left out):
 {
   "kind": "app",
   "name": "overlay",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "programs": {
     "overlay": "bin/overlay.wasm",
     "topic-demo": "bin/topic-demo.wasm",
@@ -185,7 +186,7 @@ The manifest (`etc/app.json`, this repo's own, description left out):
     "topicDocumentation": "overlay.topicDocumentation",
     "lookupDocumentation": "overlay.lookupDocumentation"
   },
-  "roles": { "root": ["register", "market", "validator"] },
+  "roles": { "root": ["register", "registerLookup", "deregisterLookup", "market", "validator"] },
   "routes": [
     {"address": "register", "handler": "overlay.register"},
     {"address": "submit", "filters": ["kernel.beef"], "handler": "overlay.submit"},
@@ -295,6 +296,46 @@ the initial value: root switches a role in the same box, `{fn:
 | {off: true}}`, answered `{market?, validator?}` (0.9.2). docs/OVERLAY.md
 "Register a topic" has the rest.
 
+### Register a lookup service
+
+Lookup services have their own pair of calls (0.11.0; David Case,
+2026-10-08: separate from the topics'), in the same box `<app>/register`,
+gated the same way:
+
+```
+{fn: "registerLookup",   args: {service, program, topics?}}   program: the role in `programs` that answers it
+{fn: "deregisterLookup", args: {service}}
+```
+
+Idempotent, answered `{service, active}`; another program or other
+topics for a registered service, or an unknown role, are refused. The set
+is the head `<app>/lookups` (`{kind: "overlay-lookups", lookups:
+[{service, program, topics?}]}`), served as if `config.overlay.lookups`
+named each: `/lookup` routes it, `/listLookupServiceProviders` lists it,
+the hooks reach it. A name neither declared nor registered answers 400
+"Lookup service not supported" (no wildcard). The hooks reach each lookup
+**program** once per admitted transaction and topic, not once per name,
+and a program serving many names keeps one index: its `Spec.index`
+(`ls_demo`), else `ls_<role>`; each call names the service it was called
+as (`Service.name`). docs/OVERLAY.md "Register a lookup service".
+
+### Root routes
+
+The @bsv/sdk clients take a bare origin and call `<origin>/submit` and
+`<origin>/lookup`. One overlay app per skein, so root may answer both at
+the origin's root with two root routes (shruggr/skein#143) to the app's
+`submit` handler and `lookup` filter (an app installed as `mandala`):
+
+```
+skein routes add --transport http --filters kernel.beef --fn submit /submit mandala.overlay <origin>
+skein routes add --transport http --filters mandala.lookup /lookup <origin>
+```
+
+The engine finds its app from either (the handler's program record; the
+filter `<app>.lookup`). An install that asks for them is not built: the
+manifest format has no such request (a skein change; docs/OVERLAY.md
+"Root routes" sketches one).
+
 ## Build and test
 
 Zig 0.16.0 (`mise.toml`).
@@ -317,14 +358,16 @@ which clone this repo at a pinned commit (or take `$SKEIN_OVERLAY_DIR`).
 | the chain app's contract | shruggr/skein-chain `docs/CHAIN.md` |
 | apps, manifests, install; an overlay as an app | skein `docs/APPS.md` §6 |
 
-Not built: BRC-88 SHIP/SLAP, GASP sync and catch-up from a peer, the
+Not built: BRC-88 SHIP/SLAP (decided 2026-10-08, stopped: revoking an ad
+spends it, and the skein's wallet program takes no caller-supplied inputs;
+docs/OVERLAY.md "Not built"), GASP sync and catch-up from a peer, the
 `historical-tx` modes.
 
 ## Versions
 
 | | |
 |---|---|
-| this app and package | 0.10.0 (tag `v0.10.0`) |
+| this app and package | 0.11.0 (tag `v0.11.0`) |
 | skein-sdk | v0.7.1, by tag URL and hash in `build.zig.zon` (modules `chain` and, for the engine, `sk`; bsvz comes through it) |
 | requires | `chain/1` (shruggr/skein-chain 0.3.0) |
 | skein | log format 9, the routes / filters / roles manifest (shruggr/skein#143); skein's equivs pin this repo by commit |
@@ -507,6 +550,26 @@ answers `{answer: <the http answer>}` (src/routes.zig); a read route's
 call names no program, so the engine's configuration comes from the app
 the route names (`match.app`, src/config.zig `matchedApp`). Nothing else
 changed; the engine never read an `owner` input.
+
+0.11.0: lookup registration and root routes (David Case, 2026-10-08). The
+engine's own pair of calls for lookup services, separate from the topics'
+`register` / `deregister` (unchanged): `registerLookup {service, program,
+topics?}` / `deregisterLookup {service}` in `<app>/register`, idempotent,
+answered `{service, active}`, the set under the head `<app>/lookups`
+(src/lookups.zig), served as `config.overlay.lookups` is (src/config.zig
+`withRegistered`); an unregistered name still answers "Lookup service not
+supported". The admitted-output hooks reach each lookup program once, not
+once per name (src/calls.zig `hookTargets`), and a program keeps one index
+whatever names it serves: `Spec.index`, else `ls_<role>` (src/lookup.zig
+`indexOf`; the calls carry `program`, the role; `Service.name` is the
+called name, `Service.index` the index) — before, `lookup.main` read
+`<app>/ls_<called name>` while the hooks wrote under each configured
+name. `ls_demo` keeps `<app>/ls_demo` (`.index = "ls_demo"`). Root routes:
+the engine finds its app from a root read route's filter `<app>.lookup`
+(src/config.zig `filterApp`), so `/submit` and `/lookup` work at the
+origin's root (README "Root routes"). The manifest's roles list the two
+new functions. BRC-88 SHIP/SLAP ads: not built (stopped; docs/OVERLAY.md
+"Not built").
 
 ## Contributing
 

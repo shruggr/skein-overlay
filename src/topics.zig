@@ -226,13 +226,16 @@ pub fn register(a: Allocator, list: []const Entry, args: Value, programs: Value,
 }
 
 /// What a mailbox message asks of the engine, by its body's `fn` alone; where it may be taken is
-/// `mayRegister`'s (one box per function class, shruggr/skein#128, 0.7.5).
-pub const Asked = enum { register, deregister, market, validator, other };
+/// `mayRegister`'s (one box per function class, shruggr/skein#128, 0.7.5). `registerLookup` /
+/// `deregisterLookup` (0.11.0, lookups.zig) are taken where `register` is.
+pub const Asked = enum { register, deregister, registerLookup, deregisterLookup, market, validator, other };
 
 pub fn asked(body: Value) Asked {
     const f = body.getText("fn") orelse return .other;
     if (eql(u8, f, "register")) return .register;
     if (eql(u8, f, "deregister")) return .deregister;
+    if (eql(u8, f, "registerLookup")) return .registerLookup;
+    if (eql(u8, f, "deregisterLookup")) return .deregisterLookup;
     if (eql(u8, f, "market")) return .market;
     if (eql(u8, f, "validator")) return .validator;
     return .other;

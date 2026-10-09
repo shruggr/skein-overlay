@@ -78,8 +78,8 @@ pub const Tx = struct { cid: []const u8, txid: [32]u8, tx: Transaction };
 
 pub const Outpoint = struct { txid: [32]u8, vout: u32 };
 
-/// The head a service's state lives under: `<app>/ls_<service>` — a head under its app's name
-/// (a service named `ls_x` is `<app>/ls_x`).
+/// The head an index lives under: `<app>/ls_<name>` — a head under its app's name (a name
+/// `ls_x` is `<app>/ls_x`).
 pub fn headName(a: Allocator, app: []const u8, service: []const u8) ![]u8 {
     if (std.mem.startsWith(u8, service, "ls_")) return std.mem.concat(a, u8, &.{ app, "/", service });
     return std.mem.concat(a, u8, &.{ app, "/ls_", service });
@@ -90,27 +90,44 @@ pub fn appOf(arg: Value) []const u8 {
     return arg.getText("app") orelse "overlay";
 }
 
-/// A lookup service's own storage: its named maps, loaded from its state record (null: new).
+/// The program's index (skein-overlay 0.11.0): one for every service name it serves — the
+/// program's own `Spec.index`, else `ls_<role>` after the role the engine calls it as (the
+/// call's `program`), else (an engine before 0.11.0, which names no role) the called name.
+pub fn indexOf(a: Allocator, spec: Spec, arg: Value) ![]const u8 {
+    if (spec.index) |x| return x;
+    if (arg.getText("program")) |role| return if (std.mem.startsWith(u8, role, "ls_")) role else std.mem.concat(a, u8, &.{ "ls_", role });
+    return arg.getText("service") orelse error.BadArgs;
+}
+
+/// A lookup service's own storage: its named maps, loaded from its index's state record (null:
+/// new). `name` is the service name it was called as; `index` the index every name of the
+/// program shares (`indexOf`), what the state record names.
 pub const Service = struct {
     arena: Allocator,
     store: Store,
     name: []const u8,
+    index: []const u8,
     names: []const []const u8,
     maps: *c.store.Maps,
     m: []Map,
 
+    /// `name` both the called name and the index (one name, one index).
     pub fn load(a: Allocator, s: Store, name: []const u8, names: []const []const u8, state: ?[]const u8) !Service {
+        return loadIndex(a, s, name, name, names, state);
+    }
+
+    pub fn loadIndex(a: Allocator, s: Store, name: []const u8, index: []const u8, names: []const []const u8, state: ?[]const u8) !Service {
         const maps = try c.store.Maps.create(a, s);
         var roots: ?Value = null;
         if (state) |sc| {
             const v = try s.getValue(a, sc);
             if (!std.mem.eql(u8, v.getText("kind") orelse "", "lookup-state")) return error.BadState;
-            if (!std.mem.eql(u8, v.getText("service") orelse "", name)) return error.BadState;
+            if (!std.mem.eql(u8, v.getText("service") orelse "", index)) return error.BadState;
             roots = v.get("maps") orelse return error.BadState;
         }
         const m = try a.alloc(Map, names.len);
         for (names, m) |n, *x| x.* = maps.map(if (roots) |r| r.getCid(n) else null);
-        return .{ .arena = a, .store = s, .name = name, .names = names, .maps = maps, .m = m };
+        return .{ .arena = a, .store = s, .name = name, .index = index, .names = names, .maps = maps, .m = m };
     }
 
     pub fn map(self: *Service, name: []const u8) *Map {
@@ -132,7 +149,7 @@ pub const Service = struct {
         }
         return self.store.putValue(self.arena, .{ .map = try self.arena.dupe(cbor.Entry, &.{
             .{ .key = "kind", .value = .{ .text = "lookup-state" } },
-            .{ .key = "service", .value = .{ .text = self.name } },
+            .{ .key = "service", .value = .{ .text = self.index } },
             .{ .key = "maps", .value = .{ .map = es } },
         }) });
     }
@@ -185,6 +202,9 @@ pub fn describe(a: Allocator, comptime Program: type, func: []const u8, args: Va
 pub const Spec = struct {
     /// The names of the service's maps (its state record's `maps`).
     maps: []const []const u8,
+    /// The index every service name of the program shares, its head `<app>/<index>` (`indexOf`);
+    /// null: `ls_<role>` after the role the engine calls it as.
+    index: ?[]const u8 = null,
     /// `ch`: the chain state, read only (an output's spender, its BEEF).
     answer: *const fn (a: Allocator, svc: *Service, ch: *Chain, query: Value) anyerror!Answer,
     admitted: ?*const fn (a: Allocator, svc: *Service, topic: []const u8, tx: Tx, outputs_to_admit: []const u32, coins_retained: []const u32) anyerror!void = null,
@@ -261,7 +281,7 @@ pub const Handled = struct { answer: Value, state: ?[]const u8 = null };
 /// `main` runs; the tests call it directly.
 pub fn handle(a: Allocator, spec: Spec, s: Store, network: c.chain.Network, state: ?[]const u8, chain: ?[]const u8, func: []const u8, arg: Value) !Handled {
     const service = arg.getText("service") orelse return error.BadArgs;
-    var svc = try Service.load(a, s, service, spec.maps, state);
+    var svc = try Service.loadIndex(a, s, service, try indexOf(a, spec, arg), spec.maps, state);
     if (std.mem.eql(u8, func, "lookup")) {
         var net = network;
         if (chain) |r| net = c.chain.Network.parse((try s.getValue(a, r)).getText("network") orelse "") orelse return error.BadChainState;
@@ -278,8 +298,8 @@ pub fn handle(a: Allocator, spec: Spec, s: Store, network: c.chain.Network, stat
 
 /// The program's main: a call — fn "lookup" (a read), fn "metadata" or
 /// "documentation" (the service's own, else the default), or a hook (in a
-/// step: the service's head `<app>/ls_<service>` advances when its maps
-/// changed — a head under its own app's name, so the kernel lets it).
+/// step: the program's index `<app>/<index>` advances when its maps changed
+/// — a head under its own app's name, so the kernel lets it).
 pub fn main(comptime spec: Spec) u8 {
     const vm = @import("sk");
     const S = struct {
@@ -290,7 +310,7 @@ pub fn main(comptime spec: Spec) u8 {
             const arg = try vm.callArg(a, in);
             if (std.mem.eql(u8, func, "metadata") or std.mem.eql(u8, func, "documentation"))
                 return vm.answer(a, try describe(a, @import("root"), func, arg));
-            const head = try headName(a, appOf(arg), arg.getText("service") orelse return error.BadArgs);
+            const head = try headName(a, appOf(arg), try indexOf(a, spec, arg));
             const chain_state = if (std.mem.eql(u8, func, "lookup")) try vm.head(a, chain_head) else null;
             const net_name = if (in.get("defaults")) |d| d.getText("walletNetwork") orelse "main" else "main";
             const network = c.chain.Network.parse(net_name) orelse return error.BadConfig;

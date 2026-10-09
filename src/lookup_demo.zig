@@ -24,6 +24,8 @@ const Service = lookup.Service;
 
 pub const spec: lookup.Spec = .{
     .maps = &.{ "outputs", "byTopic", "byScript" },
+    // Its index, whatever name it is served as (skein-overlay 0.11.0): the head `<app>/ls_demo`.
+    .index = "ls_demo",
     .answer = answer,
     .admitted = admitted,
     .spent = spent,

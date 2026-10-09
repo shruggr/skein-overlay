@@ -40,6 +40,12 @@
 //!                             `<topic>-live` (0.9.0); answered {topic, active}; with
 //!                             `seed` (0.7.8), the held seeds judged under the topic
 //!                             (submit.zig `seed`), answered {…, seeded, missing, untaken?}.
+//!   registerLookup /          a message in the box `<app>/register` only, as register (0.11.0, David
+//!   deregisterLookup          2026-10-08: "separate registration calls"): {fn: "registerLookup", args:
+//!                             {service, program, topics?}} or {fn: "deregisterLookup", args:
+//!                             {service}} (lookups.zig): the registered set under `<app>/lookups`,
+//!                             served as config.overlay.lookups is; no events; answered
+//!                             {service, active}.
 //!   market / validator        the owner's switch of a role (0.9.2, David 2026-10-07), in the box
 //!                             `<app>/register` only: {fn: "market", args: {window} | {off: true}}
 //!                             or {fn: "validator", args: {every} | {off: true}}; kept in the
@@ -50,8 +56,9 @@
 //!
 //! The state is the overlay's own, under its app's name (state.zig: `<app>/state`), over the
 //! chain app's (`chain/state`), read only. The topics and lookup services are the app's (#72,
-//! config.zig): `config.overlay` of the app record `<app>/app` and the topics registered under
-//! `<app>/topics`, read at every step and call. A
+//! config.zig): `config.overlay` of the app record `<app>/app`, the topics registered under
+//! `<app>/topics` and the lookup services registered under `<app>/lookups`, read at every step
+//! and call. A
 //! genesis-wired engine (no app record) reads the genesis config instead
 //! (defaults.overlayTopics, defaults.overlayLookups, defaults.overlayGossip) and its heads are
 //! under its program's name.
@@ -64,6 +71,8 @@
 //!   {kind: "overlay-result", op: "peer-admit", topic, txid, record, state}
 //!   {kind: "overlay-result", op: "register" | "deregister", topic, active, changed, topics?,
 //!    seeded?, missing?, untaken?, admissions?, watches?, state?}
+//!   {kind: "overlay-result", op: "registerLookup" | "deregisterLookup", service, active, changed,
+//!    lookups?}
 //!   {kind: "overlay-result", op: "market" | "validator", market?, validator?, changed, events,
 //!    topics?}
 //!   {kind: "overlay-result", op, error}                         refused
@@ -77,6 +86,7 @@ const gossip = @import("gossip.zig");
 const calls = @import("calls.zig");
 const config = @import("config.zig");
 const topics = @import("topics.zig");
+const lookups = @import("lookups.zig");
 
 const cbor = c.cbor;
 const Value = cbor.Value;
@@ -200,6 +210,59 @@ fn registration(a: Allocator, step: Value, args: Value, body: Value, func: []con
             try ans.append(a, .{ .key = "result", .value = answer });
             try fields.appendSlice(a, &.{
                 .{ .key = "topic", .value = d.answer.get("topic").? },
+                .{ .key = "active", .value = d.answer.get("active").? },
+                .{ .key = "changed", .value = .{ .boolean = d.list != null } },
+            });
+        },
+    }
+    if (args.getBytes("sender")) |sender| if (try ev_.reaches(a, step, sender)) {
+        _ = try vm.send(a, sender, topics.answerBox(args, calls.appOf(step)), .{ .map = ans.items });
+    };
+    _ = try vm.finish(a, s, try resultRecord(a, func, fields.items));
+}
+
+/// `registerLookup {service, program, topics?}` / `deregisterLookup {service}` (0.11.0, lookups.zig):
+/// a message in the box `<app>/register`, as register (refused `bad-args` elsewhere). The set written
+/// under `<app>/lookups` when it changes; no events; the answer `{fn, request, replyTo, result:
+/// {service, active} | error: {code, message}}` to the sender when a message can reach it. A refusal
+/// writes nothing.
+fn lookupRegistration(a: Allocator, step: Value, args: Value, body: Value, func: []const u8) !void {
+    const s = vm.store();
+    const head = try lookups.headName(a, calls.appOf(step));
+    const root = try vm.head(a, head);
+    const list = try lookups.entriesOf(a, if (root) |r| try s.getValue(a, r) else null);
+    const fargs: Value = body.get("args") orelse .{ .map = &.{} };
+    const change: lookups.Change = if (!topics.mayRegister(args, calls.appOf(step)))
+        .{ .refused = try topics.notHere(a, func, args, calls.appOf(step)) }
+    else if (eql(u8, func, "registerLookup"))
+        try lookups.register(a, list, fargs, step.get("programs") orelse return error.BadConfig)
+    else
+        try lookups.deregister(a, list, fargs);
+    const message = args.getCid("message") orelse return error.BadInput;
+    var ans: std.ArrayList(cbor.Entry) = .empty;
+    try ans.appendSlice(a, &.{
+        .{ .key = "fn", .value = .{ .text = func } },
+        .{ .key = "request", .value = .{ .cid = message } },
+        .{ .key = "replyTo", .value = .{ .cid = message } },
+    });
+    var fields: std.ArrayList(cbor.Entry) = .empty;
+    switch (change) {
+        .refused => |why| {
+            try ans.append(a, .{ .key = "error", .value = .{ .map = try a.dupe(cbor.Entry, &.{
+                .{ .key = "code", .value = .{ .text = "bad-args" } },
+                .{ .key = "message", .value = .{ .text = why } },
+            }) } });
+            try fields.append(a, .{ .key = "error", .value = .{ .text = why } });
+        },
+        .done => |d| {
+            if (d.list) |l| {
+                const rc = try s.putValue(a, try lookups.recordOf(a, l));
+                try vm.advance(head, rc);
+                try fields.append(a, .{ .key = "lookups", .value = .{ .cid = rc } });
+            }
+            try ans.append(a, .{ .key = "result", .value = d.answer });
+            try fields.appendSlice(a, &.{
+                .{ .key = "service", .value = d.answer.get("service").? },
                 .{ .key = "active", .value = d.answer.get("active").? },
                 .{ .key = "changed", .value = .{ .boolean = d.list != null } },
             });
@@ -337,6 +400,8 @@ fn run(a: Allocator) anyerror!void {
         switch (topics.asked(body)) {
             .register => return registration(a, step, args, body, "register"),
             .deregister => return registration(a, step, args, body, "deregister"),
+            .registerLookup => return lookupRegistration(a, step, args, body, "registerLookup"),
+            .deregisterLookup => return lookupRegistration(a, step, args, body, "deregisterLookup"),
             .market => return switching(a, step, args, body, .market),
             .validator => return switching(a, step, args, body, .validator),
             .other => {},

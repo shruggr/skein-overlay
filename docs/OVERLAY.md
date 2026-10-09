@@ -1,4 +1,4 @@
-# Overlay services in the VM (0.10.0)
+# Overlay services in the VM (0.11.0)
 
 An overlay is an app (skein docs/APPS.md §6). It judges transactions with
 its topic managers and indexes them with its lookup services; it does not
@@ -27,9 +27,11 @@ its own head. A lookup answers from those indexes.
 
 **Everything the overlay writes is under its app's name** (skein #77: an app
 writes only heads under its own name): `<app>/state` (what its topics
-admitted), `<app>/gossip` (its peers' admits), `<app>/ls_<service>` (each
-lookup service's index), `<app>/topics` (the topics registered at runtime,
-"Register a topic", below); its app record is `<app>/app`. Two overlay apps on
+admitted), `<app>/gossip` (its peers' admits), `<app>/ls_<…>` (each
+lookup program's index, one per program however many names it serves,
+"The lookup contract", below), `<app>/topics` (the topics registered at runtime,
+"Register a topic", below), `<app>/lookups` (the lookup services
+registered at runtime, "Register a lookup service", below); its app record is `<app>/app`. Two overlay apps on
 one instance — `overlay` and `amm`, say — therefore keep two sets of heads
 and share the one chain: they coexist by construction.
 
@@ -41,7 +43,15 @@ storage are not ported.
 **Not built:**
 
 - BRC-88 SHIP/SLAP advertisement. Clients reach an instance through the
-  `hostOverrides` / `facilitator` options of the @bsv/sdk clients.
+  `hostOverrides` / `facilitator` options of the @bsv/sdk clients, or at
+  its origin's root once root adds the two root routes ("Root routes",
+  below). Decided 2026-10-08 (David Case): registering a topic publishes a
+  SHIP ad and registering a lookup a SLAP ad, made and signed by the
+  skein's own wallet, each deregister spending its ad. Stopped in 0.11.0:
+  the skein's wallet program (skein `programs/wallet`) builds only from its
+  own P2PKH coins and takes no caller-supplied inputs, so the engine can
+  have it fund and sign the PushDrop ad but not spend the ad to revoke it
+  without a change to skein's wallet (an open question for skein).
 - Sync between overlay nodes (GASP); catch-up from a peer. The push half —
   submissions, admits and proofs as they happen — is the gossip (#74, below).
   The engine's half of catch-up is the want of a paused submission —
@@ -860,6 +870,55 @@ refused (`bad-args`), nothing written (`src/topics.zig` `switchRole`;
 the step's result record `{op: "market" | "validator", market?, validator?,
 changed, events, topics?}`).
 
+### Register a lookup service (0.11.0)
+
+David Case, 2026-10-08: lookup services get their own registration calls,
+separate from the topics'. A lookup service may be declared in
+`config.overlay.lookups` or registered at runtime, one call per service
+name, in the same box as `register` (`<app>/register`, the same root
+gating; refused `bad-args` in any other box):
+
+```
+{fn: "registerLookup",   args: {service, program, topics?}}   program: the role in `programs` that answers it
+{fn: "deregisterLookup", args: {service}}
+```
+
+`topics` (optional) is the list of topics whose admissions the service
+hears; without it, every topic the engine serves (as a declared service
+without `topics`). Both are idempotent: a service registered already with
+the same program and topics, or not registered, changes nothing. A service
+registered with another program or other topics is refused (deregister it
+first); so are an unknown role, an empty service and a `topics` that is
+not a list of topic names. The answer is `{service, active}`, sent as
+register's is (`{fn, request, replyTo, result}` or `error: {code:
+"bad-args", message}`). No events: a lookup service subscribes to nothing
+(the topics' messages are the topics' registration's). The topics'
+`register` / `deregister` are unchanged.
+
+**The set** is the engine's own head, `<app>/lookups` (beside
+`<app>/topics`):
+
+```
+{kind: "overlay-lookups", lookups: [{service, program, topics?}, …]}     sorted by service, each once
+```
+
+read at every step and call with `config.overlay` (`src/config.zig`
+`withRegistered`): each registered service is served as if
+`config.overlay.lookups` named it (`{program, topics?}`; a declared service
+keeps its own). So `POST /lookup` routes it, `/listLookupServiceProviders`
+lists it, `/getDocumentationForLookupServiceProvider` documents it, and the
+admitted-output hooks reach its program. A name neither declared nor
+registered answers 400 `Lookup service not supported: <name>`; there is no
+wildcard (under BRC-207 an empty answer means "not spendable", so an
+unregistered name never answers an empty list).
+
+**Hooks once per program.** The reference engine (@bsv/overlay) notifies
+every lookup service of every admitted output. Here the hooks reach each
+lookup **program** once per admitted transaction and topic, however many
+of its names listen (`src/calls.zig` `hookTargets`): the hook names the
+first of them (`service`) and the role (`program`). A program serving many
+names keeps one index ("The lookup contract", below).
+
 **Result.** Each step keeps a result record and prints its CID:
 
 - `{kind: "overlay-result", op: "submit" | "answer" | "watch" | "watched",
@@ -878,6 +937,9 @@ changed, events, topics?}`).
 - `{kind: "overlay-result", op: "register" | "deregister", topic, active,
   changed, topics?}` (`topics`: the set's new record), or `{op, error}`
   for a refusal;
+- `{kind: "overlay-result", op: "registerLookup" | "deregisterLookup",
+  service, active, changed, lookups?}` (`lookups`: the set's new record),
+  or `{op, error}` for a refusal;
 - `{op, error}` when the step fails.
 
 A topic whose instructions do not fit the transaction admits nothing.
@@ -943,20 +1005,29 @@ none removes them. It answers its metadata and documentation with literals.
 
 A lookup service is a program with its own storage and four functions, all
 in-VM calls. The hooks are called by the engine in the step that admits a
-submission or removes a judgement; they receive CIDs, never bytes, and read
+submission or removes a judgement, once per program (0.11.0: not once per
+service name); they receive CIDs, never bytes, and read
 the transactions through `get`. Every call names `app`, the app the engine
-runs as:
+runs as, `service`, the name it is called as (for a hook, the first of the
+program's names that listens to the topic), and `program`, the role in
+`programs` it is called as (0.11.0):
 
 | fn | argument | when |
 |---|---|---|
-| `admitted` | `{kind: "lookup-hook", app, service, topic, tx: <CID>, outputsToAdmit: [vout], coinsRetained: [input index]}` | a topic it listens to admitted a transaction (or consumed previous coins) |
-| `spent` | `{kind: "lookup-hook", app, service, topic, outpoint: {tx: <CID>, vout}, spendingTx: <CID>}` | for each previous coin that transaction consumed (retained or removed) |
-| `rejected` | `{kind: "lookup-hook", app, service, topic, tx: <CID>}` | a judgement of that topic was removed by a rejection |
-| `lookup` | `{kind: "lookup-call", app, service, query}` | `POST /lookup`: a read |
+| `admitted` | `{kind: "lookup-hook", app, service, program, topic, tx: <CID>, outputsToAdmit: [vout], coinsRetained: [input index]}` | a topic it listens to admitted a transaction (or consumed previous coins) |
+| `spent` | `{kind: "lookup-hook", app, service, program, topic, outpoint: {tx: <CID>, vout}, spendingTx: <CID>}` | for each previous coin that transaction consumed (retained or removed) |
+| `rejected` | `{kind: "lookup-hook", app, service, program, topic, tx: <CID>}` | a judgement of that topic was removed by a rejection |
+| `lookup` | `{kind: "lookup-call", app, service, program, query}` | `POST /lookup`: a read |
 
-A hook may be a no-op. **Own storage:** a service keeps named maps (the
-SDK chain library's `store.zig`) under its own head `<app>/ls_<service>`
-(`ls_demo` → `<app>/ls_demo`), a record `{kind: "lookup-state", service,
+A hook may be a no-op. **Own storage:** a program keeps named maps (the
+SDK chain library's `store.zig`) under one head, its **index**
+`<app>/<index>`, whatever names it serves (0.11.0; before, one head per
+called name, `<app>/ls_<service>`, while the hooks wrote under the
+configured name): the program's `Spec.index` when it names one (`ls_demo`
+→ `<app>/ls_demo`; Mandala's `ls_mandala`), else `ls_<role>` after the role
+it is called as (`lookup.indexOf`). Every name reads the one index and
+knows the name it was called as (`Service.name`; the index is
+`Service.index`). The record is `{kind: "lookup-state", service: <index>,
 maps: {name: root | null}}`. A head under its app's name: the kernel lets
 the service's program write it (its program record names the same app). The
 maps are written only through the hooks: a hook that changes them puts the
@@ -991,6 +1062,7 @@ With the module `lookup`, a service is a `Spec`:
 const lookup = @import("lookup");
 pub const spec: lookup.Spec = .{
     .maps = &.{ "outputs", "byTopic", "byScript" },
+    .index = "ls_demo",     // optional: the index's name (else ls_<role>)
     .answer = answer,       // (arena, *Service, *lookup.Chain, query) !Answer
     .admitted = admitted,   // (arena, *Service, topic, Tx, outputs_to_admit, coins_retained) !void
     .spent = spent,         // (arena, *Service, topic, Outpoint, spending: Tx) !void
@@ -1100,6 +1172,57 @@ route's call does.
 **The STEAK.** It is the `steak` of an `admitted` answer, per topic, with
 exactly the three fields the @bsv/sdk client accepts (`outputsToAdmit`,
 `coinsToRetain`, `coinsRemoved`).
+
+### Root routes (0.11.0)
+
+The @bsv/sdk clients take only a bare origin (`https://<handle>.<host>`)
+and call `<origin>/submit` and `<origin>/lookup`; an SDK client (and a
+BRC-88 ad, once built) reaches the overlay there. The overlay is one app
+per skein, so there is no routing by name: the skein answers the two paths
+at its origin's root with two plain **root routes** (shruggr/skein#143:
+root's own routes, no `app`, outside `/<app>/`), to the app's existing
+`submit` handler and `lookup` filter. Nothing else changes: the app's own
+`/<app>/submit` and `/<app>/lookup` stay.
+
+The engine works from either. `POST /submit` at the root names its handler
+as the app's engine program record (`match.program`), which names its app,
+as the app's own route does. The read route `/lookup` at the root names no
+program and no app: the engine takes its app from the route's filter,
+`<app>.lookup` (`src/config.zig` `matchedApp` / `filterApp`: the first
+filter `<app>.<filter>` whose app record lists that filter).
+
+Whether root adds the two routes by hand or the install asks for them is
+not decided. Both ways:
+
+**By hand** (works today; for an app installed as `mandala`):
+
+```
+skein routes add --transport http --filters kernel.beef --fn submit /submit mandala.overlay <origin>
+skein routes add --transport http --filters mandala.lookup /lookup <origin>
+```
+
+— the rows `{transport: "http", address: "/submit", filters:
+["kernel.beef"], program: <mandala's overlay record>, fn: "submit"}` and
+`{transport: "http", address: "/lookup", filters: ["mandala.lookup"]}` (a
+read route: anyone, signed or not, nothing logged). An upgrade or uninstall
+of the app leaves them (they are root's); after a reinstall that changes
+the engine's record, root adds `/submit` again.
+
+**Asked by the install** (not built: it needs a skein change). The
+manifest format has no way for an app to ask for a route outside
+`/<app>/`; a request might read
+
+```json
+"rootRoutes": [
+  {"transport": "http", "address": "/submit", "filters": ["kernel.beef"], "handler": "overlay.submit"},
+  {"transport": "http", "address": "/lookup", "filters": ["lookup"]}
+]
+```
+
+with the install prompt reading them aloud as root routes for root to
+approve (refused when the path is taken), the rows carrying the app so an
+uninstall removes them. That is skein's install and manifest format
+(src/host/manifest.ts), not this repo's.
 
 ## Gossip: the three topics (#74)
 

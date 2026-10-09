@@ -2524,8 +2524,9 @@ test "one box per function class (skein #128, 0.7.5, 0.7.7): register only in `<
     try std.testing.expect((try manifestRoute(a, "mailbox", "")) == null);
     const mj = try std.json.parseFromSliceLeaky(std.json.Value, a, @embedFile("etc/app.json"), .{});
     const gated = mj.object.get("roles").?.object.get("root").?.array.items;
-    try std.testing.expectEqual(@as(usize, 3), gated.len);
-    for ([_][]const u8{ "register", "market", "validator" }, gated) |w, g| try std.testing.expectEqualStrings(w, g.string);
+    // The lookup registrations (0.11.0) listed beside register: the same route, the same gate.
+    try std.testing.expectEqual(@as(usize, 5), gated.len);
+    for ([_][]const u8{ "register", "registerLookup", "deregisterLookup", "market", "validator" }, gated) |w, g| try std.testing.expectEqualStrings(w, g.string);
     try std.testing.expect(mj.object.get("dispatch") == null and mj.object.get("reads") == null);
 
     // Submit accepted in `<app>/submit`: launched, the submitter answered in that box.
@@ -2741,4 +2742,302 @@ fn expectFilters(r: std.json.ObjectMap, want: []const []const u8) !void {
     const fs = r.get("filters").?.array.items;
     try std.testing.expectEqual(want.len, fs.len);
     for (want, fs) |w, f| try std.testing.expectEqualStrings(w, f.string);
+}
+
+// ---------------------------------------------------------------- 0.11.0: registered lookup services
+
+const lookups_mod = @import("src/lookups.zig");
+
+test "registerLookup / deregisterLookup (0.11.0, David 2026-10-08): the set under <app>/lookups, idempotent, refusals; separate from the topics' register" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = c.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    const s = ms.store();
+    const prog = try s.putValue(a, try mapOf(a, &.{.{ .key = "kind", .value = .{ .text = "program" } }}));
+    const programs = try mapOf(a, &.{ .{ .key = "lookup-demo", .value = .{ .cid = prog } }, .{ .key = "other", .value = .{ .cid = prog } } });
+    const args = struct {
+        fn of(al: Allocator, service: ?[]const u8, program: ?[]const u8, topics: ?[]const []const u8) !Value {
+            var es: std.ArrayList(cbor.Entry) = .empty;
+            if (service) |x| try es.append(al, .{ .key = "service", .value = .{ .text = x } });
+            if (program) |p| try es.append(al, .{ .key = "program", .value = .{ .text = p } });
+            if (topics) |ts| {
+                const xs = try al.alloc(Value, ts.len);
+                for (ts, xs) |t, *x| x.* = .{ .text = t };
+                try es.append(al, .{ .key = "topics", .value = .{ .array = xs } });
+            }
+            return .{ .map = es.items };
+        }
+    }.of;
+
+    // The calls, by `fn`: their own pair, apart from register / deregister.
+    for ([_][2][]const u8{ .{ "registerLookup", "registerLookup" }, .{ "deregisterLookup", "deregisterLookup" }, .{ "register", "register" }, .{ "lookup", "other" } }) |x| {
+        const got = topics_mod.asked(try mapOf(a, &.{.{ .key = "fn", .value = .{ .text = x[0] } }}));
+        try std.testing.expectEqualStrings(x[1], @tagName(got));
+    }
+    try std.testing.expectEqualStrings("amm/lookups", try lookups_mod.headName(a, "amm"));
+    // Taken only in `<app>/register`, as register is.
+    try std.testing.expect(topics_mod.mayRegister(try mapOf(a, &.{.{ .key = "box", .value = .{ .text = "amm/register" } }}), "amm"));
+    try std.testing.expect(!topics_mod.mayRegister(try mapOf(a, &.{.{ .key = "box", .value = .{ .text = "amm/submit" } }}), "amm"));
+
+    // Register: the set, answered {service, active}.
+    const reg = (try lookups_mod.register(a, &.{}, try args(a, "ls_x", "lookup-demo", &.{"tm_x"}), programs)).done;
+    try std.testing.expectEqual(@as(usize, 1), reg.list.?.len);
+    try std.testing.expectEqualStrings("ls_x", reg.answer.getText("service").?);
+    try std.testing.expect(reg.answer.get("active").?.boolean);
+    try std.testing.expectEqual(@as(usize, 2), reg.answer.map.len);
+    // A second, sorted by service; no topics: every topic served.
+    const two = (try lookups_mod.register(a, reg.list.?, try args(a, "ls_a", "lookup-demo", null), programs)).done.list.?;
+    try std.testing.expectEqualStrings("ls_a", two[0].service);
+    try std.testing.expect(two[0].topics == null);
+    try std.testing.expectEqualStrings("tm_x", two[1].topics.?[0]);
+    // Idempotent: the same again writes nothing.
+    const again = (try lookups_mod.register(a, two, try args(a, "ls_x", "lookup-demo", &.{"tm_x"}), programs)).done;
+    try std.testing.expect(again.list == null and again.answer.get("active").?.boolean);
+    // Refused: no service, no program, an empty service, an unknown role, topics not a list of
+    // names, another program or other topics for a registered service.
+    try std.testing.expect(try lookups_mod.register(a, two, try args(a, null, "lookup-demo", null), programs) == .refused);
+    try std.testing.expect(try lookups_mod.register(a, two, try args(a, "ls_y", null, null), programs) == .refused);
+    try std.testing.expect(try lookups_mod.register(a, two, try args(a, "", "lookup-demo", null), programs) == .refused);
+    try std.testing.expect(try lookups_mod.register(a, two, try args(a, "ls_y", "nope", null), programs) == .refused);
+    try std.testing.expect(try lookups_mod.register(a, two, try mapOf(a, &.{ .{ .key = "service", .value = .{ .text = "ls_y" } }, .{ .key = "program", .value = .{ .text = "lookup-demo" } }, .{ .key = "topics", .value = .{ .text = "tm_x" } } }), programs) == .refused);
+    try std.testing.expect(try lookups_mod.register(a, two, try args(a, "ls_y", "lookup-demo", &.{""}), programs) == .refused);
+    try std.testing.expect(try lookups_mod.register(a, two, try args(a, "ls_x", "other", &.{"tm_x"}), programs) == .refused);
+    try std.testing.expect(try lookups_mod.register(a, two, try args(a, "ls_x", "lookup-demo", &.{"tm_y"}), programs) == .refused);
+    try std.testing.expect(try lookups_mod.register(a, two, try args(a, "ls_x", "lookup-demo", null), programs) == .refused);
+
+    // The record round-trips.
+    const rec = try lookups_mod.recordOf(a, two);
+    try std.testing.expectEqualStrings("overlay-lookups", rec.getText("kind").?);
+    try std.testing.expectEqualDeep(two, try lookups_mod.entriesOf(a, rec));
+    try std.testing.expectError(error.BadLookupSet, lookups_mod.entriesOf(a, try mapOf(a, &.{.{ .key = "kind", .value = .{ .text = "overlay-topics" } }})));
+
+    // Deregister: the set without it; again (or never registered), nothing, active false.
+    const dereg = (try lookups_mod.deregister(a, two, try args(a, "ls_x", null, null))).done;
+    try std.testing.expectEqual(@as(usize, 1), dereg.list.?.len);
+    try std.testing.expect(!dereg.answer.get("active").?.boolean);
+    const none = (try lookups_mod.deregister(a, dereg.list.?, try args(a, "ls_x", null, null))).done;
+    try std.testing.expect(none.list == null and !none.answer.get("active").?.boolean);
+    try std.testing.expect(try lookups_mod.deregister(a, two, try mapOf(a, &.{})) == .refused);
+}
+
+test "a registered lookup is served as a configured one (0.11.0): /lookup routes it, the listing lists it, its hooks reach it; a declared one keeps its own; an unknown name is not supported" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = c.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    const inst = try Instance.init(a, &ms);
+    const s = ms.store();
+    var hm = HeadMap{};
+    const engine = try s.putValue(a, try mapOf(a, &.{
+        .{ .key = "kind", .value = .{ .text = "program" } },
+        .{ .key = "name", .value = .{ .text = "overlay" } },
+        .{ .key = "app", .value = .{ .text = "overlay" } },
+    }));
+    try hm.m.put(a, "overlay/app", try appRecordOf(a, s, "overlay", engine, inst.topic_prog, inst.lookup_prog, &.{.{ .key = "tm_demo", .value = .{ .text = "topic-demo" } }}, &.{}));
+    const in = try withThread(a, s, try mapOf(a, &.{}), engine);
+    const before = try config.resolve(a, s, hm.heads(), in, null);
+    const declared = try calls.configObject(a, before, "overlayLookups");
+
+    // Not registered: not served (the route's 400 "Lookup service not supported"; no wildcard).
+    try std.testing.expect((try calls.configuredProgram(before, declared, "ls_mandala_x")) == null);
+
+    // Registered: in overlayLookups beside the declared, {program, topics?}; the declared one keeps its own.
+    const reg = (try lookups_mod.register(a, &.{}, try mapOf(a, &.{
+        .{ .key = "service", .value = .{ .text = "ls_reg" } },
+        .{ .key = "program", .value = .{ .text = "lookup-demo" } },
+        .{ .key = "topics", .value = .{ .array = try a.dupe(Value, &.{.{ .text = "tm_demo" }}) } },
+    }), before.get("programs").?)).done.list.?;
+    const shadow = (try lookups_mod.register(a, reg, try mapOf(a, &.{
+        .{ .key = "service", .value = .{ .text = "ls_demo" } },
+        .{ .key = "program", .value = .{ .text = "topic-demo" } },
+    }), before.get("programs").?)).done.list.?;
+    try hm.m.put(a, "overlay/lookups", try s.putValue(a, try lookups_mod.recordOf(a, shadow)));
+    const now = try config.resolve(a, s, hm.heads(), in, null);
+    const served = try calls.configObject(a, now, "overlayLookups");
+    try std.testing.expectEqual(@as(usize, 2), served.count());
+    try std.testing.expectEqualSlices(u8, inst.lookup_prog, (try calls.configuredProgram(now, served, "ls_reg")).?);
+    try std.testing.expectEqualSlices(u8, inst.lookup_prog, (try calls.configuredProgram(now, served, "ls_demo")).?);
+    try std.testing.expectEqualStrings("tm_demo", served.get("ls_reg").?.object.get("topics").?.array.items[0].string);
+    try std.testing.expect((try calls.configuredProgram(now, served, "ls_other")) == null);
+    // The lookup-call names the role it is called as: the program's index (lookup.zig `indexOf`).
+    const arg = try calls.lookupArg(a, now, "ls_reg", try mapOf(a, &.{}));
+    try std.testing.expectEqualStrings("lookup-demo", arg.getText("program").?);
+    // The listing's names (routes.zig `listing` walks this map): both.
+    try std.testing.expectEqualStrings("ls_demo", served.keys()[0]);
+    try std.testing.expectEqualStrings("ls_reg", served.keys()[1]);
+    // Its listeners: ls_reg hears tm_demo; tm_other no one but ls_demo (which hears every served topic).
+    const ls_ = try calls.listeners(a, now, "tm_demo");
+    try std.testing.expectEqual(@as(usize, 2), ls_.len);
+    try std.testing.expectEqualStrings("lookup-demo", ls_[1].role);
+}
+
+test "admitted-output hooks reach a lookup program once, not once per name (0.11.0): one index shared by its names, each call naming the name it was called as" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = c.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var inst = try Instance.init(a, &ms);
+    // Three names on one program, all hearing tm_demo: one declared, two as registration would add them.
+    inst.in = try config.withLookups(a, inst.in, &.{
+        .{ .service = "ls_demo_a", .program = "lookup-demo", .topics = &.{"tm_demo"} },
+        .{ .service = "ls_demo_b", .program = "lookup-demo" },
+    });
+    try std.testing.expectEqual(@as(usize, 3), (try calls.listeners(a, inst.in, "tm_demo")).len);
+    const targets = try calls.hookTargets(a, inst.in, "tm_demo");
+    try std.testing.expectEqual(@as(usize, 1), targets.len);
+    try std.testing.expectEqualStrings("ls_demo", targets[0].service);
+    try std.testing.expectEqualStrings("lookup-demo", targets[0].role);
+
+    const k = try keys(0x5a);
+    const f = try fund(a, 0x6b, 2, &k.p2pkh);
+    try inst.headers(&.{&f.h1});
+    const t1 = try spend(a, &f.tx, 0, &.{ .{ 1, &k.token }, .{ 9_000, &k.p2pkh } }, k.priv);
+    try std.testing.expect((try inst.admitted(try withFund(a, f, t1), t1.txid)).admitted);
+    try std.testing.expectEqual(@as(usize, 1), inst.count("admitted"));
+    // A spend of it: one `spent`, one `admitted`, once each.
+    const t2 = try spend(a, &t1.tx, 0, &.{.{ 1, &k.token }}, k.priv);
+    const t2_beef = try beef.serialize(a, .{ .version = beef.V2, .bumps = f.bumps, .entries = try a.dupe(beef.Entry, &.{ f.entry, .{ .txid = t1.txid, .format = .raw, .raw = t1.raw, .tx = t1.tx }, .{ .txid = t2.txid, .format = .raw, .raw = t2.raw, .tx = t2.tx } }) });
+    try std.testing.expect((try inst.admitted(t2_beef, t2.txid)).admitted);
+    try std.testing.expectEqual(@as(usize, 2), inst.count("admitted"));
+    try std.testing.expectEqual(@as(usize, 1), inst.count("spent"));
+    // One index (ls_demo's: `Spec.index`), so the outputs are there whichever name.
+    try std.testing.expectEqual(@as(usize, 1), try inst.lookTopic());
+}
+
+/// A lookup program serving any name: its index counts admissions; it answers the name it was
+/// called as and the count (the shared index, 0.11.0).
+const Shared = struct {
+    fn admitted(_: Allocator, svc: *lookup.Service, _: []const u8, tx: lookup.Tx, _: []const u32, _: []const u32) anyerror!void {
+        try svc.map("seen").add(&tx.txid);
+    }
+    fn answer(a: Allocator, svc: *lookup.Service, _: *lookup.Chain, _: Value) anyerror!lookup.Answer {
+        return .{ .freeform = .{ .map = try a.dupe(cbor.Entry, &.{
+            .{ .key = "called", .value = .{ .text = svc.name } },
+            .{ .key = "index", .value = .{ .text = svc.index } },
+            .{ .key = "seen", .value = .{ .uint = (try svc.map("seen").prefixed(&.{})).len } },
+        }) } };
+    }
+    const spec: lookup.Spec = .{ .maps = &.{"seen"}, .answer = answer, .admitted = admitted };
+};
+
+test "a lookup program's index (0.11.0): Spec.index, else ls_<role> after the role it is called as; every name it serves reads the one index and knows its own name" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = c.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    const s = ms.store();
+    // The index: the spec's, else the role's, else (an engine naming no role) the called name.
+    const call = struct {
+        fn of(al: Allocator, kind: []const u8, service: []const u8, program: ?[]const u8, rest: []const cbor.Entry) !Value {
+            var es: std.ArrayList(cbor.Entry) = .empty;
+            try es.appendSlice(al, &.{
+                .{ .key = "kind", .value = .{ .text = kind } },
+                .{ .key = "app", .value = .{ .text = "mandala" } },
+                .{ .key = "service", .value = .{ .text = service } },
+            });
+            if (program) |p| try es.append(al, .{ .key = "program", .value = .{ .text = p } });
+            try es.appendSlice(al, rest);
+            return .{ .map = es.items };
+        }
+    }.of;
+    try std.testing.expectEqualStrings("ls_demo", try lookup.indexOf(a, ls.spec, try call(a, "lookup-call", "ls_other", "lookup-demo", &.{})));
+    try std.testing.expectEqualStrings("ls_mandala-lookup", try lookup.indexOf(a, Shared.spec, try call(a, "lookup-call", "ls_mandala_x", "mandala-lookup", &.{})));
+    try std.testing.expectEqualStrings("ls_x", try lookup.indexOf(a, Shared.spec, try call(a, "lookup-call", "ls_y", "ls_x", &.{})));
+    try std.testing.expectEqualStrings("ls_y", try lookup.indexOf(a, Shared.spec, try call(a, "lookup-call", "ls_y", null, &.{})));
+    try std.testing.expectEqualStrings("mandala/ls_mandala-lookup", try lookup.headName(a, "mandala", "ls_mandala-lookup"));
+
+    // A hook under one name, a lookup under another: the same index, each answer naming its own call.
+    const k = try keys(0x21);
+    const f = try fund(a, 0x22, 1, &k.p2pkh);
+    try s.putBlock(&c.store.hashCid(.tx, f.txid), f.raw);
+    const hooked = try lookup.handle(a, Shared.spec, s, .regtest, null, null, "admitted", try call(a, "lookup-hook", "ls_mandala_a", "mandala-lookup", &.{
+        .{ .key = "topic", .value = .{ .text = "tm_mandala_a" } },
+        .{ .key = "tx", .value = .{ .cid = try a.dupe(u8, &c.store.hashCid(.tx, f.txid)) } },
+        .{ .key = "outputsToAdmit", .value = .{ .array = try a.dupe(Value, &.{.{ .uint = 0 }}) } },
+    }));
+    const st = hooked.state.?;
+    try std.testing.expectEqualStrings("ls_mandala-lookup", (try s.getValue(a, st)).getText("service").?);
+    for ([_][]const u8{ "ls_mandala_a", "ls_mandala_b" }) |name| {
+        const got = (try lookup.handle(a, Shared.spec, s, .regtest, st, null, "lookup", try call(a, "lookup-call", name, "mandala-lookup", &.{.{ .key = "query", .value = try mapOf(a, &.{}) }}))).answer.get("result").?;
+        try std.testing.expectEqualStrings(name, got.getText("called").?);
+        try std.testing.expectEqualStrings("ls_mandala-lookup", got.getText("index").?);
+        try std.testing.expectEqual(@as(u64, 1), got.getUint("seen").?);
+    }
+    // Another index's record is not this one's.
+    try std.testing.expectError(error.BadState, lookup.handle(a, Shared.spec, s, .regtest, st, null, "lookup", try call(a, "lookup-call", "ls_q", "other-lookup", &.{.{ .key = "query", .value = try mapOf(a, &.{}) }})));
+}
+
+test "root routes (0.11.0): a read route at the origin's root names its app by its filter <app>.lookup; POST /submit at the root by its handler's program record" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = c.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    const inst = try Instance.init(a, &ms);
+    const s = ms.store();
+    var hm = HeadMap{};
+    const engine = try s.putValue(a, try mapOf(a, &.{
+        .{ .key = "kind", .value = .{ .text = "program" } },
+        .{ .key = "name", .value = .{ .text = "overlay" } },
+        .{ .key = "app", .value = .{ .text = "mandala" } },
+    }));
+    // The install derives the filter `lookup` → `overlay.lookup` into the record's `filters`.
+    const app_rec = try mapOf(a, &.{
+        .{ .key = "kind", .value = .{ .text = "app" } },
+        .{ .key = "name", .value = .{ .text = "mandala" } },
+        .{ .key = "programs", .value = try mapOf(a, &.{
+            .{ .key = "overlay", .value = .{ .cid = engine } },
+            .{ .key = "topic-demo", .value = .{ .cid = inst.topic_prog } },
+            .{ .key = "lookup-demo", .value = .{ .cid = inst.lookup_prog } },
+        }) },
+        .{ .key = "filters", .value = try mapOf(a, &.{.{ .key = "lookup", .value = .{ .text = "overlay.lookup" } }}) },
+        .{ .key = "config", .value = try mapOf(a, &.{.{ .key = "overlay", .value = try mapOf(a, &.{
+            .{ .key = "lookups", .value = try mapOf(a, &.{.{ .key = "ls_demo", .value = .{ .text = "lookup-demo" } }}) },
+        }) }}) },
+    });
+    try hm.m.put(a, "mandala/app", try s.putValue(a, app_rec));
+    const call_in = try mapOf(a, &.{ .{ .key = "kind", .value = .{ .text = "call" } }, .{ .key = "filter", .value = .{ .boolean = true } } });
+    const route = struct {
+        fn of(al: Allocator, filters: []const []const u8, program: ?[]const u8, app: ?[]const u8) !Value {
+            const fs = try al.alloc(Value, filters.len);
+            for (filters, fs) |f, *x| x.* = .{ .text = f };
+            var m: std.ArrayList(cbor.Entry) = .empty;
+            try m.appendSlice(al, &.{
+                .{ .key = "transport", .value = .{ .text = "http" } },
+                .{ .key = "address", .value = .{ .text = "/lookup" } },
+                .{ .key = "filters", .value = .{ .array = fs } },
+            });
+            if (program) |p| try m.append(al, .{ .key = "program", .value = .{ .cid = p } });
+            if (app) |x| try m.append(al, .{ .key = "app", .value = .{ .text = x } });
+            return .{ .map = try al.dupe(cbor.Entry, &.{.{ .key = "match", .value = .{ .map = m.items } }}) };
+        }
+    }.of;
+
+    // Root's read route `/lookup` (no app): the app is the filter's, `mandala`.
+    const m = (try config.matchedApp(a, hm.heads(), s, call_in, try route(a, &.{"mandala.lookup"}, null, null))).?;
+    try std.testing.expectEqualStrings("mandala", m.name);
+    try std.testing.expectEqualSlices(u8, engine, m.engine.?);
+    const resolved = try config.resolve(a, s, hm.heads(), call_in, try route(a, &.{"mandala.lookup"}, null, null));
+    try std.testing.expectEqualStrings("mandala", calls.appOf(resolved));
+    try std.testing.expect((try calls.configObject(a, resolved, "overlayLookups")).contains("ls_demo"));
+    // The app's own derived read route (`app` on it) as before.
+    try std.testing.expectEqualStrings("mandala", (try config.matchedApp(a, hm.heads(), s, call_in, try route(a, &.{"mandala.lookup"}, null, "mandala"))).?.name);
+    // kernel filters are skipped; a filter its app does not list, or no app record, names nothing.
+    try std.testing.expectEqualStrings("mandala", (try config.matchedApp(a, hm.heads(), s, call_in, try route(a, &.{ "kernel.brc104", "mandala.lookup" }, null, null))).?.name);
+    try std.testing.expect((try config.matchedApp(a, hm.heads(), s, call_in, try route(a, &.{"mandala.nope"}, null, null))) == null);
+    try std.testing.expect((try config.matchedApp(a, hm.heads(), s, call_in, try route(a, &.{"amm.lookup"}, null, null))) == null);
+    try std.testing.expect((try config.matchedApp(a, hm.heads(), s, call_in, try route(a, &.{"kernel.beef"}, null, null))) == null);
+
+    // Root's `POST /submit` (a handler: the app's engine program record, `skein routes add … mandala.overlay`):
+    // the engine reads its app from its own record, as on the app's own `/<app>/submit`.
+    const sub = try route(a, &.{"kernel.beef"}, engine, null);
+    try std.testing.expect((try config.matchedApp(a, hm.heads(), s, call_in, sub)) == null);
+    const r2 = try config.resolve(a, s, hm.heads(), call_in, sub);
+    try std.testing.expectEqualStrings("mandala", calls.appOf(r2));
+    try std.testing.expectEqualSlices(u8, engine, r2.getCid("engine").?);
 }

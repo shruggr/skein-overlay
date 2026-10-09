@@ -36,6 +36,18 @@
 //! written by the engine's own `register` / `deregister`. `resolve` adds each
 //! to `overlayTopics` (judged by its `program`; a declared topic keeps its
 //! own), read at every step and call: the rest of the engine sees one set.
+//! The lookup services registered at runtime (skein-overlay 0.11.0;
+//! lookups.zig) likewise: the root record of the head `<app>/lookups`,
+//! `{kind: "overlay-lookups", lookups: [{service, program, topics?}]}`, each
+//! added to `overlayLookups` as `{program, topics?}` (a declared service keeps
+//! its own).
+//!
+//! A root route (shruggr/skein#143: root's own route, no `app`) reaches the
+//! engine too (skein-overlay 0.11.0): `POST /submit` at the origin's root,
+//! its handler the app's engine program record (`match.program`: the record
+//! names its `app`), and the read route `/lookup` at the root, its filter
+//! `<app>.lookup` (`match.filters`: the app is the one the filter names,
+//! `matchedApp`).
 //!
 //! No app record — a program record without `app` (a genesis-wired engine:
 //! its programs and config are the genesis's; its name is its program
@@ -50,6 +62,7 @@
 const std = @import("std");
 const c = @import("chain");
 const topics = @import("topics.zig");
+const lookups = @import("lookups.zig");
 
 const cbor = c.cbor;
 const Value = cbor.Value;
@@ -136,24 +149,89 @@ pub const engine_role = "overlay";
 
 /// A call whose route names no program (a read route: its filters answer, shruggr/skein#143) but
 /// its `app`: that app's record, name and engine (its role `overlay`); null for a step, a call
-/// whose route names its program, or no app record.
+/// whose route names its program, or no app record. A root route (no `app`: root's own, e.g. the
+/// read route `/lookup` at the origin's root, skein-overlay 0.11.0) names its app by its filter
+/// instead: the first of `match.filters` that is an app's (`<app>.<filter>`, not `kernel.…`)
+/// whose app record lists that filter.
 pub fn matchedApp(a: Allocator, heads: Heads, s: Store, in: Value, arg: ?Value) !?struct { app: Value, name: []const u8, engine: ?[]const u8 } {
     if (in.getCid("thread") != null) return null;
     const m = (arg orelse return null).get("match") orelse return null;
     if (m.getCid("program") != null) return null;
-    const name = m.getText("app") orelse return null;
-    const root = (try heads.head(a, try std.fmt.allocPrint(a, "{s}/app", .{name}))) orelse return null;
-    const app = try s.getValue(a, root);
-    if (!eql(u8, app.getText("kind") orelse "", "app")) return null;
+    const name = m.getText("app") orelse (try filterApp(a, heads, s, m)) orelse return null;
+    const app = (try appNamed(a, heads, s, name)) orelse return null;
     const engine = if (app.get("programs")) |ps| ps.getCid(engine_role) else null;
     return .{ .app = app, .name = name, .engine = engine };
 }
 
+/// The app record at `<name>/app`, or null.
+fn appNamed(a: Allocator, heads: Heads, s: Store, name: []const u8) !?Value {
+    const root = (try heads.head(a, try std.fmt.allocPrint(a, "{s}/app", .{name}))) orelse return null;
+    const app = try s.getValue(a, root);
+    return if (eql(u8, app.getText("kind") orelse "", "app")) app else null;
+}
+
+/// A root route's app (no `app` on the route): the app of the first filter `<app>.<filter>` in
+/// `match.filters` whose app record lists `<filter>` under `filters`. Null: none.
+pub fn filterApp(a: Allocator, heads: Heads, s: Store, m: Value) !?[]const u8 {
+    const fs = m.getArray("filters") orelse return null;
+    for (fs) |f| {
+        if (f != .text or std.mem.startsWith(u8, f.text, "kernel.")) continue;
+        const dot = std.mem.lastIndexOfScalar(u8, f.text, '.') orelse continue;
+        if (dot == 0 or dot + 1 == f.text.len) continue;
+        const app = (try appNamed(a, heads, s, f.text[0..dot])) orelse continue;
+        const listed = app.get("filters") orelse continue;
+        if (listed.get(f.text[dot + 1 ..]) == null) continue;
+        return f.text[0..dot];
+    }
+    return null;
+}
+
 /// `in` with the registered topics (the head `<app>/topics`, topics.zig) added to
-/// `defaults.overlayTopics`, each judged by its program unless the config names it already.
+/// `defaults.overlayTopics`, each judged by its program unless the config names it already, and
+/// the registered lookup services (the head `<app>/lookups`, lookups.zig) to
+/// `defaults.overlayLookups` likewise.
 pub fn withRegistered(a: Allocator, s: Store, heads: Heads, in: Value, app: []const u8) !Value {
-    const root = (try heads.head(a, try topics.headName(a, app))) orelse return in;
-    return withTopics(a, in, try topics.entriesOf(a, try s.getValue(a, root)));
+    var out = in;
+    if (try heads.head(a, try topics.headName(a, app))) |root| out = try withTopics(a, out, try topics.entriesOf(a, try s.getValue(a, root)));
+    if (try heads.head(a, try lookups.headName(a, app))) |root| out = try withLookups(a, out, try lookups.entriesOf(a, try s.getValue(a, root)));
+    return out;
+}
+
+/// `in` with the registered lookup services `list` added to `defaults.overlayLookups`, each as
+/// `{program, topics?}` unless the config names it already.
+pub fn withLookups(a: Allocator, in: Value, list: []const lookups.Entry) !Value {
+    if (list.len == 0) return in;
+    const text = if (in.get("defaults")) |d| d.getText("overlayLookups") orelse "{}" else "{}";
+    const j = std.json.parseFromSliceLeaky(std.json.Value, a, text, .{}) catch return error.BadConfig;
+    if (j != .object) return error.BadConfig;
+    var map = j.object;
+    for (list) |e| {
+        if (map.contains(e.service)) continue;
+        var o: std.json.ObjectMap = .empty;
+        try o.put(a, "program", .{ .string = e.program });
+        if (e.topics) |ts| {
+            var arr = std.json.Array.init(a);
+            for (ts) |t| try arr.append(.{ .string = t });
+            try o.put(a, "topics", .{ .array = arr });
+        }
+        try map.put(a, e.service, .{ .object = o });
+    }
+    return withDefault(a, in, "overlayLookups", try std.json.Stringify.valueAlloc(a, std.json.Value{ .object = map }, .{}));
+}
+
+/// `in` with `defaults.<key>` set to `text` (the other defaults kept).
+fn withDefault(a: Allocator, in: Value, key: []const u8, text: []const u8) !Value {
+    var es: std.ArrayList(cbor.Entry) = .empty;
+    if (in.get("defaults")) |d| if (d == .map) for (d.map) |e| {
+        if (!eql(u8, e.key, key)) try es.append(a, e);
+    };
+    try es.append(a, .{ .key = key, .value = .{ .text = text } });
+    var out: std.ArrayList(cbor.Entry) = .empty;
+    if (in == .map) for (in.map) |e| {
+        if (!eql(u8, e.key, "defaults")) try out.append(a, e);
+    };
+    try out.append(a, .{ .key = "defaults", .value = .{ .map = es.items } });
+    return .{ .map = out.items };
 }
 
 /// `in` with the registered set `list` added (`withRegistered`'s, from a set in hand: a register
@@ -167,17 +245,7 @@ pub fn withTopics(a: Allocator, in: Value, list: []const topics.Entry) !Value {
     for (list) |e| {
         if (!map.contains(e.topic)) try map.put(a, e.topic, .{ .string = e.program });
     }
-    var es: std.ArrayList(cbor.Entry) = .empty;
-    if (in.get("defaults")) |d| if (d == .map) for (d.map) |e| {
-        if (!eql(u8, e.key, "overlayTopics")) try es.append(a, e);
-    };
-    try es.append(a, .{ .key = "overlayTopics", .value = .{ .text = try std.json.Stringify.valueAlloc(a, std.json.Value{ .object = map }, .{}) } });
-    var out: std.ArrayList(cbor.Entry) = .empty;
-    if (in == .map) for (in.map) |e| {
-        if (!eql(u8, e.key, "defaults")) try out.append(a, e);
-    };
-    try out.append(a, .{ .key = "defaults", .value = .{ .map = es.items } });
-    return .{ .map = out.items };
+    return withDefault(a, in, "overlayTopics", try std.json.Stringify.valueAlloc(a, std.json.Value{ .object = map }, .{}));
 }
 
 /// The engine's own role: the key in `programs` naming its program record (`engine`, else the
