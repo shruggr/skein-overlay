@@ -22,6 +22,8 @@
 //!   config.overlay.gossip    {<topic>: bool}                                     (was defaults.overlayGossip)
 //!   config.overlay.market    {window: <ms>}   optional: the market's liveness window (defaults.overlayMarket; `rolesOf`)
 //!   config.overlay.validator {every: <ms>}    optional: the validator's beat (defaults.overlayValidator)
+//!   config.overlay.terms     <any value>      optional: copied as is into each topic's beat body as
+//!                                             `terms` (0.12.1; defaults.overlayTerms; `rolesOf`)
 //!
 //! The two roles (shruggr/skein#120; 0.12.0, David 2026-10-09: "every skein
 //! is marketplace AND validator from install, always"): registering a topic
@@ -81,8 +83,9 @@ pub const Heads = struct {
 
 /// The genesis default each `config.overlay` key replaces.
 const keys = [_][2][]const u8{ .{ "topics", "overlayTopics" }, .{ "lookups", "overlayLookups" }, .{ "gossip", "overlayGossip" } };
-/// The roles' keys (shruggr/skein#120, 2026-10-06 evening), each optional: set only when the app's config names it.
-const role_keys = [_][2][]const u8{ .{ "market", "overlayMarket" }, .{ "validator", "overlayValidator" } };
+/// The roles' keys (shruggr/skein#120, 2026-10-06 evening) and the beat's terms (0.12.1), each
+/// optional: set only when the app's config names it.
+const role_keys = [_][2][]const u8{ .{ "market", "overlayMarket" }, .{ "validator", "overlayValidator" }, .{ "terms", "overlayTerms" } };
 
 const role_min_ms = topics.role_min_ms;
 const role_max_ms = topics.role_max_ms;
@@ -91,10 +94,44 @@ const role_max_ms = topics.role_max_ms;
 /// text: an app's `config.overlay.market: {window}` / `config.overlay.validator: {every}`): each its
 /// ms, absent the default (topics.zig `default_window_ms`, `default_every_ms`; 0.12.0: always a
 /// market and a validator). Another shape, or a value outside 1 000 ms .. a day: error.BadRoles.
-pub fn rolesOf(a: Allocator, in: Value) error{BadRoles}!topics.Roles {
+///
+/// The beat's terms (0.12.1): `config.overlay.terms` (`defaults.overlayTerms`, JSON text), opaque to
+/// the engine, copied into each topic's beat body as `terms` (dag-cbor: integers, text, booleans,
+/// null, lists and maps; a non-integral number is no dag-cbor here: error.BadRoles). Absent: none.
+pub fn rolesOf(a: Allocator, in: Value) error{ BadRoles, OutOfMemory }!topics.Roles {
     return .{
         .market = (try roleMs(a, in, "overlayMarket", "window")) orelse topics.default_window_ms,
         .validator = (try roleMs(a, in, "overlayValidator", "every")) orelse topics.default_every_ms,
+        .terms = try termsOf(a, in),
+    };
+}
+
+fn termsOf(a: Allocator, in: Value) error{ BadRoles, OutOfMemory }!?Value {
+    const text = (if (in.get("defaults")) |d| d.getText("overlayTerms") else null) orelse return null;
+    const j = std.json.parseFromSliceLeaky(std.json.Value, a, text, .{}) catch return error.BadRoles;
+    return try fromJson(a, j);
+}
+
+/// A JSON value as dag-cbor (the terms, opaque): integers stay integers; a non-integral number is refused.
+fn fromJson(a: Allocator, j: std.json.Value) error{ BadRoles, OutOfMemory }!Value {
+    return switch (j) {
+        .null => .null,
+        .bool => |b| .{ .boolean = b },
+        .integer => |i| if (i >= 0) .{ .uint = @intCast(i) } else .{ .nint = @intCast(-1 - i) },
+        .float, .number_string => error.BadRoles,
+        .string => |t| .{ .text = t },
+        .array => |arr| blk: {
+            const out = try a.alloc(Value, arr.items.len);
+            for (arr.items, out) |x, *o| o.* = try fromJson(a, x);
+            break :blk .{ .array = out };
+        },
+        .object => |o| blk: {
+            const out = try a.alloc(cbor.Entry, o.count());
+            var it = o.iterator();
+            var i: usize = 0;
+            while (it.next()) |e| : (i += 1) out[i] = .{ .key = e.key_ptr.*, .value = try fromJson(a, e.value_ptr.*) };
+            break :blk .{ .map = out };
+        },
     };
 }
 

@@ -794,7 +794,7 @@ emitted when the set changes:
 | `register` | then `{event: "liveness", topic: "<topic>-live", window}` (the market) and `{event: "beacon", topic: "<topic>-live", every, body}` (the validator; `body` the topic's beat body, "Beats", below) — always (0.12.0) |
 | `deregister` | then `{event: "unliveness", topic: "<topic>-live"}` and `{event: "unbeacon", topic: "<topic>-live"}` |
 | an admission, a rejection, a register's seeds (0.12.0) | `{event: "beacon", topic: "<topic>-live", every, body}` again for each registered topic whose view digest the step changed |
-| `registerLookup` / `deregisterLookup` (0.12.0) | `{event: "beacon", topic: "<service>-live", every, body}` (the program's fn `beat`) / `{event: "unbeacon", topic: "<service>-live"}` |
+| `registerLookup` / `deregisterLookup` (0.12.0, 0.12.1) | `{event: "liveness", topic: "<service>-live", window}` then `{event: "beacon", topic: "<service>-live", every, body}` (the program's fn `beat`) / `unliveness` then `unbeacon` on `<service>-live` |
 | a step whose lookup hooks answered `beats` (0.12.0) | `{event: "beacon", topic: "<service>-live", every, body}` for each registered service named |
 
 `program` is the engine's own role in `programs` (`overlay` in this repo's
@@ -848,7 +848,11 @@ they replace SHIP/SLAP on the libp2p network (they are not SHIP/SLAP, and
 no SHIP/SLAP ad is published p2p). Every registered topic beats on
 `<topic>-live`, every registered lookup service on `<service>-live`.
 
-A topic's beat body is dag-cbor `{view: {count, digest}}`, its **view
+A topic's beat body is dag-cbor `{view: {count, digest}, terms?}`:
+`terms` (0.12.1) is `config.overlay.terms` (`defaults.overlayTerms`) as
+configured, any value, opaque to the engine and copied as is (a
+non-integral number is no dag-cbor here: the configuration is refused, as a
+bad window is); absent, no field. `view` is its **view
 digest** (`src/state.zig` `View`): `count`, the topic's admitted-and-unspent
 outputs; `digest`, 32 bytes, the sum mod 2^256 of each such outpoint's hash
 `sha256(txid (32 bytes, internal byte order) ‖ vout (4 bytes,
@@ -877,18 +881,26 @@ A lookup service's body is its program's own. `registerLookup` declares
 its beacon on `<service>-live` with the body the program's fn `beat`
 answers (`{kind: "lookup-beat", app, service, program}` → `{kind:
 "lookup-beat", body}`, `Spec.beat`; none, or a program built before
-0.12.0: the empty body); `deregisterLookup` ends it (`unbeacon`). A hook
+0.12.0: the empty body), and (0.12.1) liveness on `<service>-live` with
+the market's window, as for a topic — a skein keeps the other peers' lookup
+beats as it keeps topic beats; `deregisterLookup` ends both (`unliveness`,
+`unbeacon`). A hook
 updates it: `Service.beat(service, body)` in the hook, and the hook's
 answer carries `beats: {<service>: bytes}`; the engine re-declares each
 registered service named (the last body per service in a step).
 
-Not in the topic's body yet (stopped, 0.12.0): `terms` (the validator's
-fee and the market's minimum commission) and `origin` (optional: not every
-skein is behind a web proxy). The terms are the app's configuration (the
-AMM's `config.amm.ammValidator`; no configuration names a market's minimum
-commission yet) and the engine is generic; the origin is a host fact.
-Where the engine reads each from is undecided. Declared topics and
+`origin` is the host's, not the engine's. skein's install
+(src/host/manifest.ts `OVERLAY_FIELDS`) must accept `terms` in
+`config.overlay` before a manifest can set it. Declared topics and
 services (`config.overlay`) do not beat, as before.
+
+Not built (stopped, 0.12.1): a spend the chain app records of an output in
+the view by a transaction never submitted to the topic. The engine hears
+of none — the chain app answers an ingest's caller about that one
+transaction (accepted, proven, rejected) and nothing about who later
+spends its outputs (skein-chain README: "a reference is a subscription" is
+not built) — so the view counts the output until a spend of it is judged
+by the topic.
 
 ### Register a lookup service (0.11.0)
 

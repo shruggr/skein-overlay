@@ -45,9 +45,9 @@
 //!   deregisterLookup          2026-10-08: "separate registration calls"): {fn: "registerLookup", args:
 //!                             {service, program, topics?}} or {fn: "deregisterLookup", args:
 //!                             {service}} (lookups.zig): the registered set under `<app>/lookups`,
-//!                             served as config.overlay.lookups is; a beacon on `<service>-live`
-//!                             (0.12.0: its body the lookup program's fn "beat"), unbeacon on
-//!                             deregister; answered {service, active}.
+//!                             served as config.overlay.lookups is; liveness (0.12.1) and a beacon
+//!                             on `<service>-live` (0.12.0: its body the lookup program's fn
+//!                             "beat"), unliveness and unbeacon on deregister; answered {service, active}.
 //!
 //! The market / validator switch (0.9.2) is gone (0.12.0, David 2026-10-09: "every skein is
 //! marketplace AND validator from install, always"): a message {fn: "market" | "validator"} is
@@ -164,7 +164,7 @@ fn emitBeats(a: Allocator, step: Value, st: *@import("state.zig").State) !usize 
     const tl = try topics.entriesOf(a, if (troot) |r| try s.getValue(a, r) else null);
     const services = try lookupNames(a, step);
     const roles = config.rolesOf(a, step) catch return 0; // a bad configuration: registering is refused
-    const evs = try topics.beatEvents(a, roles.validator, tl, services, changes, st.lookup_beats.items);
+    const evs = try topics.beatEvents(a, roles, tl, services, changes, st.lookup_beats.items);
     for (evs) |e| _ = try vm.emitEvent(a, e);
     return evs.len;
 }
@@ -183,13 +183,13 @@ fn answersField(fields: *std.ArrayList(cbor.Entry), a: Allocator) !void {
     if (ev_.answers.items.len > 0) try fields.append(a, .{ .key = "answers", .value = .{ .array = ev_.answers.items } });
 }
 
-/// A topic's beat body as the state holds its view now (0.12.0, topics.zig `beatBody`): the
-/// register's `topic` (none: the empty view).
-fn topicBeat(a: Allocator, step: Value, fargs: Value) ![]const u8 {
-    const t = fargs.getText("topic") orelse return topics.beatBody(a, .{});
-    if (t.len == 0) return topics.beatBody(a, .{});
+/// A topic's beat body as the state holds its view now (0.12.0, topics.zig `beatBody`), with the
+/// configured terms (0.12.1): the register's `topic` (none: the empty view).
+fn topicBeat(a: Allocator, step: Value, fargs: Value, roles: topics.Roles) ![]const u8 {
+    const t = fargs.getText("topic") orelse return topics.beatBody(a, .{}, roles.terms);
+    if (t.len == 0) return topics.beatBody(a, .{}, roles.terms);
     var loaded = try ev_.load(a, step);
-    return topics.beatBody(a, try loaded.st.view(t));
+    return topics.beatBody(a, try loaded.st.view(t), roles.terms);
 }
 
 /// `register {topic, program}` / `deregister {topic}` (topics.zig, shruggr/skein#120): a message in
@@ -210,9 +210,9 @@ fn registration(a: Allocator, step: Value, args: Value, body: Value, func: []con
     const change: topics.Change = if (!topics.mayRegister(args, calls.appOf(step)))
         .{ .refused = try topics.notHere(a, func, args, calls.appOf(step)) }
     else if (roles == null)
-        .{ .refused = try std.fmt.allocPrint(a, "{s}: the configuration's roles are config.overlay.market {{window: <ms>}} and config.overlay.validator {{every: <ms>}}, each from 1000 ms to a day", .{func}) }
+        .{ .refused = try std.fmt.allocPrint(a, "{s}: the configuration's roles are config.overlay.market {{window: <ms>}} and config.overlay.validator {{every: <ms>}}, each from 1000 ms to a day, and config.overlay.terms has no non-integral number", .{func}) }
     else if (eql(u8, func, "register"))
-        try topics.withRoles(a, try topics.register(a, list, fargs, step.get("programs") orelse return error.BadConfig, try config.selfRole(a, s, step, null)), true, roles.?, try topicBeat(a, step, fargs))
+        try topics.withRoles(a, try topics.register(a, list, fargs, step.get("programs") orelse return error.BadConfig, try config.selfRole(a, s, step, null)), true, roles.?, try topicBeat(a, step, fargs, roles.?))
     else
         try topics.withRoles(a, try topics.deregister(a, list, fargs), false, roles.?, "");
     const message = args.getCid("message") orelse return error.BadInput;
@@ -270,7 +270,7 @@ fn lookupRegistration(a: Allocator, step: Value, args: Value, body: Value, func:
     const change: lookups.Change = if (!topics.mayRegister(args, calls.appOf(step)))
         .{ .refused = try topics.notHere(a, func, args, calls.appOf(step)) }
     else if (roles == null)
-        .{ .refused = try std.fmt.allocPrint(a, "{s}: the configuration's roles are config.overlay.market {{window: <ms>}} and config.overlay.validator {{every: <ms>}}, each from 1000 ms to a day", .{func}) }
+        .{ .refused = try std.fmt.allocPrint(a, "{s}: the configuration's roles are config.overlay.market {{window: <ms>}} and config.overlay.validator {{every: <ms>}}, each from 1000 ms to a day, and config.overlay.terms has no non-integral number", .{func}) }
     else if (eql(u8, func, "registerLookup"))
         try lookups.register(a, list, fargs, step.get("programs") orelse return error.BadConfig)
     else
@@ -296,12 +296,11 @@ fn lookupRegistration(a: Allocator, step: Value, args: Value, body: Value, func:
                 const rc = try s.putValue(a, try lookups.recordOf(a, l));
                 try vm.advance(head, rc);
                 try fields.append(a, .{ .key = "lookups", .value = .{ .cid = rc } });
+                // Liveness and the beacon on `<service>-live` (0.12.0, 0.12.1), as a topic's.
                 const service = d.answer.getText("service").?;
-                const ev = if (eql(u8, func, "registerLookup"))
-                    try topics.beaconEvent(a, service, roles.?.validator, try calls.lookupBeat(a, ev_.caller(), try config.withLookups(a, step, l), service, fargs.getText("program") orelse ""))
-                else
-                    try topics.unbeaconEvent(a, service);
-                _ = try vm.emitEvent(a, ev);
+                const reg = eql(u8, func, "registerLookup");
+                const beat = if (reg) try calls.lookupBeat(a, ev_.caller(), try config.withLookups(a, step, l), service, fargs.getText("program") orelse "") else "";
+                for (try topics.roleEvents(a, reg, service, roles.?, beat)) |ev| _ = try vm.emitEvent(a, ev);
             }
             try ans.append(a, .{ .key = "result", .value = d.answer });
             try fields.appendSlice(a, &.{
@@ -330,7 +329,7 @@ fn seeding(a: Allocator, step: Value, list: []const topics.Entry, answer: Value,
     const sd = try submit.seed(cx, topic, seeds);
     for (sd.records) |r| try vm.keep(r);
     // The view the seeds changed: the beacons re-declared (0.12.0), over the set this step wrote.
-    const beats = try topics.beatEvents(a, roles.validator, list, try lookupNames(a, step), try loaded.st.viewChanges(), loaded.st.lookup_beats.items);
+    const beats = try topics.beatEvents(a, roles, list, try lookupNames(a, step), try loaded.st.viewChanges(), loaded.st.lookup_beats.items);
     for (beats) |e| _ = try vm.emitEvent(a, e);
     if (beats.len > 0) try fields.append(a, .{ .key = "beats", .value = .{ .uint = beats.len } });
     const new_state = try loaded.st.save();

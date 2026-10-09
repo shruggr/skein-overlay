@@ -1502,7 +1502,7 @@ test "market and validator, always (0.12.0, David 2026-10-09): liveness and beac
         .{ .key = "program", .value = .{ .text = "topic-demo" } },
     });
     const dereg_args = try mapOf(a, &.{.{ .key = "topic", .value = .{ .text = "tm_r" } }});
-    const body = try topics_mod.beatBody(a, .{});
+    const body = try topics_mod.beatBody(a, .{}, null);
 
     const Case = struct { market: ?u64, validator: ?u64 };
     for ([_]Case{ .{ .market = 60_000, .validator = null }, .{ .market = null, .validator = 20_000 }, .{ .market = 60_000, .validator = 20_000 }, .{ .market = null, .validator = null } }) |case| {
@@ -1626,8 +1626,8 @@ test "the view digest (0.12.0, David 2026-10-09): count and an order-independent
     try std.testing.expect((try state.View.parse(&x.bytes())).eql(x));
     try std.testing.expectError(error.BadIndex, state.View.parse("short"));
 
-    // The beat body: dag-cbor {view: {count, digest}}.
-    const body = try cbor.decode(a, try topics_mod.beatBody(a, x));
+    // The beat body: dag-cbor {view: {count, digest}} (no terms configured: no `terms`).
+    const body = try cbor.decode(a, try topics_mod.beatBody(a, x, null));
     try std.testing.expectEqual(@as(usize, 1), body.map.len);
     try std.testing.expectEqual(@as(u64, 4), body.get("view").?.getUint("count").?);
     try std.testing.expectEqualSlices(u8, &x.digest, body.get("view").?.getBytes("digest").?);
@@ -1640,12 +1640,12 @@ test "the view digest (0.12.0, David 2026-10-09): count and an order-independent
         .{ .topic = "tm_a", .before = .{}, .now = x },
         .{ .topic = "tm_declared", .before = .{}, .now = x },
     };
-    const evs = try topics_mod.beatEvents(a, 30_000, &list, &.{}, &changes, &.{});
+    const evs = try topics_mod.beatEvents(a, .{ .validator = 30_000 }, &list, &.{}, &changes, &.{});
     try std.testing.expectEqual(@as(usize, 1), evs.len);
     try std.testing.expectEqualStrings("beacon", evs[0].getText("event").?);
     try std.testing.expectEqualStrings("tm_a-live", evs[0].getText("topic").?);
     try std.testing.expectEqual(@as(u64, 30_000), evs[0].getUint("every").?);
-    try std.testing.expectEqualSlices(u8, try topics_mod.beatBody(a, x), evs[0].getBytes("body").?);
+    try std.testing.expectEqualSlices(u8, try topics_mod.beatBody(a, x, null), evs[0].getBytes("body").?);
 }
 
 test "lookup beats (0.12.0, David 2026-10-09): <service>-live for each registered lookup service; the body the program's own — fn beat at the declaration, a hook's answer to update it" {
@@ -1712,17 +1712,91 @@ test "lookup beats (0.12.0, David 2026-10-09): <service>-live for each registere
     // Re-declared: a beacon on <service>-live for each registered service given a body (the last per
     // service), none for an unregistered one.
     const later = [_]state.LookupBeat{ got.items[0], got.items[1], .{ .service = "ls_x", .body = "price 4" } };
-    const evs = try topics_mod.beatEvents(a, 30_000, &.{}, &.{"ls_x"}, &.{}, &later);
+    const evs = try topics_mod.beatEvents(a, .{ .validator = 30_000 }, &.{}, &.{"ls_x"}, &.{}, &later);
     try std.testing.expectEqual(@as(usize, 1), evs.len);
     try std.testing.expectEqualStrings("ls_x-live", evs[0].getText("topic").?);
     try std.testing.expectEqualStrings("price 4", evs[0].getBytes("body").?);
-    // Declared and ended with the registration: beacon / unbeacon on <service>-live.
-    const b = try topics_mod.beaconEvent(a, "ls_x", 30_000, "price 1");
-    try std.testing.expectEqualStrings("ls_x-live", b.getText("topic").?);
-    try std.testing.expectEqualStrings("price 1", b.getBytes("body").?);
-    const u = try topics_mod.unbeaconEvent(a, "ls_x");
-    try std.testing.expectEqualStrings("unbeacon", u.getText("event").?);
-    try std.testing.expectEqualStrings("ls_x-live", u.getText("topic").?);
+    // Declared and ended with the registration (0.12.1: liveness too, as a topic's — a skein keeps
+    // the other peers' lookup beats as it keeps topic beats): liveness then beacon on
+    // <service>-live at registerLookup, unliveness then unbeacon at deregisterLookup.
+    const roles: topics_mod.Roles = .{ .market = 40_000, .validator = 30_000 };
+    const on = try topics_mod.roleEvents(a, true, "ls_x", roles, "price 1");
+    try std.testing.expectEqual(@as(usize, 2), on.len);
+    try std.testing.expectEqualStrings("liveness", on[0].getText("event").?);
+    try std.testing.expectEqualStrings("ls_x-live", on[0].getText("topic").?);
+    try std.testing.expectEqual(@as(u64, 40_000), on[0].getUint("window").?);
+    try std.testing.expectEqualStrings("beacon", on[1].getText("event").?);
+    try std.testing.expectEqualStrings("ls_x-live", on[1].getText("topic").?);
+    try std.testing.expectEqual(@as(u64, 30_000), on[1].getUint("every").?);
+    try std.testing.expectEqualStrings("price 1", on[1].getBytes("body").?);
+    const off = try topics_mod.roleEvents(a, false, "ls_x", roles, "");
+    try std.testing.expectEqual(@as(usize, 2), off.len);
+    try std.testing.expectEqualStrings("unliveness", off[0].getText("event").?);
+    try std.testing.expectEqualStrings("ls_x-live", off[0].getText("topic").?);
+    try std.testing.expectEqualStrings("unbeacon", off[1].getText("event").?);
+    try std.testing.expectEqualStrings("ls_x-live", off[1].getText("topic").?);
+}
+
+test "the beat's terms (0.12.1): config.overlay.terms, opaque, copied into each topic's beat body as `terms`; absent, no field" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = c.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    const s = ms.store();
+    const engine = try s.putValue(a, try mapOf(a, &.{
+        .{ .key = "kind", .value = .{ .text = "program" } },
+        .{ .key = "app", .value = .{ .text = "overlay" } },
+    }));
+    const genesis_in = try mapOf(a, &.{.{ .key = "defaults", .value = try mapOf(a, &.{.{ .key = "walletNetwork", .value = .{ .text = "regtest" } }}) }});
+    const in = try withThread(a, s, genesis_in, engine);
+    const appWith = struct {
+        fn f(al: Allocator, st: Store, eng: []const u8, ov: Value) ![]const u8 {
+            return st.putValue(al, try mapOf(al, &.{
+                .{ .key = "kind", .value = .{ .text = "app" } },
+                .{ .key = "name", .value = .{ .text = "overlay" } },
+                .{ .key = "programs", .value = try mapOf(al, &.{.{ .key = "engine", .value = .{ .cid = eng } }}) },
+                .{ .key = "config", .value = try mapOf(al, &.{.{ .key = "overlay", .value = ov }}) },
+            }));
+        }
+    }.f;
+
+    // Configured: whatever the app's config says, read from the app record at every step.
+    const terms = try mapOf(a, &.{
+        .{ .key = "validatorFeeBps", .value = .{ .uint = 5 } },
+        .{ .key = "note", .value = .{ .text = "any shape" } },
+        .{ .key = "tiers", .value = .{ .array = &.{ .{ .uint = 1 }, .null, .{ .boolean = true } } } },
+    });
+    var hm = HeadMap{};
+    try hm.m.put(a, "overlay/app", try appWith(a, s, engine, try mapOf(a, &.{.{ .key = "terms", .value = terms }})));
+    const step = try config.resolve(a, s, hm.heads(), in, null);
+    const roles = try config.rolesOf(a, step);
+    try std.testing.expect(roles.terms != null);
+    const v: state.View = viewOf(&.{.{ .{0x11} ** 32, 0 }});
+    const body = try cbor.decode(a, try topics_mod.beatBody(a, v, roles.terms));
+    try std.testing.expectEqual(@as(usize, 2), body.map.len);
+    try std.testing.expectEqual(@as(u64, 1), body.get("view").?.getUint("count").?);
+    // Copied as is (dag-cbor's map order is the encoder's: compare by encoding).
+    try std.testing.expectEqualSlices(u8, try cbor.encode(a, terms), try cbor.encode(a, body.get("terms").?));
+    // A re-declared beacon carries them too.
+    const evs = try topics_mod.beatEvents(a, roles, &.{.{ .topic = "tm_a", .program = "p" }}, &.{}, &.{.{ .topic = "tm_a", .before = .{}, .now = v }}, &.{});
+    try std.testing.expectEqualSlices(u8, try topics_mod.beatBody(a, v, roles.terms), evs[0].getBytes("body").?);
+    // And the register's beacon (withRoles over the body the engine gives it).
+    const reg_body = try cbor.decode(a, (try topics_mod.roleEvents(a, true, "tm_a", roles, try topics_mod.beatBody(a, .{}, roles.terms)))[1].getBytes("body").?);
+    try std.testing.expect(reg_body.get("terms") != null);
+
+    // Absent: no field.
+    try hm.m.put(a, "overlay/app", try appWith(a, s, engine, try mapOf(a, &.{})));
+    const plain = try config.rolesOf(a, try config.resolve(a, s, hm.heads(), in, null));
+    try std.testing.expect(plain.terms == null);
+    try std.testing.expect((try cbor.decode(a, try topics_mod.beatBody(a, v, plain.terms))).get("terms") == null);
+
+    // A non-integral number is no dag-cbor here: refused as a bad configuration (registering is refused).
+    const bad = try mapOf(a, &.{.{ .key = "defaults", .value = try mapOf(a, &.{.{ .key = "overlayTerms", .value = .{ .text = "{\"fee\":0.5}" } }}) }});
+    try std.testing.expectError(error.BadRoles, config.rolesOf(a, bad));
+    // Not JSON: likewise.
+    const junk = try mapOf(a, &.{.{ .key = "defaults", .value = try mapOf(a, &.{.{ .key = "overlayTerms", .value = .{ .text = "{" } }}) }});
+    try std.testing.expectError(error.BadRoles, config.rolesOf(a, junk));
 }
 
 /// fund (mined) → t1 (mints a token) → t2 (spends it into a new one), both unproven.

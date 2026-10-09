@@ -4,7 +4,7 @@ The overlay services engine for a [skein](https://github.com/shruggr/skein),
 as an app: BRC-22 submit and BRC-24 lookup, served by the instance's own
 front door, with topic managers and lookup services as programs the engine
 calls. It is also a Zig package: an overlay of your own depends on it for
-the topic and lookup contracts. Version **0.12.0**.
+the topic and lookup contracts. Version **0.12.1**.
 
 ## What it is
 
@@ -29,9 +29,10 @@ the topic and lookup contracts. Version **0.12.0**.
   `<topic>-proof` (the proofs) on its own; `<topic>-live` the beats, the
   runtime's liveness tool (unlogged).
 - **Beats** (0.12.0): every skein is a market and a validator, always. Each
-  registered topic beats on `<topic>-live` with its view digest, and each
-  registered lookup service on `<service>-live` with a body its program
-  gives ("Beats" below).
+  registered topic beats on `<topic>-live` with its view digest (and the
+  configured terms), and each registered lookup service on `<service>-live`
+  with a body its program gives; the skein keeps liveness on both ("Beats"
+  below).
 - **The examples**: `tm_demo` (`bin/topic-demo.wasm`) and `ls_demo`
   (`bin/lookup-demo.wasm`).
 
@@ -319,7 +320,10 @@ is published p2p). Every topic manager and every lookup service the engine
 runs as registered beats on its own topic, named after itself:
 `<topic>-live`, `<service>-live`.
 
-- **A topic's body** is dag-cbor `{view: {count, digest}}`, the topic's
+- **A topic's body** is dag-cbor `{view: {count, digest}, terms?}`:
+  `terms` (0.12.1) is `config.overlay.terms` as configured, any value,
+  opaque to the engine and copied as is (a non-integral number refuses the
+  registration: no dag-cbor here); absent, no field. `view` is the topic's
   **view digest**: `count` the topic's admitted-and-unspent outputs, and
   `digest` (32 bytes) the sum mod 2^256 of `sha256(txid ‖ vout)` over them
   (txid 32 bytes in internal byte order, vout 4 bytes little-endian, each
@@ -341,15 +345,20 @@ runs as registered beats on its own topic, named after itself:
 - **A lookup service's body** is the lookup program's own. `registerLookup`
   declares the beacon on `<service>-live` with the body its program's fn
   `beat` answers (`Spec.beat`; a program without one beats an empty body),
-  and `deregisterLookup` ends it. A hook (`admitted`, `spent`, `rejected`)
+  and liveness on it with the market's window (0.12.1: a skein keeps the
+  other peers' lookup beats as it keeps topic beats); `deregisterLookup`
+  ends both (`unliveness`, `unbeacon`). A hook (`admitted`, `spent`, `rejected`)
   updates it by answering `{beats: {<service>: bytes}}` (`Service.beat` in
   the hook): the engine re-declares that registered service's beacon.
-- Not yet in the topic's body (stopped, 0.12.0): `terms` (the validator's
-  fee and the market's minimum commission) and `origin`. The engine is
-  generic and the terms are the app's (the AMM's `config.amm.ammValidator`;
-  no configuration names a market's minimum commission yet), and the origin
-  is a host fact the engine does not know. Which configuration the engine
-  reads them from is undecided.
+- `origin` is the host's, not the engine's. What goes in `terms` is the
+  app's (the engine never reads it); skein's install must accept the field
+  `terms` in `config.overlay` before a manifest can set it.
+- "Spent" in the view is the topic's own reading: a previous coin a
+  transaction the topic admits consumes. A spend the chain app records of a
+  transaction never submitted to the topic is not folded out: the engine
+  hears of no such spend (the chain app answers an ingest's caller about
+  that transaction only), so `inTopic` and a lookup, which read the chain's
+  `spent`, can count fewer outputs than the view. Not built (stopped, 0.12.1).
 - A topic or service declared in `config.overlay` (not registered) does not
   beat, as before.
 
@@ -424,7 +433,7 @@ docs/OVERLAY.md "Not built"), GASP sync and catch-up from a peer, the
 
 | | |
 |---|---|
-| this app and package | 0.12.0 (tag `v0.12.0`) |
+| this app and package | 0.12.1 (tag `v0.12.1`) |
 | skein-sdk | v0.11.0, by tag URL and hash in `build.zig.zon` (modules `chain` and, for the engine, `sk`; bsvz comes through it) |
 | requires | `chain/1` (shruggr/skein-chain 0.3.0) |
 | skein | log format 10, the BEEF envelope beside the pointer record (shruggr/skein#146); the routes / filters / roles manifest (shruggr/skein#143); skein's equivs pin this repo by commit |
@@ -645,6 +654,14 @@ are removed; a register starts liveness and the beacon at
 the topic's view digest in the state (`views`), its beat body re-declared
 when it changes; lookup services beat on `<service>-live` with their
 program's body (fn `beat`; a hook's `beats`). README "Beats".
+
+0.12.1 (David, 2026-10-09): `registerLookup` keeps liveness on
+`<service>-live` beside its beacon (the market's window), and
+`deregisterLookup` ends it (`unliveness`); `config.overlay.terms`, opaque,
+is copied into each topic's beat body as `terms` (absent: no field;
+config.zig `rolesOf`, topics.zig `beatBody`). Not built: folding out spends
+the chain app records of transactions never submitted to the topic
+(README "Beats").
 
 ## Contributing
 
