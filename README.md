@@ -4,7 +4,7 @@ The overlay services engine for a [skein](https://github.com/shruggr/skein),
 as an app: BRC-22 submit and BRC-24 lookup, served by the instance's own
 front door, with topic managers and lookup services as programs the engine
 calls. It is also a Zig package: an overlay of your own depends on it for
-the topic and lookup contracts. Version **0.12.1**.
+the topic and lookup contracts. Version **0.13.0**.
 
 ## What it is
 
@@ -157,6 +157,18 @@ pub fn main() u8 {
 }
 ```
 
+`topic.Instructions` also has `ancillary_txids` (skein-overlay#4, the
+shape of go-overlay-services' `AdmittanceInstructions.AncillaryTxids`): the
+transactions the topic read and relied on that it does not admit, such as
+the funding parents that fix a 1Sat ordinal's satoshi offset on a transfer.
+The answer carries them as `ancillaryTxids: [<txid hex>]` (omitted when
+empty). Each must be in the submitted BEEF or held, or the engine refuses
+the judgement (`UnknownAncillary`). The engine keeps them on the
+admittance (`ancillary`, a `mentions` ref each), and the read
+`GET /holds?txid=` answers `{txid, tx, via: "admitted" | "retained" |
+"ancillary", outpoint: {txid, vout}}` (or `{}`) for a peer's want
+(docs/OVERLAY.md "Holds").
+
 A lookup service is a `lookup.Spec` (its map names, `answer`, and the
 `admitted` / `spent` / `rejected` hooks); `src/lookup_demo.zig` is a complete
 one with its own index.
@@ -174,7 +186,7 @@ The manifest (`etc/app.json`, this repo's own, description left out):
 {
   "kind": "app",
   "name": "overlay",
-  "version": "0.12.0",
+  "version": "0.13.0",
   "programs": {
     "overlay": "bin/overlay.wasm",
     "topic-demo": "bin/topic-demo.wasm",
@@ -192,7 +204,8 @@ The manifest (`etc/app.json`, this repo's own, description left out):
     "listTopicManagers": "overlay.listTopicManagers",
     "listLookupServiceProviders": "overlay.listLookupServiceProviders",
     "topicDocumentation": "overlay.topicDocumentation",
-    "lookupDocumentation": "overlay.lookupDocumentation"
+    "lookupDocumentation": "overlay.lookupDocumentation",
+    "holds": "overlay.holds"
   },
   "roles": { "root": ["register", "registerLookup", "deregisterLookup"] },
   "routes": [
@@ -202,7 +215,8 @@ The manifest (`etc/app.json`, this repo's own, description left out):
     {"transport": "http", "address": "/listTopicManagers", "filters": ["listTopicManagers"]},
     {"transport": "http", "address": "/listLookupServiceProviders", "filters": ["listLookupServiceProviders"]},
     {"transport": "http", "address": "/getDocumentationForTopicManager", "filters": ["topicDocumentation"]},
-    {"transport": "http", "address": "/getDocumentationForLookupServiceProvider", "filters": ["lookupDocumentation"]}
+    {"transport": "http", "address": "/getDocumentationForLookupServiceProvider", "filters": ["lookupDocumentation"]},
+    {"transport": "http", "address": "/holds", "filters": ["holds"]}
   ]
 }
 ```
@@ -226,8 +240,8 @@ handler, and no sender; who may run a function is `roles`.
   The install prompt reads them all aloud, marked derived.
 - Read routes (shruggr/skein#143). An http route with no handler is a
   **read**: its filters answer and nothing is logged. The overlay's reads
-  are `/lookup` (derived) and the four listing and documentation paths
-  above, each with the engine's function as its filter. Called as a filter
+  are `/lookup` (derived), the four listing and documentation paths and
+  `/holds` above, each with the engine's function as its filter. Called as a filter
   (the input's `filter: true`), the engine answers `{answer: {status,
   type, body}}`, the same http answer as before inside it; anyone, signed
   or not. A read route names no program, so the engine finds its app by
@@ -433,7 +447,7 @@ docs/OVERLAY.md "Not built"), GASP sync and catch-up from a peer, the
 
 | | |
 |---|---|
-| this app and package | 0.12.1 (tag `v0.12.1`) |
+| this app and package | 0.13.0 (tag `v0.13.0`) |
 | skein-sdk | v0.11.0, by tag URL and hash in `build.zig.zon` (modules `chain` and, for the engine, `sk`; bsvz comes through it) |
 | requires | `chain/1` (shruggr/skein-chain 0.3.0) |
 | skein | log format 10, the BEEF envelope beside the pointer record (shruggr/skein#146); the routes / filters / roles manifest (shruggr/skein#143); skein's equivs pin this repo by commit |
@@ -662,6 +676,16 @@ is copied into each topic's beat body as `terms` (absent: no field;
 config.zig `rolesOf`, topics.zig `beatBody`). Not built: folding out spends
 the chain app records of transactions never submitted to the topic
 (README "Beats").
+
+0.13.0 (David, 2026-10-15; skein-overlay#4): ancillary txids. A topic's
+answer may name `ancillaryTxids` (`topic.Instructions.ancillary_txids`);
+the route refuses a judgement naming one that does not resolve to a
+`bitcoin-tx` block (`UnknownAncillary`) or naming one twice; the
+admittance record keeps them as `ancillary: [<tx CID>]` with a `mentions`
+ref each, and `<app>/state` indexes them (`ancillary`: txid ‖ tp ‖
+outpoint → admittance, removed with it). The read `/holds` (filter
+`overlay.holds`, `State.holds`) answers whether the state reaches a
+transaction: admitted, retained, or ancillary.
 
 ## Contributing
 

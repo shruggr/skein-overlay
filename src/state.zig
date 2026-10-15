@@ -10,10 +10,12 @@
 //!
 //! The record, the root of `<app>/state`:
 //!
-//!   {kind: "overlay-state", maps: {admitted, applied, pending, wants, views}}
+//!   {kind: "overlay-state", maps: {admitted, applied, pending, wants, views, ancillary}}
 //!
 //! The maps (keys bytes, ordered bytewise; `tp` = len ‖ topic):
-//!   admitted   tp ‖ txid ‖ vout → admittance record {kind: "admitted", topic, txid, vout, script, satoshis, admittedAt, tx, refs}
+//!   admitted   tp ‖ txid ‖ vout → admittance record {kind: "admitted", topic, txid, vout, script, satoshis, admittedAt, tx, ancillary?, refs}
+//!                (ancillary: the tx CIDs of the transactions the topic named in `ancillaryTxids`,
+//!                 skein-overlay#4; each a `mentions` ref)
 //!   applied    tp ‖ txid → applied record {kind: "applied", topic, txid, outputsToAdmit, coinsToRetain, coinsRemoved, at, tx, beef, refs}
 //!                (beef: the submission's BEEF as the overlay was handed it — the door's envelope
 //!                 {form, beef: <pointer record>, subject?, vout?} as a block (shruggr/skein#121,
@@ -43,6 +45,9 @@
 //!                a rejection (`unapply`) takes its transaction's outputs out and gives the coins
 //!                it consumed back. An empty topic: count 0, digest 32 zero bytes. The beat body
 //!                on `<topic>-live` carries it (topics.zig `beatBody`).
+//!   ancillary  ancillary txid ‖ tp ‖ outpoint → admittance record   (skein-overlay#4): each
+//!                transaction an admittance names in `ancillary`, by the admitted output naming it;
+//!                `holds` reads it, removed with the admittance (`unapply`)
 //!
 //! Nothing here is derived from the chain: whether an admitted output is
 //! spent is the chain state's `spent` (the first held spender that is not
@@ -50,8 +55,10 @@
 //! transaction's judgements are removed when the chain app answers
 //! `rejected` (`unapply`); a rejected spend gives the coins it consumed back
 //! by itself (the chain's `spent` no longer counts it). The records carry
-//! `refs: [{to: <tx CID>, rel: "admits"}]`, so the step that keeps them gives
-//! the kernel the edges (skein docs/VM.md "Edges").
+//! `refs: [{to: <tx CID>, rel: "admits"}]` (an admittance also `{to: <tx CID>,
+//! rel: "mentions"}` for each ancillary transaction: evidence, not a
+//! dependency), so the step that keeps them gives the kernel the edges (skein
+//! docs/VM.md "Edges").
 const std = @import("std");
 const c = @import("chain");
 const topic = @import("topic");
@@ -76,7 +83,7 @@ pub const Network = c.chain.Network;
 /// The head the chain state lives under: the chain app's (its name is `chain`).
 pub const chain_head = "chain/state";
 
-pub const map_names = [_][]const u8{ "admitted", "applied", "pending", "wants", "views" };
+pub const map_names = [_][]const u8{ "admitted", "applied", "pending", "wants", "views", "ancillary" };
 
 /// A topic's view digest (the map `views`, 0.12.0): how many outputs the topic holds admitted and
 /// unspent, and the sum (mod 2^256) of their outpoints' hashes (`outpointHash`). Two topics holding
@@ -171,6 +178,16 @@ pub const Decoded = struct {
     proven: []const Proven,
     /// Entries that named a txid only (the chain must hold them).
     txid_only: []const [32]u8,
+};
+
+/// How a transaction is reachable from the state (`State.holds`, skein-overlay#4): an admitted
+/// output's, a retained coin's, or named by an admittance as ancillary. `outpoint` is the output
+/// (for `ancillary`, the admitted output naming it).
+pub const Held = struct {
+    txid: [32]u8,
+    via: enum { admitted, retained, ancillary },
+    topic: []const u8,
+    outpoint: struct { txid: [32]u8, vout: u32 },
 };
 
 /// A topic's judgement a rejection removed: its lookup services are told (`rejected`).
@@ -571,6 +588,7 @@ pub const State = struct {
         const a = self.arena;
         if (try self.isApplied(t, sub.txid)) return .{ .dupe = true };
         try check(sub.tx, previous, ins);
+        const ancillary = try resolveAncillary(a, self.store, ins.ancillary_txids);
         var removed: std.ArrayList(u32) = .empty;
         for (previous) |p| if (!contains(ins.coins_to_retain, p)) try removed.append(a, p);
         if (!takes(previous, ins)) return .{};
@@ -588,7 +606,8 @@ pub const State = struct {
         std.mem.sort(u32, sorted, {}, std.sort.asc(u32));
         for (sorted) |vout| {
             const out = sub.tx.outputs[vout];
-            const rec = try self.store.putValue(a, .{ .map = try a.dupe(cbor.Entry, &.{
+            var fields: std.ArrayList(cbor.Entry) = .empty;
+            try fields.appendSlice(a, &.{
                 .{ .key = "kind", .value = .{ .text = "admitted" } },
                 .{ .key = "topic", .value = .{ .text = t } },
                 .{ .key = "txid", .value = .{ .text = txid_hex } },
@@ -597,9 +616,13 @@ pub const State = struct {
                 .{ .key = "satoshis", .value = .{ .uint = @intCast(out.satoshis) } },
                 .{ .key = "admittedAt", .value = .{ .uint = @intCast(@max(self.now, 0)) } },
                 .{ .key = "tx", .value = .{ .cid = sub.cid } },
-                .{ .key = "refs", .value = try admitsRef(a, sub.cid) },
-            }) });
-            try self.map("admitted").putLink(try cat(a, &.{ tp, &store_mod.outpointKey(sub.txid, vout) }), rec);
+            });
+            if (ancillary.len > 0) try fields.append(a, .{ .key = "ancillary", .value = .{ .array = try cidValues(a, ancillary) } });
+            try fields.append(a, .{ .key = "refs", .value = try admittanceRefs(a, sub.cid, ancillary) });
+            const rec = try self.store.putValue(a, .{ .map = fields.items });
+            const op = store_mod.outpointKey(sub.txid, vout);
+            try self.map("admitted").putLink(try cat(a, &.{ tp, &op }), rec);
+            for (ins.ancillary_txids) |x| try self.map("ancillary").putLink(try cat(a, &.{ &x, tp, &op }), rec);
             try records.append(a, rec);
             v.fold(sub.txid, vout, true);
         }
@@ -640,7 +663,14 @@ pub const State = struct {
                 if (try self.counted(t, o.txid, o.vout)) v.fold(o.txid, o.vout, false);
             }
             _ = try self.map("applied").remove(key);
-            for (try self.map("admitted").prefixed(key)) |kv| _ = try self.map("admitted").remove(kv.key);
+            for (try self.map("admitted").prefixed(key)) |kv| {
+                const adm = try self.record(if (kv.value == .cid) kv.value.cid else return error.BadIndex);
+                for (adm.getArray("ancillary") orelse &.{}) |x| {
+                    const at = store_mod.bitcoinHash(if (x == .cid) x.cid else return error.BadRecord) orelse return error.BadRecord;
+                    _ = try self.map("ancillary").remove(try cat(a, &.{ &at, kv.key }));
+                }
+                _ = try self.map("admitted").remove(kv.key);
+            }
             const rec = try self.record(rc);
             const raw = self.store.get(a, rec.getCid("tx") orelse return error.BadRecord) catch return error.BadRecord;
             const tx = Transaction.parse(a, raw) catch return error.BadRecord;
@@ -739,20 +769,84 @@ pub const State = struct {
         try unspent.appendSlice(a, spent.items);
         return unspent.items;
     }
+
+    /// How `txid` is reachable from what `topics` hold (skein-overlay#4; a want's answer): an output
+    /// of it admitted and not taken out by a judgement of the topic (`admitted`), else one admitted
+    /// and retained by the topic's judgement of its spender (`retained`), else named in an
+    /// admittance's `ancillary` (`ancillary`, the first in key order). A coin the topic removed
+    /// does not count. Topics in order, outputs in vout order; null: none of them.
+    pub fn holds(self: *State, topics: []const []const u8, txid: [32]u8) !?Held {
+        const a = self.arena;
+        var retained: ?Held = null;
+        for (topics) |t| {
+            const key = try cat(a, &.{ try topicPrefix(a, t), &txid });
+            for (try self.map("admitted").prefixed(key)) |kv| {
+                const o = try store_mod.outpointOf(kv.key[key.len - 32 ..]);
+                const held: Held = .{ .txid = txid, .via = .admitted, .topic = t, .outpoint = .{ .txid = o.txid, .vout = o.vout } };
+                const sp = (try self.spender(t, o.txid, o.vout)) orelse return held;
+                if (!sp.judged) return held;
+                if (sp.retained and retained == null) retained = .{ .txid = txid, .via = .retained, .topic = t, .outpoint = held.outpoint };
+            }
+        }
+        if (retained) |r| return r;
+        for (try self.map("ancillary").prefixed(&txid)) |kv| {
+            const rest = kv.key[32..];
+            if (rest.len < 1 or rest.len != 1 + @as(usize, rest[0]) + 36) return error.BadIndex;
+            const t = rest[1 .. 1 + @as(usize, rest[0])];
+            for (topics) |x| if (std.mem.eql(u8, x, t)) {
+                const o = try store_mod.outpointOf(rest[1 + t.len ..]);
+                return .{ .txid = txid, .via = .ancillary, .topic = x, .outpoint = .{ .txid = o.txid, .vout = o.vout } };
+            };
+        }
+        return null;
+    }
 };
 
-fn admitsRef(a: Allocator, tx_cid: []const u8) !Value {
-    const refs = try a.alloc(Value, 1);
-    refs[0] = .{ .map = try a.dupe(cbor.Entry, &.{
-        .{ .key = "to", .value = .{ .cid = tx_cid } },
-        .{ .key = "rel", .value = .{ .text = "admits" } },
+/// The tx CIDs of the transactions a topic named ancillary (skein-overlay#4): each a `bitcoin-tx`
+/// block readable here (in a call, the submission's BEEF through its overlay, or held; in a step,
+/// kept). One that is not refuses the judgement (`UnknownAncillary`).
+pub fn resolveAncillary(a: Allocator, s: Store, txids: []const [32]u8) ![]const []const u8 {
+    const out = try a.alloc([]const u8, txids.len);
+    for (txids, out) |x, *o| {
+        const tc = try a.dupe(u8, &store_mod.hashCid(.tx, x));
+        if (s.tryGet(a, tc) == null) return error.UnknownAncillary;
+        o.* = tc;
+    }
+    return out;
+}
+
+fn cidValues(a: Allocator, cs: []const []const u8) ![]Value {
+    const out = try a.alloc(Value, cs.len);
+    for (cs, out) |x, *o| o.* = .{ .cid = x };
+    return out;
+}
+
+fn ref(a: Allocator, to: []const u8, rel: []const u8) !Value {
+    return .{ .map = try a.dupe(cbor.Entry, &.{
+        .{ .key = "to", .value = .{ .cid = to } },
+        .{ .key = "rel", .value = .{ .text = rel } },
     }) };
+}
+
+/// An admittance's refs: `admits` its transaction, `mentions` each ancillary one.
+fn admittanceRefs(a: Allocator, tx_cid: []const u8, ancillary: []const []const u8) !Value {
+    const refs = try a.alloc(Value, 1 + ancillary.len);
+    refs[0] = try ref(a, tx_cid, "admits");
+    for (ancillary, refs[1..]) |x, *o| o.* = try ref(a, x, "mentions");
     return .{ .array = refs };
 }
 
+fn admitsRef(a: Allocator, tx_cid: []const u8) !Value {
+    return admittanceRefs(a, tx_cid, &.{});
+}
+
 /// Check a topic's instructions against the transaction: output indices in
-/// range and distinct, retained coins among the previous coins.
+/// range and distinct, retained coins among the previous coins, ancillary
+/// txids distinct.
 pub fn check(tx: Transaction, previous: []const u32, ins: Instructions) !void {
+    for (ins.ancillary_txids, 0..) |x, i| for (ins.ancillary_txids[0..i]) |y| {
+        if (std.mem.eql(u8, &x, &y)) return error.BadInstructions;
+    };
     for (ins.outputs_to_admit, 0..) |o, i| {
         if (o >= tx.outputs.len) return error.BadInstructions;
         if (contains(ins.outputs_to_admit[0..i], o)) return error.BadInstructions;

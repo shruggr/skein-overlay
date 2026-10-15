@@ -12,9 +12,13 @@
 //! call, through the call's in-memory overlay, where the BEEF was decoded).
 //! The call's answer (dag-cbor on stdout):
 //!
-//!   {kind: "admittance", topic, txid, outputsToAdmit: [output index], coinsToRetain: [input index]}
+//!   {kind: "admittance", topic, txid, outputsToAdmit: [output index], coinsToRetain: [input index], ancillaryTxids?: [txid hex]}
 //!
-//! identify(tx: cid, previousCoins, offChain?) → {outputsToAdmit, coinsToRetain}.
+//! identify(tx: cid, previousCoins, offChain?) → {outputsToAdmit, coinsToRetain, ancillaryTxids}.
+//! `ancillaryTxids` (skein-overlay#4; go-overlay-services' AdmittanceInstructions.AncillaryTxids)
+//! names transactions the topic read and relied on that it does not admit — for a 1Sat ordinal
+//! transfer, the funding parents that fix the satoshi's offset. Each must be one the topic could
+//! read (in the submitted BEEF, or held); the engine keeps them on the admittance. Empty: omitted.
 //! A topic program is `pub fn main() u8 { return topic.main(identify); }`
 //! with `identify(arena, Call) !Instructions` — the TopicManager's
 //! identifyAdmissibleOutputs. `judge` is the same over any store (tests).
@@ -51,11 +55,13 @@ const Store = c.store.Store;
 const Transaction = c.bsvz.transaction.Transaction;
 
 /// A topic's decision on one transaction (BRC-22 AdmittanceInstructions):
-/// output indices to admit, and input indices whose admitted predecessors
-/// stay queryable for history.
+/// output indices to admit, input indices whose admitted predecessors stay
+/// queryable for history, and the transactions it relied on that are not
+/// admitted (skein-overlay#4).
 pub const Instructions = struct {
     outputs_to_admit: []const u32 = &.{},
     coins_to_retain: []const u32 = &.{},
+    ancillary_txids: []const [32]u8 = &.{},
 };
 
 /// What a topic judges.
@@ -105,6 +111,19 @@ fn uintList(a: std.mem.Allocator, v: ?Value) ![]u32 {
     return out;
 }
 
+fn txidList(a: std.mem.Allocator, v: ?Value) ![][32]u8 {
+    const items = if (v) |x| (if (x == .array) x.array else return error.BadArgs) else return &.{};
+    const out = try a.alloc([32]u8, items.len);
+    for (items, out) |it, *o| o.* = c.header.fromHex(if (it == .text) it.text else return error.BadArgs) catch return error.BadArgs;
+    return out;
+}
+
+fn hexes(a: std.mem.Allocator, xs: []const [32]u8) ![]Value {
+    const out = try a.alloc(Value, xs.len);
+    for (xs, out) |x, *o| o.* = .{ .text = try a.dupe(u8, &c.header.toHex(x)) };
+    return out;
+}
+
 fn uints(a: std.mem.Allocator, xs: []const u32) ![]Value {
     const out = try a.alloc(Value, xs.len);
     for (xs, out) |x, *o| o.* = .{ .uint = x };
@@ -133,19 +152,26 @@ pub fn callOf(a: std.mem.Allocator, s: Store, args: Value) !Call {
 pub fn judge(a: std.mem.Allocator, s: Store, identify: Identify, args: Value) !Value {
     const call = try callOf(a, s, args);
     const ins = try identify(a, call);
-    return .{ .map = try a.dupe(cbor.Entry, &.{
+    var es: std.ArrayList(cbor.Entry) = .empty;
+    try es.appendSlice(a, &.{
         .{ .key = "kind", .value = .{ .text = "admittance" } },
         .{ .key = "topic", .value = .{ .text = call.topic } },
         .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &c.header.toHex(call.txid)) } },
         .{ .key = "outputsToAdmit", .value = .{ .array = try uints(a, ins.outputs_to_admit) } },
         .{ .key = "coinsToRetain", .value = .{ .array = try uints(a, ins.coins_to_retain) } },
-    }) };
+    });
+    if (ins.ancillary_txids.len > 0) try es.append(a, .{ .key = "ancillaryTxids", .value = .{ .array = try hexes(a, ins.ancillary_txids) } });
+    return .{ .map = es.items };
 }
 
 /// An admittance record's instructions (the engine reads them back).
 pub fn instructionsOf(a: std.mem.Allocator, rec: Value) !Instructions {
     if (!std.mem.eql(u8, rec.getText("kind") orelse "", "admittance")) return error.BadAdmittance;
-    return .{ .outputs_to_admit = try uintList(a, rec.get("outputsToAdmit")), .coins_to_retain = try uintList(a, rec.get("coinsToRetain")) };
+    return .{
+        .outputs_to_admit = try uintList(a, rec.get("outputsToAdmit")),
+        .coins_to_retain = try uintList(a, rec.get("coinsToRetain")),
+        .ancillary_txids = try txidList(a, rec.get("ancillaryTxids")),
+    };
 }
 
 /// A metadata record (`{kind: "metadata", …}`): `name` the configured name unless `m` names one.

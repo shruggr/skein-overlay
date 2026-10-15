@@ -68,7 +68,7 @@
 //! thread a submission launches):
 //!
 //!   {kind: "submit", txid (hex), beef: <the pointer record> | bytes (the BEEF as received, the off-chain framing taken off),
-//!    topics: [{topic, previousCoins, outputsToAdmit, coinsToRetain}] (the subject's),
+//!    topics: [{topic, previousCoins, outputsToAdmit, coinsToRetain, ancillaryTxids?}] (the subject's),
 //!    earlier?: [{txid, topics}] (the items before it, oldest first), wanted?: true,
 //!    requested?: [topic], waiting?: [txid hex] (paused), offChainValues?: bytes,
 //!    source?: {transport, topic?, request: <the request record>}}
@@ -236,7 +236,7 @@ pub fn route(a: Allocator, caller: calls.Caller, st: *State, in: Value, beef: In
                 if (is_subject) try why.print(a, "{s}{s}: {s}", .{ if (why.items.len > 0) "; " else "", t, @errorName(e) });
                 continue;
             };
-            state.check(tx.tx, previous, ins) catch |e| {
+            check(a, st.store, tx.tx, previous, ins) catch |e| {
                 if (is_subject) try why.print(a, "{s}{s}: {s}", .{ if (why.items.len > 0) "; " else "", t, @errorName(e) });
                 continue;
             };
@@ -280,14 +280,30 @@ pub fn wantedTopics(a: Allocator, st: *State, txid: [32]u8) ![]const []const u8 
     return out.items;
 }
 
+/// A topic's instructions checked against the transaction (`state.check`) and its ancillary txids
+/// resolved (`state.resolveAncillary`: in the route's call, the BEEF's blocks or the held ones).
+fn check(a: Allocator, s: c.store.Store, tx: c.bsvz.transaction.Transaction, previous: []const u32, ins: topic_mod.Instructions) !void {
+    try state.check(tx, previous, ins);
+    _ = try state.resolveAncillary(a, s, ins.ancillary_txids);
+}
+
 fn judgements(a: Allocator, judged: []const Judged) ![]Value {
     const out = try a.alloc(Value, judged.len);
-    for (judged, out) |j, *o| o.* = .{ .map = try a.dupe(cbor.Entry, &.{
-        .{ .key = "topic", .value = .{ .text = j.topic } },
-        .{ .key = "previousCoins", .value = .{ .array = try uints(a, j.previous) } },
-        .{ .key = "outputsToAdmit", .value = .{ .array = try uints(a, j.ins.outputs_to_admit) } },
-        .{ .key = "coinsToRetain", .value = .{ .array = try uints(a, j.ins.coins_to_retain) } },
-    }) };
+    for (judged, out) |j, *o| {
+        var es: std.ArrayList(cbor.Entry) = .empty;
+        try es.appendSlice(a, &.{
+            .{ .key = "topic", .value = .{ .text = j.topic } },
+            .{ .key = "previousCoins", .value = .{ .array = try uints(a, j.previous) } },
+            .{ .key = "outputsToAdmit", .value = .{ .array = try uints(a, j.ins.outputs_to_admit) } },
+            .{ .key = "coinsToRetain", .value = .{ .array = try uints(a, j.ins.coins_to_retain) } },
+        });
+        if (j.ins.ancillary_txids.len > 0) {
+            const xs = try a.alloc(Value, j.ins.ancillary_txids.len);
+            for (j.ins.ancillary_txids, xs) |x, *v| v.* = try hexText(a, x);
+            try es.append(a, .{ .key = "ancillaryTxids", .value = .{ .array = xs } });
+        }
+        o.* = .{ .map = es.items };
+    }
     return out;
 }
 
@@ -1213,13 +1229,13 @@ fn admitItem(cx: Ctx, ev: Value, it: EventItem, beef: []const u8, records: *std.
         ap.* = .{};
         const previous = try st.previousCoins(t.*, sub.tx);
         const ins: topic_mod.Instructions = if (std.mem.eql(u32, previous, try uintList(a, j.get("previousCoins"))))
-            .{ .outputs_to_admit = try uintList(a, j.get("outputsToAdmit")), .coins_to_retain = try uintList(a, j.get("coinsToRetain")) }
+            .{ .outputs_to_admit = try uintList(a, j.get("outputsToAdmit")), .coins_to_retain = try uintList(a, j.get("coinsToRetain")), .ancillary_txids = try hexList(a, j.get("ancillaryTxids")) }
         else blk: {
             const prog = (try calls.configuredProgram(cx.in, served, t.*)) orelse continue;
             break :blk identify(a, cx.caller, prog, t.*, sub, previous, if (it.subject) ev.getBytes("offChainValues") else null) catch continue;
         };
         ap.* = st.apply(sub, t.*, previous, ins, beef) catch |e| switch (e) {
-            error.BadInstructions => continue,
+            error.BadInstructions, error.UnknownAncillary => continue,
             else => return e,
         };
         if (ap.records.len == 0) continue;
@@ -1309,11 +1325,11 @@ pub fn seed(cx: Ctx, topic: []const u8, seeds: []const [32]u8) !Seeding {
             const sub = try state.subjectOf(a, st.store, t);
             const previous = try st.previousCoins(topic, sub.tx);
             const ins = identify(a, cx.caller, prog, topic, sub, previous, null) catch continue;
-            state.check(sub.tx, previous, ins) catch continue;
+            check(a, st.store, sub.tx, previous, ins) catch continue;
             if (!state.takes(previous, ins)) continue;
             const bytes = try state.beefFor(st.ch, t);
             const ap = st.apply(sub, topic, previous, ins, try state.putRaw(a, st.store, bytes)) catch |e| switch (e) {
-                error.BadInstructions => continue,
+                error.BadInstructions, error.UnknownAncillary => continue,
                 else => return e,
             };
             if (ap.records.len == 0) continue;

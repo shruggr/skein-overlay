@@ -68,7 +68,7 @@ storage are not ported.
 |---|---|
 | `src/engine.zig` → `overlay.wasm` | The engine: called, the front door's route handlers (`routes.zig`); stepped, a submission by message, the submission's thread, a watch, a resume, a peer's admit. |
 | `src/submit.zig` | A submission from the wire to the state: the route's half (decode, missing parents, verify, judge oldest first), a submission by message (`received`), the submission's thread (one ingest per item to the chain app; each admitted, in order, on its answer), a pause and its `resume`, the watch, the answers to the submitter. |
-| `src/state.zig` | The overlay's state (`<app>/state`) over the chain state (read only): the maps, the previous coins, recording a judgement (`apply`), removing one (`unapply`), `inTopic`, `spender`; a paused submission's `wants` and the step's want / unwant events (`wantEvents`); the parents a BEEF lacks (`missingParents`) and an item's Atomic BEEF cut from a submission's (`atomicFor`); the door's envelope and pointer record read (`decodeRecord`, #121, #146); the view digest (`views`, `View`, `viewChanges`, 0.12.0) or the one BEEF parse of bytes (`decode`), SPV over the records (`verifyDecoded`; BUMPs only for bytes); the bytes of a BEEF that came as bytes kept as a raw block (`putRaw`), which the `applied` record names; BEEF out for a lookup (`beefFor`, `beefOfMany`). |
+| `src/state.zig` | The overlay's state (`<app>/state`) over the chain state (read only): the maps, the previous coins, recording a judgement (`apply`), removing one (`unapply`), `inTopic`, `spender`; whether a transaction is reachable (`holds`, the `ancillary` index); a paused submission's `wants` and the step's want / unwant events (`wantEvents`); the parents a BEEF lacks (`missingParents`) and an item's Atomic BEEF cut from a submission's (`atomicFor`); the door's envelope and pointer record read (`decodeRecord`, #121, #146); the view digest (`views`, `View`, `viewChanges`, 0.12.0) or the one BEEF parse of bytes (`decode`), SPV over the records (`verifyDecoded`; BUMPs only for bytes); the bytes of a BEEF that came as bytes kept as a raw block (`putRaw`), which the `applied` record names; BEEF out for a lookup (`beefFor`, `beefOfMany`). |
 | `src/calls.zig` | The configuration as the engine reads it (`configObject`, `listeners`, the app's name) and its calls of topics and lookup services (`Caller`, `hookAdmitted`, `hookRejected`). |
 | `src/routes.zig` | The route handlers (#40): the overlay-express wire contract (`/submit` BRC-22, synchronous: `httpFirst`, `httpAgain`, 0.9.1), and the gossip's inbound routes (`peerAdmit`, `peerProof`, #74). |
 | `src/gossip.zig` | The gossip topics (#74; 0.12.0: submit and admit two kinds on `<topic>`): message shapes, what an admission and a proof publish, a peer's proof checked, the peer-admit records. |
@@ -322,8 +322,8 @@ its verdict goes back at once.)
 
 ```
 {kind: "submit", txid (hex: the subject), beef: <the door's envelope {form, beef: <pointer record>, subject?, vout?}> | bytes (the BEEF as received, off-chain framing taken off),
- topics: [{topic, previousCoins, outputsToAdmit, coinsToRetain}],     the subject's judgements ([] when no topic took it)
- earlier?: [{txid (hex), topics: [{topic, previousCoins, outputsToAdmit, coinsToRetain}]}],
+ topics: [{topic, previousCoins, outputsToAdmit, coinsToRetain, ancillaryTxids?}],     the subject's judgements ([] when no topic took it)
+ earlier?: [{txid (hex), topics: [{topic, previousCoins, outputsToAdmit, coinsToRetain, ancillaryTxids?}]}],
                                        the items before the subject, oldest first (topics [] for one only wanted)
  wanted?: true,                        no topic took the subject, but a paused submission wants it: it is an item all the same
  offChainValues?: bytes,
@@ -534,7 +534,7 @@ submission's thread answers only its own submitter.
 ## The state: `<app>/state`
 
 ```
-{kind: "overlay-state", maps: {admitted, applied, pending, wants, views}}
+{kind: "overlay-state", maps: {admitted, applied, pending, wants, views, ancillary}}
 ```
 
 `tp` is len ‖ topic. The outpoint is txid (internal order) ‖ vout (u32 BE).
@@ -545,11 +545,18 @@ submission's thread answers only its own submitter.
 | `applied` | tp ‖ txid → applied record | the topic's judgement of this transaction: a later submission is a dupe; which previous coins it retained |
 | `pending` | txid → submission record | a submission's transaction handed to the chain app, not yet admitted (or rejected); or a paused submission (skein-overlay#1) |
 | `wants` | parent txid ‖ tp ‖ peer? → [subject txid] | a want: a parent paused submissions wait on, wanted under that topic, to be asked of that peer — or, with no peer, of the topic's mesh (skein-overlay#1, shruggr/skein#112) |
+| `ancillary` | ancillary txid ‖ tp ‖ outpoint → admittance record | a transaction an admittance names in `ancillary`, by the admitted output naming it (skein-overlay#4); removed with the admittance |
 
 **Records.**
 
 - **Admittance:** `{kind: "admitted", topic, txid, vout, script, satoshis,
-  admittedAt, tx: <tx CID>, refs: [{to: <tx CID>, rel: "admits"}]}`.
+  admittedAt, tx: <tx CID>, ancillary?: [<tx CID>], refs: [{to: <tx CID>,
+  rel: "admits"}, {to: <ancillary tx CID>, rel: "mentions"}, …]}`.
+  `ancillary` is the transactions the topic named in `ancillaryTxids`
+  (below, "The topic contract"), absent when it named none; each is a
+  `mentions` ref. A rejection of an ancillary transaction does not reach the
+  admittance: it is evidence, not a dependency (skein docs/VM.md "relation
+  kinds").
 - **Applied:** `{kind: "applied", topic, txid, outputsToAdmit,
   coinsToRetain, coinsRemoved, at, tx, beef, refs}`. `beef` is the
   submission's BEEF as the overlay was handed it: the door's envelope as a
@@ -601,6 +608,15 @@ that spender, if it admitted it.
 **Sync note (GASP, later).** Other overlay engines answer history /
 `consumedBy` from per-topic tables. Here the answer is the chain's spends
 joined to `applied`; wire answers for sync are to be derived from those.
+
+**Holds** (skein-overlay#4; the host's answer to a want, shruggr/skein#150).
+`holds(topics, txid)` says whether the state reaches a transaction, over the
+served topics in order: **admitted**, an output of it admitted and not taken
+out by a judgement of the topic (unspent, or spent by a transaction the
+topic did not judge); else **retained**, an output of it admitted and
+retained by the topic's judgement of its spender; else **ancillary**, named
+in an admittance's `ancillary` (the `ancillary` index). A coin the topic
+removed does not count. The read `/holds` answers it ("The wire", below).
 
 ## The engine (`overlay`)
 
@@ -989,12 +1005,25 @@ the admitting step), with the argument
 It answers (dag-cbor on stdout)
 
 ```
-{kind: "admittance", topic, txid, outputsToAdmit: [output index], coinsToRetain: [input index]}
+{kind: "admittance", topic, txid, outputsToAdmit: [output index], coinsToRetain: [input index], ancillaryTxids?: [<txid hex>]}
 ```
 
 That is `identify(tx: cid, previousCoins, offChain?) → {outputsToAdmit,
-coinsToRetain}`, BRC-22's `identifyAdmissibleOutputs` on a CID instead of a
-BEEF. With the module `topic`, a topic is only its identify function:
+coinsToRetain, ancillaryTxids}`, BRC-22's `identifyAdmissibleOutputs` on a CID instead of a
+BEEF.
+
+**`ancillaryTxids`** (skein-overlay#4; go-overlay-services'
+`AdmittanceInstructions.AncillaryTxids`) names the transactions the topic
+read and relied on that it does not admit: for a 1Sat ordinal transfer, the
+funding parents whose outputs fix the satoshi's offset. A peer judging the
+transfer again needs them. In `topic.Instructions` it is `ancillary_txids:
+[]const [32]u8` (default empty; omitted from the answer when empty). Each
+must be a transaction the topic could read (in the submitted BEEF, or held):
+the engine resolves each to its `bitcoin-tx` block and refuses the
+judgement if one does not resolve (`UnknownAncillary`) or one is named twice
+(`BadInstructions`). The admittances keep them (`ancillary`, "The state"
+above). They do not travel with the output in any delivery, and the
+`applied` record's `beef` is unchanged. With the module `topic`, a topic is only its identify function:
 
 ```zig
 const topic = @import("topic");
@@ -1136,7 +1165,7 @@ The overlay is served by the instance itself, through its routes
 
 | route | what it is | the overlay's |
 |---|---|---|
-| **read route** (http, no handler) | its filters run over the request and the last one answers: the engine's function, called as a filter (input `filter: true`, the deterministic profile) over the current state, answering `{answer: {status, type, body}}`; any method, signed or not, **no entry, nothing logged**; a function that writes fails inside the call | `/lookup` (derived from `config.overlay`, filter `overlay.lookup`), `/listTopicManagers`, `/listLookupServiceProviders`, `/getDocumentationForTopicManager`, `/getDocumentationForLookupServiceProvider` (the manifest's, each with its filter) |
+| **read route** (http, no handler) | its filters run over the request and the last one answers: the engine's function, called as a filter (input `filter: true`, the deterministic profile) over the current state, answering `{answer: {status, type, body}}`; any method, signed or not, **no entry, nothing logged**; a function that writes fails inside the call | `/lookup` (derived from `config.overlay`, filter `overlay.lookup`), `/listTopicManagers`, `/listLookupServiceProviders`, `/getDocumentationForTopicManager`, `/getDocumentationForLookupServiceProvider`, `/holds` (the manifest's, each with its filter) |
 | **route with a handler** | its filters run (`kernel.beef`: the BEEF decoded and checked, its envelope handed on), the gate checks the handler's function against `roles`, then the request is an entry, stepped | `/submit` (derived, `kernel.beef`: anyone whose BEEF validates); the boxes `<app>/submit` (`kernel.beef`), `<app>/register` (root), `<app>` (derived event and mailbox routes; "Submitting", above: the three boxes); the libp2p routes |
 
 The same path twice is refused at install.
@@ -1158,6 +1187,7 @@ overlay apps.
 | `POST /lookup` | read | `lookup` | `{service, query}` JSON; `X-Aggregation: yes` | `{type: "output-list", outputs: [{beef: [bytes], outputIndex, context?}]}`, or the compact octet-stream (count, per output txid ‖ index ‖ context, then one BEEF of them all, `state.beefOfMany`); a freeform answer as `{type, result}` |
 | `GET /listTopicManagers`, `/listLookupServiceProviders` | read | `listTopicManagers`, `listLookupServiceProviders` | | `{name: {name, shortDescription, iconURL?, version?, informationURL?}}`: each configured topic's or service's fn `metadata` |
 | `GET /getDocumentationForTopicManager?manager=`, `/getDocumentationForLookupServiceProvider?lookupService=` | read | `topicDocumentation`, `lookupDocumentation` | | `text/markdown`: its fn `documentation`; 400 if not configured |
+| `GET /holds?txid=` | read | `holds` | `txid` hex | `{txid, tx: {"/": <tx CID hex>}, via: "admitted" \| "retained" \| "ancillary", outpoint: {txid, vout}}` ("Holds", above; for `ancillary` the outpoint is the admitted output naming it), or `{}`; 400 for a txid that is not hex (skein-overlay#4) |
 
 **A submit is the one write**, and only when a topic takes the transaction
 (above). Over HTTP it is BRC-22: the route launches the submission's thread

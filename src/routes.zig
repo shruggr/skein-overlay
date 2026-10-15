@@ -25,6 +25,8 @@
 //!   GET  /listTopicManagers, /listLookupServiceProviders         fn "listTopicManagers" / "listLookupServiceProviders"
 //!   GET  /getDocumentationForTopicManager?manager=…              fn "topicDocumentation"
 //!   GET  /getDocumentationForLookupServiceProvider?lookupService=…  fn "lookupDocumentation"
+//!   GET  /holds?txid=…    fn "holds"   (skein-overlay#4) → {txid, tx: <tx CID>, via: "admitted" | "retained" |
+//!                                   "ancillary", outpoint: {txid, vout}}, or {} when the state reaches it not
 //!
 //! Every request is appended, and the front door's step calls these (#68).
 //! A submit over HTTP is BRC-22 (0.9.1, shruggr/skein#112, David 2026-10-07: "the HTTP
@@ -256,6 +258,8 @@ pub fn call(a: Allocator, call_in: Value) !void {
         try documentation(a, in, "overlayTopics", (try param(a, arg, "manager")) orelse "", "Topic manager")
     else if (eql(u8, func, "lookupDocumentation"))
         try documentation(a, in, "overlayLookups", (try param(a, arg, "lookupService")) orelse "", "Lookup service")
+    else if (eql(u8, func, "holds"))
+        try holds(a, in, arg)
     else
         return error.UnknownFunction;
     // A read route's filter (shruggr/skein#143: /lookup, the listings, the documentation): the
@@ -752,4 +756,26 @@ fn documentation(a: Allocator, in: Value, key: []const u8, name: []const u8, wha
     const prog = (try programFor(in, map, name)) orelse return failure(a, 400, try std.fmt.allocPrint(a, "{s} not found: {s}", .{ what, name }));
     const d = describe(a, in, key, prog, name, "documentation") catch |e| return callFailure(a, e);
     return respond(a, 200, "text/markdown", d.getText("documentation") orelse "");
+}
+
+/// Whether the state reaches a transaction (skein-overlay#4; the host's want answers): `State.holds`
+/// over the served topics. `?txid=` is the txid, hex.
+fn holds(a: Allocator, in: Value, req: Value) !Value {
+    const txid = c.header.fromHex((try param(a, req, "txid")) orelse "") catch return failure(a, 400, "Invalid request: txid must be a transaction id (hex)");
+    var st = try load(a, in);
+    const h = (try st.holds(try calls.servedTopics(a, in), txid)) orelse return respond(a, 200, "application/json", "{}");
+    return respond(a, 200, "application/json", try toJson(a, try heldValue(a, h)));
+}
+
+/// A `Held` as the read answers it: `{txid, tx: <tx CID>, via, outpoint: {txid, vout}}`.
+pub fn heldValue(a: Allocator, h: state.Held) !Value {
+    return .{ .map = try a.dupe(cbor.Entry, &.{
+        .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &c.header.toHex(h.txid)) } },
+        .{ .key = "tx", .value = .{ .cid = try a.dupe(u8, &c.store.hashCid(.tx, h.txid)) } },
+        .{ .key = "via", .value = .{ .text = @tagName(h.via) } },
+        .{ .key = "outpoint", .value = .{ .map = try a.dupe(cbor.Entry, &.{
+            .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &c.header.toHex(h.outpoint.txid)) } },
+            .{ .key = "vout", .value = .{ .uint = h.outpoint.vout } },
+        }) } },
+    }) };
 }

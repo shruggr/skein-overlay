@@ -216,6 +216,8 @@ const Instance = struct {
     lookup_prog: []const u8,
     /// The topics a submission requests (X-Topics, or the gossip message's).
     topics: []const []const u8 = &.{"tm_demo"},
+    /// How the topic program judges: tm_demo's identify, or it naming ancillary txids (skein-overlay#4).
+    identify_: enum { demo, funding, unknown } = .demo,
     calls_: std.StringHashMapUnmanaged(usize) = .empty,
     wire_: *FakeWire,
     out_: *FakeOut,
@@ -260,7 +262,11 @@ const Instance = struct {
         gop.value_ptr.* += 1;
         if (std.mem.eql(u8, program, self.topic_prog)) {
             if (!std.mem.eql(u8, func, "identify")) return error.UnknownFunction;
-            return topic.judge(a, self.current, demo.identify, arg);
+            return switch (self.identify_) {
+                .demo => topic.judge(a, self.current, demo.identify, arg),
+                .funding => topic.judge(a, self.current, fundingIdentify, arg),
+                .unknown => topic.judge(a, self.current, unknownIdentify, arg),
+            };
         }
         if (std.mem.eql(u8, program, self.lookup_prog)) {
             try std.testing.expectEqualStrings("overlay", arg.getText("app").?);
@@ -482,6 +488,31 @@ const Instance = struct {
         return out;
     }
 };
+
+/// tm_demo naming, when it admits a token, the source transactions of the inputs that are not
+/// previous coins as ancillary (a 1Sat transfer's funding parents, skein-overlay#4).
+fn fundingIdentify(a: Allocator, call: topic.Call) anyerror!topic.Instructions {
+    var ins = try demo.identify(a, call);
+    if (ins.outputs_to_admit.len == 0) return ins;
+    var anc: std.ArrayList([32]u8) = .empty;
+    for (call.tx.inputs, 0..) |in, i| {
+        const coin = for (call.previous_coins) |p| {
+            if (p == i) break true;
+        } else false;
+        if (!coin) try anc.append(a, in.previous_outpoint.txid.bytes);
+    }
+    ins.ancillary_txids = anc.items;
+    return ins;
+}
+
+const unknown_txid: [32]u8 = .{0xee} ** 32;
+
+/// tm_demo naming a transaction it could not have read as ancillary.
+fn unknownIdentify(a: Allocator, call: topic.Call) anyerror!topic.Instructions {
+    var ins = try demo.identify(a, call);
+    ins.ancillary_txids = &.{unknown_txid};
+    return ins;
+}
 
 fn subjectOf(a: Allocator, v: Value) ![32]u8 {
     return (try beef.parse(a, v.getBytes("beef").?)).subject().?;
@@ -827,6 +858,111 @@ test "the gate (#73, the chain app's answer): admitted on the first of accepted 
     }
 }
 
+test "ancillary txids (skein-overlay#4): kept on the admittance with mentions refs; an unknown one refused; holds answers admitted, retained, ancillary; a rejection takes the index entry out" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = c.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var inst = try Instance.init(a, &ms);
+    const k = try keys(0x42);
+    const f = try fund(a, 0x33, 3, &k.p2pkh);
+    try inst.headers(&.{&f.h1});
+    const topics = &[_][]const u8{"tm_demo"};
+    const fund_cid = c.store.hashCid(.tx, f.txid);
+
+    // ------------------------------------------------ a verdict naming the funding parent: kept on the admittance
+    inst.identify_ = .funding;
+    const t1 = try spend(a, &f.tx, 0, &.{.{ 1, &k.token }}, k.priv);
+    try std.testing.expect((try inst.admitted(try withFund(a, f, t1), t1.txid)).admitted);
+    {
+        var st = try inst.load();
+        const tp = try state.topicPrefix(a, "tm_demo");
+        const rec = try st.record((try st.map("admitted").link(try std.mem.concat(a, u8, &.{ tp, &c.store.outpointKey(t1.txid, 0) }))).?);
+        const anc = rec.getArray("ancillary").?;
+        try std.testing.expectEqual(@as(usize, 1), anc.len);
+        try std.testing.expectEqualSlices(u8, &fund_cid, anc[0].cid);
+        const refs = rec.getArray("refs").?;
+        try std.testing.expectEqual(@as(usize, 2), refs.len);
+        try std.testing.expectEqualStrings("admits", refs[0].getText("rel").?);
+        try std.testing.expectEqualSlices(u8, &c.store.hashCid(.tx, t1.txid), refs[0].getCid("to").?);
+        try std.testing.expectEqualStrings("mentions", refs[1].getText("rel").?);
+        try std.testing.expectEqualSlices(u8, &fund_cid, refs[1].getCid("to").?);
+
+        const by_anc = (try st.holds(topics, f.txid)).?;
+        try std.testing.expect(by_anc.via == .ancillary);
+        try std.testing.expectEqualSlices(u8, &t1.txid, &by_anc.outpoint.txid);
+        try std.testing.expectEqual(@as(u32, 0), by_anc.outpoint.vout);
+        const by_adm = (try st.holds(topics, t1.txid)).?;
+        try std.testing.expect(by_adm.via == .admitted);
+        try std.testing.expectEqualSlices(u8, &t1.txid, &by_adm.outpoint.txid);
+        // The read's answer.
+        const v = try routes.heldValue(a, by_anc);
+        try std.testing.expectEqualStrings(&hdr.toHex(f.txid), v.getText("txid").?);
+        try std.testing.expectEqualSlices(u8, &fund_cid, v.getCid("tx").?);
+        try std.testing.expectEqualStrings("ancillary", v.getText("via").?);
+        try std.testing.expectEqualStrings(&hdr.toHex(t1.txid), v.get("outpoint").?.getText("txid").?);
+        try std.testing.expectEqual(@as(u64, 0), v.get("outpoint").?.getUint("vout").?);
+        // A transaction the state does not reach.
+        try std.testing.expect((try st.holds(topics, unknown_txid)) == null);
+    }
+
+    // ------------------------------------------------ a spend that retains the coin: holds answers `retained`
+    const t2 = try spend(a, &t1.tx, 0, &.{.{ 1, &k.token }}, k.priv);
+    try std.testing.expect((try inst.admitted(try atomic(a, t2), t2.txid)).admitted);
+    {
+        var st = try inst.load();
+        const tp = try state.topicPrefix(a, "tm_demo");
+        // Its one input is a previous coin: nothing named.
+        const rec = try st.record((try st.map("admitted").link(try std.mem.concat(a, u8, &.{ tp, &c.store.outpointKey(t2.txid, 0) }))).?);
+        try std.testing.expect(rec.get("ancillary") == null);
+        try std.testing.expectEqual(@as(usize, 1), rec.getArray("refs").?.len);
+        const h = (try st.holds(topics, t1.txid)).?;
+        try std.testing.expect(h.via == .retained);
+        try std.testing.expectEqualSlices(u8, &t1.txid, &h.outpoint.txid);
+        try std.testing.expect((try st.holds(topics, t2.txid)).?.via == .admitted);
+        try std.testing.expect((try st.holds(topics, f.txid)).?.via == .ancillary);
+    }
+
+    // ------------------------------------------------ an ancillary txid it could not have read: refused, nothing persists
+    inst.identify_ = .unknown;
+    {
+        const t3 = try spend(a, &f.tx, 1, &.{.{ 1, &k.token }}, k.priv);
+        const before = ms.count();
+        const r = try inst.route(try withFund(a, f, t3));
+        try std.testing.expect(r == .nothing);
+        try std.testing.expect(std.mem.indexOf(u8, r.nothing, "UnknownAncillary") != null);
+        try std.testing.expectEqual(before, ms.count());
+        var st = try inst.load();
+        try std.testing.expect((try st.holds(topics, t3.txid)) == null);
+        // Named twice: refused as bad instructions.
+        const tx = (try state.subjectOf(a, ms.store(), t1.txid)).tx;
+        try std.testing.expectError(error.BadInstructions, state.check(tx, &.{}, .{ .ancillary_txids = &.{ f.txid, f.txid } }));
+    }
+
+    // ------------------------------------------------ admitted on acceptance, then rejected: the index entry goes with the admittance
+    inst.identify_ = .funding;
+    {
+        const f2 = try fund(a, 0x34, 1, &k.p2pkh);
+        const h2 = mine(hdr.hash(&f.h1), f2.txid, 1_700_001_200);
+        try inst.headers(&.{&h2});
+        const bumps = try a.dupe(bsvz.spv.MerklePath, &.{try bsvz.spv.MerklePath.parse(a, try soloPath(a, 2, f2.txid))});
+        const f2b: Fund = .{ .tx = f2.tx, .raw = f2.raw, .txid = f2.txid, .h1 = h2, .entry = f2.entry, .bumps = bumps };
+        const t4 = try spend(a, &f2.tx, 0, &.{.{ 1, &k.token }}, k.priv);
+        try std.testing.expect((try inst.admitted(try withFund(a, f2b, t4), t4.txid)).admitted);
+        {
+            var st = try inst.load();
+            try std.testing.expect((try st.holds(topics, f2.txid)).?.via == .ancillary);
+        }
+        _ = try inst.chainStatus(t4.txid, "REJECTED", null);
+        try std.testing.expectEqual(@as(usize, 1), (try inst.watchStart(t4.txid)).unapplied.len);
+        var st = try inst.load();
+        try std.testing.expect((try st.holds(topics, f2.txid)) == null);
+        try std.testing.expect((try st.holds(topics, t4.txid)) == null);
+        try std.testing.expect((try st.holds(topics, f.txid)).?.via == .ancillary);
+    }
+}
+
 test "the topic contract: identify on a CID, reading records" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -841,6 +977,25 @@ test "the topic contract: identify on a CID, reading records" {
         .{ .key = "tx", .value = .{ .cid = try a.dupe(u8, &c.store.hashCid(.tx, .{0x5a} ** 32)) } },
     }) };
     try std.testing.expectError(error.UnknownTransaction, topic.judge(a, s, demo.identify, missing));
+
+    // ancillaryTxids (skein-overlay#4): written when named, read back; none named, no field.
+    const k = try keys(0x42);
+    const f = try fund(a, 0x11, 1, &k.p2pkh);
+    const t = try spend(a, &f.tx, 0, &.{.{ 1, &k.token }}, k.priv);
+    try s.putBlock(&c.store.hashCid(.tx, t.txid), t.raw);
+    const call: Value = .{ .map = try a.dupe(cbor.Entry, &.{
+        .{ .key = "kind", .value = .{ .text = "topic-call" } },
+        .{ .key = "topic", .value = .{ .text = "tm_demo" } },
+        .{ .key = "tx", .value = .{ .cid = try a.dupe(u8, &c.store.hashCid(.tx, t.txid)) } },
+    }) };
+    const named = try cbor.decode(a, try cbor.encode(a, try topic.judge(a, s, fundingIdentify, call)));
+    try std.testing.expectEqualStrings(&hdr.toHex(f.txid), named.getArray("ancillaryTxids").?[0].text);
+    const ins = try topic.instructionsOf(a, named);
+    try std.testing.expectEqual(@as(usize, 1), ins.ancillary_txids.len);
+    try std.testing.expectEqualSlices(u8, &f.txid, &ins.ancillary_txids[0]);
+    const plain = try topic.judge(a, s, demo.identify, call);
+    try std.testing.expect(plain.get("ancillaryTxids") == null);
+    try std.testing.expectEqual(@as(usize, 0), (try topic.instructionsOf(a, plain)).ancillary_txids.len);
 }
 
 test "metadata and documentation: the program's own, else the default" {
@@ -2880,6 +3035,7 @@ test "the listings and documentation are read routes (shruggr/skein#143, 0.10.0)
         .{ "/listLookupServiceProviders", "listLookupServiceProviders" },
         .{ "/getDocumentationForTopicManager", "topicDocumentation" },
         .{ "/getDocumentationForLookupServiceProvider", "lookupDocumentation" },
+        .{ "/holds", "holds" },
     };
     const filters = j.object.get("filters").?.object;
     for (want) |w| {
