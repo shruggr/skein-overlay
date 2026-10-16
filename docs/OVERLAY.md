@@ -486,7 +486,10 @@ this instance on **`/skein/overlay/beef/1.0.0`** (the manifest's row
 Atomic BEEF per frame, the wanted txid its subject; "The wire", below. The
 door decodes it (`filter: "beef"`) and `submit` routes it as a submission
 from that peer, with the topics the paused submissions waiting on its
-subject requested (`submit.wantedTopics`); a BEEF no one here wants is
+subject requested (`submit.wantedTopics`). A BEEF no one here wants is a
+**pull** (0.14.0, shruggr/skein#150: the host fetched it from a peer's
+admitted lists) when a BUMP in it proves its subject mined
+(`routes.minedSubject`): routed with every served topic; otherwise it is
 `ignore`. It is an item even if no topic takes it (below), and it may
 itself pause and want.
 

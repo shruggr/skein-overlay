@@ -3552,6 +3552,15 @@ test "anchors (0.14.0, shruggr/skein#150): BRC-136's root and anchor per height 
         try std.testing.expectEqualSlices(u8, &t5.txid, &(try beef.parse(a, try hexBytes(a, ans5.getText("beef").?))).subject().?);
     }
 
+    // ------------------------------------------------ the receive row's pull (0.14.0): a BEEF proving its subject mined
+    try std.testing.expect(routes.minedSubject(a, ms.store(), .{ .bytes = try withFund(a, f, t1) }, f.txid));
+    try std.testing.expect(!routes.minedSubject(a, ms.store(), .{ .bytes = try withFund(a, f, t1) }, t1.txid));
+    {
+        const st = try inst.load();
+        const mined_beef = try state.beefFor(st.ch, t1.txid);
+        try std.testing.expect(routes.minedSubject(a, ms.store(), .{ .bytes = mined_beef }, t1.txid));
+    }
+
     // ------------------------------------------------ another instance, the same history in another order: the same anchors
     {
         var ms2 = c.store.MemStore.init(std.testing.allocator);

@@ -740,6 +740,8 @@ gains `mined`, `placed`, `anchors` and `tips`; the beat body gains
 `tipHeight`, `tipAnchor` and `tailDigest`; the reads `/anchors` and
 `/admitted`; `/holds` answers `judged` for a transaction a topic took that
 admitted no output, and carries the chain state's Atomic BEEF (`beef`).
+A BEEF on `/skein/overlay/beef/1.0.0` that no one here waits on is taken
+when it proves its subject mined (a pull), judged by every served topic.
 README "Anchors".
 
 ## Contributing

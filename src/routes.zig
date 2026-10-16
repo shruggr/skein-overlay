@@ -19,7 +19,8 @@
 //!   libp2p:/skein/overlay/beef/1.0.0   fn "submit"   a direct stream (skein-overlay#1, shruggr/skein#112):
 //!                                           a peer answering a want, one Atomic BEEF per frame (the
 //!                                           wanted txid its subject), submitted as from that peer
-//!                                           with the topics its waiters requested → {verdict, admit?}
+//!                                           with the topics its waiters requested; a mined one no one
+//!                                           waits on (a pull, 0.14.0), with every served topic → {verdict, admit?}
 //!   POST /lookup      fn "lookup"   {service, query} (JSON) → {type: "output-list", outputs: [{beef, outputIndex, context?}]}
 //!                                   X-Aggregation: yes → the compact octet-stream form (count, [txid, index, context], one BEEF)
 //!   GET  /listTopicManagers, /listLookupServiceProviders         fn "listTopicManagers" / "listLookupServiceProviders"
@@ -590,9 +591,28 @@ fn stream(a: Allocator, in: Value, req: Value) !Value {
         .bytes => |b| (c.beef.parse(a, b) catch return verdictOf(a, "ignore", "Invalid BEEF")).subject() orelse return verdictOf(a, "ignore", "Invalid BEEF: no subject"),
     };
     var st = try load(a, in);
-    const topics = try served(a, try submit_mod.wantedTopics(a, &st, subject), try configMap(a, in, "overlayTopics"));
-    if (topics.len == 0) return verdictOf(a, "ignore", "not wanted here");
+    var topics = try served(a, try submit_mod.wantedTopics(a, &st, subject), try configMap(a, in, "overlayTopics"));
+    // A pull (0.14.0, shruggr/skein#150): a mined transaction no one here waits on, judged by every served topic.
+    if (topics.len == 0 and minedSubject(a, vm.store(), beef, subject)) topics = try calls.servedTopics(a, in);
+    if (topics.len == 0) return verdictOf(a, "ignore", "not wanted here, and not mined");
     return libp2pRouted(a, in, &st, beef, topics, try sourceOf(a, req, null), req);
+}
+
+/// Whether the BEEF proves its subject mined: a BUMP names it (the door checked the BUMPs against the
+/// chain state's headers; bytes are checked when routed).
+pub fn minedSubject(a: Allocator, s: c.store.Store, beef: submit_mod.Input, subject: [32]u8) bool {
+    switch (beef) {
+        .envelope => |e| {
+            const d = state.decodeRecord(a, s, e) catch return false;
+            for (d.proven) |p| if (eql(u8, &p.txid, &subject)) return true;
+            return false;
+        },
+        .bytes => |b| {
+            const parsed = c.beef.parse(a, b) catch return false;
+            const entry = parsed.find(subject) orelse return false;
+            return entry.format == .raw_with_bump;
+        },
+    }
 }
 
 /// Where a submission came from, carried on its entry (#74: an admission re-publishes it on `<topic>`
