@@ -52,13 +52,14 @@ storage are not ported.
   own P2PKH coins and takes no caller-supplied inputs, so the engine can
   have it fund and sign the PushDrop ad but not spend the ad to revoke it
   without a change to skein's wallet (an open question for skein).
-- Sync between overlay nodes (GASP); catch-up from a peer. The push half —
+- GASP. Sync between overlay nodes is shruggr/skein#150: the push half —
   submissions, admits and proofs as they happen — is the gossip (#74, below).
-  The engine's half of catch-up is the want of a paused submission —
-  `{event: "want", txid, topic, peer?}` — its clear (`unwant`), and the
-  stream a peer answers it on (`/skein/overlay/beef/1.0.0`; "Paused on a
-  missing parent", below); asking the peer, or the topic's mesh, is the
-  host's (shruggr/skein#112, #126).
+  The engine's half of catch-up is the anchors and their reads ("Anchors",
+  below), the want of a paused submission — `{event: "want", txid, topic,
+  peer?}` — its clear (`unwant`), and the stream a peer answers it on
+  (`/skein/overlay/beef/1.0.0`; "Paused on a missing parent", below); the
+  locator exchange, the ranged pulls and asking a peer, or the topic's
+  mesh, are the host's (shruggr/skein#112, #126, #150).
 - The `historical-tx` modes.
 - BRC-64 history queries beyond "spent too" (`includeSpent`).
 
@@ -68,7 +69,7 @@ storage are not ported.
 |---|---|
 | `src/engine.zig` → `overlay.wasm` | The engine: called, the front door's route handlers (`routes.zig`); stepped, a submission by message, the submission's thread, a watch, a resume, a peer's admit. |
 | `src/submit.zig` | A submission from the wire to the state: the route's half (decode, missing parents, verify, judge oldest first), a submission by message (`received`), the submission's thread (one ingest per item to the chain app; each admitted, in order, on its answer), a pause and its `resume`, the watch, the answers to the submitter. |
-| `src/state.zig` | The overlay's state (`<app>/state`) over the chain state (read only): the maps, the previous coins, recording a judgement (`apply`), removing one (`unapply`), `inTopic`, `spender`; whether a transaction is reachable (`holds`, the `ancillary` index); a paused submission's `wants` and the step's want / unwant events (`wantEvents`); the parents a BEEF lacks (`missingParents`) and an item's Atomic BEEF cut from a submission's (`atomicFor`); the door's envelope and pointer record read (`decodeRecord`, #121, #146); the view digest (`views`, `View`, `viewChanges`, 0.12.0) or the one BEEF parse of bytes (`decode`), SPV over the records (`verifyDecoded`; BUMPs only for bytes); the bytes of a BEEF that came as bytes kept as a raw block (`putRaw`), which the `applied` record names; BEEF out for a lookup (`beefFor`, `beefOfMany`). |
+| `src/state.zig` | The overlay's state (`<app>/state`) over the chain state (read only): the maps, the previous coins, recording a judgement (`apply`), removing one (`unapply`), `inTopic`, `spender`; whether a transaction is reachable (`holds`, the `ancillary` index); a paused submission's `wants` and the step's want / unwant events (`wantEvents`); the parents a BEEF lacks (`missingParents`) and an item's Atomic BEEF cut from a submission's (`atomicFor`); the door's envelope and pointer record read (`decodeRecord`, #121, #146); the view digest (`views`, `View`, `viewChanges`, 0.12.0) or the one BEEF parse of bytes (`decode`), SPV over the records (`verifyDecoded`; BUMPs only for bytes); the bytes of a BEEF that came as bytes kept as a raw block (`putRaw`), which the `applied` record names; BEEF out for a lookup (`beefFor`, `beefOfMany`); the anchors (0.14.0: `place`, `settleAnchors`, `beat`, `minedBlocks`). |
 | `src/calls.zig` | The configuration as the engine reads it (`configObject`, `listeners`, the app's name) and its calls of topics and lookup services (`Caller`, `hookAdmitted`, `hookRejected`). |
 | `src/routes.zig` | The route handlers (#40): the overlay-express wire contract (`/submit` BRC-22, synchronous: `httpFirst`, `httpAgain`, 0.9.1), and the gossip's inbound routes (`peerAdmit`, `peerProof`, #74). |
 | `src/gossip.zig` | The gossip topics (#74; 0.12.0: submit and admit two kinds on `<topic>`): message shapes, what an admission and a proof publish, a peer's proof checked, the peer-admit records. |
@@ -534,7 +535,7 @@ submission's thread answers only its own submitter.
 ## The state: `<app>/state`
 
 ```
-{kind: "overlay-state", maps: {admitted, applied, pending, wants, views, ancillary}}
+{kind: "overlay-state", maps: {admitted, applied, pending, wants, views, ancillary, mined, placed, anchors, tips}}
 ```
 
 `tp` is len ‖ topic. The outpoint is txid (internal order) ‖ vout (u32 BE).
@@ -546,6 +547,10 @@ submission's thread answers only its own submitter.
 | `pending` | txid → submission record | a submission's transaction handed to the chain app, not yet admitted (or rejected); or a paused submission (skein-overlay#1) |
 | `wants` | parent txid ‖ tp ‖ peer? → [subject txid] | a want: a parent paused submissions wait on, wanted under that topic, to be asked of that peer — or, with no peer, of the topic's mesh (skein-overlay#1, shruggr/skein#112) |
 | `ancillary` | ancillary txid ‖ tp ‖ outpoint → admittance record | a transaction an admittance names in `ancillary`, by the admitted output naming it (skein-overlay#4); removed with the admittance |
+| `mined` | tp ‖ height (u32 BE) ‖ offset (u64 BE) → txid | a transaction the topic judged, mined at that height and offset in its block (0.14.0, "Anchors") |
+| `placed` | tp ‖ txid → height (u32 BE) ‖ offset (u64 BE) ‖ block hash | where the topic has it mined |
+| `anchors` | tp ‖ height (u32 BE) → root ‖ anchor (32 + 32 bytes) | every height from the topic's genesis to its tip |
+| `tips` | tp → tail (40 bytes: count ‖ digest, as a view) ‖ [genesis (u32 BE) ‖ tip (u32 BE)] | the topic's tail and span (no span before anything it judged is mined) |
 
 **Records.**
 
@@ -605,9 +610,10 @@ A spender of a rejected transaction is rejected by the chain app in turn
 (`input-rejected`) and answered to its own watchers — the overlay's watch of
 that spender, if it admitted it.
 
-**Sync note (GASP, later).** Other overlay engines answer history /
-`consumedBy` from per-topic tables. Here the answer is the chain's spends
-joined to `applied`; wire answers for sync are to be derived from those.
+**Sync note.** Other overlay engines answer history / `consumedBy` from
+per-topic tables. Here the answer is the chain's spends joined to
+`applied`; the sync reads (0.14.0) are the anchors and the admitted lists
+by height ("Anchors", below).
 
 **Holds** (skein-overlay#4; the host's answer to a want, shruggr/skein#150).
 `holds(topics, txid)` says whether the state reaches a transaction, over the
@@ -615,8 +621,38 @@ served topics in order: **admitted**, an output of it admitted and not taken
 out by a judgement of the topic (unspent, or spent by a transaction the
 topic did not judge); else **retained**, an output of it admitted and
 retained by the topic's judgement of its spender; else **ancillary**, named
-in an admittance's `ancillary` (the `ancillary` index). A coin the topic
-removed does not count. The read `/holds` answers it ("The wire", below).
+in an admittance's `ancillary` (the `ancillary` index); else **judged**
+(0.14.0), a transaction the topic took that admitted no output of it (a
+spend in its admitted lists). A coin the topic removed does not count. The
+read `/holds` answers it, with the chain state's Atomic BEEF of the
+transaction ("The wire", below).
+
+### Anchors (0.14.0, shruggr/skein#150)
+
+BRC-136's construction, per topic. `root(H)` is the merkle root over the
+txids the topic judged (an `applied` record) that the chain state has
+mined at height H, in block order (their proofs' offsets): 32 zero bytes
+for none, the txid for one, else Bitcoin's tree (sha256d, the odd last
+node paired with itself). `anchor(H) = sha256d(anchor(H-1) ‖ blockhash(H) ‖
+root(H))`, internal byte order, `anchor(genesis-1)` 32 zero bytes. The
+genesis is the lowest height a transaction the topic judged is mined at,
+the tip the highest; every height between has an anchor (`anchors`). The
+**tail** is the outputs the topic admitted in transactions not mined
+(`tips`, as a view digest).
+
+A transaction is **placed** (`State.place`, `settleMined`) where the chain
+state has it — proven, its proof's block on the best chain — when the
+engine judges it (`apply`) and when a watch hears a proof (`watchStart`,
+`watched`): mined (`mined`, `placed`; out of the tail), moved (a reorg's
+proof), or back in the tail. A rejection (`unapply`) takes it out. The
+step notes the lowest height it touched per topic; `settleAnchors`
+(called by `beat` and `save`) computes the anchors again from there to the
+tip and removes those outside the span. The beat carries the tip's height
+and anchor and the tail's digest ("Beats", below).
+
+Not built: a reorg the engine hears no proof for (a replaced block with
+nothing of the topic's in it, or a proof never re-sent) leaves the anchors
+at that height until a proof at or below it lands.
 
 ## The engine (`overlay`)
 
@@ -864,7 +900,10 @@ they replace SHIP/SLAP on the libp2p network (they are not SHIP/SLAP, and
 no SHIP/SLAP ad is published p2p). Every registered topic beats on
 `<topic>-live`, every registered lookup service on `<service>-live`.
 
-A topic's beat body is dag-cbor `{view: {count, digest}, terms?}`:
+A topic's beat body is dag-cbor `{view: {count, digest}, terms?,
+tipHeight?, tipAnchor?, tailDigest}` (0.14.0: the tip's height and anchor,
+absent before anything the topic judged is mined, and the tail's digest;
+"Anchors", above):
 `terms` (0.12.1) is `config.overlay.terms` (`defaults.overlayTerms`) as
 configured, any value, opaque to the engine and copied as is (a
 non-integral number is no dag-cbor here: the configuration is refused, as a
@@ -888,10 +927,10 @@ The host publishes the declared body and reads no state at beat time; an
 app's new `beacon {topic, every, body}` for the same topic replaces its
 previous one (skein `src/host/p2p.ts`), and a receiver's liveness tool
 keeps the latest beat per sender. So the engine re-declares the beacon
-when the view changes: at the end of a step that admitted, rejected or
-seeded, one `beacon` per registered topic whose view differs from the
-step's start (`State.viewChanges`, `src/topics.zig` `beatEvents`) — one
-logged event per change.
+when the beat changes: at the end of a step that admitted, rejected,
+placed a proof or seeded, one `beacon` per registered topic whose beat
+differs from the step's start (`State.beatChanges`, `src/topics.zig`
+`beatEvents`) — one logged event per change.
 
 A lookup service's body is its program's own. `registerLookup` declares
 its beacon on `<service>-live` with the body the program's fn `beat`
@@ -1187,7 +1226,9 @@ overlay apps.
 | `POST /lookup` | read | `lookup` | `{service, query}` JSON; `X-Aggregation: yes` | `{type: "output-list", outputs: [{beef: [bytes], outputIndex, context?}]}`, or the compact octet-stream (count, per output txid ‖ index ‖ context, then one BEEF of them all, `state.beefOfMany`); a freeform answer as `{type, result}` |
 | `GET /listTopicManagers`, `/listLookupServiceProviders` | read | `listTopicManagers`, `listLookupServiceProviders` | | `{name: {name, shortDescription, iconURL?, version?, informationURL?}}`: each configured topic's or service's fn `metadata` |
 | `GET /getDocumentationForTopicManager?manager=`, `/getDocumentationForLookupServiceProvider?lookupService=` | read | `topicDocumentation`, `lookupDocumentation` | | `text/markdown`: its fn `documentation`; 400 if not configured |
-| `GET /holds?txid=` | read | `holds` | `txid` hex | `{txid, tx: {"/": <tx CID hex>}, via: "admitted" \| "retained" \| "ancillary", outpoint: {txid, vout}}` ("Holds", above; for `ancillary` the outpoint is the admitted output naming it), or `{}`; 400 for a txid that is not hex (skein-overlay#4) |
+| `GET /holds?txid=` | read | `holds` | `txid` hex | `{txid, tx: {"/": <tx CID hex>}, via: "admitted" \| "retained" \| "ancillary" \| "judged", outpoint?: {txid, vout}, beef?: hex}` ("Holds", above; for `ancillary` the outpoint is the admitted output naming it, for `judged` none; `beef` the chain state's Atomic BEEF of the transaction, absent when it cannot be built), or `{}`; 400 for a txid that is not hex (skein-overlay#4) |
+| `GET /anchors?topic=&heights=` | read | `anchors` | a served topic; `heights` a comma list (none: the locator's — tip, tip-1, tip-2, tip-4, tip-8 … then genesis) | `{topic, genesisHeight, tipHeight, anchors: [{height, anchor (hex, internal order)}]}` for the heights in the span, in the order named; `{topic, anchors: []}` before anything is mined; 400 for a topic not served (0.14.0) |
+| `GET /admitted?topic=&fromHeight=&toHeight=&limit=` | read | `admitted` | a served topic; heights (default genesis, tip); `limit` blocks (default and most 1 000) | `{topic, blocks: [{height, blockHash, txids, bump}], nextHeight}`: the heights with transactions the topic judged, txids in block order (hex, display order), `bump` a compound BUMP over them (BRC-74, hex); at most 10 000 heights looked at; `nextHeight` where to go on, `null` when none is left (0.14.0) |
 
 **A submit is the one write**, and only when a topic takes the transaction
 (above). Over HTTP it is BRC-22: the route launches the submission's thread
@@ -1369,8 +1410,9 @@ the chain app" while pending): no topic manager runs.
 **Config.** `config.overlay.gossip` (genesis-wired: `defaults.overlayGossip`):
 `{"<topic>": false}` turns a topic's publishing off; the default is on.
 
-**Not built:** catch-up (asking a peer for its admitted set, or proofs by
-block — the pull half of #44–#48).
+Catch-up — the admitted lists by height, pulled by the host — is
+shruggr/skein#150 ("Anchors", above, and the reads `/anchors`,
+`/admitted`).
 
 ## Two overlays on one instance
 

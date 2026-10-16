@@ -4,7 +4,7 @@ The overlay services engine for a [skein](https://github.com/shruggr/skein),
 as an app: BRC-22 submit and BRC-24 lookup, served by the instance's own
 front door, with topic managers and lookup services as programs the engine
 calls. It is also a Zig package: an overlay of your own depends on it for
-the topic and lookup contracts. Version **0.13.0**.
+the topic and lookup contracts. Version **0.14.0**.
 
 ## What it is
 
@@ -166,7 +166,9 @@ empty). Each must be in the submitted BEEF or held, or the engine refuses
 the judgement (`UnknownAncillary`). The engine keeps them on the
 admittance (`ancillary`, a `mentions` ref each), and the read
 `GET /holds?txid=` answers `{txid, tx, via: "admitted" | "retained" |
-"ancillary", outpoint: {txid, vout}}` (or `{}`) for a peer's want
+"ancillary" | "judged", outpoint?: {txid, vout}, beef?}` (or `{}`) for a
+peer's want: `judged` is a transaction the topic took that admitted no
+output of it, and `beef` the chain state's Atomic BEEF of it, hex
 (docs/OVERLAY.md "Holds").
 
 A lookup service is a `lookup.Spec` (its map names, `answer`, and the
@@ -186,7 +188,7 @@ The manifest (`etc/app.json`, this repo's own, description left out):
 {
   "kind": "app",
   "name": "overlay",
-  "version": "0.13.0",
+  "version": "0.14.0",
   "programs": {
     "overlay": "bin/overlay.wasm",
     "topic-demo": "bin/topic-demo.wasm",
@@ -205,7 +207,9 @@ The manifest (`etc/app.json`, this repo's own, description left out):
     "listLookupServiceProviders": "overlay.listLookupServiceProviders",
     "topicDocumentation": "overlay.topicDocumentation",
     "lookupDocumentation": "overlay.lookupDocumentation",
-    "holds": "overlay.holds"
+    "holds": "overlay.holds",
+    "anchors": "overlay.anchors",
+    "admitted": "overlay.admitted"
   },
   "roles": { "root": ["register", "registerLookup", "deregisterLookup"] },
   "routes": [
@@ -216,7 +220,9 @@ The manifest (`etc/app.json`, this repo's own, description left out):
     {"transport": "http", "address": "/listLookupServiceProviders", "filters": ["listLookupServiceProviders"]},
     {"transport": "http", "address": "/getDocumentationForTopicManager", "filters": ["topicDocumentation"]},
     {"transport": "http", "address": "/getDocumentationForLookupServiceProvider", "filters": ["lookupDocumentation"]},
-    {"transport": "http", "address": "/holds", "filters": ["holds"]}
+    {"transport": "http", "address": "/holds", "filters": ["holds"]},
+    {"transport": "http", "address": "/anchors", "filters": ["anchors"]},
+    {"transport": "http", "address": "/admitted", "filters": ["admitted"]}
   ]
 }
 ```
@@ -240,8 +246,8 @@ handler, and no sender; who may run a function is `roles`.
   The install prompt reads them all aloud, marked derived.
 - Read routes (shruggr/skein#143). An http route with no handler is a
   **read**: its filters answer and nothing is logged. The overlay's reads
-  are `/lookup` (derived), the four listing and documentation paths and
-  `/holds` above, each with the engine's function as its filter. Called as a filter
+  are `/lookup` (derived), the four listing and documentation paths,
+  `/holds`, `/anchors` and `/admitted` above, each with the engine's function as its filter. Called as a filter
   (the input's `filter: true`), the engine answers `{answer: {status,
   type, body}}`, the same http answer as before inside it; anyone, signed
   or not. A read route names no program, so the engine finds its app by
@@ -334,7 +340,9 @@ is published p2p). Every topic manager and every lookup service the engine
 runs as registered beats on its own topic, named after itself:
 `<topic>-live`, `<service>-live`.
 
-- **A topic's body** is dag-cbor `{view: {count, digest}, terms?}`:
+- **A topic's body** is dag-cbor `{view: {count, digest}, terms?,
+  tipHeight?, tipAnchor?, tailDigest}` (the last three 0.14.0, "Anchors"
+  below):
   `terms` (0.12.1) is `config.overlay.terms` as configured, any value,
   opaque to the engine and copied as is (a non-integral number refuses the
   registration: no dag-cbor here); absent, no field. `view` is the topic's
@@ -353,9 +361,9 @@ runs as registered beats on its own topic, named after itself:
   declared body and reads no state at beat time, and an app's new `beacon
   {topic, every, body}` for the same topic replaces its previous one (skein
   `src/host/p2p.ts`); a receiver's liveness tool keeps the latest beat per
-  sender. So a step that changes a registered topic's view (an admission, a
-  rejection, a register's seeds) emits `beacon` again with the new body:
-  one logged event per change.
+  sender. So a step that changes a registered topic's beat (an admission, a
+  rejection, a proof, a register's seeds) emits `beacon` again with the new
+  body: one logged event per change.
 - **A lookup service's body** is the lookup program's own. `registerLookup`
   declares the beacon on `<service>-live` with the body its program's fn
   `beat` answers (`Spec.beat`; a program without one beats an empty body),
@@ -375,6 +383,45 @@ runs as registered beats on its own topic, named after itself:
   `spent`, can count fewer outputs than the view. Not built (stopped, 0.12.1).
 - A topic or service declared in `config.overlay` (not registered) does not
   beat, as before.
+
+### Anchors (0.14.0, shruggr/skein#150)
+
+Per topic the engine keeps BRC-136's anchor chain, in `<app>/state`:
+
+- `root(H)`: the merkle root over the txids the topic judged that are mined
+  at height H, in block order (32 zero bytes when none; the txid itself when
+  one; else Bitcoin's tree, sha256d, the odd last node paired with itself).
+- `anchor(H) = sha256d(anchor(H-1) ‖ blockhash(H) ‖ root(H))`, from the
+  topic's genesis height (`anchor(genesis-1)` is 32 zero bytes), all in
+  internal byte order.
+- The genesis height is the lowest height a transaction the topic judged is
+  mined at; the tip, the highest. Every height between has an anchor.
+- The tail is the outputs the topic admitted in transactions not mined, as
+  a view digest (count and sum).
+
+A transaction is placed when the engine learns its proof: admitted at its
+proof, or a watch hearing `proven` (a reorg's proof moves it). A rejection
+removes it. The anchors from the lowest height touched to the tip are
+computed again at the end of the step, and the beacon is declared again
+when the beat changed. The beat carries `tipHeight` and `tipAnchor` (absent
+before anything is mined) and `tailDigest`.
+
+Two reads serve the host's sync:
+
+- `GET /anchors?topic=&heights=h1,h2,…` → `{topic, genesisHeight,
+  tipHeight, anchors: [{height, anchor}]}` for the heights in the span
+  (anchor hex, internal byte order). Without `heights`: the locator's — tip,
+  tip-1, tip-2, tip-4, tip-8 … then genesis. Before anything is mined:
+  `{topic, anchors: []}`.
+- `GET /admitted?topic=&fromHeight=&toHeight=&limit=` → `{topic, blocks:
+  [{height, blockHash, txids, bump}], nextHeight}`: only heights with
+  transactions the topic judged, txids in block order (hex, display order),
+  `bump` a compound BUMP over them (BRC-74, hex). At most 1 000 blocks and
+  10 000 heights per read; `nextHeight` is where to go on, or `null`.
+
+Not built: a reorg that replaces a block the engine hears no proof for (a
+block with nothing of the topic's in it, or a proof never re-sent) leaves
+the anchors at that height until a proof at or below it lands.
 
 ### Register a lookup service
 
@@ -440,14 +487,15 @@ which clone this repo at a pinned commit (or take `$SKEIN_OVERLAY_DIR`).
 
 Not built: BRC-88 SHIP/SLAP (decided 2026-10-08, stopped: revoking an ad
 spends it, and the skein's wallet program takes no caller-supplied inputs;
-docs/OVERLAY.md "Not built"), GASP sync and catch-up from a peer, the
-`historical-tx` modes.
+docs/OVERLAY.md "Not built"), GASP, the `historical-tx` modes. Catch-up
+from a peer is the host's (shruggr/skein#150): the engine keeps the
+anchors and answers the reads above.
 
 ## Versions
 
 | | |
 |---|---|
-| this app and package | 0.13.0 (tag `v0.13.0`) |
+| this app and package | 0.14.0 (tag `v0.14.0`) |
 | skein-sdk | v0.11.0, by tag URL and hash in `build.zig.zon` (modules `chain` and, for the engine, `sk`; bsvz comes through it) |
 | requires | `chain/1` (shruggr/skein-chain 0.3.0) |
 | skein | log format 10, the BEEF envelope beside the pointer record (shruggr/skein#146); the routes / filters / roles manifest (shruggr/skein#143); skein's equivs pin this repo by commit |
@@ -686,6 +734,13 @@ ref each, and `<app>/state` indexes them (`ancillary`: txid ‖ tp ‖
 outpoint → admittance, removed with it). The read `/holds` (filter
 `overlay.holds`, `State.holds`) answers whether the state reaches a
 transaction: admitted, retained, or ancillary.
+
+0.14.0 (shruggr/skein#150, David, 2026-10-15): anchors. `<app>/state`
+gains `mined`, `placed`, `anchors` and `tips`; the beat body gains
+`tipHeight`, `tipAnchor` and `tailDigest`; the reads `/anchors` and
+`/admitted`; `/holds` answers `judged` for a transaction a topic took that
+admitted no output, and carries the chain state's Atomic BEEF (`beef`).
+README "Anchors".
 
 ## Contributing
 

@@ -46,13 +46,15 @@
 //! they replace SHIP/SLAP on the libp2p network" — not SHIP/SLAP, and no
 //! SHIP/SLAP ad is published p2p). A topic's beat body is dag-cbor
 //!
-//!   {view: {count: uint, digest: bytes(32)}, terms?}
+//!   {view: {count: uint, digest: bytes(32)}, terms?, tipHeight?: uint, tipAnchor?: bytes(32), tailDigest: bytes(32)}
 //!
 //! the topic's VIEW DIGEST (state.zig `View`: its admitted-and-unspent
 //! outputs, counted and summed), kept in the topic's state record and put in
-//! the body when the beacon is declared (`beatBody`). The host publishes the
-//! declared body and reads no state at beat time, so the engine re-declares
-//! the beacon when the view changes (on admit and spend): an app's new
+//! the body when the beacon is declared (`beatBody`); and (0.14.0,
+//! shruggr/skein#150) its anchor at its tip and its tail's digest (state.zig
+//! `Beat`). The host publishes the declared body and reads no state at beat
+//! time, so the engine re-declares the beacon when the beat changes (on admit,
+//! spend and proof): an app's new
 //! `beacon {topic, every, body}` replaces its previous one (skein
 //! src/host/p2p.ts), and a receiver's liveness tool keeps the latest beat per
 //! sender — one logged event per change (`beatEvents`). `terms` (0.12.1) is
@@ -328,15 +330,22 @@ pub fn unbeaconEvent(a: Allocator, name: []const u8) !Value {
     }) };
 }
 
-/// A topic's beat body (0.12.0): dag-cbor `{view: {count, digest}, terms?}`, the topic's view digest
-/// (state.zig `View`) and (0.12.1) `config.overlay.terms` as configured, when it is.
-pub fn beatBody(a: Allocator, v: st_mod.View, terms: ?Value) ![]const u8 {
+/// A topic's beat body (0.12.0): dag-cbor `{view: {count, digest}, terms?, tipHeight?, tipAnchor?,
+/// tailDigest}`, the topic's view digest (state.zig `View`), (0.12.1) `config.overlay.terms` as
+/// configured, when it is, and (0.14.0, shruggr/skein#150) the anchor at its tip and the digest of its
+/// tail (state.zig `Beat`): `tipHeight` and `tipAnchor` once a transaction it judged is mined.
+pub fn beatBody(a: Allocator, b: st_mod.Beat, terms: ?Value) ![]const u8 {
     var es: std.ArrayList(cbor.Entry) = .empty;
     try es.append(a, .{ .key = "view", .value = .{ .map = try a.dupe(cbor.Entry, &.{
-        .{ .key = "count", .value = .{ .uint = v.count } },
-        .{ .key = "digest", .value = .{ .bytes = try a.dupe(u8, &v.digest) } },
+        .{ .key = "count", .value = .{ .uint = b.view.count } },
+        .{ .key = "digest", .value = .{ .bytes = try a.dupe(u8, &b.view.digest) } },
     }) } });
     if (terms) |t| try es.append(a, .{ .key = "terms", .value = t });
+    if (b.tip) |tip| try es.appendSlice(a, &.{
+        .{ .key = "tipHeight", .value = .{ .uint = tip.height } },
+        .{ .key = "tipAnchor", .value = .{ .bytes = try a.dupe(u8, &tip.anchor) } },
+    });
+    try es.append(a, .{ .key = "tailDigest", .value = .{ .bytes = try a.dupe(u8, &b.tail.digest) } });
     return cbor.encode(a, .{ .map = es.items });
 }
 
@@ -352,10 +361,10 @@ pub fn withRoles(a: Allocator, change: Change, subscribe: bool, roles: Roles, bo
 }
 
 /// The beacons a step re-declares (0.12.0), each beating every `roles.validator` ms: one per registered topic
-/// whose view the step changed (`changes`, state.zig `viewChanges`: the body over its view now), then
+/// whose beat the step changed (`changes`, state.zig `beatChanges`: the body over its beat now), then
 /// one per registered lookup service a hook gave a new body (`lookup_beats`, the last one per
 /// service). Nothing for a topic or service not registered (`topics`, `services`).
-pub fn beatEvents(a: Allocator, roles: Roles, topics: []const Entry, services: []const []const u8, changes: []const st_mod.ViewChange, lookup_beats: []const st_mod.LookupBeat) ![]const Value {
+pub fn beatEvents(a: Allocator, roles: Roles, topics: []const Entry, services: []const []const u8, changes: []const st_mod.BeatChange, lookup_beats: []const st_mod.LookupBeat) ![]const Value {
     const ms = roles.validator;
     var out: std.ArrayList(Value) = .empty;
     for (changes) |ch| {

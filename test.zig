@@ -228,7 +228,7 @@ const Instance = struct {
     /// The last step's want / unwant events (state.zig `wantEvents`, shruggr/skein#112).
     events: []const Value = &.{},
     /// The view changes (0.12.0) and lookup beats of the last thread or watch step.
-    view_changes: []const state.ViewChange = &.{},
+    view_changes: []const state.BeatChange = &.{},
     lookup_beats: []const state.LookupBeat = &.{},
     /// The peers' admits (`<app>/gossip`), when a test sets them.
     gossip_: ?*gossip.State = null,
@@ -366,7 +366,7 @@ const Instance = struct {
         var st = try self.load();
         const done = try submit.answered(self.cx(&st, true), t.ev, t.ingest, ans);
         self.events = try st.wantEvents();
-        self.view_changes = try st.viewChanges();
+        self.view_changes = try st.beatChanges();
         self.lookup_beats = st.lookup_beats.items;
         self.ov_root = try st.save();
         return done;
@@ -388,7 +388,7 @@ const Instance = struct {
     fn watchedOf(self: *Instance, w: submit.Watch, ans: submit.Answer) !submit.Stepped {
         var st = try self.load();
         const done = try submit.watched(self.cx(&st, true), w, ans);
-        self.view_changes = try st.viewChanges();
+        self.view_changes = try st.beatChanges();
         self.lookup_beats = st.lookup_beats.items;
         self.ov_root = try st.save();
         return done;
@@ -660,7 +660,7 @@ test "the submission flow: parse once, persist only on admission, a lookup servi
         try std.testing.expect((try st.view("tm_demo")).eql(viewOf(&.{.{ t2.txid, 0 }})));
         try std.testing.expectEqual(@as(usize, 1), inst.view_changes.len);
         try std.testing.expectEqualStrings("tm_demo", inst.view_changes[0].topic);
-        try std.testing.expect(inst.view_changes[0].before.eql(viewOf(&.{.{ t1.txid, 0 }})));
+        try std.testing.expect(inst.view_changes[0].before.view.eql(viewOf(&.{.{ t1.txid, 0 }})));
     }
 
     // ------------------------------------------------ T2 rejected later (its watch hears it): `rejected`, T1's token live again
@@ -891,11 +891,11 @@ test "ancillary txids (skein-overlay#4): kept on the admittance with mentions re
 
         const by_anc = (try st.holds(topics, f.txid)).?;
         try std.testing.expect(by_anc.via == .ancillary);
-        try std.testing.expectEqualSlices(u8, &t1.txid, &by_anc.outpoint.txid);
-        try std.testing.expectEqual(@as(u32, 0), by_anc.outpoint.vout);
+        try std.testing.expectEqualSlices(u8, &t1.txid, &by_anc.outpoint.?.txid);
+        try std.testing.expectEqual(@as(u32, 0), by_anc.outpoint.?.vout);
         const by_adm = (try st.holds(topics, t1.txid)).?;
         try std.testing.expect(by_adm.via == .admitted);
-        try std.testing.expectEqualSlices(u8, &t1.txid, &by_adm.outpoint.txid);
+        try std.testing.expectEqualSlices(u8, &t1.txid, &by_adm.outpoint.?.txid);
         // The read's answer.
         const v = try routes.heldValue(a, by_anc);
         try std.testing.expectEqualStrings(&hdr.toHex(f.txid), v.getText("txid").?);
@@ -919,7 +919,7 @@ test "ancillary txids (skein-overlay#4): kept on the admittance with mentions re
         try std.testing.expectEqual(@as(usize, 1), rec.getArray("refs").?.len);
         const h = (try st.holds(topics, t1.txid)).?;
         try std.testing.expect(h.via == .retained);
-        try std.testing.expectEqualSlices(u8, &t1.txid, &h.outpoint.txid);
+        try std.testing.expectEqualSlices(u8, &t1.txid, &h.outpoint.?.txid);
         try std.testing.expect((try st.holds(topics, t2.txid)).?.via == .admitted);
         try std.testing.expect((try st.holds(topics, f.txid)).?.via == .ancillary);
     }
@@ -1782,8 +1782,8 @@ test "the view digest (0.12.0, David 2026-10-09): count and an order-independent
     try std.testing.expectError(error.BadIndex, state.View.parse("short"));
 
     // The beat body: dag-cbor {view: {count, digest}} (no terms configured: no `terms`).
-    const body = try cbor.decode(a, try topics_mod.beatBody(a, x, null));
-    try std.testing.expectEqual(@as(usize, 1), body.map.len);
+    const body = try cbor.decode(a, try topics_mod.beatBody(a, .{ .view = x }, null));
+    try std.testing.expectEqual(@as(usize, 2), body.map.len); // view and tailDigest (0.14.0)
     try std.testing.expectEqual(@as(u64, 4), body.get("view").?.getUint("count").?);
     try std.testing.expectEqualSlices(u8, &x.digest, body.get("view").?.getBytes("digest").?);
 
@@ -1791,16 +1791,16 @@ test "the view digest (0.12.0, David 2026-10-09): count and an order-independent
     // beacon per registered topic whose view changed, with the body over its view now; a topic not
     // registered (a declared one), none.
     const list = [_]topics_mod.Entry{.{ .topic = "tm_a", .program = "topic-demo" }};
-    const changes = [_]state.ViewChange{
-        .{ .topic = "tm_a", .before = .{}, .now = x },
-        .{ .topic = "tm_declared", .before = .{}, .now = x },
+    const changes = [_]state.BeatChange{
+        .{ .topic = "tm_a", .before = .{}, .now = .{ .view = x } },
+        .{ .topic = "tm_declared", .before = .{}, .now = .{ .view = x } },
     };
     const evs = try topics_mod.beatEvents(a, .{ .validator = 30_000 }, &list, &.{}, &changes, &.{});
     try std.testing.expectEqual(@as(usize, 1), evs.len);
     try std.testing.expectEqualStrings("beacon", evs[0].getText("event").?);
     try std.testing.expectEqualStrings("tm_a-live", evs[0].getText("topic").?);
     try std.testing.expectEqual(@as(u64, 30_000), evs[0].getUint("every").?);
-    try std.testing.expectEqualSlices(u8, try topics_mod.beatBody(a, x, null), evs[0].getBytes("body").?);
+    try std.testing.expectEqualSlices(u8, try topics_mod.beatBody(a, .{ .view = x }, null), evs[0].getBytes("body").?);
 }
 
 test "lookup beats (0.12.0, David 2026-10-09): <service>-live for each registered lookup service; the body the program's own — fn beat at the declaration, a hook's answer to update it" {
@@ -1928,14 +1928,14 @@ test "the beat's terms (0.12.1): config.overlay.terms, opaque, copied into each 
     const roles = try config.rolesOf(a, step);
     try std.testing.expect(roles.terms != null);
     const v: state.View = viewOf(&.{.{ .{0x11} ** 32, 0 }});
-    const body = try cbor.decode(a, try topics_mod.beatBody(a, v, roles.terms));
-    try std.testing.expectEqual(@as(usize, 2), body.map.len);
+    const body = try cbor.decode(a, try topics_mod.beatBody(a, .{ .view = v }, roles.terms));
+    try std.testing.expectEqual(@as(usize, 3), body.map.len); // view, terms, tailDigest
     try std.testing.expectEqual(@as(u64, 1), body.get("view").?.getUint("count").?);
     // Copied as is (dag-cbor's map order is the encoder's: compare by encoding).
     try std.testing.expectEqualSlices(u8, try cbor.encode(a, terms), try cbor.encode(a, body.get("terms").?));
     // A re-declared beacon carries them too.
-    const evs = try topics_mod.beatEvents(a, roles, &.{.{ .topic = "tm_a", .program = "p" }}, &.{}, &.{.{ .topic = "tm_a", .before = .{}, .now = v }}, &.{});
-    try std.testing.expectEqualSlices(u8, try topics_mod.beatBody(a, v, roles.terms), evs[0].getBytes("body").?);
+    const evs = try topics_mod.beatEvents(a, roles, &.{.{ .topic = "tm_a", .program = "p" }}, &.{}, &.{.{ .topic = "tm_a", .before = .{}, .now = .{ .view = v } }}, &.{});
+    try std.testing.expectEqualSlices(u8, try topics_mod.beatBody(a, .{ .view = v }, roles.terms), evs[0].getBytes("body").?);
     // And the register's beacon (withRoles over the body the engine gives it).
     const reg_body = try cbor.decode(a, (try topics_mod.roleEvents(a, true, "tm_a", roles, try topics_mod.beatBody(a, .{}, roles.terms)))[1].getBytes("body").?);
     try std.testing.expect(reg_body.get("terms") != null);
@@ -1944,7 +1944,7 @@ test "the beat's terms (0.12.1): config.overlay.terms, opaque, copied into each 
     try hm.m.put(a, "overlay/app", try appWith(a, s, engine, try mapOf(a, &.{})));
     const plain = try config.rolesOf(a, try config.resolve(a, s, hm.heads(), in, null));
     try std.testing.expect(plain.terms == null);
-    try std.testing.expect((try cbor.decode(a, try topics_mod.beatBody(a, v, plain.terms))).get("terms") == null);
+    try std.testing.expect((try cbor.decode(a, try topics_mod.beatBody(a, .{ .view = v }, plain.terms))).get("terms") == null);
 
     // A non-integral number is no dag-cbor here: refused as a bad configuration (registering is refused).
     const bad = try mapOf(a, &.{.{ .key = "defaults", .value = try mapOf(a, &.{.{ .key = "overlayTerms", .value = .{ .text = "{\"fee\":0.5}" } }}) }});
@@ -3036,6 +3036,8 @@ test "the listings and documentation are read routes (shruggr/skein#143, 0.10.0)
         .{ "/getDocumentationForTopicManager", "topicDocumentation" },
         .{ "/getDocumentationForLookupServiceProvider", "lookupDocumentation" },
         .{ "/holds", "holds" },
+        .{ "/anchors", "anchors" },
+        .{ "/admitted", "admitted" },
     };
     const filters = j.object.get("filters").?.object;
     for (want) |w| {
@@ -3376,4 +3378,232 @@ test "root routes (0.11.0): a read route at the origin's root names its app by i
     const r2 = try config.resolve(a, s, hm.heads(), call_in, sub);
     try std.testing.expectEqualStrings("mandala", calls.appOf(r2));
     try std.testing.expectEqualSlices(u8, engine, r2.getCid("engine").?);
+}
+
+/// A BUMP for a block of two transactions, `x` at offset 0 and `y` at 1, both flagged (BRC-74).
+fn pairPath(a: Allocator, height: u32, x: [32]u8, y: [32]u8) ![]const u8 {
+    var path: std.ArrayList(u8) = .empty;
+    try path.appendSlice(a, &.{ @intCast(height), 0x01, 0x02, 0x00, 0x02 });
+    try path.appendSlice(a, &x);
+    try path.appendSlice(a, &.{ 0x01, 0x02 });
+    try path.appendSlice(a, &y);
+    return path.items;
+}
+
+fn dbl(x: [32]u8, y: [32]u8) [32]u8 {
+    return c.store.dblSha256(&(x ++ y));
+}
+
+/// Admitted at its proof: submitted, ingested, mined by `path`, the proven answer stepped.
+fn admittedProven(inst: *Instance, bytes: []const u8, txid: [32]u8, path: []const u8) !void {
+    _ = try inst.submitted(bytes);
+    _ = try inst.ingest(bytes);
+    try std.testing.expectEqual(Chain.Outcome.proven, try inst.chainStatus(txid, "MINED", path));
+    try std.testing.expect((try inst.answer(txid, .{ .proven = .{} })).admitted);
+}
+
+test "anchors (0.14.0, shruggr/skein#150): BRC-136's root and anchor per height from the topic's genesis, kept as proofs land; the tail; the beat; the locator; the admitted lists with a compound BUMP" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const zero: [32]u8 = .{0} ** 32;
+    const x: [32]u8 = .{0x11} ** 32;
+    const y: [32]u8 = .{0x22} ** 32;
+    const z: [32]u8 = .{0x33} ** 32;
+
+    // ------------------------------------------------ the root: none → zero; one → itself; more → Bitcoin's tree, the odd last paired with itself
+    try std.testing.expectEqualSlices(u8, &zero, &(try state.basmRoot(a, &.{})));
+    try std.testing.expectEqualSlices(u8, &x, &(try state.basmRoot(a, &.{x})));
+    try std.testing.expectEqualSlices(u8, &dbl(x, y), &(try state.basmRoot(a, &.{ x, y })));
+    try std.testing.expectEqualSlices(u8, &dbl(dbl(x, y), dbl(z, z)), &(try state.basmRoot(a, &.{ x, y, z })));
+    try std.testing.expectEqualSlices(u8, &c.store.dblSha256(&(x ++ y ++ z)), &state.anchorStep(x, y, z));
+
+    // ------------------------------------------------ the locator: tip, tip-1, tip-2, tip-4, tip-8 … then genesis
+    try std.testing.expectEqualSlices(u32, &.{ 20, 19, 18, 16, 12, 4, 0 }, try state.locatorHeights(a, .{ .genesis = 0, .tip = 20 }));
+    try std.testing.expectEqualSlices(u32, &.{ 20, 19, 18, 16, 12, 10 }, try state.locatorHeights(a, .{ .genesis = 10, .tip = 20 }));
+    try std.testing.expectEqualSlices(u32, &.{5}, try state.locatorHeights(a, .{ .genesis = 5, .tip = 5 }));
+
+    var ms = c.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var inst = try Instance.init(a, &ms);
+    const k = try keys(0x42);
+    const f = try fund(a, 0x33, 4, &k.p2pkh);
+    try inst.headers(&.{&f.h1});
+    const t1 = try spend(a, &f.tx, 0, &.{.{ 1, &k.token }}, k.priv);
+    const t2 = try spend(a, &f.tx, 1, &.{.{ 1, &k.token }}, k.priv);
+    const t3 = try spend(a, &f.tx, 2, &.{.{ 1, &k.token }}, k.priv);
+    const t4 = try spend(a, &f.tx, 3, &.{.{ 1, &k.token }}, k.priv);
+    const h2 = mine(hdr.hash(&f.h1), dbl(t1.txid, t2.txid), 1_700_001_000);
+    const h3 = mine(hdr.hash(&h2), .{0x77} ** 32, 1_700_001_600);
+    const h4 = mine(hdr.hash(&h3), t3.txid, 1_700_002_200);
+    const pair = try pairPath(a, 2, t1.txid, t2.txid);
+
+    // ------------------------------------------------ t1 admitted on acceptance: in the tail, no tip yet
+    _ = try inst.admitted(try withFund(a, f, t1), t1.txid);
+    {
+        var st = try inst.load();
+        const b = try st.beat("tm_demo");
+        try std.testing.expect(b.tip == null and b.genesis == null);
+        try std.testing.expect(b.tail.eql(viewOf(&.{.{ t1.txid, 0 }})));
+        const body = try cbor.decode(a, try topics_mod.beatBody(a, b, null));
+        try std.testing.expect(body.get("tipHeight") == null and body.get("tipAnchor") == null);
+        try std.testing.expectEqualSlices(u8, &b.tail.digest, body.getBytes("tailDigest").?);
+        try std.testing.expect(inst.view_changes[0].now.eql(b));
+    }
+
+    // ------------------------------------------------ its proof (the watch): mined at 2, the tail empty; genesis = tip = 2
+    try inst.headers(&.{ &h2, &h3, &h4 });
+    _ = try inst.chainStatus(t1.txid, "MINED", pair);
+    _ = try inst.watched(t1.txid, .{ .proven = .{} });
+    const a2_alone = state.anchorStep(zero, hdr.hash(&h2), t1.txid);
+    {
+        var st = try inst.load();
+        const b = try st.beat("tm_demo");
+        try std.testing.expectEqual(@as(?u32, 2), b.genesis);
+        try std.testing.expectEqual(@as(u32, 2), b.tip.?.height);
+        try std.testing.expectEqualSlices(u8, &a2_alone, &b.tip.?.anchor);
+        try std.testing.expect(b.tail.eql(.{}));
+        // The step's beat changed: the beacon is declared again.
+        try std.testing.expectEqual(@as(usize, 1), inst.view_changes.len);
+        try std.testing.expect(inst.view_changes[0].now.eql(b));
+    }
+
+    // ------------------------------------------------ t2, proven first: the same block, after t1 in block order
+    try admittedProven(&inst, try withFund(a, f, t2), t2.txid, pair);
+    const a2 = state.anchorStep(zero, hdr.hash(&h2), dbl(t1.txid, t2.txid));
+    // ------------------------------------------------ t3 at 4: the span 2..4, an empty height between
+    try admittedProven(&inst, try withFund(a, f, t3), t3.txid, try soloPath(a, 4, t3.txid));
+    const a3 = state.anchorStep(a2, hdr.hash(&h3), zero);
+    const a4 = state.anchorStep(a3, hdr.hash(&h4), t3.txid);
+    // ------------------------------------------------ t4 accepted, not mined: the tail
+    _ = try inst.admitted(try withFund(a, f, t4), t4.txid);
+    {
+        var st = try inst.load();
+        const b = try st.beat("tm_demo");
+        try std.testing.expectEqual(@as(?u32, 2), b.genesis);
+        try std.testing.expectEqual(@as(u32, 4), b.tip.?.height);
+        try std.testing.expectEqualSlices(u8, &a4, &b.tip.?.anchor);
+        try std.testing.expect(b.tail.eql(viewOf(&.{.{ t4.txid, 0 }})));
+        try std.testing.expectEqualSlices(u8, &a2, &(try st.anchorAt("tm_demo", 2)).?.anchor);
+        try std.testing.expectEqualSlices(u8, &zero, &(try st.anchorAt("tm_demo", 3)).?.root);
+        try std.testing.expectEqualSlices(u8, &a3, &(try st.anchorAt("tm_demo", 3)).?.anchor);
+        try std.testing.expect((try st.anchorAt("tm_demo", 1)) == null and (try st.anchorAt("tm_demo", 5)) == null);
+        const body = try cbor.decode(a, try topics_mod.beatBody(a, b, null));
+        try std.testing.expectEqual(@as(u64, 4), body.getUint("tipHeight").?);
+        try std.testing.expectEqualSlices(u8, &a4, body.getBytes("tipAnchor").?);
+        try std.testing.expectEqualSlices(u8, &b.tail.digest, body.getBytes("tailDigest").?);
+
+        // The admitted lists: only heights with admissions, txids in block order, a compound BUMP whose
+        // root is the header's and which flags each.
+        const got = try st.minedBlocks("tm_demo", 0, std.math.maxInt(u32), 100, 10_000);
+        try std.testing.expect(got.next == null);
+        try std.testing.expectEqual(@as(usize, 2), got.blocks.len);
+        try std.testing.expectEqual(@as(u32, 2), got.blocks[0].height);
+        try std.testing.expectEqualSlices(u8, &hdr.hash(&h2), &got.blocks[0].block);
+        try std.testing.expectEqualSlices([32]u8, &.{ t1.txid, t2.txid }, got.blocks[0].txids);
+        const bump = try bsvz.spv.MerklePath.parse(a, got.blocks[0].bump);
+        try std.testing.expectEqual(@as(u32, 2), bump.block_height);
+        try std.testing.expectEqualSlices(u8, &dbl(t1.txid, t2.txid), &(try bump.computeRoot(a, null)).bytes);
+        for (bump.path[0]) |l| try std.testing.expect(l.txid orelse false);
+        try std.testing.expectEqualSlices([32]u8, &.{t3.txid}, got.blocks[1].txids);
+        // A limit: the height to go on from; a span bound likewise.
+        const one = try st.minedBlocks("tm_demo", 0, std.math.maxInt(u32), 1, 10_000);
+        try std.testing.expectEqual(@as(usize, 1), one.blocks.len);
+        try std.testing.expectEqual(@as(?u32, 3), one.next);
+        const short = try st.minedBlocks("tm_demo", 3, std.math.maxInt(u32), 100, 1);
+        try std.testing.expectEqual(@as(usize, 0), short.blocks.len);
+        try std.testing.expectEqual(@as(?u32, 4), short.next);
+        try std.testing.expectEqual(@as(usize, 0), (try st.minedBlocks("tm_demo", 3, 3, 100, 10_000)).blocks.len);
+
+        // The reads' answers.
+        const an = try routes.anchorsAnswer(a, &st, "tm_demo", null);
+        try std.testing.expectEqual(@as(u64, 2), an.getUint("genesisHeight").?);
+        try std.testing.expectEqual(@as(u64, 4), an.getUint("tipHeight").?);
+        const loc = an.getArray("anchors").?;
+        try std.testing.expectEqual(@as(usize, 3), loc.len); // 4, 3, 2
+        try std.testing.expectEqual(@as(u64, 4), loc[0].getUint("height").?);
+        try std.testing.expectEqualStrings(&std.fmt.bytesToHex(a4, .lower), loc[0].getText("anchor").?);
+        try std.testing.expectEqual(@as(u64, 2), loc[2].getUint("height").?);
+        const named = try routes.anchorsAnswer(a, &st, "tm_demo", &.{ 9, 3 });
+        try std.testing.expectEqual(@as(usize, 1), named.getArray("anchors").?.len);
+        const ad = try routes.admittedAnswer(a, &st, "tm_demo", 0, std.math.maxInt(u32), 100);
+        const blk = ad.getArray("blocks").?[0];
+        try std.testing.expectEqualStrings(&hdr.toHex(hdr.hash(&h2)), blk.getText("blockHash").?);
+        try std.testing.expectEqualStrings(&hdr.toHex(t1.txid), blk.getArray("txids").?[0].text);
+        try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "{x}", .{got.blocks[0].bump}), blk.getText("bump").?);
+        try std.testing.expect(ad.get("nextHeight").? == .null);
+        try std.testing.expectEqual(@as(usize, 0), (try routes.anchorsAnswer(a, &st, "tm_other", null)).getArray("anchors").?.len);
+    }
+
+    // ------------------------------------------------ holds (0.14.0): with the chain state's BEEF; a spend the topic took, `judged`
+    const t5 = try spend(a, &t3.tx, 0, &.{.{ 1, &k.p2pkh }}, k.priv);
+    try std.testing.expectEqualSlices(u32, &.{0}, (try inst.admitted(try atomic(a, t5), t5.txid)).applied[0].coins_removed);
+    {
+        var st = try inst.load();
+        const h1 = (try st.holds(&.{"tm_demo"}, t1.txid)).?;
+        const ans = try routes.heldAnswer(a, &st, h1);
+        try std.testing.expectEqualStrings("admitted", ans.getText("via").?);
+        const got = try beef.parse(a, try hexBytes(a, ans.getText("beef").?));
+        try std.testing.expectEqualSlices(u8, &t1.txid, &got.subject().?);
+        const h5 = (try st.holds(&.{"tm_demo"}, t5.txid)).?;
+        try std.testing.expect(h5.via == .judged and h5.outpoint == null);
+        const ans5 = try routes.heldAnswer(a, &st, h5);
+        try std.testing.expect(ans5.get("outpoint") == null);
+        try std.testing.expectEqualSlices(u8, &t5.txid, &(try beef.parse(a, try hexBytes(a, ans5.getText("beef").?))).subject().?);
+    }
+
+    // ------------------------------------------------ another instance, the same history in another order: the same anchors
+    {
+        var ms2 = c.store.MemStore.init(std.testing.allocator);
+        defer ms2.deinit();
+        var other = try Instance.init(a, &ms2);
+        try other.headers(&.{ &f.h1, &h2, &h3, &h4 });
+        try admittedProven(&other, try withFund(a, f, t3), t3.txid, try soloPath(a, 4, t3.txid));
+        try admittedProven(&other, try withFund(a, f, t2), t2.txid, pair);
+        {
+            var st = try other.load();
+            try std.testing.expect(!std.mem.eql(u8, &a4, &(try st.beat("tm_demo")).tip.?.anchor));
+        }
+        try admittedProven(&other, try withFund(a, f, t1), t1.txid, pair);
+        var st = try other.load();
+        const b = try st.beat("tm_demo");
+        try std.testing.expectEqual(@as(?u32, 2), b.genesis);
+        try std.testing.expectEqualSlices(u8, &a4, &b.tip.?.anchor);
+        try std.testing.expect(b.tail.eql(.{}));
+    }
+
+    // ------------------------------------------------ t3's judgement removed: the tip back to 2, the anchors above gone
+    _ = try inst.watched(t3.txid, .{ .rejected = "REJECTED" });
+    {
+        var st = try inst.load();
+        const b = try st.beat("tm_demo");
+        try std.testing.expectEqual(@as(u32, 2), b.tip.?.height);
+        try std.testing.expectEqualSlices(u8, &a2, &b.tip.?.anchor);
+        try std.testing.expect((try st.anchorAt("tm_demo", 3)) == null and (try st.anchorAt("tm_demo", 4)) == null);
+    }
+    // ------------------------------------------------ t4 rejected while unmined: out of the tail
+    _ = try inst.watched(t4.txid, .{ .rejected = "REJECTED" });
+    {
+        var st = try inst.load();
+        try std.testing.expect((try st.beat("tm_demo")).tail.eql(.{}));
+    }
+    // ------------------------------------------------ t1 and t2 removed: no span, no anchors
+    _ = try inst.watched(t2.txid, .{ .rejected = "REJECTED" });
+    {
+        var st = try inst.load();
+        try std.testing.expectEqualSlices(u8, &a2_alone, &(try st.beat("tm_demo")).tip.?.anchor);
+    }
+    _ = try inst.watched(t1.txid, .{ .rejected = "REJECTED" });
+    {
+        var st = try inst.load();
+        const b = try st.beat("tm_demo");
+        try std.testing.expect(b.tip == null and b.genesis == null);
+        try std.testing.expect((try st.anchorAt("tm_demo", 2)) == null);
+    }
+}
+
+fn hexBytes(a: Allocator, h: []const u8) ![]u8 {
+    const out = try a.alloc(u8, h.len / 2);
+    _ = try std.fmt.hexToBytes(out, h);
+    return out;
 }

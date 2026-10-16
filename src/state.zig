@@ -10,7 +10,7 @@
 //!
 //! The record, the root of `<app>/state`:
 //!
-//!   {kind: "overlay-state", maps: {admitted, applied, pending, wants, views, ancillary}}
+//!   {kind: "overlay-state", maps: {admitted, applied, pending, wants, views, ancillary, mined, placed, anchors, tips}}
 //!
 //! The maps (keys bytes, ordered bytewise; `tp` = len ‖ topic):
 //!   admitted   tp ‖ txid ‖ vout → admittance record {kind: "admitted", topic, txid, vout, script, satoshis, admittedAt, tx, ancillary?, refs}
@@ -48,6 +48,14 @@
 //!   ancillary  ancillary txid ‖ tp ‖ outpoint → admittance record   (skein-overlay#4): each
 //!                transaction an admittance names in `ancillary`, by the admitted output naming it;
 //!                `holds` reads it, removed with the admittance (`unapply`)
+//!   mined      tp ‖ height (u32 BE) ‖ offset (u64 BE) → txid   (0.14.0, shruggr/skein#150): a transaction
+//!                the topic judged, mined at that height and offset in its block, as the chain state proves it
+//!   placed     tp ‖ txid → height (u32 BE) ‖ offset (u64 BE) ‖ block hash   where the topic has it mined
+//!   anchors    tp ‖ height (u32 BE) → root ‖ anchor   BRC-136: root(H) over the txids `mined` at H in block
+//!                order, anchor(H) = sha256d(anchor(H-1) ‖ blockhash(H) ‖ root(H)), every height from the
+//!                topic's genesis (its lowest mined height) to its tip (its highest)
+//!   tips       tp → tail (40 bytes, as a view) ‖ [genesis (u32 BE) ‖ tip (u32 BE)]   the outputs it admitted in
+//!                transactions not mined, and its span (none before anything it judged is mined)
 //!
 //! Nothing here is derived from the chain: whether an admitted output is
 //! spent is the chain state's `spent` (the first held spender that is not
@@ -83,7 +91,68 @@ pub const Network = c.chain.Network;
 /// The head the chain state lives under: the chain app's (its name is `chain`).
 pub const chain_head = "chain/state";
 
-pub const map_names = [_][]const u8{ "admitted", "applied", "pending", "wants", "views", "ancillary" };
+pub const map_names = [_][]const u8{ "admitted", "applied", "pending", "wants", "views", "ancillary", "mined", "placed", "anchors", "tips" };
+
+/// A transaction's place in its block, as the chain state proves it (`mined`, `placed`).
+pub const Placed = struct { height: u32, offset: u64, block: [32]u8 };
+
+/// The heights a topic's anchors span (`tips`): its genesis (the lowest height a transaction it
+/// judged is mined at) through its tip (the highest).
+pub const Span = struct { genesis: u32, tip: u32 };
+
+/// A topic's anchor at its tip (shruggr/skein#150).
+pub const Tip = struct { height: u32, anchor: [32]u8 };
+
+/// What a topic's beat body carries (topics.zig `beatBody`): its view digest (0.12.0), its tip anchor
+/// and its tail (0.14.0, shruggr/skein#150).
+pub const Beat = struct {
+    view: View = .{},
+    /// The outputs it admitted in transactions not mined (count and digest, as a view's).
+    tail: View = .{},
+    genesis: ?u32 = null,
+    tip: ?Tip = null,
+
+    pub fn eql(x: Beat, y: Beat) bool {
+        if (!x.view.eql(y.view) or !x.tail.eql(y.tail) or x.genesis != y.genesis) return false;
+        if (x.tip == null or y.tip == null) return x.tip == null and y.tip == null;
+        return x.tip.?.height == y.tip.?.height and std.mem.eql(u8, &x.tip.?.anchor, &y.tip.?.anchor);
+    }
+};
+
+/// BRC-136's BASM root over txids (internal byte order) in block order: 32 zero bytes for none, the
+/// txid itself for one, else Bitcoin's merkle tree (sha256d, the odd last node paired with itself).
+pub fn basmRoot(a: Allocator, txids: []const [32]u8) ![32]u8 {
+    if (txids.len == 0) return .{0} ** 32;
+    var layer = try a.dupe([32]u8, txids);
+    while (layer.len > 1) {
+        const next = try a.alloc([32]u8, (layer.len + 1) / 2);
+        for (next, 0..) |*n, i| {
+            const l = layer[2 * i];
+            const r = if (2 * i + 1 < layer.len) layer[2 * i + 1] else l;
+            n.* = store_mod.dblSha256(&(l ++ r));
+        }
+        layer = next;
+    }
+    return layer[0];
+}
+
+/// BRC-136's TAC step: sha256d(anchor(H-1) ‖ blockhash(H) ‖ root(H)), each 32 bytes in internal order.
+pub fn anchorStep(prev: [32]u8, block: [32]u8, root: [32]u8) [32]u8 {
+    return store_mod.dblSha256(&(prev ++ block ++ root));
+}
+
+/// The heights a locator names (shruggr/skein#150, Bitcoin's headers-first locator): tip, tip-1,
+/// tip-2, tip-4, tip-8 … while above genesis, then genesis.
+pub fn locatorHeights(a: Allocator, span: Span) ![]const u32 {
+    var out: std.ArrayList(u32) = .empty;
+    var back: u64 = 0;
+    while (back <= span.tip - span.genesis) {
+        try out.append(a, span.tip - @as(u32, @intCast(back)));
+        back = if (back == 0) 1 else back * 2;
+    }
+    if (out.items[out.items.len - 1] != span.genesis) try out.append(a, span.genesis);
+    return out.items;
+}
 
 /// A topic's view digest (the map `views`, 0.12.0): how many outputs the topic holds admitted and
 /// unspent, and the sum (mod 2^256) of their outpoints' hashes (`outpointHash`). Two topics holding
@@ -128,8 +197,8 @@ pub fn outpointHash(txid: [32]u8, vout: u32) [32]u8 {
     return out;
 }
 
-/// A topic whose view a step changed: what it was before the step, and what it is now.
-pub const ViewChange = struct { topic: []const u8, before: View, now: View };
+/// A topic whose beat a step changed: what it was before the step, and what it is now.
+pub const BeatChange = struct { topic: []const u8, before: Beat, now: Beat };
 
 /// A lookup service's beat body, as a hook of its program answered it (`{beats: {<service>:
 /// bytes}}`, calls.zig): the engine re-declares the beacon on `<service>-live` with it (topics.zig
@@ -181,13 +250,14 @@ pub const Decoded = struct {
 };
 
 /// How a transaction is reachable from the state (`State.holds`, skein-overlay#4): an admitted
-/// output's, a retained coin's, or named by an admittance as ancillary. `outpoint` is the output
-/// (for `ancillary`, the admitted output naming it).
+/// output's, a retained coin's, named by an admittance as ancillary, or (0.14.0, shruggr/skein#150)
+/// judged by a topic that admitted no output of it (a spend it took: in its admitted lists).
+/// `outpoint` is the output (for `ancillary`, the admitted output naming it; none for `judged`).
 pub const Held = struct {
     txid: [32]u8,
-    via: enum { admitted, retained, ancillary },
+    via: enum { admitted, retained, ancillary, judged },
     topic: []const u8,
-    outpoint: struct { txid: [32]u8, vout: u32 },
+    outpoint: ?struct { txid: [32]u8, vout: u32 },
 };
 
 /// A topic's judgement a rejection removed: its lookup services are told (`rejected`).
@@ -239,6 +309,13 @@ fn contains(xs: []const u32, x: u32) bool {
     return false;
 }
 
+fn uintList(a: Allocator, v: ?[]const Value) ![]u32 {
+    const xs = v orelse return &.{};
+    const out = try a.alloc(u32, xs.len);
+    for (xs, out) |x, *o| o.* = if (x == .uint and x.uint <= std.math.maxInt(u32)) @intCast(x.uint) else return error.BadRecord;
+    return out;
+}
+
 fn uints(a: Allocator, xs: []const u32) ![]Value {
     const out = try a.alloc(Value, xs.len);
     for (xs, out) |x, *o| o.* = .{ .uint = x };
@@ -273,8 +350,11 @@ pub const State = struct {
     now: i64 = 0,
     /// The wants this step touched, and whether each stood before (`wantEvents`).
     want_log: std.ArrayList(struct { key: []const u8, stood: bool }) = .empty,
-    /// The topics whose view this step touched, and each one's view before its first touch (`viewChanges`).
-    view_log: std.ArrayList(struct { topic: []const u8, before: View }) = .empty,
+    /// The topics whose beat this step touched, and each one's beat before its first touch (`beatChanges`).
+    beat_log: std.ArrayList(struct { topic: []const u8, before: Beat }) = .empty,
+    /// The topics whose anchors this step must compute again, from which height, and the span they
+    /// had before (`settleAnchors`).
+    dirty: std.ArrayList(struct { topic: []const u8, from: u32, old: ?Span }) = .empty,
     /// The lookup beat bodies this step's hooks answered, in order (`LookupBeat`).
     lookup_beats: std.ArrayList(LookupBeat) = .empty,
 
@@ -299,6 +379,7 @@ pub const State = struct {
 
     /// Put every new map node and a state record naming the maps' roots; → its CID.
     pub fn save(self: *State) ![]const u8 {
+        try self.settleAnchors();
         const es = try self.arena.alloc(cbor.Entry, map_names.len);
         for (map_names, &self.m, es) |n, *mp, *e| {
             try mp.flush();
@@ -597,7 +678,8 @@ pub const State = struct {
         const txid_hex = try a.dupe(u8, &hdr.toHex(sub.txid));
         var records: std.ArrayList([]const u8) = .empty;
         // The view (0.12.0): each previous coin it consumes out (retained or not: spent), each output it admits in.
-        var v = try self.touchView(t);
+        try self.touchBeat(t);
+        var v = try self.view(t);
         for (previous) |p| {
             const po = sub.tx.inputs[p].previous_outpoint;
             if (try self.counted(t, po.txid.bytes, po.index)) v.fold(po.txid.bytes, po.index, false);
@@ -643,6 +725,7 @@ pub const State = struct {
         }) });
         try self.map("applied").putLink(try cat(a, &.{ tp, &sub.txid }), applied);
         try records.append(a, applied);
+        try self.place(t, sub.txid, sorted, true);
         return .{ .outputs_to_admit = sorted, .coins_to_retain = retained, .coins_removed = removed.items, .records = records.items };
     }
 
@@ -657,7 +740,9 @@ pub const State = struct {
             const tp = try topicPrefix(a, t);
             const key = try cat(a, &.{ tp, &txid });
             const rc = (try self.map("applied").link(key)) orelse continue;
-            var v = try self.touchView(t);
+            try self.touchBeat(t);
+            try self.unplace(t, txid, try uintList(self.arena, (try self.record(rc)).getArray("outputsToAdmit")));
+            var v = try self.view(t);
             for (try self.map("admitted").prefixed(key)) |kv| {
                 const o = try store_mod.outpointOf(kv.key[tp.len..]);
                 if (try self.counted(t, o.txid, o.vout)) v.fold(o.txid, o.vout, false);
@@ -698,12 +783,23 @@ pub const State = struct {
         try self.map("views").put(try topicPrefix(self.arena, t), .{ .bytes = try self.arena.dupe(u8, &b) });
     }
 
-    /// The topic's view, noted in the step's journal (its value before the step's first touch).
-    fn touchView(self: *State, t: []const u8) !View {
-        const v = try self.view(t);
-        for (self.view_log.items) |x| if (std.mem.eql(u8, x.topic, t)) return v;
-        try self.view_log.append(self.arena, .{ .topic = try self.arena.dupe(u8, t), .before = v });
-        return v;
+    /// The topic's beat noted in the step's journal (its value before the step's first touch).
+    fn touchBeat(self: *State, t: []const u8) !void {
+        for (self.beat_log.items) |x| if (std.mem.eql(u8, x.topic, t)) return;
+        try self.beat_log.append(self.arena, .{ .topic = try self.arena.dupe(u8, t), .before = try self.beat(t) });
+    }
+
+    /// What the topic's beat body carries now (topics.zig `beatBody`): its view, its tail, and the
+    /// anchor at its tip (none before a transaction it judged is mined).
+    pub fn beat(self: *State, t: []const u8) !Beat {
+        try self.settleAnchors();
+        const tips = try self.tipsOf(t);
+        var out: Beat = .{ .view = try self.view(t), .tail = tips.tail };
+        if (tips.span) |sp| {
+            out.genesis = sp.genesis;
+            out.tip = .{ .height = sp.tip, .anchor = ((try self.anchorAt(t, sp.tip)) orelse return error.BadIndex).anchor };
+        }
+        return out;
     }
 
     /// Whether the output is in the topic's view: admitted under it, and consumed by no transaction
@@ -717,15 +813,224 @@ pub const State = struct {
         return true;
     }
 
-    /// The topics whose view this step changed (before ≠ now), in the order first touched.
-    pub fn viewChanges(self: *State) ![]ViewChange {
-        var out: std.ArrayList(ViewChange) = .empty;
-        for (self.view_log.items) |x| {
-            const now = try self.view(x.topic);
+    /// The topics whose beat this step changed (before ≠ now), in the order first touched.
+    pub fn beatChanges(self: *State) ![]BeatChange {
+        var out: std.ArrayList(BeatChange) = .empty;
+        for (self.beat_log.items) |x| {
+            const now = try self.beat(x.topic);
             if (now.eql(x.before)) continue;
             try out.append(self.arena, .{ .topic = x.topic, .before = x.before, .now = now });
         }
         return out.items;
+    }
+
+    // ------------------------------------------------------------ anchors (0.14.0, shruggr/skein#150)
+
+    /// The topic's tail (the outputs it admitted in transactions not mined) and its span (none: no
+    /// transaction it judged is mined). `tips`: tp → tail (40 bytes, as a view) ‖ [genesis (u32 BE) ‖ tip (u32 BE)].
+    pub fn tipsOf(self: *State, t: []const u8) !struct { tail: View, span: ?Span } {
+        const v = (try self.map("tips").get(try topicPrefix(self.arena, t))) orelse return .{ .tail = .{}, .span = null };
+        const b = if (v == .bytes) v.bytes else return error.BadIndex;
+        if (b.len != 40 and b.len != 48) return error.BadIndex;
+        return .{ .tail = try View.parse(b[0..40]), .span = if (b.len == 48) .{
+            .genesis = std.mem.readInt(u32, b[40..44], .big),
+            .tip = std.mem.readInt(u32, b[44..48], .big),
+        } else null };
+    }
+
+    fn putTips(self: *State, t: []const u8, tail: View, span: ?Span) !void {
+        const tp = try topicPrefix(self.arena, t);
+        if (span == null and tail.count == 0 and std.mem.eql(u8, &tail.digest, &([_]u8{0} ** 32))) {
+            _ = try self.map("tips").remove(tp);
+            return;
+        }
+        var b: std.ArrayList(u8) = .empty;
+        try b.appendSlice(self.arena, &tail.bytes());
+        if (span) |sp| {
+            try b.appendSlice(self.arena, &store_mod.be32(sp.genesis));
+            try b.appendSlice(self.arena, &store_mod.be32(sp.tip));
+        }
+        try self.map("tips").put(tp, .{ .bytes = b.items });
+    }
+
+    /// The topic's root and anchor at `height` (`anchors`: tp ‖ height (u32 BE) → root ‖ anchor), or
+    /// null outside its span.
+    pub fn anchorAt(self: *State, t: []const u8, height: u32) !?struct { root: [32]u8, anchor: [32]u8 } {
+        const v = (try self.map("anchors").get(try cat(self.arena, &.{ try topicPrefix(self.arena, t), &store_mod.be32(height) }))) orelse return null;
+        const b = if (v == .bytes and v.bytes.len == 64) v.bytes else return error.BadIndex;
+        return .{ .root = b[0..32].*, .anchor = b[32..64].* };
+    }
+
+    /// The txids the topic judged that are mined at `height`, in block order (`mined`: tp ‖ height
+    /// (u32 BE) ‖ offset (u64 BE) → txid).
+    pub fn minedAt(self: *State, t: []const u8, height: u32) ![]const [32]u8 {
+        const kvs = try self.map("mined").prefixed(try cat(self.arena, &.{ try topicPrefix(self.arena, t), &store_mod.be32(height) }));
+        const out = try self.arena.alloc([32]u8, kvs.len);
+        for (kvs, out) |kv, *o| o.* = if (kv.value == .bytes and kv.value.bytes.len == 32) kv.value.bytes[0..32].* else return error.BadIndex;
+        return out;
+    }
+
+    /// Where the chain state has `txid` mined: its proof's block on our best chain, its height and its
+    /// offset in the block. Null while it is not proven.
+    pub fn chainPlace(self: *State, txid: [32]u8) !?Placed {
+        const r = (try self.ch.proofRecord(txid)) orelse return null;
+        const block = store_mod.bitcoinHash(r.block) orelse return error.BadIndex;
+        const height = (try self.ch.chain().heightOf(block)) orelse return null;
+        if (try self.ch.map("rejected").has(&txid)) return null;
+        return .{ .height = height, .offset = r.pos.offset, .block = block };
+    }
+
+    /// Where the topic has `txid` mined (`placed`: tp ‖ txid → height (u32 BE) ‖ offset (u64 BE) ‖ block hash).
+    fn placedOf(self: *State, t: []const u8, txid: [32]u8) !?Placed {
+        const v = (try self.map("placed").get(try cat(self.arena, &.{ try topicPrefix(self.arena, t), &txid }))) orelse return null;
+        const b = if (v == .bytes and v.bytes.len == 44) v.bytes else return error.BadIndex;
+        return .{ .height = std.mem.readInt(u32, b[0..4], .big), .offset = std.mem.readInt(u64, b[4..12], .big), .block = b[12..44].* };
+    }
+
+    fn tailFold(tail: *View, txid: [32]u8, outs: []const u32, in: bool) void {
+        for (outs) |o| tail.fold(txid, o, in);
+    }
+
+    /// A transaction the topic judged, placed where the chain state has it now: mined (`mined`,
+    /// `placed`; its height's anchors computed again) or in the tail, its admitted outputs `outs`.
+    /// `fresh`: just judged, in neither yet.
+    fn place(self: *State, t: []const u8, txid: [32]u8, outs: []const u32, fresh: bool) !void {
+        const a = self.arena;
+        const cur: ?Placed = if (fresh) null else try self.placedOf(t, txid);
+        const now = try self.chainPlace(txid);
+        if (!fresh) if (cur) |x| if (now) |y| {
+            if (x.height == y.height and x.offset == y.offset and std.mem.eql(u8, &x.block, &y.block)) return;
+        };
+        if (!fresh and cur == null and now == null) return;
+        try self.touchBeat(t);
+        var tips = try self.tipsOf(t);
+        if (cur) |x| try self.dropMined(t, txid, x, &tips.span) else if (!fresh) tailFold(&tips.tail, txid, outs, false);
+        if (now) |y| {
+            const tp = try topicPrefix(a, t);
+            var off: [8]u8 = undefined;
+            std.mem.writeInt(u64, &off, y.offset, .big);
+            try self.map("mined").put(try cat(a, &.{ tp, &store_mod.be32(y.height), &off }), .{ .bytes = try a.dupe(u8, &txid) });
+            try self.map("placed").put(try cat(a, &.{ tp, &txid }), .{ .bytes = try cat(a, &.{ &store_mod.be32(y.height), &off, &y.block }) });
+            try self.markDirty(t, y.height, tips.span);
+            tips.span = if (tips.span) |sp| .{ .genesis = @min(sp.genesis, y.height), .tip = @max(sp.tip, y.height) } else .{ .genesis = y.height, .tip = y.height };
+        } else tailFold(&tips.tail, txid, outs, true);
+        try self.putTips(t, tips.tail, tips.span);
+    }
+
+    /// A judgement removed (a rejection): the transaction out of the topic's mined history, or out
+    /// of its tail.
+    fn unplace(self: *State, t: []const u8, txid: [32]u8, outs: []const u32) !void {
+        var tips = try self.tipsOf(t);
+        if (try self.placedOf(t, txid)) |x| try self.dropMined(t, txid, x, &tips.span) else tailFold(&tips.tail, txid, outs, false);
+        try self.putTips(t, tips.tail, tips.span);
+    }
+
+    /// `txid` out of the topic's `mined` and `placed` at `x`; its height's anchors due again, and the
+    /// span narrowed when that height held nothing else and was an end of it.
+    fn dropMined(self: *State, t: []const u8, txid: [32]u8, x: Placed, span: *?Span) !void {
+        const a = self.arena;
+        const tp = try topicPrefix(a, t);
+        var off: [8]u8 = undefined;
+        std.mem.writeInt(u64, &off, x.offset, .big);
+        _ = try self.map("mined").remove(try cat(a, &.{ tp, &store_mod.be32(x.height), &off }));
+        _ = try self.map("placed").remove(try cat(a, &.{ tp, &txid }));
+        try self.markDirty(t, x.height, span.*);
+        const sp = span.* orelse return;
+        if ((try self.minedAt(t, x.height)).len > 0 or (x.height != sp.genesis and x.height != sp.tip)) return;
+        const all = try self.map("mined").prefixed(tp);
+        if (all.len == 0) {
+            span.* = null;
+            return;
+        }
+        span.* = .{
+            .genesis = std.mem.readInt(u32, all[0].key[tp.len..][0..4], .big),
+            .tip = std.mem.readInt(u32, all[all.len - 1].key[tp.len..][0..4], .big),
+        };
+        if (span.*.?.genesis != sp.genesis) try self.markDirty(t, span.*.?.genesis, sp);
+    }
+
+    fn markDirty(self: *State, t: []const u8, from: u32, old: ?Span) !void {
+        for (self.dirty.items) |*d| if (std.mem.eql(u8, d.topic, t)) {
+            d.from = @min(d.from, from);
+            return;
+        };
+        try self.dirty.append(self.arena, .{ .topic = try self.arena.dupe(u8, t), .from = from, .old = old });
+    }
+
+    /// The anchors of each topic this step placed or removed a mined transaction of, computed again
+    /// from the lowest height it touched to its tip (BRC-136: root(H) over the txids it judged mined
+    /// at H in block order; anchor(H) = sha256d(anchor(H-1) ‖ blockhash(H) ‖ root(H)), anchor(genesis
+    /// - 1) = 32 zero bytes); the anchors outside its span now removed.
+    pub fn settleAnchors(self: *State) !void {
+        if (self.dirty.items.len == 0) return;
+        const a = self.arena;
+        const dirty = try a.dupe(@TypeOf(self.dirty.items[0]), self.dirty.items);
+        self.dirty.clearRetainingCapacity();
+        for (dirty) |d| {
+            const tp = try topicPrefix(a, d.topic);
+            const span = (try self.tipsOf(d.topic)).span;
+            if (d.old) |old| {
+                var h = old.genesis;
+                while (h <= old.tip) : (h += 1) {
+                    const inside = if (span) |sp| h >= sp.genesis and h <= sp.tip else false;
+                    if (!inside) _ = try self.map("anchors").remove(try cat(a, &.{ tp, &store_mod.be32(h) }));
+                }
+            }
+            const sp = span orelse continue;
+            var h = @max(d.from, sp.genesis);
+            if (h > sp.tip) continue;
+            var prev: [32]u8 = .{0} ** 32;
+            if (h > sp.genesis) prev = if (try self.anchorAt(d.topic, h - 1)) |x| x.anchor else blk: {
+                h = sp.genesis;
+                break :blk .{0} ** 32;
+            };
+            while (h <= sp.tip) : (h += 1) {
+                const at = (try self.ch.chain().at(h)) orelse return error.UnknownHeader;
+                const root = try basmRoot(a, try self.minedAt(d.topic, h));
+                prev = anchorStep(prev, at.hash, root);
+                try self.map("anchors").put(try cat(a, &.{ tp, &store_mod.be32(h) }), .{ .bytes = try cat(a, &.{ &root, &prev }) });
+            }
+        }
+    }
+
+    /// Each transaction of `txids` the served `topics` judged, placed where the chain state has it
+    /// now (a proof heard: mined; a reorg's: moved; reverted: back in the tail).
+    pub fn settleMined(self: *State, topics: []const []const u8, txid: [32]u8) !void {
+        for (topics) |t| {
+            const rec = (try self.appliedRecord(t, txid)) orelse continue;
+            try self.place(t, txid, try uintList(self.arena, rec.getArray("outputsToAdmit")), false);
+        }
+    }
+
+    /// The topic's blocks with transactions it judged mined in them, from `from` up to `to` (at most
+    /// its tip), at most `limit` of them and at most `max_span` heights looked at: each block's
+    /// height, hash, txids in block order and a compound BUMP over them (BRC-74). `next`: the height
+    /// to go on from (null: none left up to `to`).
+    pub const MinedBlock = struct { height: u32, block: [32]u8, txids: []const [32]u8, bump: []const u8 };
+    pub fn minedBlocks(self: *State, t: []const u8, from: u32, to: u32, limit: usize, max_span: u32) !struct { blocks: []const MinedBlock, next: ?u32 } {
+        const a = self.arena;
+        var out: std.ArrayList(MinedBlock) = .empty;
+        const span = (try self.tipsOf(t)).span orelse return .{ .blocks = &.{}, .next = null };
+        const last = @min(to, span.tip);
+        var h = @max(from, span.genesis);
+        var looked: u32 = 0;
+        while (h <= last) : (h += 1) {
+            if (out.items.len >= limit or looked >= max_span) return .{ .blocks = out.items, .next = h };
+            looked += 1;
+            const txids = try self.minedAt(t, h);
+            if (txids.len == 0) continue;
+            var path: ?merkle.MerklePath = null;
+            for (txids) |x| {
+                var p = (try self.ch.proofFor(x)) orelse return error.MissingProof;
+                if (path) |*q| try q.combine(&p, a) else path = p;
+            }
+            for (path.?.path[0]) |*l| if (l.hash) |hh| for (txids) |x| if (std.mem.eql(u8, &hh.bytes, &x)) {
+                l.txid = true;
+            };
+            const at = (try self.ch.chain().at(h)) orelse return error.UnknownHeader;
+            try out.append(a, .{ .height = h, .block = at.hash, .txids = txids, .bump = try path.?.bytes(a) });
+        }
+        return .{ .blocks = out.items, .next = null };
     }
 
     /// Who spent an admitted output, as the topic sees it: the chain's `spent` (the first held
@@ -774,7 +1079,8 @@ pub const State = struct {
     /// of it admitted and not taken out by a judgement of the topic (`admitted`), else one admitted
     /// and retained by the topic's judgement of its spender (`retained`), else named in an
     /// admittance's `ancillary` (`ancillary`, the first in key order). A coin the topic removed
-    /// does not count. Topics in order, outputs in vout order; null: none of them.
+    /// does not count; else judged by one of them (0.14.0). Topics in order, outputs in vout order;
+    /// null: none of them.
     pub fn holds(self: *State, topics: []const []const u8, txid: [32]u8) !?Held {
         const a = self.arena;
         var retained: ?Held = null;
@@ -798,6 +1104,7 @@ pub const State = struct {
                 return .{ .txid = txid, .via = .ancillary, .topic = x, .outpoint = .{ .txid = o.txid, .vout = o.vout } };
             };
         }
+        for (topics) |t| if (try self.isApplied(t, txid)) return .{ .txid = txid, .via = .judged, .topic = t, .outpoint = null };
         return null;
     }
 };

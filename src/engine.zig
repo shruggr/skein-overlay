@@ -152,11 +152,11 @@ fn emitWants(a: Allocator, st: *@import("state.zig").State) !usize {
     return evs.len;
 }
 
-/// The beacons the step re-declares (0.12.0, topics.zig `beatEvents`): each registered topic whose
-/// view digest it changed, each registered lookup service its hooks gave a new body; emitted. → how
+/// The beacons the step re-declares (0.12.0, topics.zig `beatEvents`): each registered topic whose beat
+/// (view digest, tip anchor, tail) it changed, each registered lookup service its hooks gave a new body; emitted. → how
 /// many.
 fn emitBeats(a: Allocator, step: Value, st: *@import("state.zig").State) !usize {
-    const changes = try st.viewChanges();
+    const changes = try st.beatChanges();
     if (changes.len == 0 and st.lookup_beats.items.len == 0) return 0;
     const s = vm.store();
     const app = calls.appOf(step);
@@ -183,13 +183,13 @@ fn answersField(fields: *std.ArrayList(cbor.Entry), a: Allocator) !void {
     if (ev_.answers.items.len > 0) try fields.append(a, .{ .key = "answers", .value = .{ .array = ev_.answers.items } });
 }
 
-/// A topic's beat body as the state holds its view now (0.12.0, topics.zig `beatBody`), with the
+/// A topic's beat body as the state holds its beat now (0.12.0, 0.14.0, topics.zig `beatBody`), with the
 /// configured terms (0.12.1): the register's `topic` (none: the empty view).
 fn topicBeat(a: Allocator, step: Value, fargs: Value, roles: topics.Roles) ![]const u8 {
     const t = fargs.getText("topic") orelse return topics.beatBody(a, .{}, roles.terms);
     if (t.len == 0) return topics.beatBody(a, .{}, roles.terms);
     var loaded = try ev_.load(a, step);
-    return topics.beatBody(a, try loaded.st.view(t), roles.terms);
+    return topics.beatBody(a, try loaded.st.beat(t), roles.terms);
 }
 
 /// `register {topic, program}` / `deregister {topic}` (topics.zig, shruggr/skein#120): a message in
@@ -329,7 +329,7 @@ fn seeding(a: Allocator, step: Value, list: []const topics.Entry, answer: Value,
     const sd = try submit.seed(cx, topic, seeds);
     for (sd.records) |r| try vm.keep(r);
     // The view the seeds changed: the beacons re-declared (0.12.0), over the set this step wrote.
-    const beats = try topics.beatEvents(a, roles, list, try lookupNames(a, step), try loaded.st.viewChanges(), loaded.st.lookup_beats.items);
+    const beats = try topics.beatEvents(a, roles, list, try lookupNames(a, step), try loaded.st.beatChanges(), loaded.st.lookup_beats.items);
     for (beats) |e| _ = try vm.emitEvent(a, e);
     if (beats.len > 0) try fields.append(a, .{ .key = "beats", .value = .{ .uint = beats.len } });
     const new_state = try loaded.st.save();

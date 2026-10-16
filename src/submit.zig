@@ -1141,6 +1141,7 @@ pub fn watchStart(cx: Ctx, w: Watch) !Stepped {
     var out = Stepped{ .txid = w.txid };
     switch (try cx.st.ch.status(w.txid)) {
         .proven => {
+            try cx.st.settleMined(try calls.servedTopics(cx.a, cx.in), w.txid);
             if (w.proven) {
                 out.done = false;
                 return out;
@@ -1179,6 +1180,7 @@ pub fn watched(cx: Ctx, w: Watch, ans: Answer) !Stepped {
     var out = Stepped{ .txid = w.txid, .heard = @tagName(ans) };
     switch (ans) {
         .proven => |p| {
+            try cx.st.settleMined(try calls.servedTopics(cx.a, cx.in), w.txid);
             // Published once per transaction (a reorg's proof is not published again).
             if (p.via == null and !w.proven) if (cx.out) |o| {
                 out.published += try gossip.proven(cx.a, o, cx.st, cx.in, w.txid);

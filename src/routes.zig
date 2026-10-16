@@ -26,7 +26,13 @@
 //!   GET  /getDocumentationForTopicManager?manager=…              fn "topicDocumentation"
 //!   GET  /getDocumentationForLookupServiceProvider?lookupService=…  fn "lookupDocumentation"
 //!   GET  /holds?txid=…    fn "holds"   (skein-overlay#4) → {txid, tx: <tx CID>, via: "admitted" | "retained" |
-//!                                   "ancillary", outpoint: {txid, vout}}, or {} when the state reaches it not
+//!                                   "ancillary" | "judged", outpoint?: {txid, vout}, beef?: hex (0.14.0: the
+//!                                   chain state's Atomic BEEF of it)}, or {} when the state reaches it not
+//!   GET  /anchors?topic=…&heights=…   fn "anchors"   (0.14.0, shruggr/skein#150) → {topic, genesisHeight?,
+//!                                   tipHeight?, anchors: [{height, anchor}]}: the topic's anchors at those
+//!                                   heights (a comma list; none named: its locator's)
+//!   GET  /admitted?topic=…&fromHeight=…&toHeight=…&limit=…   fn "admitted"   (0.14.0, shruggr/skein#150) →
+//!                                   {topic, blocks: [{height, blockHash, txids, bump}], nextHeight}
 //!
 //! Every request is appended, and the front door's step calls these (#68).
 //! A submit over HTTP is BRC-22 (0.9.1, shruggr/skein#112, David 2026-10-07: "the HTTP
@@ -260,6 +266,10 @@ pub fn call(a: Allocator, call_in: Value) !void {
         try documentation(a, in, "overlayLookups", (try param(a, arg, "lookupService")) orelse "", "Lookup service")
     else if (eql(u8, func, "holds"))
         try holds(a, in, arg)
+    else if (eql(u8, func, "anchors"))
+        try anchors(a, in, arg)
+    else if (eql(u8, func, "admitted"))
+        try admitted(a, in, arg)
     else
         return error.UnknownFunction;
     // A read route's filter (shruggr/skein#143: /lookup, the listings, the documentation): the
@@ -759,23 +769,146 @@ fn documentation(a: Allocator, in: Value, key: []const u8, name: []const u8, wha
 }
 
 /// Whether the state reaches a transaction (skein-overlay#4; the host's want answers): `State.holds`
-/// over the served topics. `?txid=` is the txid, hex.
+/// over the served topics. `?txid=` is the txid, hex. The answer carries the chain state's Atomic
+/// BEEF of it (0.14.0: back to proven transactions, `state.beefFor`), what the host hands the peer
+/// that asked.
 fn holds(a: Allocator, in: Value, req: Value) !Value {
     const txid = c.header.fromHex((try param(a, req, "txid")) orelse "") catch return failure(a, 400, "Invalid request: txid must be a transaction id (hex)");
     var st = try load(a, in);
     const h = (try st.holds(try calls.servedTopics(a, in), txid)) orelse return respond(a, 200, "application/json", "{}");
-    return respond(a, 200, "application/json", try toJson(a, try heldValue(a, h)));
+    return respond(a, 200, "application/json", try toJson(a, try heldAnswer(a, &st, h)));
 }
 
-/// A `Held` as the read answers it: `{txid, tx: <tx CID>, via, outpoint: {txid, vout}}`.
-pub fn heldValue(a: Allocator, h: state.Held) !Value {
+/// The `/holds` answer: `heldValue` and `beef` (hex), or without `beef` when the chain state cannot
+/// build one (an ancestor it does not hold).
+pub fn heldAnswer(a: Allocator, st: *State, h: state.Held) !Value {
+    const v = try heldValue(a, h);
+    const bytes = state.beefFor(st.ch, h.txid) catch return v;
+    return .{ .map = try std.mem.concat(a, cbor.Entry, &.{ v.map, &.{.{ .key = "beef", .value = .{ .text = try vm.hexAlloc(a, bytes) } }} }) };
+}
+
+/// The most heights an `/admitted` read looks at, and the most blocks it answers (0.14.0).
+pub const admitted_span: u32 = 10_000;
+pub const admitted_limit: u64 = 1_000;
+
+/// A served topic named by `?topic=`, or the 400 to answer.
+fn servedTopic(a: Allocator, in: Value, req: Value) !union(enum) { ok: []const u8, refused: Value } {
+    const t = (try param(a, req, "topic")) orelse return .{ .refused = try failure(a, 400, "Invalid request: topic is required") };
+    for (try calls.servedTopics(a, in)) |x| if (eql(u8, x, t)) return .{ .ok = x };
+    return .{ .refused = try failure(a, 400, try std.fmt.allocPrint(a, "Topic not served: {s}", .{t})) };
+}
+
+/// A `?name=` integer (u32), absent: null; one that is not, the 400 to answer.
+fn heightParam(a: Allocator, req: Value, name: []const u8) !union(enum) { ok: ?u32, refused: Value } {
+    const v = (try param(a, req, name)) orelse return .{ .ok = null };
+    return .{ .ok = std.fmt.parseInt(u32, v, 10) catch return .{ .refused = try failure(a, 400, try std.fmt.allocPrint(a, "Invalid request: {s} must be a height", .{name})) } };
+}
+
+/// A topic's anchors (0.14.0, shruggr/skein#150; state.zig `anchorAt`): `?topic=` served here,
+/// `?heights=` a comma list of heights (none: the locator's, `state.locatorHeights`). → `{topic,
+/// genesisHeight, tipHeight, anchors: [{height, anchor (hex, internal byte order)}]}` for the heights
+/// within its span, in the order named; before a transaction it judged is mined, `{topic, anchors: []}`.
+fn anchors(a: Allocator, in: Value, req: Value) !Value {
+    const t = switch (try servedTopic(a, in, req)) {
+        .ok => |x| x,
+        .refused => |r| return r,
+    };
+    var heights: ?[]const u32 = null;
+    if (try param(a, req, "heights")) |hs| {
+        var xs: std.ArrayList(u32) = .empty;
+        var it = std.mem.splitScalar(u8, hs, ',');
+        while (it.next()) |h| {
+            const x = std.mem.trim(u8, h, " ");
+            if (x.len == 0) continue;
+            try xs.append(a, std.fmt.parseInt(u32, x, 10) catch return failure(a, 400, "Invalid request: heights must be a comma list of heights"));
+        }
+        heights = xs.items;
+    }
+    var st = try load(a, in);
+    return respond(a, 200, "application/json", try toJson(a, try anchorsAnswer(a, &st, t, heights)));
+}
+
+/// The `/anchors` answer over the state (null `heights`: the locator's).
+pub fn anchorsAnswer(a: Allocator, st: *State, t: []const u8, heights: ?[]const u32) !Value {
+    var es: std.ArrayList(cbor.Entry) = .empty;
+    try es.append(a, .{ .key = "topic", .value = .{ .text = t } });
+    var out: std.ArrayList(Value) = .empty;
+    if ((try st.tipsOf(t)).span) |sp| {
+        try es.appendSlice(a, &.{
+            .{ .key = "genesisHeight", .value = .{ .uint = sp.genesis } },
+            .{ .key = "tipHeight", .value = .{ .uint = sp.tip } },
+        });
+        for (heights orelse try state.locatorHeights(a, sp)) |h| {
+            const x = (try st.anchorAt(t, h)) orelse continue;
+            try out.append(a, .{ .map = try a.dupe(cbor.Entry, &.{
+                .{ .key = "height", .value = .{ .uint = h } },
+                .{ .key = "anchor", .value = .{ .text = try vm.hexAlloc(a, &x.anchor) } },
+            }) });
+        }
+    }
+    try es.append(a, .{ .key = "anchors", .value = .{ .array = out.items } });
+    return .{ .map = es.items };
+}
+
+/// A topic's admitted lists by height (0.14.0, shruggr/skein#150; state.zig `minedBlocks`): `?topic=`
+/// served here, `?fromHeight=` (default its genesis), `?toHeight=` (default its tip), `?limit=` blocks
+/// (default and most `admitted_limit`); at most `admitted_span` heights looked at. → `{topic, blocks:
+/// [{height, blockHash (hex, display order), txids: [hex, display order] in block order, bump (hex: a
+/// compound BUMP over them, BRC-74)}], nextHeight: the height to go on from | null}`; only heights
+/// with transactions it judged come back.
+fn admitted(a: Allocator, in: Value, req: Value) !Value {
+    const t = switch (try servedTopic(a, in, req)) {
+        .ok => |x| x,
+        .refused => |r| return r,
+    };
+    const from = switch (try heightParam(a, req, "fromHeight")) {
+        .ok => |x| x orelse 0,
+        .refused => |r| return r,
+    };
+    const to = switch (try heightParam(a, req, "toHeight")) {
+        .ok => |x| x orelse std.math.maxInt(u32),
+        .refused => |r| return r,
+    };
+    const limit = switch (try heightParam(a, req, "limit")) {
+        .ok => |x| @min(@as(u64, x orelse admitted_limit), admitted_limit),
+        .refused => |r| return r,
+    };
+    var st = try load(a, in);
+    return respond(a, 200, "application/json", try toJson(a, try admittedAnswer(a, &st, t, from, to, limit)));
+}
+
+/// The `/admitted` answer over the state.
+pub fn admittedAnswer(a: Allocator, st: *State, t: []const u8, from: u32, to: u32, limit: u64) !Value {
+    const got = try st.minedBlocks(t, from, to, @intCast(@max(limit, 1)), admitted_span);
+    const blocks = try a.alloc(Value, got.blocks.len);
+    for (got.blocks, blocks) |b, *o| {
+        const txids = try a.alloc(Value, b.txids.len);
+        for (b.txids, txids) |x, *y| y.* = .{ .text = try a.dupe(u8, &c.header.toHex(x)) };
+        o.* = .{ .map = try a.dupe(cbor.Entry, &.{
+            .{ .key = "height", .value = .{ .uint = b.height } },
+            .{ .key = "blockHash", .value = .{ .text = try a.dupe(u8, &c.header.toHex(b.block)) } },
+            .{ .key = "txids", .value = .{ .array = txids } },
+            .{ .key = "bump", .value = .{ .text = try vm.hexAlloc(a, b.bump) } },
+        }) };
+    }
     return .{ .map = try a.dupe(cbor.Entry, &.{
+        .{ .key = "topic", .value = .{ .text = t } },
+        .{ .key = "blocks", .value = .{ .array = blocks } },
+        .{ .key = "nextHeight", .value = if (got.next) |n| .{ .uint = n } else .null },
+    }) };
+}
+
+/// A `Held` as the read answers it: `{txid, tx: <tx CID>, via, outpoint?: {txid, vout}}`.
+pub fn heldValue(a: Allocator, h: state.Held) !Value {
+    var es: std.ArrayList(cbor.Entry) = .empty;
+    try es.appendSlice(a, &.{
         .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &c.header.toHex(h.txid)) } },
         .{ .key = "tx", .value = .{ .cid = try a.dupe(u8, &c.store.hashCid(.tx, h.txid)) } },
         .{ .key = "via", .value = .{ .text = @tagName(h.via) } },
-        .{ .key = "outpoint", .value = .{ .map = try a.dupe(cbor.Entry, &.{
-            .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &c.header.toHex(h.outpoint.txid)) } },
-            .{ .key = "vout", .value = .{ .uint = h.outpoint.vout } },
-        }) } },
-    }) };
+    });
+    if (h.outpoint) |o| try es.append(a, .{ .key = "outpoint", .value = .{ .map = try a.dupe(cbor.Entry, &.{
+        .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &c.header.toHex(o.txid)) } },
+        .{ .key = "vout", .value = .{ .uint = o.vout } },
+    }) } });
+    return .{ .map = es.items };
 }

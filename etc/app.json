@@ -1,7 +1,7 @@
 {
   "kind": "app",
   "name": "overlay",
-  "version": "0.13.0",
+  "version": "0.14.0",
   "programs": {
     "overlay": "bin/overlay.wasm",
     "topic-demo": "bin/topic-demo.wasm",
@@ -33,7 +33,9 @@
     "listLookupServiceProviders": "overlay.listLookupServiceProviders",
     "topicDocumentation": "overlay.topicDocumentation",
     "lookupDocumentation": "overlay.lookupDocumentation",
-    "holds": "overlay.holds"
+    "holds": "overlay.holds",
+    "anchors": "overlay.anchors",
+    "admitted": "overlay.admitted"
   },
   "roles": {
     "root": [
@@ -95,6 +97,20 @@
       "address": "/holds",
       "filters": [
         "holds"
+      ]
+    },
+    {
+      "transport": "http",
+      "address": "/anchors",
+      "filters": [
+        "anchors"
+      ]
+    },
+    {
+      "transport": "http",
+      "address": "/admitted",
+      "filters": [
+        "admitted"
       ]
     }
   ],
