@@ -4,7 +4,7 @@ The overlay services engine for a [skein](https://github.com/shruggr/skein),
 as an app: BRC-22 submit and BRC-24 lookup, served by the instance's own
 front door, with topic managers and lookup services as programs the engine
 calls. It is also a Zig package: an overlay of your own depends on it for
-the topic and lookup contracts. Version **0.14.0**.
+the topic and lookup contracts. Version **0.14.1**.
 
 ## What it is
 
@@ -188,7 +188,7 @@ The manifest (`etc/app.json`, this repo's own, description left out):
 {
   "kind": "app",
   "name": "overlay",
-  "version": "0.14.0",
+  "version": "0.14.1",
   "programs": {
     "overlay": "bin/overlay.wasm",
     "topic-demo": "bin/topic-demo.wasm",
@@ -495,8 +495,8 @@ anchors and answers the reads above.
 
 | | |
 |---|---|
-| this app and package | 0.14.0 (tag `v0.14.0`) |
-| skein-sdk | v0.11.0, by tag URL and hash in `build.zig.zon` (modules `chain` and, for the engine, `sk`; bsvz comes through it) |
+| this app and package | 0.14.1 (tag `v0.14.1`) |
+| skein-sdk | v0.11.1, by tag URL and hash in `build.zig.zon` (modules `chain` and, for the engine, `sk`; bsvz comes through it) |
 | requires | `chain/1` (shruggr/skein-chain 0.3.0) |
 | skein | log format 10, the BEEF envelope beside the pointer record (shruggr/skein#146); the routes / filters / roles manifest (shruggr/skein#143); skein's equivs pin this repo by commit |
 
@@ -743,6 +743,14 @@ admitted no output, and carries the chain state's Atomic BEEF (`beef`).
 A BEEF on `/skein/overlay/beef/1.0.0` that no one here waits on is taken
 when it proves its subject mined (a pull), judged by every served topic.
 README "Anchors".
+
+0.14.1 (David, 2026-10-22): a BEEF out of order (a child before its
+parent; ts-sdk's writer puts a proven child before its proven parent) is
+sorted parents-first, not refused `NotParentsFirst`: `decode` (bytes,
+skein-sdk v0.11.1 `beef.sorted`), `decodeRecord` (the door's envelope;
+the pointer record keeps the wire's order) and `atomicFor`. The walk, the
+ingests and the checks then go oldest first as before; a cycle is the one
+order refused.
 
 ## Contributing
 

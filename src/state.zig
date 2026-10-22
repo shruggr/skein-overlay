@@ -238,7 +238,7 @@ pub const Proven = struct { txid: [32]u8, height: u32, pos: merkle.Position };
 /// unless the chain app ingests the submission.
 pub const Decoded = struct {
     subject: [32]u8,
-    /// Every transaction with its bytes, in BEEF order (parents first).
+    /// Every transaction with its bytes, parents first (the BEEF's order, sorted where it was not).
     txs: []const DecodedTx,
     /// The merkle nodes the BUMPs reveal, each once.
     nodes: []const merkle.Node,
@@ -1184,15 +1184,19 @@ fn flagged(p: merkle.MerklePath, txid: [32]u8) bool {
 /// BEEF's, else the last transaction) into records, parsing it once (#50):
 /// each transaction put as its `bitcoin-tx` block, each BUMP as the merkle
 /// nodes it reveals. Nothing is kept here: in a front-door call the blocks
-/// live in the call's overlay. Structure is checked (parents first, a BUMP
-/// that names a transaction holds it); the chain and the scripts are
-/// `verifyDecoded`'s.
+/// live in the call's overlay. Structure is checked (a BUMP that names a
+/// transaction holds it); the transactions are sorted parents-first, a
+/// writer's order not refused (skein-sdk `beef.sorted`; only a cycle is);
+/// the chain and the scripts are `verifyDecoded`'s.
 pub fn decode(a: Allocator, s: Store, bytes: []const u8) !Decoded {
-    const b = beef_mod.parse(a, bytes) catch return error.InvalidBeef;
-    const subject = b.subject() orelse return error.InvalidBeef;
-    const entry = b.find(subject) orelse return error.InvalidBeef;
+    const parsed = beef_mod.parse(a, bytes) catch return error.InvalidBeef;
+    const subject = parsed.subject() orelse return error.InvalidBeef;
+    const entry = parsed.find(subject) orelse return error.InvalidBeef;
     if (entry.raw == null) return error.InvalidBeef; // a txid-only subject
-    if (!beef_mod.parentsFirst(b)) return error.NotParentsFirst;
+    const b = beef_mod.sorted(a, parsed) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidBeef => return error.NotParentsFirst,
+    };
 
     var bumps: std.ArrayList(Bump) = .empty;
     var nodes: std.ArrayList(merkle.Node) = .empty;
@@ -1252,7 +1256,8 @@ pub fn decode(a: Allocator, s: Store, bytes: []const u8) !Decoded {
 /// door, so `proven` names the transactions its BUMPs prove (the record's `proves`) and nothing is
 /// proven again (`verifyDecoded`'s `door`). The subject is the envelope's (an Atomic, Outpoint or
 /// Subject BEEF), else the record's last transaction (skein-sdk `record.subjectOf`). A txid-only
-/// subject is refused.
+/// subject is refused. The transactions are sorted parents-first (`parentsFirst`); the record keeps
+/// the wire's order.
 pub fn decodeRecord(a: Allocator, s: Store, envelope: Value) !Decoded {
     const env = c.record.envelopeOf(envelope) orelse return error.InvalidBeef;
     const rec = s.getValue(a, env.beef) catch return error.InvalidBeef;
@@ -1280,7 +1285,27 @@ pub fn decodeRecord(a: Allocator, s: Store, envelope: Value) !Decoded {
         if (p) |i| try proven.append(a, .{ .txid = txid, .height = @intCast(bv[i].getUint("height") orelse return error.InvalidBeef), .pos = .{ .depth = 0, .offset = 0 } });
     }
     if (!has_subject) return error.InvalidBeef; // a txid-only subject
-    return .{ .subject = subject, .txs = txs.items, .nodes = &.{}, .bumps = &.{}, .proven = proven.items, .txid_only = txid_only.items };
+    return .{ .subject = subject, .txs = try parentsFirst(a, txs.items), .nodes = &.{}, .bumps = &.{}, .proven = proven.items, .txid_only = txid_only.items };
+}
+
+/// Decoded transactions parents-first (skein-sdk `beef.order`: stable, an order that already holds
+/// kept), so that "decoded before it" (`missingParents`, `verifyDecoded`, the walk) means its
+/// in-BEEF parents. error.NotParentsFirst: a cycle.
+pub fn parentsFirst(a: Allocator, txs: []const DecodedTx) ![]const DecodedTx {
+    const entries = try a.alloc(beef_mod.Entry, txs.len);
+    for (entries, txs) |*e, t| e.* = .{
+        .txid = t.txid,
+        .format = .raw,
+        .raw = t.raw,
+        .tx = Transaction.parse(a, t.raw) catch return error.InvalidBeef,
+    };
+    const ord = beef_mod.order(a, entries) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidBeef => return error.NotParentsFirst,
+    };
+    const out = try a.alloc(DecodedTx, txs.len);
+    for (out, ord) |*o, j| o.* = txs[j];
+    return out;
 }
 
 fn provenAt(d: Decoded, txid: [32]u8) ?u32 {
@@ -1394,7 +1419,8 @@ pub fn putRaw(a: Allocator, s: Store, bytes: []const u8) ![]const u8 {
 /// the transaction and its ancestors in that BEEF, in its order, back to the ones its BUMPs prove
 /// (and txid-only entries); the BUMPs those name. Nothing is added that the BEEF did not carry.
 pub fn atomicFor(a: Allocator, bytes: []const u8, txid: [32]u8) ![]const u8 {
-    const b = beef_mod.parse(a, bytes) catch return error.InvalidBeef;
+    // Parents first (a writer's order sorted): the walk back from `txid` reaches every ancestor.
+    const b = beef_mod.sorted(a, beef_mod.parse(a, bytes) catch return error.InvalidBeef) catch return error.InvalidBeef;
     const keep = try a.alloc(bool, b.entries.len);
     @memset(keep, false);
     const at = b.indexOf(txid) orelse return error.InvalidBeef;

@@ -2062,6 +2062,56 @@ test "oldest first (skein-overlay#1): a two-transaction BEEF judged in order, ea
     try std.testing.expect((try inst.route(two)) == .unchanged);
 }
 
+test "out of order (skein-sdk 0.11.1, David 2026-10-22): a BEEF with children before parents is sorted, not refused — by bytes and by the door's envelope; judged and ingested oldest first" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = c.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var inst = try Instance.init(a, &ms);
+    const x = try chain3(a, &inst);
+    // Wire order t2, t1, fund (the subject first, its proven grandparent last): Atomic for t2.
+    const back = try beef.serialize(a, .{ .version = beef.V2, .atomic = x.t2.txid, .bumps = x.f.bumps, .entries = try a.dupe(beef.Entry, &.{
+        .{ .txid = x.t2.txid, .format = .raw, .raw = x.t2.raw, .tx = x.t2.tx },
+        .{ .txid = x.t1.txid, .format = .raw, .raw = x.t1.raw, .tx = x.t1.tx },
+        x.f.entry,
+    }) });
+    try std.testing.expect(!beef.parentsFirst(try beef.parse(a, back)));
+    const d = try state.decode(a, ms.store(), back);
+    try std.testing.expectEqualSlices(u8, &x.f.txid, &d.txs[0].txid);
+    try std.testing.expectEqualSlices(u8, &x.t1.txid, &d.txs[1].txid);
+    try std.testing.expectEqualSlices(u8, &x.t2.txid, &d.txs[2].txid);
+    // The door's envelope over the same wire: the record keeps the wire's order, the decoding sorts.
+    const env = try pointerOf(a, ms.store(), back);
+    const dr = try state.decodeRecord(a, ms.store(), env);
+    try std.testing.expectEqualSlices(u8, &x.f.txid, &dr.txs[0].txid);
+    try std.testing.expectEqualSlices(u8, &x.t2.txid, &dr.txs[2].txid);
+    try std.testing.expectEqualSlices(u8, back, try c.record.wireOf(a, ms.store(), env));
+    const re = try inst.routeEnvelope(env);
+    try std.testing.expectEqualSlices(u8, &x.t2.txid, &re.admit.txid);
+
+    const r = try inst.route(back);
+    const ev = r.admit.event;
+    try std.testing.expectEqualSlices(u8, &x.t2.txid, &r.admit.txid);
+    const earlier = ev.getArray("earlier").?;
+    try std.testing.expectEqual(@as(usize, 1), earlier.len);
+    try std.testing.expectEqualStrings(&hdr.toHex(x.t1.txid), earlier[0].getText("txid").?);
+    // t1's Atomic BEEF cut from it is parents-first; the chain app takes both.
+    const sent0 = inst.wire_.sent.items.len;
+    _ = try inst.begin(ev);
+    const cut_bytes = inst.wire_.sent.items[sent0].body.get("args").?.getBytes("beef").?;
+    const cut = try beef.parse(a, cut_bytes);
+    try std.testing.expectEqualSlices(u8, &x.t1.txid, &cut.atomic.?);
+    try std.testing.expectEqual(@as(usize, 2), cut.entries.len);
+    try std.testing.expect(beef.parentsFirst(cut));
+    try std.testing.expectEqual(c.state.Status.unproven, try inst.ingest(cut_bytes));
+    try std.testing.expectEqual(c.state.Status.unproven, try inst.ingest(back));
+
+    // A cycle is the one order refused (a transaction named as its own input's source).
+    const loop = [_]state.DecodedTx{.{ .txid = x.t1.tx.inputs[0].previous_outpoint.txid.bytes, .raw = x.t1.raw }};
+    try std.testing.expectError(error.NotParentsFirst, state.parentsFirst(a, &loop));
+}
+
 /// A libp2p peer (its peer ID's multihash, as a gossip message's `from` carries it), by a letter.
 fn peerId(comptime letter: u8) []const u8 {
     return &([_]u8{ 0x00, 0x25, 0x08, 0x02, 0x12, 0x21, 0x02 } ++ [_]u8{letter} ** 32);
