@@ -3666,3 +3666,191 @@ fn hexBytes(a: Allocator, h: []const u8) ![]u8 {
     _ = try std.fmt.hexToBytes(out, h);
     return out;
 }
+
+// ---------------------------------------------------------------- 0.15.0: the sync protocol (skein-overlay#5)
+
+fn syncFrame(a: Allocator, es: []const cbor.Entry) ![]u8 {
+    return cbor.encode(a, .{ .map = try a.dupe(cbor.Entry, es) });
+}
+
+fn locatorFrame(a: Allocator, tp: []const u8, entries: []const struct { u64, []const u8 }) ![]u8 {
+    const loc = try a.alloc(Value, entries.len);
+    for (entries, loc) |e, *v| v.* = try mapOf(a, &.{ .{ .key = "height", .value = .{ .uint = e[0] } }, .{ .key = "anchor", .value = .{ .bytes = e[1] } } });
+    return syncFrame(a, &.{ .{ .key = "kind", .value = .{ .text = "locator" } }, .{ .key = "topic", .value = .{ .text = tp } }, .{ .key = "locator", .value = .{ .array = loc } } });
+}
+
+/// One frame through `syncAnswer`, its answer round-tripped through dag-cbor as the wire carries it.
+fn syncAsk(a: Allocator, st: *state.State, frame: []const u8) !Value {
+    return cbor.decode(a, try cbor.encode(a, try routes.syncAnswer(a, st, &.{"tm_demo"}, frame)));
+}
+
+fn expectSyncError(v: Value, message: []const u8) !void {
+    try std.testing.expectEqualStrings("error", v.getText("kind").?);
+    try std.testing.expectEqualStrings(message, v.getText("message").?);
+}
+
+test "the sync protocol (0.15.0, skein-overlay#5): fn sync a filter on the libp2p row; locator agreement, admitted ranges, a transaction's BEEF; errors for a topic not served, an unknown kind, a frame not dag-cbor" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const zero: [32]u8 = .{0} ** 32;
+
+    // ------------------------------------------------ the manifest: the filter and the libp2p row, no handler (a read)
+    {
+        const j = try std.json.parseFromSliceLeaky(std.json.Value, a, @embedFile("etc/app.json"), .{});
+        try std.testing.expectEqualStrings("overlay.sync", j.object.get("filters").?.object.get("sync").?.string);
+        const r = (try manifestRoute(a, "libp2p", "/skein/overlay/sync/1.0.0")).?;
+        try std.testing.expect(r.get("handler") == null);
+        try expectFilters(r, &.{"sync"});
+        // The http reads stay.
+        for ([_][]const u8{ "/anchors", "/admitted", "/holds" }) |p| try std.testing.expect((try manifestRoute(a, "http", p)) != null);
+    }
+
+    var ms = c.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var inst = try Instance.init(a, &ms);
+    const k = try keys(0x42);
+    const f = try fund(a, 0x33, 4, &k.p2pkh);
+    try inst.headers(&.{&f.h1});
+
+    // ------------------------------------------------ before anything is mined: no span, no agreement
+    {
+        var st = try inst.load();
+        const ans = try syncAsk(a, &st, try locatorFrame(a, "tm_demo", &.{}));
+        try std.testing.expectEqualStrings("locator", ans.getText("kind").?);
+        try std.testing.expectEqualStrings("tm_demo", ans.getText("topic").?);
+        try std.testing.expect(ans.get("genesisHeight") == null and ans.get("tipHeight") == null and ans.get("agreedHeight") == null);
+    }
+
+    const t1 = try spend(a, &f.tx, 0, &.{.{ 1, &k.token }}, k.priv);
+    const t2 = try spend(a, &f.tx, 1, &.{.{ 1, &k.token }}, k.priv);
+    const t3 = try spend(a, &f.tx, 2, &.{.{ 1, &k.token }}, k.priv);
+    const h2 = mine(hdr.hash(&f.h1), dbl(t1.txid, t2.txid), 1_700_001_000);
+    const h3 = mine(hdr.hash(&h2), .{0x77} ** 32, 1_700_001_600);
+    const h4 = mine(hdr.hash(&h3), t3.txid, 1_700_002_200);
+    const pair = try pairPath(a, 2, t1.txid, t2.txid);
+    try inst.headers(&.{ &h2, &h3, &h4 });
+    try admittedProven(&inst, try withFund(a, f, t1), t1.txid, pair);
+    try admittedProven(&inst, try withFund(a, f, t2), t2.txid, pair);
+    try admittedProven(&inst, try withFund(a, f, t3), t3.txid, try soloPath(a, 4, t3.txid));
+    const a2 = state.anchorStep(zero, hdr.hash(&h2), dbl(t1.txid, t2.txid));
+    const a3 = state.anchorStep(a2, hdr.hash(&h3), zero);
+    const a4 = state.anchorStep(a3, hdr.hash(&h4), t3.txid);
+    const other: [32]u8 = .{0x99} ** 32;
+
+    var st = try inst.load();
+
+    // ------------------------------------------------ the locator: the highest height where the anchors agree
+    {
+        // Agree at every height named: the highest, 4.
+        const all = try syncAsk(a, &st, try locatorFrame(a, "tm_demo", &.{ .{ 4, &a4 }, .{ 3, &a3 }, .{ 2, &a2 } }));
+        try std.testing.expectEqualStrings("locator", all.getText("kind").?);
+        try std.testing.expectEqual(@as(u64, 2), all.getUint("genesisHeight").?);
+        try std.testing.expectEqual(@as(u64, 4), all.getUint("tipHeight").?);
+        try std.testing.expectEqual(@as(u64, 4), all.getUint("agreedHeight").?);
+        // A peer ahead of us (heights past our tip) that agrees below: 3, whatever the order named.
+        const below = try syncAsk(a, &st, try locatorFrame(a, "tm_demo", &.{ .{ 2, &a2 }, .{ 6, &other }, .{ 4, &other }, .{ 3, &a3 } }));
+        try std.testing.expectEqual(@as(u64, 3), below.getUint("agreedHeight").?);
+        // Agreeing only at the genesis.
+        const low = try syncAsk(a, &st, try locatorFrame(a, "tm_demo", &.{ .{ 4, &other }, .{ 3, &other }, .{ 2, &a2 } }));
+        try std.testing.expectEqual(@as(u64, 2), low.getUint("agreedHeight").?);
+        // Agreeing at none (another history; heights below our genesis): the span, no agreedHeight.
+        const none = try syncAsk(a, &st, try locatorFrame(a, "tm_demo", &.{ .{ 4, &other }, .{ 2, &other }, .{ 1, &a2 }, .{ 0, &zero } }));
+        try std.testing.expect(none.get("agreedHeight") == null);
+        try std.testing.expectEqual(@as(u64, 2), none.getUint("genesisHeight").?);
+        try std.testing.expectEqual(@as(u64, 4), none.getUint("tipHeight").?);
+        // An empty locator: the span only.
+        const empty = try syncAsk(a, &st, try locatorFrame(a, "tm_demo", &.{}));
+        try std.testing.expect(empty.get("agreedHeight") == null);
+        try std.testing.expectEqual(@as(u64, 2), empty.getUint("genesisHeight").?);
+        try std.testing.expectEqual(@as(u64, 4), empty.getUint("tipHeight").?);
+        // No `locator` at all: the same.
+        const missing = try syncAsk(a, &st, try syncFrame(a, &.{ .{ .key = "kind", .value = .{ .text = "locator" } }, .{ .key = "topic", .value = .{ .text = "tm_demo" } } }));
+        try std.testing.expect(missing.get("agreedHeight") == null and missing.getUint("tipHeight").? == 4);
+        // Entries without a height or an anchor (bytes) do not count.
+        const odd = try syncAsk(a, &st, try syncFrame(a, &.{
+            .{ .key = "kind", .value = .{ .text = "locator" } },
+            .{ .key = "topic", .value = .{ .text = "tm_demo" } },
+            .{ .key = "locator", .value = .{ .array = &.{
+                try mapOf(a, &.{ .{ .key = "height", .value = .{ .uint = 4 } }, .{ .key = "anchor", .value = .{ .text = try a.dupe(u8, &std.fmt.bytesToHex(a4, .lower)) } } }),
+                try mapOf(a, &.{.{ .key = "anchor", .value = .{ .bytes = &a3 } }}),
+                try mapOf(a, &.{ .{ .key = "height", .value = .{ .uint = 2 } }, .{ .key = "anchor", .value = .{ .bytes = &a2 } } }),
+            } } },
+        }));
+        try std.testing.expectEqual(@as(u64, 2), odd.getUint("agreedHeight").?);
+        // A height that is not one: the reads' 400, as an error frame.
+        const neg = try syncAsk(a, &st, try syncFrame(a, &.{
+            .{ .key = "kind", .value = .{ .text = "locator" } },
+            .{ .key = "topic", .value = .{ .text = "tm_demo" } },
+            .{ .key = "locator", .value = .{ .array = &.{try mapOf(a, &.{ .{ .key = "height", .value = .{ .nint = 0 } }, .{ .key = "anchor", .value = .{ .bytes = &a2 } } })} } },
+        }));
+        try expectSyncError(neg, "Invalid request: heights must be a comma list of heights");
+    }
+
+    // ------------------------------------------------ admitted: as /admitted answers, with kind
+    {
+        const ans = try syncAsk(a, &st, try syncFrame(a, &.{
+            .{ .key = "kind", .value = .{ .text = "admitted" } },
+            .{ .key = "topic", .value = .{ .text = "tm_demo" } },
+            .{ .key = "fromHeight", .value = .{ .uint = 0 } },
+            .{ .key = "toHeight", .value = .{ .uint = 10 } },
+            .{ .key = "limit", .value = .{ .uint = 1_000 } },
+        }));
+        try std.testing.expectEqualStrings("admitted", ans.getText("kind").?);
+        try std.testing.expectEqualStrings("tm_demo", ans.getText("topic").?);
+        const http = try routes.admittedAnswer(a, &st, "tm_demo", 0, 10, 1_000);
+        try std.testing.expectEqualSlices(u8, try cbor.encode(a, http.get("blocks").?), try cbor.encode(a, ans.get("blocks").?));
+        const blocks = ans.getArray("blocks").?;
+        try std.testing.expectEqual(@as(usize, 2), blocks.len);
+        try std.testing.expectEqual(@as(u64, 2), blocks[0].getUint("height").?);
+        try std.testing.expectEqualStrings(&hdr.toHex(hdr.hash(&h2)), blocks[0].getText("blockHash").?);
+        try std.testing.expectEqualStrings(&hdr.toHex(t1.txid), blocks[0].getArray("txids").?[0].text);
+        try std.testing.expectEqualStrings(&hdr.toHex(t2.txid), blocks[0].getArray("txids").?[1].text);
+        try std.testing.expect(blocks[0].getText("bump") != null);
+        try std.testing.expectEqualStrings(&hdr.toHex(t3.txid), blocks[1].getArray("txids").?[0].text);
+        try std.testing.expect(ans.get("nextHeight").? == .null);
+        // A limit: the height to go on from.
+        const one = try syncAsk(a, &st, try syncFrame(a, &.{
+            .{ .key = "kind", .value = .{ .text = "admitted" } },
+            .{ .key = "topic", .value = .{ .text = "tm_demo" } },
+            .{ .key = "fromHeight", .value = .{ .uint = 2 } },
+            .{ .key = "toHeight", .value = .{ .uint = 4 } },
+            .{ .key = "limit", .value = .{ .uint = 1 } },
+        }));
+        try std.testing.expectEqual(@as(usize, 1), one.getArray("blocks").?.len);
+        try std.testing.expectEqual(@as(u64, 3), one.getUint("nextHeight").?);
+        // No range named: the defaults (genesis to tip).
+        const all = try syncAsk(a, &st, try syncFrame(a, &.{ .{ .key = "kind", .value = .{ .text = "admitted" } }, .{ .key = "topic", .value = .{ .text = "tm_demo" } } }));
+        try std.testing.expectEqual(@as(usize, 2), all.getArray("blocks").?.len);
+        const bad = try syncAsk(a, &st, try syncFrame(a, &.{ .{ .key = "kind", .value = .{ .text = "admitted" } }, .{ .key = "topic", .value = .{ .text = "tm_demo" } }, .{ .key = "fromHeight", .value = .{ .nint = 4 } } }));
+        try expectSyncError(bad, "Invalid request: fromHeight must be a height");
+    }
+
+    // ------------------------------------------------ tx: the chain state's Atomic BEEF as bytes; absent when not held
+    {
+        const ans = try syncAsk(a, &st, try syncFrame(a, &.{ .{ .key = "kind", .value = .{ .text = "tx" } }, .{ .key = "topic", .value = .{ .text = "tm_demo" } }, .{ .key = "txid", .value = .{ .text = &hdr.toHex(t1.txid) } } }));
+        try std.testing.expectEqualStrings("tx", ans.getText("kind").?);
+        try std.testing.expectEqualStrings(&hdr.toHex(t1.txid), ans.getText("txid").?);
+        try std.testing.expectEqual(@as(usize, 3), ans.map.len);
+        try std.testing.expectEqualSlices(u8, &t1.txid, &(try beef.parse(a, ans.getBytes("beef").?)).subject().?);
+        try std.testing.expectEqualSlices(u8, try state.beefFor(st.ch, t1.txid), ans.getBytes("beef").?);
+        const not_held = try syncAsk(a, &st, try syncFrame(a, &.{ .{ .key = "kind", .value = .{ .text = "tx" } }, .{ .key = "topic", .value = .{ .text = "tm_demo" } }, .{ .key = "txid", .value = .{ .text = &hdr.toHex(other) } } }));
+        try std.testing.expectEqualStrings("tx", not_held.getText("kind").?);
+        try std.testing.expect(not_held.get("beef") == null);
+        try std.testing.expectEqual(@as(usize, 2), not_held.map.len);
+        const upper = try a.dupe(u8, &hdr.toHex(t1.txid));
+        for (upper) |*ch| ch.* = std.ascii.toUpper(ch.*);
+        try expectSyncError(try syncAsk(a, &st, try syncFrame(a, &.{ .{ .key = "kind", .value = .{ .text = "tx" } }, .{ .key = "topic", .value = .{ .text = "tm_demo" } }, .{ .key = "txid", .value = .{ .text = upper } } })), "tx: txid is hex");
+        try expectSyncError(try syncAsk(a, &st, try syncFrame(a, &.{ .{ .key = "kind", .value = .{ .text = "tx" } }, .{ .key = "topic", .value = .{ .text = "tm_demo" } }, .{ .key = "txid", .value = .{ .bytes = &t1.txid } } })), "tx: txid is hex");
+    }
+
+    // ------------------------------------------------ errors: not served, no topic, unknown kind, not dag-cbor
+    {
+        try expectSyncError(try syncAsk(a, &st, try locatorFrame(a, "tm_other", &.{.{ 4, &a4 }})), "tm_other is not served here");
+        try expectSyncError(try syncAsk(a, &st, try syncFrame(a, &.{.{ .key = "kind", .value = .{ .text = "locator" } }})), "no topic");
+        try expectSyncError(try syncAsk(a, &st, try syncFrame(a, &.{ .{ .key = "kind", .value = .{ .text = "gossip" } }, .{ .key = "topic", .value = .{ .text = "tm_demo" } } })), "no request gossip");
+        try expectSyncError(try syncAsk(a, &st, "\xa1\x64kind"), "not dag-cbor");
+        try expectSyncError(try syncAsk(a, &st, ""), "not dag-cbor");
+        try expectSyncError(try syncAsk(a, &st, try cbor.encode(a, .{ .text = "tm_demo" })), "no topic");
+    }
+}

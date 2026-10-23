@@ -34,6 +34,9 @@
 //!                                   heights (a comma list; none named: its locator's)
 //!   GET  /admitted?topic=…&fromHeight=…&toHeight=…&limit=…   fn "admitted"   (0.14.0, shruggr/skein#150) →
 //!                                   {topic, blocks: [{height, blockHash, txids, bump}], nextHeight}
+//!   libp2p:/skein/overlay/sync/1.0.0   fn "sync"   (0.15.0, skein-overlay#5, shruggr/skein#154) a filter on
+//!                                   each frame of the sync protocol: one dag-cbor frame in, one answered
+//!                                   (`syncAnswer`), over the three reads above; nothing written, nothing logged
 //!
 //! Every request is appended, and the front door's step calls these (#68).
 //! A submit over HTTP is BRC-22 (0.9.1, shruggr/skein#112, David 2026-10-07: "the HTTP
@@ -271,6 +274,8 @@ pub fn call(a: Allocator, call_in: Value) !void {
         try anchors(a, in, arg)
     else if (eql(u8, func, "admitted"))
         try admitted(a, in, arg)
+    else if (eql(u8, func, "sync"))
+        try sync(a, in, arg)
     else
         return error.UnknownFunction;
     // A read route's filter (shruggr/skein#143: /lookup, the listings, the documentation): the
@@ -916,6 +921,142 @@ pub fn admittedAnswer(a: Allocator, st: *State, t: []const u8, from: u32, to: u3
         .{ .key = "blocks", .value = .{ .array = blocks } },
         .{ .key = "nextHeight", .value = if (got.next) |n| .{ .uint = n } else .null },
     }) };
+}
+
+// ---------------------------------------------------------------- the sync protocol (0.15.0)
+
+/// The sync protocol's frames (skein-overlay#5, David 2026-10-23; shruggr/skein#150, #154): the
+/// libp2p row `/skein/overlay/sync/1.0.0` names this function as its filter. Each inbound frame is
+/// one front-door call; the frame is the package's body (`request.body`, the kernel's filterArg for a
+/// libp2p frame: `{transport: "libp2p", request: {kind: "p2p-frame", protocol, from, body}, match,
+/// principal?, caller?}`), and the filter's answer body is the frame written back. Always answered
+/// (status 200), an error too: `{kind: "error", message}`. A read: nothing written, nothing logged.
+fn sync(a: Allocator, in: Value, req: Value) !Value {
+    const frame = if (req.get("request")) |r| r.getBytes("body") orelse "" else "";
+    var st = try load(a, in);
+    const out = try syncAnswer(a, &st, try calls.servedTopics(a, in), frame);
+    return respond(a, 200, sync_type, try cbor.encode(a, out));
+}
+
+/// The content type of a sync answer: one dag-cbor frame.
+pub const sync_type = "application/vnd.ipld.dag-cbor";
+
+fn syncError(a: Allocator, message: []const u8) !Value {
+    return .{ .map = try a.dupe(cbor.Entry, &.{
+        .{ .key = "kind", .value = .{ .text = "error" } },
+        .{ .key = "message", .value = .{ .text = message } },
+    }) };
+}
+
+/// One sync frame's answer over the state, the wire as the host's pulling half reads it (skein
+/// src/host/sync.ts; the answering half moved here from its `OverlaySync.answer`):
+///
+///   {kind: "locator", topic, locator: [{height, anchor: bytes(32)}]}
+///       → {kind: "locator", topic, genesisHeight?, agreedHeight?, tipHeight?}
+///   {kind: "admitted", topic, fromHeight, toHeight, limit}
+///       → {kind: "admitted", topic, blocks: [{height, blockHash, txids, bump}], nextHeight}   (hex, as /admitted)
+///   {kind: "tx", topic, txid}
+///       → {kind: "tx", txid, beef?: bytes}                                                   (absent: not held)
+///   anything else, a topic not served here, a frame that is not dag-cbor → {kind: "error", message}
+pub fn syncAnswer(a: Allocator, st: *State, served_topics: []const []const u8, frame: []const u8) !Value {
+    const req = cbor.decode(a, frame) catch return syncError(a, "not dag-cbor");
+    return syncOf(a, st, served_topics, req) catch |e| syncError(a, @errorName(e));
+}
+
+fn syncOf(a: Allocator, st: *State, served_topics: []const []const u8, req: Value) !Value {
+    const topic = req.getText("topic") orelse "";
+    if (topic.len == 0) return syncError(a, "no topic");
+    const t = for (served_topics) |x| {
+        if (eql(u8, x, topic)) break x;
+    } else return syncError(a, try std.fmt.allocPrint(a, "{s} is not served here", .{topic}));
+    const kind = req.getText("kind") orelse "";
+    if (eql(u8, kind, "locator")) return syncLocator(a, st, t, req);
+    if (eql(u8, kind, "admitted")) return syncAdmitted(a, st, t, req);
+    if (eql(u8, kind, "tx")) return syncTx(a, st, served_topics, req);
+    return syncError(a, try std.fmt.allocPrint(a, "no request {s}", .{if (req.get("kind")) |k| (if (k == .text) k.text else "?") else "undefined"}));
+}
+
+/// A frame's number as a height: absent or not a number, null; a number that is not a height (negative,
+/// fractional, past u32), `error.NotAHeight` (the `/anchors` and `/admitted` reads' 400).
+fn heightOf(v: ?Value) !?u32 {
+    const x = v orelse return null;
+    return switch (x) {
+        .uint => |n| if (n <= std.math.maxInt(u32)) @intCast(n) else error.NotAHeight,
+        .nint => error.NotAHeight,
+        .float => |f| if (f >= 0 and f <= std.math.maxInt(u32) and @floor(f) == f) @intFromFloat(f) else error.NotAHeight,
+        else => null,
+    };
+}
+
+/// The locator: the highest height in the peer's locator whose anchor equals ours; our genesis and tip.
+/// Only entries with a height and an anchor (bytes) count; none: our anchor at 0 is asked, which gives
+/// the span and no agreement.
+fn syncLocator(a: Allocator, st: *State, t: []const u8, req: Value) !Value {
+    var heights: std.ArrayList(u32) = .empty;
+    var theirs: std.ArrayList([]const u8) = .empty;
+    for (req.getArray("locator") orelse &.{}) |x| {
+        const h = (heightOf(x.get("height")) catch return syncError(a, "Invalid request: heights must be a comma list of heights")) orelse continue;
+        const anchor = x.getBytes("anchor") orelse continue;
+        try heights.append(a, h);
+        try theirs.append(a, anchor);
+    }
+    const ours = try anchorsAnswer(a, st, t, if (heights.items.len > 0) heights.items else &.{0});
+    var agreed: ?u32 = null;
+    for (heights.items, theirs.items) |h, anchor| {
+        for (ours.getArray("anchors").?) |o| {
+            if (o.getUint("height").? != h) continue;
+            if (!eql(u8, o.getText("anchor").?, try vm.hexAlloc(a, anchor))) continue;
+            if (agreed == null or h > agreed.?) agreed = h;
+        }
+    }
+    var es: std.ArrayList(cbor.Entry) = .empty;
+    try es.appendSlice(a, &.{
+        .{ .key = "kind", .value = .{ .text = "locator" } },
+        .{ .key = "topic", .value = .{ .text = t } },
+    });
+    if (ours.get("genesisHeight")) |g| try es.appendSlice(a, &.{
+        .{ .key = "genesisHeight", .value = g },
+        .{ .key = "tipHeight", .value = ours.get("tipHeight").? },
+    });
+    if (agreed) |h| try es.append(a, .{ .key = "agreedHeight", .value = .{ .uint = h } });
+    return .{ .map = es.items };
+}
+
+/// A range of the admitted lists, as `/admitted` answers it (the same defaults and bounds).
+fn syncAdmitted(a: Allocator, st: *State, t: []const u8, req: Value) !Value {
+    var q: [3]?u32 = undefined;
+    for ([_][]const u8{ "fromHeight", "toHeight", "limit" }, &q) |name, *x| {
+        x.* = heightOf(req.get(name)) catch return syncError(a, try std.fmt.allocPrint(a, "Invalid request: {s} must be a height", .{name}));
+    }
+    const ans = try admittedAnswer(a, st, t, q[0] orelse 0, q[1] orelse std.math.maxInt(u32), @min(@as(u64, q[2] orelse admitted_limit), admitted_limit));
+    return .{ .map = try a.dupe(cbor.Entry, &.{
+        .{ .key = "kind", .value = .{ .text = "admitted" } },
+        .{ .key = "topic", .value = .{ .text = t } },
+        .{ .key = "blocks", .value = ans.get("blocks").? },
+        .{ .key = "nextHeight", .value = ans.get("nextHeight").? },
+    }) };
+}
+
+/// A transaction the state reaches (`/holds` over the served topics): its Atomic BEEF from the chain
+/// state, as bytes; absent when not held (or the chain state cannot build one).
+fn syncTx(a: Allocator, st: *State, served_topics: []const []const u8, req: Value) !Value {
+    const txid_hex = req.getText("txid") orelse "";
+    const lower_hex = txid_hex.len == 64 and for (txid_hex) |ch| {
+        if (!std.ascii.isDigit(ch) and !(ch >= 'a' and ch <= 'f')) break false;
+    } else true;
+    if (!lower_hex) return syncError(a, "tx: txid is hex");
+    const txid = c.header.fromHex(txid_hex) catch return syncError(a, "tx: txid is hex");
+    var es: std.ArrayList(cbor.Entry) = .empty;
+    try es.appendSlice(a, &.{
+        .{ .key = "kind", .value = .{ .text = "tx" } },
+        .{ .key = "txid", .value = .{ .text = txid_hex } },
+    });
+    if (try st.holds(served_topics, txid)) |h| {
+        if (state.beefFor(st.ch, h.txid)) |bytes| {
+            try es.append(a, .{ .key = "beef", .value = .{ .bytes = bytes } });
+        } else |_| {}
+    }
+    return .{ .map = es.items };
 }
 
 /// A `Held` as the read answers it: `{txid, tx: <tx CID>, via, outpoint?: {txid, vout}}`.

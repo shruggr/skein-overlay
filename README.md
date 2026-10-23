@@ -4,7 +4,7 @@ The overlay services engine for a [skein](https://github.com/shruggr/skein),
 as an app: BRC-22 submit and BRC-24 lookup, served by the instance's own
 front door, with topic managers and lookup services as programs the engine
 calls. It is also a Zig package: an overlay of your own depends on it for
-the topic and lookup contracts. Version **0.14.1**.
+the topic and lookup contracts. Version **0.15.0**.
 
 ## What it is
 
@@ -188,7 +188,7 @@ The manifest (`etc/app.json`, this repo's own, description left out):
 {
   "kind": "app",
   "name": "overlay",
-  "version": "0.14.1",
+  "version": "0.15.0",
   "programs": {
     "overlay": "bin/overlay.wasm",
     "topic-demo": "bin/topic-demo.wasm",
@@ -209,7 +209,8 @@ The manifest (`etc/app.json`, this repo's own, description left out):
     "lookupDocumentation": "overlay.lookupDocumentation",
     "holds": "overlay.holds",
     "anchors": "overlay.anchors",
-    "admitted": "overlay.admitted"
+    "admitted": "overlay.admitted",
+    "sync": "overlay.sync"
   },
   "roles": { "root": ["register", "registerLookup", "deregisterLookup"] },
   "routes": [
@@ -222,7 +223,8 @@ The manifest (`etc/app.json`, this repo's own, description left out):
     {"transport": "http", "address": "/getDocumentationForLookupServiceProvider", "filters": ["lookupDocumentation"]},
     {"transport": "http", "address": "/holds", "filters": ["holds"]},
     {"transport": "http", "address": "/anchors", "filters": ["anchors"]},
-    {"transport": "http", "address": "/admitted", "filters": ["admitted"]}
+    {"transport": "http", "address": "/admitted", "filters": ["admitted"]},
+    {"transport": "libp2p", "address": "/skein/overlay/sync/1.0.0", "filters": ["sync"]}
   ]
 }
 ```
@@ -251,7 +253,9 @@ handler, and no sender; who may run a function is `roles`.
   (the input's `filter: true`), the engine answers `{answer: {status,
   type, body}}`, the same http answer as before inside it; anyone, signed
   or not. A read route names no program, so the engine finds its app by
-  the route's `app` (src/config.zig `matchedApp`).
+  the route's `app` (src/config.zig `matchedApp`). The libp2p row
+  `/skein/overlay/sync/1.0.0` is a read too: its filter `sync` answers each
+  frame (0.15.0, "Anchors" below).
 - One box per function class (shruggr/skein#128), three boxes:
   `<app>/submit` for submissions, `<app>/register` for registration, `<app>`
   for the engine's own events and messages.
@@ -406,7 +410,8 @@ computed again at the end of the step, and the beacon is declared again
 when the beat changed. The beat carries `tipHeight` and `tipAnchor` (absent
 before anything is mined) and `tailDigest`.
 
-Two reads serve the host's sync:
+Three http reads give the same answers to an app that chooses to publish
+them:
 
 - `GET /anchors?topic=&heights=h1,h2,…` → `{topic, genesisHeight,
   tipHeight, anchors: [{height, anchor}]}` for the heights in the span
@@ -418,6 +423,33 @@ Two reads serve the host's sync:
   transactions the topic judged, txids in block order (hex, display order),
   `bump` a compound BUMP over them (BRC-74, hex). At most 1 000 blocks and
   10 000 heights per read; `nextHeight` is where to go on, or `null`.
+
+The sync protocol (0.15.0, skein-overlay#5, shruggr/skein#154): libp2p
+`/skein/overlay/sync/1.0.0` is answered through the front door, by the
+engine's filter `sync` on the libp2p row of that address an app declares
+(the manifest above; an app that declares no such row does not serve sync).
+Each frame is one front-door call; the filter decodes it (the package's
+`body`) and answers one dag-cbor frame (the filter's answer body, type
+`application/vnd.ipld.dag-cbor`), which the host writes back on the
+stream. A read: the current state only, nothing written, nothing logged.
+
+```
+{kind: "locator", topic, locator: [{height, anchor: bytes(32)}]}
+    → {kind: "locator", topic, genesisHeight?, agreedHeight?, tipHeight?}
+{kind: "admitted", topic, fromHeight, toHeight, limit}
+    → {kind: "admitted", topic, blocks: [{height, blockHash, txids, bump}], nextHeight}   (hex, as /admitted)
+{kind: "tx", topic, txid}
+    → {kind: "tx", txid, beef?: bytes}                                                   (absent: not held)
+anything else, a topic not served here, a frame that is not dag-cbor → {kind: "error", message}
+```
+
+`agreedHeight` is the highest height in the peer's locator where our anchor
+equals theirs (absent: none; an empty locator asks for none). The ranges
+take `/admitted`'s defaults and bounds; `tx` is `/holds` over the served
+topics, with the chain state's Atomic BEEF as bytes. The pulling half (the
+beat trigger, the locator, the ranged pulls checked against the headers,
+the fetches into `/skein/overlay/beef/1.0.0`, the wants) is the host's
+(skein `src/host/sync.ts`).
 
 Not built: a reorg that replaces a block the engine hears no proof for (a
 block with nothing of the topic's in it, or a proof never re-sent) leaves
@@ -488,14 +520,14 @@ which clone this repo at a pinned commit (or take `$SKEIN_OVERLAY_DIR`).
 Not built: BRC-88 SHIP/SLAP (decided 2026-10-08, stopped: revoking an ad
 spends it, and the skein's wallet program takes no caller-supplied inputs;
 docs/OVERLAY.md "Not built"), GASP, the `historical-tx` modes. Catch-up
-from a peer is the host's (shruggr/skein#150): the engine keeps the
-anchors and answers the reads above.
+from a peer is pulled by the host (shruggr/skein#150): the engine keeps
+the anchors and answers the sync protocol's frames (0.15.0).
 
 ## Versions
 
 | | |
 |---|---|
-| this app and package | 0.14.1 (tag `v0.14.1`) |
+| this app and package | 0.15.0 (tag `v0.15.0`) |
 | skein-sdk | v0.11.1, by tag URL and hash in `build.zig.zon` (modules `chain` and, for the engine, `sk`; bsvz comes through it) |
 | requires | `chain/1` (shruggr/skein-chain 0.3.0) |
 | skein | log format 10, the BEEF envelope beside the pointer record (shruggr/skein#146); the routes / filters / roles manifest (shruggr/skein#143); skein's equivs pin this repo by commit |
@@ -751,6 +783,18 @@ skein-sdk v0.11.1 `beef.sorted`), `decodeRecord` (the door's envelope;
 the pointer record keeps the wire's order) and `atomicFor`. The walk, the
 ingests and the checks then go oldest first as before; a cycle is the one
 order refused.
+
+0.15.0 (skein-overlay#5, David, 2026-10-23): the sync protocol
+`/skein/overlay/sync/1.0.0` is answered by the engine through the front
+door, not by the host (shruggr/skein#154): fn `sync`, a filter on a libp2p
+row (`filters.sync: "overlay.sync"`, the row `{transport: "libp2p",
+address: "/skein/overlay/sync/1.0.0", filters: ["sync"]}`), decodes the
+frame and answers one frame — the locator (the comparison moved in from
+the host's `OverlaySync.answer`), a range of the admitted lists, a
+transaction's BEEF, or an error. An app serves sync only when it declares
+the row (skein-amm's and skein-1color's manifests each carry it, pinned on
+this release). The http reads `/anchors`, `/admitted` and `/holds` are
+unchanged. README "Anchors".
 
 ## Contributing
 
