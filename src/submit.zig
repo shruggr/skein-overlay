@@ -53,6 +53,16 @@
 //! lacks. Each want that ends is cleared by the event `{event: "unwant",
 //! txid, topic, peer?}` in the step that ends it (`State.wantEvents`).
 //!
+//! skein-overlay#6 (David 2026-10-23): a parent **in flight** — held, its own
+//! submission ingested and awaiting the chain app's answer, admission not yet
+//! landed (`State.isInFlight`) — pauses the submission too, waiting on it as
+//! on a missing one, but with no want (the event's `held`: nothing to ask
+//! anyone for). When the chain app answers for that parent (admitted,
+//! rejected, or an error answer) its thread sends the same `resume`
+//! (`State.heldWaitersOf`); routed again, the child is judged with the
+//! parent's outputs admitted (or refused on the merits, the parent rejected),
+//! or paused again for what it still lacks.
+//!
 //! shruggr/skein#112 (0.7.2): a submission is a message, `{fn: "submit",
 //! args: {beef, topics, offChainValues?}}`, into a box a row routes to the
 //! engine (`received`); POST /submit is the other path (0.9.1: BRC-22,
@@ -70,7 +80,8 @@
 //!   {kind: "submit", txid (hex), beef: <the pointer record> | bytes (the BEEF as received, the off-chain framing taken off),
 //!    topics: [{topic, previousCoins, outputsToAdmit, coinsToRetain, ancillaryTxids?}] (the subject's),
 //!    earlier?: [{txid, topics}] (the items before it, oldest first), wanted?: true,
-//!    requested?: [topic], waiting?: [txid hex] (paused), offChainValues?: bytes,
+//!    requested?: [topic], waiting?: [txid hex] (paused), held?: [txid hex] (of `waiting`, those in
+//!    flight: skein-overlay#6), offChainValues?: bytes,
 //!    source?: {transport, topic?, request: <the request record>}}
 //!
 //! `source` (#74) says where the submission came from: at admission it is
@@ -187,7 +198,9 @@ pub const Input = union(enum) {
 /// BUMPs are not proven again (the door did, #121); bytes are decoded once (#50) and checked.
 ///
 /// skein-overlay#1: a BEEF with parents neither in it nor held by the chain app (`missingParents`)
-/// is **paused**, judged by nothing yet, however it came (shruggr/skein#112). Otherwise the BEEF is walked oldest first, up to and
+/// is **paused**, judged by nothing yet, however it came (shruggr/skein#112). skein-overlay#6: so is
+/// one with parents in flight (`heldParents`: handed to the chain app in a submission, admission
+/// not yet landed), waiting on them too (`held` in its event: no want for them). Otherwise the BEEF is walked oldest first, up to and
 /// including the subject: each transaction every requested topic has not judged, and that is not
 /// pending in a submission of its own, is judged by each such topic, with the previous coins it
 /// would have once the transactions before it are admitted (`previousCoinsWith`: the outputs the
@@ -198,13 +211,19 @@ pub fn route(a: Allocator, caller: calls.Caller, st: *State, in: Value, beef: In
         .envelope => |e| state.decodeRecord(a, st.store, e),
         .bytes => |b| state.decode(a, st.store, b),
     } catch |e| return .{ .refused = @errorName(e) };
-    const missing = state.missingParents(a, st.ch, d) catch |e| return .{ .refused = @errorName(e) };
-    if (missing.len > 0 and topics.len > 0) {
+    const lacking = state.missingParents(a, st.ch, d) catch |e| return .{ .refused = @errorName(e) };
+    // skein-overlay#6: parents in flight (handed to the chain app, not yet admitted) are waited on
+    // too, with no want; one the chain app has not taken in yet is in flight, not missing.
+    const held = state.heldParents(a, st, d) catch |e| return .{ .refused = @errorName(e) };
+    var waiting: std.ArrayList([32]u8) = .empty;
+    for (lacking) |m| if (!contains(held, m)) try waiting.append(a, m);
+    try waiting.appendSlice(a, held);
+    if (waiting.items.len > 0 and topics.len > 0) {
         if (try st.isPending(d.subject) and !(try st.isPaused(d.subject))) return .{ .pending = d.subject };
         var all = true;
         for (topics) |t| all = all and try st.isApplied(t, d.subject);
         if (all) return .{ .unchanged = d.subject };
-        return .{ .paused = .{ .event = try pausedEvent(a, d.subject, beef, topics, missing, off, source), .txid = d.subject, .waiting = missing } };
+        return .{ .paused = .{ .event = try pausedEvent(a, d.subject, beef, topics, waiting.items, held, off, source), .txid = d.subject, .waiting = waiting.items } };
     }
     const sub = state.verifyDecoded(a, st.store, st.ch, d, beef == .envelope) catch |e| switch (e) {
         // A known-rejected transaction is a valid request that admits nothing (answered `rejected`).
@@ -253,6 +272,11 @@ pub fn route(a: Allocator, caller: calls.Caller, st: *State, in: Value, beef: In
         return .{ .nothing = if (why.items.len > 0) why.items else "NotAdmitted: no topic admitted an output or consumed a previous coin" };
     }
     return .{ .admit = .{ .event = try event(a, sub.txid, beef, items.items, off, source), .txid = sub.txid } };
+}
+
+fn contains(xs: []const [32]u8, x: [32]u8) bool {
+    for (xs) |y| if (eql(u8, &x, &y)) return true;
+    return false;
 }
 
 /// The libp2p peer a submission came from (its source's `from`), or null (HTTP, a host's own).
@@ -346,8 +370,9 @@ pub fn event(a: Allocator, txid: [32]u8, beef: Input, items: []const Item, off: 
 }
 
 /// A paused submission's event (skein-overlay#1): the subject, the BEEF, no judgement, the topics
-/// requested (`requested`: routed again with them), the parents it waits on (`waiting`, hex).
-fn pausedEvent(a: Allocator, txid: [32]u8, beef: Input, topics: []const []const u8, waiting: []const [32]u8, off: ?[]const u8, source: ?Value) !Value {
+/// requested (`requested`: routed again with them), the parents it waits on (`waiting`, hex), those
+/// of them in flight (`held`, hex, skein-overlay#6: no want; absent when none).
+fn pausedEvent(a: Allocator, txid: [32]u8, beef: Input, topics: []const []const u8, waiting: []const [32]u8, held: []const [32]u8, off: ?[]const u8, source: ?Value) !Value {
     const req = try a.alloc(Value, topics.len);
     for (topics, req) |t, *o| o.* = .{ .text = t };
     const ws = try a.alloc(Value, waiting.len);
@@ -361,6 +386,11 @@ fn pausedEvent(a: Allocator, txid: [32]u8, beef: Input, topics: []const []const 
         .{ .key = "requested", .value = .{ .array = req } },
         .{ .key = "waiting", .value = .{ .array = ws } },
     });
+    if (held.len > 0) {
+        const hs = try a.alloc(Value, held.len);
+        for (held, hs) |h, *o| o.* = try hexText(a, h);
+        try es.append(a, .{ .key = "held", .value = .{ .array = hs } });
+    }
     if (off) |o| try es.append(a, .{ .key = "offChainValues", .value = .{ .bytes = o } });
     if (source) |src| try es.append(a, .{ .key = "source", .value = src });
     return .{ .map = es.items };
@@ -484,6 +514,9 @@ pub const Begun = struct {
     paused: bool = false,
     waiting: []const [32]u8 = &.{},
     wants: []const Value = &.{},
+    /// The resume messages sent (skein-overlay#6): a parent in flight at the route answered for
+    /// before this step paused the submission.
+    resumes: []const []const u8 = &.{},
 };
 
 /// The submission thread's first step. Each item of the event (oldest first) to the chain app — an
@@ -523,7 +556,7 @@ pub fn begin(cx: Ctx, ev: Value) !Begun {
 }
 
 /// A paused submission's wants (shruggr/skein#112): one per (parent it waits on, topic requested,
-/// peer). The peers: every one that announced it — the event's `from`, the peers whose `-admit`
+/// peer), but none for a parent in flight (`held`, skein-overlay#6). The peers: every one that announced it — the event's `from`, the peers whose `-admit`
 /// for it was seen (`<app>/gossip`), the peers its wants stood against already (an earlier
 /// announcement; a resume) — or something needing it (the peers its own subject is wanted from).
 /// No peer (a submission by message or HTTP, or one whose wants had none): the want with no peer
@@ -533,6 +566,7 @@ fn pause(cx: Ctx, ev: Value, txid: [32]u8) !Begun {
     const a = cx.a;
     const st = cx.st;
     const waiting = try hexList(a, ev.get("waiting"));
+    const held = try hexList(a, ev.get("held"));
     const topics = try textList(a, ev.get("requested"));
     var peers: std.ArrayList([]const u8) = .empty;
     const own = peerOf(ev.get("source"));
@@ -548,11 +582,21 @@ fn pause(cx: Ctx, ev: Value, txid: [32]u8) !Begun {
     // Paused again: its waiters wait on (0.9.1).
     const wakes = if (try st.pendingRecord(txid)) |prior| try wakesOf(a, prior) else &.{};
     try st.putPending(txid, .{ .thread = cx.thread, .waiting = waiting, .event = ec, .wakes = wakes });
-    for (waiting) |w| for (topics) |t| {
-        if (none) try st.want(w, t, null, txid);
-        for (peers.items) |p| try st.want(w, t, p, txid);
+    for (waiting) |w| {
+        if (contains(held, w)) continue; // in flight: held here, nothing to ask anyone for (skein-overlay#6)
+        for (topics) |t| {
+            if (none) try st.want(w, t, null, txid);
+            for (peers.items) |p| try st.want(w, t, p, txid);
+        }
+    }
+    // A parent in flight at the route the chain app answered for since: its resume went out before
+    // this pause was recorded, so it is sent now (skein-overlay#6).
+    var resumes: std.ArrayList([]const u8) = .empty;
+    for (held) |h| if (!(try st.isInFlight(h))) {
+        try resumes.append(a, try cx.wire.send(a, calls.appOf(cx.in), try resumeBody(a, txid)));
+        break;
     };
-    return .{ .paused = true, .waiting = waiting, .wants = try st.wantEvents() };
+    return .{ .paused = true, .waiting = waiting, .wants = try st.wantEvents(), .resumes = resumes.items };
 }
 
 fn textList(a: Allocator, v: ?Value) ![]const []const u8 {
@@ -569,9 +613,10 @@ pub fn admitSeen(cx: Ctx, topic: []const u8, txid: [32]u8, peer: []const u8) !vo
     const rec = (try cx.st.pendingRecord(txid)) orelse return;
     if (rec.get("waiting") == null) return;
     const ev = try cx.st.store.getValue(cx.a, rec.getCid("event") orelse return error.BadState);
+    const held = try hexList(cx.a, ev.get("held"));
     for (try textList(cx.a, ev.get("requested"))) |t| {
         if (!eql(u8, t, topic)) continue;
-        for (try hexList(cx.a, rec.get("waiting"))) |w| try cx.st.want(w, t, peer, txid);
+        for (try hexList(cx.a, rec.get("waiting"))) |w| if (!contains(held, w)) try cx.st.want(w, t, peer, txid);
     }
 }
 
@@ -900,6 +945,8 @@ pub fn answered(cx: Ctx, ev: Value, ingest: []const u8, ans: Answer) !Stepped {
             },
             .failed => |why| {
                 try st.dropPending(it.txid);
+                // No longer in flight: a submission paused on it is routed again (skein-overlay#6).
+                try resumeHeld(cx, it.txid, &resumes);
                 if (it.subject and subjectTaken(ev)) try answerRejected(cx, source, it.txid, why);
             },
             .other => {},
@@ -970,10 +1017,26 @@ pub fn answered(cx: Ctx, ev: Value, ingest: []const u8, ans: Answer) !Stepped {
 }
 
 /// `txid` has come (the chain app answered for it: admitted or rejected): each paused submission
-/// waiting on it is sent a `resume` (box `<app>`, to the instance itself). Every want for it ends.
+/// waiting on it is sent a `resume` (box `<app>`, to the instance itself) — those that wanted it,
+/// and those that waited on it in flight (skein-overlay#6). Every want for it ends.
 fn resumeWaiters(cx: Ctx, txid: [32]u8, out: *std.ArrayList([]const u8)) !void {
-    for (try cx.st.takeWants(txid)) |w| {
+    const wanted = try cx.st.takeWants(txid);
+    for (wanted) |w| {
         if (!(try cx.st.isPaused(w))) continue;
+        try out.append(cx.a, try cx.wire.send(cx.a, calls.appOf(cx.in), try resumeBody(cx.a, w)));
+    }
+    try resumeHeldExcept(cx, txid, wanted, out);
+}
+
+/// `txid` is no longer in flight (skein-overlay#6): each paused submission that waited on it so
+/// (`held`) is sent a `resume`; routed again, it is judged, or paused again for what it still lacks.
+fn resumeHeld(cx: Ctx, txid: [32]u8, out: *std.ArrayList([]const u8)) !void {
+    try resumeHeldExcept(cx, txid, &.{}, out);
+}
+
+fn resumeHeldExcept(cx: Ctx, txid: [32]u8, sent: []const [32]u8, out: *std.ArrayList([]const u8)) !void {
+    for (try cx.st.heldWaitersOf(txid)) |w| {
+        if (contains(sent, w)) continue;
         try out.append(cx.a, try cx.wire.send(cx.a, calls.appOf(cx.in), try resumeBody(cx.a, w)));
     }
 }
@@ -982,7 +1045,7 @@ fn resumeWaiters(cx: Ctx, txid: [32]u8, out: *std.ArrayList([]const u8)) !void {
 pub const Resumed = union(enum) {
     /// Not paused (any more), or pending already in a submission of its own: nothing to do.
     none,
-    /// Missing parents: paused (again) (its wants recorded; the step's want / unwant events).
+    /// Missing parents, or parents in flight: paused (again) (its wants recorded for the missing; the step's want / unwant events).
     paused: Begun,
     /// Whole: the submit event to launch the submission's thread on (a pause is dropped).
     launch: Value,

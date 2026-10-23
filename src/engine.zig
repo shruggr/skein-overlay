@@ -23,7 +23,9 @@
 //!                             (`<topic>-proof`), rejected (the judgements removed, `rejected` hooks).
 //!   a resume                  the message {fn: "resume", args: {txid}} in box `<app>` from the
 //!                             instance itself (skein-overlay#1): a paused submission's parent has
-//!                             come; it is routed again — its thread launched, paused again, or dropped.
+//!                             come (or, skein-overlay#6, a parent in flight was answered for: admitted,
+//!                             rejected, failed); it is routed again — its thread launched, paused
+//!                             again, or dropped.
 //!   a wait                    the message {fn: "wait", args: {txid}} in box `<app>` from the
 //!                             instance itself (0.9.1): a POST /submit request waiting on a paused
 //!                             submission — one of its waiters, answered when the pause ends, or
@@ -422,7 +424,7 @@ fn run(a: Allocator) anyerror!void {
     var done: submit.Stepped = undefined;
     if (eql(u8, op, "submit")) {
         const begun = try submit.begin(cx, ev);
-        done = .{ .txid = try submit.txidOf(ev), .awaiting = begun.ingests, .done = begun.ingests.len == 0 };
+        done = .{ .txid = try submit.txidOf(ev), .awaiting = begun.ingests, .done = begun.ingests.len == 0, .resumes = begun.resumes };
         if (begun.ingests.len > 0) ingest = begun.ingests[begun.ingests.len - 1];
         try fields.append(a, .{ .key = "ingests", .value = .{ .array = try cids(a, begun.ingests) } });
         if (begun.paused) try fields.appendSlice(a, &.{

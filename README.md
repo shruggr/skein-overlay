@@ -4,7 +4,7 @@ The overlay services engine for a [skein](https://github.com/shruggr/skein),
 as an app: BRC-22 submit and BRC-24 lookup, served by the instance's own
 front door, with topic managers and lookup services as programs the engine
 calls. It is also a Zig package: an overlay of your own depends on it for
-the topic and lookup contracts. Version **0.15.0**.
+the topic and lookup contracts. Version **0.15.1**.
 
 ## What it is
 
@@ -61,7 +61,13 @@ cleared by `{event: "unwant", txid, topic, peer?}`. A peer answers a want
 on the stream `/skein/overlay/beef/1.0.0` (one Atomic BEEF per frame, the
 wanted txid its subject; no reply frame), routed to `submit` as a
 submission from that peer; when the parent is in, the paused one is routed
-again. The pause is internal: the submitter hears nothing of it. A
+again. A submission whose parent is held but not yet admitted (in flight:
+its own submission handed to the chain app, the answer not in) pauses on
+it the same way, with no want — nothing to ask anyone for — and is routed
+again when the chain app answers for that parent: judged with the parent's
+outputs admitted, refused on the merits if the parent was rejected, or
+paused again for what it still lacks (skein-overlay#6). The pause is
+internal: the submitter hears nothing of it. A
 transaction admitted on `accepted` sends the app itself a `watch`, which
 waits for `proven` (publishes `-proof`) or `rejected` (unwinds); with a
 submitter to answer, each proof is relayed and a new watch waits for the
@@ -188,7 +194,7 @@ The manifest (`etc/app.json`, this repo's own, description left out):
 {
   "kind": "app",
   "name": "overlay",
-  "version": "0.15.0",
+  "version": "0.15.1",
   "programs": {
     "overlay": "bin/overlay.wasm",
     "topic-demo": "bin/topic-demo.wasm",
@@ -527,7 +533,7 @@ the anchors and answers the sync protocol's frames (0.15.0).
 
 | | |
 |---|---|
-| this app and package | 0.15.0 (tag `v0.15.0`) |
+| this app and package | 0.15.1 (tag `v0.15.1`) |
 | skein-sdk | v0.11.1, by tag URL and hash in `build.zig.zon` (modules `chain` and, for the engine, `sk`; bsvz comes through it) |
 | requires | `chain/1` (shruggr/skein-chain 0.3.0) |
 | skein | log format 10, the BEEF envelope beside the pointer record (shruggr/skein#146); the routes / filters / roles manifest (shruggr/skein#143); skein's equivs pin this repo by commit |
@@ -795,6 +801,19 @@ transaction's BEEF, or an error. An app serves sync only when it declares
 the row (skein-amm's and skein-1color's manifests each carry it, pinned on
 this release). The http reads `/anchors`, `/admitted` and `/holds` are
 unchanged. README "Anchors".
+
+0.15.1 (skein-overlay#6, David, 2026-10-23): a submission whose parent is
+held but not yet admitted (in flight: its own submission ingested, the
+chain app's answer not in) pauses on that parent as on a missing one, with
+no want, and the parent's thread resumes it when the chain app answers
+(accepted or proven: admitted; rejected; an error answer). Before, it was
+judged at once against a parent whose outputs were not admitted yet and
+refused `NotAdmitted` (a block's transactions delivered back to back by the
+topic catch-up admitted one dependency level per beat, shruggr/skein#154).
+The paused event carries the parents in flight as `held`; a parent
+answered for between the route and the pause is resumed by the pause step
+itself. No wire, host or kernel change; the missing-parent pause and its
+wants are as they were.
 
 ## Contributing
 

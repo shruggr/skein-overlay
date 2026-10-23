@@ -26,8 +26,9 @@
 //!                rejected): `submission` the submission's subject (hex), `ingest` its own ingest
 //!                message, `heard` the chain app's admitting answer while an earlier transaction of
 //!                the same submission is still pending (skein-overlay#1); or a submission paused on
-//!                parents neither in its BEEF nor held (`waiting`: their txids, hex; `event`: the
-//!                submit event to route again)
+//!                parents neither in its BEEF nor held, or in flight (handed to the chain app in a
+//!                submission and not yet admitted, skein-overlay#6) (`waiting`: their txids, hex;
+//!                `event`: the submit event to route again, its `held` the ones in flight)
 //!   wants      wanted txid ‖ tp ‖ peer? → [subject txid (bytes)]   a want (skein-overlay#1, shruggr/skein#112):
 //!                a parent the paused submissions `subject` wait on, wanted under the topic `tp`,
 //!                to be asked of `peer` (the libp2p peer ID's multihash, a gossip message's
@@ -459,6 +460,33 @@ pub const State = struct {
 
     pub fn dropPending(self: *State, txid: [32]u8) !void {
         _ = try self.map("pending").remove(&txid);
+    }
+
+    /// Whether this transaction is handed to the chain app in a submission and awaiting its
+    /// answer (skein-overlay#6): pending with its ingest message (not a paused submission).
+    pub fn isInFlight(self: *State, txid: [32]u8) !bool {
+        const rec = (try self.pendingRecord(txid)) orelse return false;
+        return rec.getCid("ingest") != null;
+    }
+
+    /// The paused submissions waiting on `txid` as a parent in flight (skein-overlay#6: their
+    /// event's `held`; no want stands for it), each once, in key order.
+    pub fn heldWaitersOf(self: *State, txid: [32]u8) ![][32]u8 {
+        const hex = hdr.toHex(txid);
+        var out: std.ArrayList([32]u8) = .empty;
+        for (try self.map("pending").prefixed("")) |kv| {
+            if (kv.key.len != 32 or kv.value != .cid) continue;
+            const rec = try self.record(kv.value.cid);
+            if (rec.get("waiting") == null) continue;
+            const ev = try self.store.getValue(self.arena, rec.getCid("event") orelse continue);
+            for (ev.getArray("held") orelse &.{}) |h| {
+                if (h == .text and std.mem.eql(u8, h.text, &hex)) {
+                    try out.append(self.arena, kv.key[0..32].*);
+                    break;
+                }
+            }
+        }
+        return out.items;
     }
 
     // ------------------------------------------------------------ wanted parents (skein-overlay#1)
@@ -1344,6 +1372,29 @@ pub fn missingParents(a: Allocator, ch: *Chain, d: Decoded) ![][32]u8 {
             if (earlier or try ch.holds(src)) continue;
             try add(a, &out, src);
         }
+    }
+    return out.items;
+}
+
+/// The parents a submission waits on in flight (skein-overlay#6, David 2026-10-23): for every
+/// transaction the walk would judge (the subject and each one before it not pending in a
+/// submission of its own), each input's source handed to the chain app in a submission and not yet
+/// admitted (`State.isInFlight`). Held, not missing: no want for them; the submission pauses on
+/// them and is routed again when the chain app answers for them. Each once, in BEEF order.
+pub fn heldParents(a: Allocator, st: *State, d: Decoded) ![][32]u8 {
+    var out: std.ArrayList([32]u8) = .empty;
+    for (d.txs) |t| {
+        const is_subject = std.mem.eql(u8, &t.txid, &d.subject);
+        if (!is_subject and try st.isPending(t.txid)) continue; // its own submission's: not judged here
+        const tx = Transaction.parse(a, t.raw) catch return error.InvalidBeef;
+        for (tx.inputs) |in| {
+            const src = in.previous_outpoint.txid.bytes;
+            if (!(try st.isInFlight(src))) continue;
+            for (out.items) |x| {
+                if (std.mem.eql(u8, &x, &src)) break;
+            } else try out.append(a, src);
+        }
+        if (is_subject) break;
     }
     return out.items;
 }

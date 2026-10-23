@@ -156,7 +156,8 @@ shruggr/skein#121, #146). Delivery is the only acknowledgement: nothing answers
 until there is a verdict, and no request stays open. The engine routes the
 submission in its step on the message (`submit.received`, the same route's
 half as below): whole, it launches the submission's thread; lacking a
-parent, it pauses — internally: the submitter hears nothing of the pause or
+parent, or with a parent held but not yet admitted (0.15.1, skein-overlay#6:
+no want for it; routed again on its answer), it pauses — internally: the submitter hears nothing of the pause or
 the parents; refused (a BEEF that does not decode or verify), taken by no
 topic, or for no topic served here, it answers `rejected` at once.
 

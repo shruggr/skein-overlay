@@ -2499,6 +2499,217 @@ fn httpAnswer(a: Allocator, next: routes.HttpNext) !struct { status: u64, json: 
     return .{ .status = v.getUint("status").?, .json = try std.json.parseFromSliceLeaky(std.json.Value, a, v.getBytes("body").?, .{}), .v = v };
 }
 
+/// A spend of two outputs (`src0:vout0`, `src1:vout1`), each signed with `priv`.
+fn spend2(a: Allocator, src0: *const bsvz.transaction.Transaction, vout0: u32, src1: *const bsvz.transaction.Transaction, vout1: u32, outs: []const struct { u64, []const u8 }, priv: [32]u8) !Spent {
+    var b = bsvz.transaction.Builder.init(a);
+    try b.addInputFromTx(src0, vout0);
+    try b.addInputFromTx(src1, vout1);
+    for (outs) |o| try b.addOutput(.{ .satoshis = @intCast(o[0]), .locking_script = bsvz.script.Script.init(try a.dupe(u8, o[1])) });
+    var tx = try b.build();
+    const sp = bsvz.transaction.templates.p2pkh_spend;
+    const key = try bsvz.crypto.PrivateKey.fromBytes(priv);
+    for ([_]struct { *const bsvz.transaction.Transaction, u32 }{ .{ src0, vout0 }, .{ src1, vout1 } }, 0..) |s_, i| {
+        const prev = s_[0].outputs[s_[1]];
+        @constCast(tx.inputs)[i].unlocking_script = try sp.signAndBuildUnlockingScript(a, &tx, i, prev.locking_script, prev.satoshis, key, sp.default_scope);
+    }
+    const raw = try tx.serialize(a);
+    return .{ .tx = tx, .raw = raw, .txid = beef.txidOf(raw) };
+}
+
+/// fund, t1, t2 in one BEEF (the puller's shape: a block's transactions back to back).
+fn chainBeef(a: Allocator, x: Chain3) ![]const u8 {
+    return beef.serialize(a, .{ .version = beef.V2, .bumps = x.f.bumps, .entries = try a.dupe(beef.Entry, &.{
+        x.f.entry,
+        .{ .txid = x.t1.txid, .format = .raw, .raw = x.t1.raw, .tx = x.t1.tx },
+        .{ .txid = x.t2.txid, .format = .raw, .raw = x.t2.raw, .tx = x.t2.tx },
+    }) });
+}
+
+test "a parent in flight pauses (skein-overlay#6, David 2026-10-23): no want; admitted after its parent in one pass, no NotAdmitted; the missing-parent pause unchanged beside it" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = c.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var inst = try Instance.init(a, &ms);
+    const x = try chain3(a, &inst);
+
+    // t1 submitted: ingested, its answer not in yet (the chain app has not even taken it in).
+    const parent = try withFund(a, x.f, x.t1);
+    _ = try inst.submitted(parent);
+    try std.testing.expect(try inst.pending(x.t1.txid));
+
+    // t2 arrives with t1 in its BEEF (the deploy in the pool's, skein#154): before this change judged
+    // at once and refused NotAdmitted; now paused on t1, in flight — waiting on it, no want.
+    const two = try chainBeef(a, x);
+    const r = try inst.routeFrom(two, try fromGossip(a, peerId('A')));
+    try std.testing.expect(r == .paused);
+    try std.testing.expectEqual(@as(usize, 1), r.paused.waiting.len);
+    try std.testing.expectEqualSlices(u8, &x.t1.txid, &r.paused.waiting[0]);
+    try std.testing.expectEqualStrings(&hdr.toHex(x.t1.txid), r.paused.event.getArray("held").?[0].text);
+    const sent0 = inst.wire_.sent.items.len;
+    _ = try inst.begin(r.paused.event);
+    try std.testing.expect(inst.begun.paused);
+    try std.testing.expectEqual(@as(usize, 0), inst.begun.wants.len);
+    try std.testing.expectEqual(@as(usize, 0), inst.begun.resumes.len);
+    try std.testing.expectEqual(sent0, inst.wire_.sent.items.len); // nothing to the chain app, no resume
+    var st = try inst.load();
+    try std.testing.expect(try st.isPaused(x.t2.txid));
+    try std.testing.expect(!(try st.isWanted(x.t1.txid)));
+    try std.testing.expectEqual(@as(usize, 0), try st.map("wants").count());
+    // A peer's -admit for t2 seen: still no want for a parent in flight.
+    try inst.admitSeen(x.t2.txid, peerId('B'));
+    st = try inst.load();
+    try std.testing.expectEqual(@as(usize, 0), try st.map("wants").count());
+    // t2 alone (t1 held by the chain app now, still in flight): paused the same way.
+    _ = try inst.ingest(parent);
+    const alone = try inst.route(try atomic(a, x.t2));
+    try std.testing.expect(alone == .paused);
+    try std.testing.expectEqualSlices(u8, &x.t1.txid, &alone.paused.waiting[0]);
+
+    // t1 accepted: admitted, and the paused t2 resumed.
+    _ = try inst.chainStatus(x.t1.txid, "RECEIVED", null);
+    const got = try inst.answer(x.t1.txid, .accepted);
+    try std.testing.expect(got.admitted and got.done);
+    try std.testing.expectEqual(@as(usize, 1), got.resumes.len);
+    const rm = inst.wire_.last();
+    try std.testing.expectEqualStrings("resume", rm.body.getText("fn").?);
+    try std.testing.expectEqualStrings(&hdr.toHex(x.t2.txid), rm.body.get("args").?.getText("txid").?);
+
+    // The resume: t2 judged with t1's token live, launched, admitted — one pass.
+    const res = try inst.resumed(x.t2.txid);
+    try std.testing.expect(res == .launch);
+    try expectUints(&.{0}, res.launch.getArray("topics").?[0].get("previousCoins"));
+    try std.testing.expect(res.launch.get("earlier") == null); // t1 is admitted: not an item again
+    _ = try inst.begin(res.launch);
+    _ = try inst.ingest(two);
+    _ = try inst.chainStatus(x.t2.txid, "RECEIVED", null);
+    const done = try inst.answer(x.t2.txid, .accepted);
+    try std.testing.expect(done.admitted and done.done);
+    try std.testing.expectEqualSlices(u32, &.{0}, done.applied[0].coins_to_retain);
+    st = try inst.load();
+    try std.testing.expect(try st.isApplied("tm_demo", x.t2.txid));
+    try std.testing.expect(!(try st.isPending(x.t2.txid)));
+}
+
+test "a parent in flight rejected (skein-overlay#6): the waiting child routed once and refused on the merits, its pause dropped" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = c.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var inst = try Instance.init(a, &ms);
+    const x = try chain3(a, &inst);
+    const parent = try withFund(a, x.f, x.t1);
+    _ = try inst.submitted(parent);
+    _ = try inst.ingest(parent);
+    const child = try atomic(a, x.t2);
+    _ = try inst.begin((try inst.route(child)).paused.event);
+    try std.testing.expect(inst.begun.paused);
+
+    _ = try inst.chainStatus(x.t1.txid, "REJECTED", null);
+    const got = try inst.answer(x.t1.txid, .{ .rejected = "REJECTED" });
+    try std.testing.expect(!got.admitted and got.done);
+    try std.testing.expectEqual(@as(usize, 1), got.resumes.len);
+    // Routed once, on the merits: judged without t1's token (no previous coin; tm_demo takes the
+    // new token as a mint), its pause dropped, its thread launched — and the chain app refuses it.
+    const res = try inst.resumed(x.t2.txid);
+    try std.testing.expect(res == .launch);
+    try expectUints(&.{}, res.launch.getArray("topics").?[0].get("previousCoins"));
+    var st = try inst.load();
+    try std.testing.expect(!(try st.isPaused(x.t2.txid)));
+    // A stale resume finds nothing paused.
+    try std.testing.expect((try inst.resumed(x.t2.txid)) == .none);
+    _ = try inst.begin(res.launch);
+    _ = try inst.ingest(child);
+    // The chain app's word on a spend of a rejected transaction.
+    const done = try inst.answer(x.t2.txid, .{ .rejected = "REJECTED" });
+    try std.testing.expect(!done.admitted and done.done);
+    try std.testing.expect(!(try inst.pending(x.t2.txid)));
+    try std.testing.expect(!(try inst.applied(x.t2.txid)));
+}
+
+test "a parent in flight and a parent missing (skein-overlay#6): waits on both, wants only the missing one; the one in flight admitted, paused again on the missing one" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = c.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var inst = try Instance.init(a, &ms);
+    const k = try keys(0x42);
+    const f = try fund(a, 0x55, 2, &k.p2pkh);
+    try inst.headers(&.{&f.h1});
+    const t1 = try spend(a, &f.tx, 0, &.{ .{ 1, &k.token }, .{ 9_000, &k.p2pkh } }, k.priv);
+    const u = try spend(a, &f.tx, 1, &.{.{ 9_500, &k.p2pkh }}, k.priv); // never submitted here: missing
+    const child = try spend2(a, &t1.tx, 0, &u.tx, 0, &.{.{ 1, &k.token }}, k.priv);
+
+    const parent = try withFund(a, f, t1);
+    _ = try inst.submitted(parent);
+    _ = try inst.ingest(parent);
+    const pa = peerId('A');
+    const r = try inst.routeFrom(try atomic(a, child), try fromGossip(a, pa));
+    try std.testing.expect(r == .paused);
+    try std.testing.expectEqual(@as(usize, 2), r.paused.waiting.len);
+    try std.testing.expectEqualSlices(u8, &u.txid, &r.paused.waiting[0]); // the missing, then the one in flight
+    try std.testing.expectEqualSlices(u8, &t1.txid, &r.paused.waiting[1]);
+    _ = try inst.begin(r.paused.event);
+    try std.testing.expectEqual(@as(usize, 1), inst.begun.wants.len);
+    try std.testing.expectEqualStrings(&hdr.toHex(u.txid), inst.begun.wants[0].getText("txid").?);
+    var st = try inst.load();
+    try std.testing.expect(try st.hasWant(u.txid, "tm_demo", pa));
+    try std.testing.expect(!(try st.isWanted(t1.txid)));
+    try std.testing.expectEqual(@as(usize, 1), try st.map("wants").count());
+
+    // t1 admitted: the child resumed, paused again on u alone; its want stands, no new event.
+    _ = try inst.chainStatus(t1.txid, "RECEIVED", null);
+    const got = try inst.answer(t1.txid, .accepted);
+    try std.testing.expect(got.admitted);
+    try std.testing.expectEqual(@as(usize, 1), got.resumes.len);
+    const res = try inst.resumed(child.txid);
+    try std.testing.expect(res == .paused);
+    try std.testing.expectEqual(@as(usize, 1), res.paused.waiting.len);
+    try std.testing.expectEqualSlices(u8, &u.txid, &res.paused.waiting[0]);
+    try std.testing.expectEqual(@as(usize, 0), res.paused.wants.len);
+    st = try inst.load();
+    try std.testing.expect(try st.hasWant(u.txid, "tm_demo", pa));
+    try std.testing.expectEqual(@as(usize, 1), try st.map("wants").count());
+}
+
+test "a parent in flight answered for between the route and the pause (skein-overlay#6): the pause step resumes it at once; an error answer resumes too" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = c.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var inst = try Instance.init(a, &ms);
+    const x = try chain3(a, &inst);
+    const parent = try withFund(a, x.f, x.t1);
+    _ = try inst.submitted(parent);
+    _ = try inst.ingest(parent);
+    // The libp2p route (a call) pauses t2 on t1 in flight; t1's answer lands before the thread's first step.
+    const r = try inst.routeFrom(try atomic(a, x.t2), try fromGossip(a, peerId('A')));
+    try std.testing.expect(r == .paused);
+    _ = try inst.chainStatus(x.t1.txid, "RECEIVED", null);
+    const got = try inst.answer(x.t1.txid, .accepted);
+    try std.testing.expect(got.admitted);
+    try std.testing.expectEqual(@as(usize, 0), got.resumes.len); // nobody paused on it yet
+    _ = try inst.begin(r.paused.event);
+    try std.testing.expect(inst.begun.paused);
+    try std.testing.expectEqual(@as(usize, 0), inst.begun.wants.len);
+    try std.testing.expectEqual(@as(usize, 1), inst.begun.resumes.len);
+    try std.testing.expectEqualStrings("resume", inst.wire_.last().body.getText("fn").?);
+    try std.testing.expect((try inst.resumed(x.t2.txid)) == .launch);
+
+    // An error answer for a parent in flight: no longer in flight, the child resumed.
+    var inst2 = try Instance.init(a, &ms);
+    const y = try chain3(a, &inst2);
+    _ = try inst2.submitted(try withFund(a, y.f, y.t1));
+    _ = try inst2.begin((try inst2.route(try atomic(a, y.t2))).paused.event);
+    const failed = try inst2.answer(y.t1.txid, .{ .failed = "chain app unavailable" });
+    try std.testing.expect(failed.done);
+    try std.testing.expectEqual(@as(usize, 1), failed.resumes.len);
+}
+
 test "POST /submit is BRC-22 and synchronous (0.9.1, shruggr/skein#112, David 2026-10-07): the thread launched and waited on, the STEAK; several waiters on one thread; a resubmission judged before answered from the state, nothing run again; undecided 503 with Retry-After; rejected 400; no topic 200 with the empty STEAK" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
