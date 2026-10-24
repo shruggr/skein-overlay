@@ -670,6 +670,7 @@ wire"). Stepped:
 | a message in box `<app>` from the instance itself (row from `$self`) | `{fn: "watch", args: {txid, ingest}}` | the watch: the later proof (`-proof`) or rejection (unwound) |
 | a message in box `<app>` from the instance itself (row from `$self`) | `{fn: "resume", args: {txid}}` | a paused submission routed again (skein-overlay#1): its thread launched, paused again, or dropped; its wake at that thread's end, nothing |
 | a message in box `<app>` from the instance itself (row from `$self`) | `{fn: "wait", args: {txid}}` (0.9.1) | an HTTP request waiting on a paused submission: added to its waiters, or answered at once when it is not paused ("POST /submit", above); a late answer to a `wait`, nothing |
+| a message in box `<app>` from the instance itself (row from `$self`) | `{fn: "rebeat"}` (0.16.0) | the app's program that wrote the head `<app>/terms` says so: every registered topic's beacon re-declared, its body over its beat now with the new terms ("Beats", below); nothing written |
 | the `peer-admit` event in box `<app>` (an `admit` message's admit) | `{kind: "peer-admit", …}` | recorded under `<app>/gossip` ("Gossip", below); nothing admitted; a pause of that transaction wants its parents from that peer too |
 | a message in box `register`, i.e. `<app>/register` (the manifest's row, from `$owner`; 0.7.7) | `{fn: "register", args: {topic, program}}` or `{fn: "deregister", args: {topic}}` | the registered set under `<app>/topics` and its events ("Register a topic", below); in any other box, refused (`bad-args`) |
 
@@ -725,7 +726,7 @@ key), `<topic>-proof` → `overlay.peerProof`; the http route
 and the read route `/lookup` (the filter `lookup`, `overlay.lookup`;
 anyone, signed or not), under `/<app>/`; and the app's box `<app>` as an
 `event` route (the libp2p routes' admitted events) and a `mailbox` route
-(its own watch, resume and wait, by the host's loopback; the engine takes
+(its own watch, resume, wait and rebeat, by the host's loopback; the engine takes
 only the instance's own messages there) — all to the role `overlay`. The
 manifest's own routes: the submission box `submit` (`kernel.beef`), the
 registration box `register` (handler `overlay.register`, gated by `roles:
@@ -908,10 +909,19 @@ A topic's beat body is dag-cbor `{view: {count, digest}, terms?,
 tipHeight?, tipAnchor?, tailDigest}` (0.14.0: the tip's height and anchor,
 absent before anything the topic judged is mined, and the tail's digest;
 "Anchors", above):
-`terms` (0.12.1) is `config.overlay.terms` (`defaults.overlayTerms`) as
-configured, any value, opaque to the engine and copied as is (a
-non-integral number is no dag-cbor here: the configuration is refused, as a
-bad window is); absent, no field. `view` is its **view
+`terms` (0.16.0, David 2026-10-23: "The configs should not be published in
+the image. This will be a dynamic, competitive marketplace.") is the root
+record of the head `<app>/terms` (config.zig `termsOf`), a dag-cbor record
+the app writes at runtime (skein-amm: root's `terms` message to
+amm-validator), opaque to the engine and copied as is, read at each beacon
+declaration; no head, or a root that is not a map (the app's cleared terms:
+the record `null`), no field. Terms set: a validator; unset: a market only.
+The beat itself stays for every node either way (the sync needs the view
+digest). A change of the terms re-declares every registered topic's beacon:
+the engine sees no other program's head change in a step of its own, so the
+writer sends the instance itself `{fn: "rebeat"}` in box `<app>` (topics.zig
+`rebeatEvents`). 0.12.1 to 0.15.1 copied `config.overlay.terms`
+(`defaults.overlayTerms`) instead; it is no longer read. `view` is its **view
 digest** (`src/state.zig` `View`): `count`, the topic's admitted-and-unspent
 outputs; `digest`, 32 bytes, the sum mod 2^256 of each such outpoint's hash
 `sha256(txid (32 bytes, internal byte order) ‖ vout (4 bytes,
@@ -948,9 +958,7 @@ updates it: `Service.beat(service, body)` in the hook, and the hook's
 answer carries `beats: {<service>: bytes}`; the engine re-declares each
 registered service named (the last body per service in a step).
 
-`origin` is the host's, not the engine's. skein's install
-(src/host/manifest.ts `OVERLAY_FIELDS`) must accept `terms` in
-`config.overlay` before a manifest can set it. Declared topics and
+`origin` is the host's, not the engine's. Declared topics and
 services (`config.overlay`) do not beat, as before.
 
 Not built (stopped, 0.12.1): a spend the chain app records of an output in

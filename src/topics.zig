@@ -57,9 +57,15 @@
 //! spend and proof): an app's new
 //! `beacon {topic, every, body}` replaces its previous one (skein
 //! src/host/p2p.ts), and a receiver's liveness tool keeps the latest beat per
-//! sender — one logged event per change (`beatEvents`). `terms` (0.12.1) is
-//! `config.overlay.terms` as configured, opaque to the engine; absent, no
-//! field. (`origin` is the host's.)
+//! sender — one logged event per change (`beatEvents`). `terms` (0.16.0) is
+//! the root record of the head `<app>/terms`, which the app writes at runtime
+//! (config.zig `termsOf`; 0.12.1 to 0.15.1: `config.overlay.terms`, gone),
+//! opaque to the engine; absent, no field: a beat without terms (David
+//! 2026-10-23: terms set, a validator; unset, a market only). The beat itself
+//! stays for every node (the sync needs the view digest). A change of the
+//! terms re-declares every registered topic's beacon (`rebeatEvents`), on the
+//! message `{fn: "rebeat"}` the writer sends the instance itself in box
+//! `<app>` (engine.zig `rebeatStep`). (`origin` is the host's.)
 //!
 //! Each registered lookup service beats too, on `<service>-live` (lookups.zig;
 //! `registerLookup` declares its beacon, `deregisterLookup` ends it, every
@@ -285,7 +291,8 @@ pub fn answerBox(args: Value, app: []const u8) []const u8 {
 pub const Roles = struct {
     market: u64 = default_window_ms,
     validator: u64 = default_every_ms,
-    /// `config.overlay.terms` (0.12.1): opaque, copied into each topic's beat body as `terms`; null: none.
+    /// The head `<app>/terms`'s record (0.16.0, config.zig `termsOf`): opaque, copied into each topic's
+    /// beat body as `terms`; null: none.
     terms: ?Value = null,
 };
 
@@ -331,8 +338,8 @@ pub fn unbeaconEvent(a: Allocator, name: []const u8) !Value {
 }
 
 /// A topic's beat body (0.12.0): dag-cbor `{view: {count, digest}, terms?, tipHeight?, tipAnchor?,
-/// tailDigest}`, the topic's view digest (state.zig `View`), (0.12.1) `config.overlay.terms` as
-/// configured, when it is, and (0.14.0, shruggr/skein#150) the anchor at its tip and the digest of its
+/// tailDigest}`, the topic's view digest (state.zig `View`), (0.16.0) the head `<app>/terms`'s record
+/// when there is one, and (0.14.0, shruggr/skein#150) the anchor at its tip and the digest of its
 /// tail (state.zig `Beat`): `tipHeight` and `tipAnchor` once a transaction it judged is mined.
 pub fn beatBody(a: Allocator, b: st_mod.Beat, terms: ?Value) ![]const u8 {
     var es: std.ArrayList(cbor.Entry) = .empty;
@@ -383,6 +390,15 @@ pub fn beatEvents(a: Allocator, roles: Roles, topics: []const Entry, services: [
         try out.append(a, try beaconEvent(a, lb.service, ms, lb.body));
     }
     return out.items;
+}
+
+/// The beacons a `rebeat` re-declares (0.16.0): one per registered topic (`topics`), its body over
+/// its beat now (`beats`, one per topic, in order) with `roles.terms` — the terms changed, so every
+/// topic's body did.
+pub fn rebeatEvents(a: Allocator, roles: Roles, topics: []const Entry, beats: []const st_mod.Beat) ![]const Value {
+    const out = try a.alloc(Value, topics.len);
+    for (topics, beats, out) |e, b, *o| o.* = try beaconEvent(a, e.topic, roles.validator, try beatBody(a, b, roles.terms));
+    return out;
 }
 
 /// `deregister {topic}`.

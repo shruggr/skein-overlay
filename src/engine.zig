@@ -30,6 +30,9 @@
 //!                             instance itself (0.9.1): a POST /submit request waiting on a paused
 //!                             submission — one of its waiters, answered when the pause ends, or
 //!                             answered at once (submit.zig `waitOn`).
+//!   a rebeat                  the message {fn: "rebeat"} in box `<app>` from the instance itself
+//!                             (0.16.0): sent by the app's program that wrote the head `<app>/terms`
+//!                             (the beat's terms); every registered topic's beacon re-declared.
 //!   a peer's admit            the `peer-admit` event an `admit` message on `<topic>` (or one on a
 //!                             `-admit` route, before 0.12.0) admits (box `<app>`): recorded under
 //!                             `<app>/gossip`.
@@ -165,10 +168,44 @@ fn emitBeats(a: Allocator, step: Value, st: *@import("state.zig").State) !usize 
     const troot = try vm.head(a, try topics.headName(a, app));
     const tl = try topics.entriesOf(a, if (troot) |r| try s.getValue(a, r) else null);
     const services = try lookupNames(a, step);
-    const roles = config.rolesOf(a, step) catch return 0; // a bad configuration: registering is refused
+    const roles = (try rolesNow(a, step)) orelse return 0; // a bad configuration: registering is refused
     const evs = try topics.beatEvents(a, roles, tl, services, changes, st.lookup_beats.items);
     for (evs) |e| _ = try vm.emitEvent(a, e);
     return evs.len;
+}
+
+/// The engine's roles (config.zig `rolesOf`; null: a bad configuration, error.BadRoles) with the
+/// beat's terms (0.16.0): the record of the head `<app>/terms` the app writes (config.zig `termsOf`),
+/// read now, at each beacon declaration.
+fn rolesNow(a: Allocator, step: Value) !?topics.Roles {
+    var r = config.rolesOf(a, step) catch |e| switch (e) {
+        error.BadRoles => return null,
+        else => |x| return x,
+    };
+    r.terms = try config.termsOf(a, vm.store(), ev_.heads(), calls.appOf(step));
+    return r;
+}
+
+/// `rebeat` (0.16.0): the message `{fn: "rebeat"}` in box `<app>` from the instance itself, sent by
+/// the app's program that wrote the head `<app>/terms` (skein-amm's amm-validator, on root's `terms`):
+/// the engine sees no other program's head change in a step of its own, so the writer tells it.
+/// Every registered topic's beacon is re-declared with its beat body now (`topics.rebeatEvents`: the
+/// terms the head's, or none); the lookup services' beacons are their programs' and stay. Nothing
+/// is written. Result `{op: "rebeat", beats}`, or `{op, error}` on a bad configuration.
+fn rebeatStep(a: Allocator, step: Value) !void {
+    const s = vm.store();
+    var fields: std.ArrayList(cbor.Entry) = .empty;
+    if (try rolesNow(a, step)) |roles| {
+        const troot = try vm.head(a, try topics.headName(a, calls.appOf(step)));
+        const tl = try topics.entriesOf(a, if (troot) |r| try s.getValue(a, r) else null);
+        var loaded = try ev_.load(a, step);
+        const beats = try a.alloc(@import("state.zig").Beat, tl.len);
+        for (tl, beats) |e, *b| b.* = try loaded.st.beat(e.topic);
+        const evs = try topics.rebeatEvents(a, roles, tl, beats);
+        for (evs) |e| _ = try vm.emitEvent(a, e);
+        try fields.append(a, .{ .key = "beats", .value = .{ .uint = evs.len } });
+    } else try fields.append(a, .{ .key = "error", .value = .{ .text = "rebeat: the configuration's roles are config.overlay.market {window: <ms>} and config.overlay.validator {every: <ms>}, each from 1000 ms to a day" } });
+    _ = try vm.finish(a, s, try resultRecord(a, "rebeat", fields.items));
 }
 
 /// The registered lookup services' names (`<app>/lookups`).
@@ -186,7 +223,7 @@ fn answersField(fields: *std.ArrayList(cbor.Entry), a: Allocator) !void {
 }
 
 /// A topic's beat body as the state holds its beat now (0.12.0, 0.14.0, topics.zig `beatBody`), with the
-/// configured terms (0.12.1): the register's `topic` (none: the empty view).
+/// terms (0.16.0: the head `<app>/terms`'s record, `rolesNow`): the register's `topic` (none: the empty view).
 fn topicBeat(a: Allocator, step: Value, fargs: Value, roles: topics.Roles) ![]const u8 {
     const t = fargs.getText("topic") orelse return topics.beatBody(a, .{}, roles.terms);
     if (t.len == 0) return topics.beatBody(a, .{}, roles.terms);
@@ -208,11 +245,11 @@ fn registration(a: Allocator, step: Value, args: Value, body: Value, func: []con
     const list = try topics.entriesOf(a, rec);
     const fargs: Value = body.get("args") orelse .{ .map = &.{} };
     // The roles: always a market and a validator (0.12.0), at config.overlay.market / .validator's ms or the defaults.
-    const roles: ?topics.Roles = config.rolesOf(a, step) catch null; // error.BadRoles only
+    const roles: ?topics.Roles = try rolesNow(a, step); // null: error.BadRoles
     const change: topics.Change = if (!topics.mayRegister(args, calls.appOf(step)))
         .{ .refused = try topics.notHere(a, func, args, calls.appOf(step)) }
     else if (roles == null)
-        .{ .refused = try std.fmt.allocPrint(a, "{s}: the configuration's roles are config.overlay.market {{window: <ms>}} and config.overlay.validator {{every: <ms>}}, each from 1000 ms to a day, and config.overlay.terms has no non-integral number", .{func}) }
+        .{ .refused = try std.fmt.allocPrint(a, "{s}: the configuration's roles are config.overlay.market {{window: <ms>}} and config.overlay.validator {{every: <ms>}}, each from 1000 ms to a day", .{func}) }
     else if (eql(u8, func, "register"))
         try topics.withRoles(a, try topics.register(a, list, fargs, step.get("programs") orelse return error.BadConfig, try config.selfRole(a, s, step, null)), true, roles.?, try topicBeat(a, step, fargs, roles.?))
     else
@@ -268,11 +305,11 @@ fn lookupRegistration(a: Allocator, step: Value, args: Value, body: Value, func:
     const root = try vm.head(a, head);
     const list = try lookups.entriesOf(a, if (root) |r| try s.getValue(a, r) else null);
     const fargs: Value = body.get("args") orelse .{ .map = &.{} };
-    const roles: ?topics.Roles = config.rolesOf(a, step) catch null; // error.BadRoles only
+    const roles: ?topics.Roles = try rolesNow(a, step); // null: error.BadRoles
     const change: lookups.Change = if (!topics.mayRegister(args, calls.appOf(step)))
         .{ .refused = try topics.notHere(a, func, args, calls.appOf(step)) }
     else if (roles == null)
-        .{ .refused = try std.fmt.allocPrint(a, "{s}: the configuration's roles are config.overlay.market {{window: <ms>}} and config.overlay.validator {{every: <ms>}}, each from 1000 ms to a day, and config.overlay.terms has no non-integral number", .{func}) }
+        .{ .refused = try std.fmt.allocPrint(a, "{s}: the configuration's roles are config.overlay.market {{window: <ms>}} and config.overlay.validator {{every: <ms>}}, each from 1000 ms to a day", .{func}) }
     else if (eql(u8, func, "registerLookup"))
         try lookups.register(a, list, fargs, step.get("programs") orelse return error.BadConfig)
     else
@@ -399,6 +436,7 @@ fn run(a: Allocator) anyerror!void {
         const func = body.getText("fn") orelse "";
         if (eql(u8, func, "resume")) return resumeStep(a, step, body.get("args") orelse return error.BadInput);
         if (eql(u8, func, "wait")) return waitStep(a, step, args, body);
+        if (eql(u8, func, "rebeat")) return rebeatStep(a, step);
         if (!eql(u8, func, "watch")) return error.UnknownFn;
         watch_args = body.get("args") orelse return error.BadInput;
         op = if (reply == null) "watch" else "watched";

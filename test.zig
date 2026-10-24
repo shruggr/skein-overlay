@@ -1892,7 +1892,7 @@ test "lookup beats (0.12.0, David 2026-10-09): <service>-live for each registere
     try std.testing.expectEqualStrings("ls_x-live", off[1].getText("topic").?);
 }
 
-test "the beat's terms (0.12.1): config.overlay.terms, opaque, copied into each topic's beat body as `terms`; absent, no field" {
+test "the beat's terms (0.16.0): the head <app>/terms's record, opaque, copied into each topic's beat body as `terms`; no head, no field; a change re-declares every topic's beacon; config.overlay.terms is no more" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -1915,43 +1915,68 @@ test "the beat's terms (0.12.1): config.overlay.terms, opaque, copied into each 
             }));
         }
     }.f;
-
-    // Configured: whatever the app's config says, read from the app record at every step.
-    const terms = try mapOf(a, &.{
-        .{ .key = "validatorFeeBps", .value = .{ .uint = 5 } },
-        .{ .key = "note", .value = .{ .text = "any shape" } },
-        .{ .key = "tiers", .value = .{ .array = &.{ .{ .uint = 1 }, .null, .{ .boolean = true } } } },
-    });
-    var hm = HeadMap{};
-    try hm.m.put(a, "overlay/app", try appWith(a, s, engine, try mapOf(a, &.{.{ .key = "terms", .value = terms }})));
-    const step = try config.resolve(a, s, hm.heads(), in, null);
-    const roles = try config.rolesOf(a, step);
-    try std.testing.expect(roles.terms != null);
     const v: state.View = viewOf(&.{.{ .{0x11} ** 32, 0 }});
+    const reg = [_]topics_mod.Entry{ .{ .topic = "tm_a", .program = "p" }, .{ .topic = "tm_b", .program = "p" } };
+    const beats = [_]state.Beat{ .{ .view = v }, .{} };
+    var hm = HeadMap{};
+
+    // config.overlay.terms (0.12.1 to 0.15.1) is read no more: an app that still sets it beats without terms.
+    try hm.m.put(a, "overlay/app", try appWith(a, s, engine, try mapOf(a, &.{.{ .key = "terms", .value = try mapOf(a, &.{.{ .key = "fee", .value = .{ .uint = 1 } }}) }})));
+    const step = try config.resolve(a, s, hm.heads(), in, null);
+    try std.testing.expect((try config.rolesOf(a, step)).terms == null);
+    try std.testing.expect(step.get("defaults").?.get("overlayTerms") == null);
+
+    // Without: no head <app>/terms, no field (a market only; the beat stays).
+    var plain = try config.rolesOf(a, step);
+    plain.terms = try config.termsOf(a, s, hm.heads(), "overlay");
+    try std.testing.expect(plain.terms == null);
+    const plain_body = try cbor.decode(a, try topics_mod.beatBody(a, .{ .view = v }, plain.terms));
+    try std.testing.expect(plain_body.get("terms") == null);
+    try std.testing.expectEqual(@as(u64, 1), plain_body.get("view").?.getUint("count").?);
+
+    // With: the head's record, as is (dag-cbor's map order is the encoder's: compare by encoding).
+    const terms = try mapOf(a, &.{
+        .{ .key = "lpFeeBps", .value = .{ .uint = 30 } },
+        .{ .key = "validatorFeeBps", .value = .{ .uint = 5 } },
+        .{ .key = "commissionBps", .value = .{ .uint = 0 } },
+    });
+    try std.testing.expectEqualStrings("overlay/terms", try config.termsHeadName(a, "overlay"));
+    try hm.m.put(a, "overlay/terms", try s.putValue(a, terms));
+    var roles = try config.rolesOf(a, step);
+    roles.terms = try config.termsOf(a, s, hm.heads(), "overlay");
+    try std.testing.expect(roles.terms != null);
     const body = try cbor.decode(a, try topics_mod.beatBody(a, .{ .view = v }, roles.terms));
     try std.testing.expectEqual(@as(usize, 3), body.map.len); // view, terms, tailDigest
-    try std.testing.expectEqual(@as(u64, 1), body.get("view").?.getUint("count").?);
-    // Copied as is (dag-cbor's map order is the encoder's: compare by encoding).
     try std.testing.expectEqualSlices(u8, try cbor.encode(a, terms), try cbor.encode(a, body.get("terms").?));
-    // A re-declared beacon carries them too.
-    const evs = try topics_mod.beatEvents(a, roles, &.{.{ .topic = "tm_a", .program = "p" }}, &.{}, &.{.{ .topic = "tm_a", .before = .{}, .now = .{ .view = v } }}, &.{});
+    // A beacon re-declared on a view change carries them, and so does the register's.
+    const evs = try topics_mod.beatEvents(a, roles, reg[0..1], &.{}, &.{.{ .topic = "tm_a", .before = .{}, .now = .{ .view = v } }}, &.{});
     try std.testing.expectEqualSlices(u8, try topics_mod.beatBody(a, .{ .view = v }, roles.terms), evs[0].getBytes("body").?);
-    // And the register's beacon (withRoles over the body the engine gives it).
     const reg_body = try cbor.decode(a, (try topics_mod.roleEvents(a, true, "tm_a", roles, try topics_mod.beatBody(a, .{}, roles.terms)))[1].getBytes("body").?);
     try std.testing.expect(reg_body.get("terms") != null);
 
-    // Absent: no field.
-    try hm.m.put(a, "overlay/app", try appWith(a, s, engine, try mapOf(a, &.{})));
-    const plain = try config.rolesOf(a, try config.resolve(a, s, hm.heads(), in, null));
-    try std.testing.expect(plain.terms == null);
-    try std.testing.expect((try cbor.decode(a, try topics_mod.beatBody(a, .{ .view = v }, plain.terms))).get("terms") == null);
-
-    // A non-integral number is no dag-cbor here: refused as a bad configuration (registering is refused).
-    const bad = try mapOf(a, &.{.{ .key = "defaults", .value = try mapOf(a, &.{.{ .key = "overlayTerms", .value = .{ .text = "{\"fee\":0.5}" } }}) }});
-    try std.testing.expectError(error.BadRoles, config.rolesOf(a, bad));
-    // Not JSON: likewise.
-    const junk = try mapOf(a, &.{.{ .key = "defaults", .value = try mapOf(a, &.{.{ .key = "overlayTerms", .value = .{ .text = "{" } }}) }});
-    try std.testing.expectError(error.BadRoles, config.rolesOf(a, junk));
+    // After a change (the rebeat): every registered topic's beacon, its body over its beat now, the new terms.
+    const changed = try mapOf(a, &.{
+        .{ .key = "lpFeeBps", .value = .{ .uint = 30 } },
+        .{ .key = "validatorFeeBps", .value = .{ .uint = 5 } },
+        .{ .key = "commissionBps", .value = .{ .uint = 25 } },
+    });
+    try hm.m.put(a, "overlay/terms", try s.putValue(a, changed));
+    roles.terms = try config.termsOf(a, s, hm.heads(), "overlay");
+    const re = try topics_mod.rebeatEvents(a, roles, &reg, &beats);
+    try std.testing.expectEqual(@as(usize, 2), re.len);
+    for (re, reg, beats) |e, r, b| {
+        try std.testing.expectEqualStrings("beacon", e.getText("event").?);
+        try std.testing.expectEqualStrings(try std.mem.concat(a, u8, &.{ r.topic, "-live" }), e.getText("topic").?);
+        try std.testing.expectEqual(@as(u64, 30_000), e.getUint("every").?);
+        try std.testing.expectEqualSlices(u8, try topics_mod.beatBody(a, b, roles.terms), e.getBytes("body").?);
+        const t = (try cbor.decode(a, e.getBytes("body").?)).get("terms").?;
+        try std.testing.expectEqual(@as(u64, 25), t.getUint("commissionBps").?);
+    }
+    // Cleared (the app writes the record null): none again, and the rebeat's bodies carry no terms.
+    try hm.m.put(a, "overlay/terms", try s.putValue(a, .null));
+    roles.terms = try config.termsOf(a, s, hm.heads(), "overlay");
+    try std.testing.expect(roles.terms == null);
+    for (try topics_mod.rebeatEvents(a, roles, &reg, &beats)) |e| try std.testing.expect((try cbor.decode(a, e.getBytes("body").?)).get("terms") == null);
 }
 
 /// fund (mined) → t1 (mints a token) → t2 (spends it into a new one), both unproven.
