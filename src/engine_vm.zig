@@ -129,7 +129,9 @@ pub fn gossipState(a: Allocator, in: Value) !*gossip.State {
 /// sees them now; `head` the overlay state's CID it loaded.
 pub fn load(a: Allocator, in: Value) !struct { st: state.State, head: ?[]const u8 } {
     const s = vm.store();
-    const ch = try state.chainView(a, s, try vm.head(a, state.chain_head), try network(in));
+    // The chain app's state, read only, through the SDK's one opener (shruggr/skein-sdk#1).
+    const ch = try a.create(state.Chain);
+    ch.* = try c.open(a, s, try vm.head(a, state.chain_head), try network(in));
     const h = try vm.head(a, try stateHead(a, in));
     return .{ .st = try state.State.load(a, s, h, ch), .head = h };
 }

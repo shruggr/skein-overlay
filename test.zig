@@ -328,7 +328,8 @@ const Instance = struct {
         var ovl = Overlay{ .inner = self.ms.store(), .arena = self.a };
         self.current = ovl.store();
         defer self.current = self.ms.store();
-        const ch = try state.chainView(self.a, ovl.store(), self.chain_root, .regtest);
+        const ch = try self.a.create(state.Chain);
+        ch.* = try c.open(self.a, ovl.store(), self.chain_root, .regtest);
         var st = try state.State.load(self.a, ovl.store(), self.ov_root, ch);
         st.now = self.now;
         return submit.route(self.a, self.caller(), &st, self.in, input, self.topics, null, source);
@@ -340,7 +341,8 @@ const Instance = struct {
     }
     fn load(self: *Instance) !state.State {
         self.current = self.ms.store();
-        const ch = try state.chainView(self.a, self.ms.store(), self.chain_root, .regtest);
+        const ch = try self.a.create(state.Chain);
+        ch.* = try c.open(self.a, self.ms.store(), self.chain_root, .regtest);
         var st = try state.State.load(self.a, self.ms.store(), self.ov_root, ch);
         st.now = self.now;
         return st;
@@ -425,7 +427,8 @@ const Instance = struct {
         var ovl = Overlay{ .inner = self.ms.store(), .arena = self.a };
         self.current = ovl.store();
         defer self.current = self.ms.store();
-        const ch = try state.chainView(self.a, ovl.store(), self.chain_root, .regtest);
+        const ch = try self.a.create(state.Chain);
+        ch.* = try c.open(self.a, ovl.store(), self.chain_root, .regtest);
         var st = try state.State.load(self.a, ovl.store(), self.ov_root, ch);
         st.now = self.now;
         const sub = (try routes.httpRequest(self.a, req)).ok;

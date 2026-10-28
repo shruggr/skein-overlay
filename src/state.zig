@@ -323,16 +323,6 @@ fn uints(a: Allocator, xs: []const u32) ![]Value {
     return out;
 }
 
-/// The chain state the root names (null: none yet, an empty chain on `network`), read only. Its own
-/// record says which network it is on.
-pub fn chainView(a: Allocator, s: Store, root: ?[]const u8, network: Network) !*Chain {
-    var net = network;
-    if (root) |r| net = Network.parse((try s.getValue(a, r)).getText("network") orelse "") orelse return error.BadChainState;
-    const ch = try a.create(Chain);
-    ch.* = try Chain.load(a, s, root, net);
-    return ch;
-}
-
 /// A transaction's block, read (`get`: in a call, through its overlay) and decoded.
 pub fn subjectOf(a: Allocator, s: Store, txid: [32]u8) !Subject {
     const tc = try a.dupe(u8, &store_mod.hashCid(.tx, txid));

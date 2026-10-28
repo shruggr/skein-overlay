@@ -308,9 +308,7 @@ pub fn handle(a: Allocator, spec: Spec, s: Store, network: c.chain.Network, stat
     const service = arg.getText("service") orelse return error.BadArgs;
     var svc = try Service.loadIndex(a, s, service, try indexOf(a, spec, arg), spec.maps, state);
     if (std.mem.eql(u8, func, "lookup")) {
-        var net = network;
-        if (chain) |r| net = c.chain.Network.parse((try s.getValue(a, r)).getText("network") orelse "") orelse return error.BadChainState;
-        var ch = try Chain.load(a, s, chain, net);
+        var ch = try c.open(a, s, chain, network);
         return .{ .answer = try answerRecord(a, spec, &svc, &ch, arg) };
     }
     if (std.mem.eql(u8, func, "beat")) {

@@ -4,7 +4,7 @@ The overlay services engine for a [skein](https://github.com/shruggr/skein),
 as an app: BRC-22 submit and BRC-24 lookup, served by the instance's own
 front door, with topic managers and lookup services as programs the engine
 calls. It is also a Zig package: an overlay of your own depends on it for
-the topic and lookup contracts. Version **0.16.0**.
+the topic and lookup contracts. Version **0.16.1**.
 
 ## What it is
 
@@ -194,7 +194,7 @@ The manifest (`etc/app.json`, this repo's own, description left out):
 {
   "kind": "app",
   "name": "overlay",
-  "version": "0.16.0",
+  "version": "0.16.1",
   "programs": {
     "overlay": "bin/overlay.wasm",
     "topic-demo": "bin/topic-demo.wasm",
@@ -536,8 +536,8 @@ the anchors and answers the sync protocol's frames (0.15.0).
 
 | | |
 |---|---|
-| this app and package | 0.16.0 (tag `v0.16.0`) |
-| skein-sdk | v0.11.1, by tag URL and hash in `build.zig.zon` (modules `chain` and, for the engine, `sk`; bsvz comes through it) |
+| this app and package | 0.16.1 (tag `v0.16.1`) |
+| skein-sdk | v0.12.0, by tag URL and hash in `build.zig.zon` (modules `chain` and, for the engine, `sk`; bsvz comes through it) |
 | requires | `chain/1` (shruggr/skein-chain 0.3.0) |
 | skein | log format 10, the BEEF envelope beside the pointer record (shruggr/skein#146); the routes / filters / roles manifest (shruggr/skein#143); skein's equivs pin this repo by commit |
 
@@ -829,6 +829,14 @@ read; `defaults.overlayTerms` gone). A terms change re-declares every
 registered topic's beacon: the message `{fn: "rebeat"}` in box `<app>` from
 the instance itself, sent by the program that wrote the head (engine.zig
 `rebeatStep`, topics.zig `rebeatEvents`). No wire, host or kernel change.
+
+0.16.1 (shruggr/skein-sdk#1, shruggr/skein#156): the chain app's state is
+read through the SDK's one opener, skein-sdk v0.12.0 `chain.open` (network
+from the record; none yet, an empty state on the configured network):
+`state.chainView` is gone, the engine and the lookup handler call it. No
+behaviour change. (skein-chain 0.7.0's chain state names the host chain's
+`headers` and `heights` roots, read through the host/chain exception: the
+same layout, nothing here changes.)
 
 ## Contributing
 
