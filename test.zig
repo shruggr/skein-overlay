@@ -29,6 +29,7 @@ const config = @import("src/config.zig");
 const topics_mod = @import("src/topics.zig");
 const calls = @import("src/calls.zig");
 const routes = @import("src/routes.zig");
+const configured = @import("src/configured.zig");
 
 const bsvz = c.bsvz;
 const beef = c.beef;
@@ -1923,11 +1924,22 @@ test "the beat's terms (0.16.0): the head <app>/terms's record, opaque, copied i
     const beats = [_]state.Beat{ .{ .view = v }, .{} };
     var hm = HeadMap{};
 
-    // config.overlay.terms (0.12.1 to 0.15.1) is read no more: an app that still sets it beats without terms.
-    try hm.m.put(a, "overlay/app", try appWith(a, s, engine, try mapOf(a, &.{.{ .key = "terms", .value = try mapOf(a, &.{.{ .key = "fee", .value = .{ .uint = 1 } }}) }})));
+    // config.overlay.terms (0.17.0, skein-amm#4): the initial value while no head <app>/terms is written.
+    const initial = try mapOf(a, &.{.{ .key = "fee", .value = .{ .uint = 1 } }});
+    try hm.m.put(a, "overlay/app", try appWith(a, s, engine, try mapOf(a, &.{.{ .key = "terms", .value = initial }})));
+    {
+        const st0 = try config.resolve(a, s, hm.heads(), in, null);
+        try std.testing.expect((try config.rolesOf(a, st0)).terms == null); // rolesOf names none: termsOf does
+        try std.testing.expect(st0.get("defaults").?.get("overlayTerms") == null);
+        const t0 = (try config.termsOf(a, s, hm.heads(), "overlay")).?;
+        try std.testing.expectEqualSlices(u8, try cbor.encode(a, initial), try cbor.encode(a, t0));
+        // The head wins once written, its cleared null too.
+        try hm.m.put(a, "overlay/terms", try s.putValue(a, .null));
+        try std.testing.expect(try config.termsOf(a, s, hm.heads(), "overlay") == null);
+        _ = hm.m.remove("overlay/terms");
+    }
+    try hm.m.put(a, "overlay/app", try appWith(a, s, engine, try mapOf(a, &.{})));
     const step = try config.resolve(a, s, hm.heads(), in, null);
-    try std.testing.expect((try config.rolesOf(a, step)).terms == null);
-    try std.testing.expect(step.get("defaults").?.get("overlayTerms") == null);
 
     // Without: no head <app>/terms, no field (a market only; the beat stays).
     var plain = try config.rolesOf(a, step);
@@ -4092,4 +4104,8 @@ test "the sync protocol (0.15.0, skein-overlay#5): fn sync a filter on the libp2
         try expectSyncError(try syncAsk(a, &st, ""), "not dag-cbor");
         try expectSyncError(try syncAsk(a, &st, try cbor.encode(a, .{ .text = "tm_demo" })), "no topic");
     }
+}
+
+test {
+    _ = configured;
 }

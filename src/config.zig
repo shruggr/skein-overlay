@@ -23,10 +23,13 @@
 //!   config.overlay.market    {window: <ms>}   optional: the market's liveness window (defaults.overlayMarket; `rolesOf`)
 //!   config.overlay.validator {every: <ms>}    optional: the validator's beat (defaults.overlayValidator)
 //!
+//!   config.overlay.terms     {…}              optional (0.17.0): the beat's INITIAL terms (`termsOf`)
+//!
 //! (0.16.0, David 2026-10-23: "The configs should not be published in the image. This will be a
-//! dynamic, competitive marketplace.") `config.overlay.terms` (0.12.1 to 0.15.1) is gone: the
-//! beat's terms are the root record of the head `<app>/terms`, which the app writes at runtime
-//! (`termsOf`).
+//! dynamic, competitive marketplace.") The beat's terms are the root record of the head
+//! `<app>/terms`, which the app writes at runtime (`termsOf`). (0.17.0, shruggr/skein-amm#4) Until
+//! the app writes it, `config.overlay.terms` is their initial value: the admin's, given at a
+//! create's config (not the image's); the head, once written, wins (its `null` too).
 //!
 //! The two roles (shruggr/skein#120; 0.12.0, David 2026-10-09: "every skein
 //! is marketplace AND validator from install, always"): registering a topic
@@ -97,7 +100,7 @@ const role_max_ms = topics.role_max_ms;
 /// text: an app's `config.overlay.market: {window}` / `config.overlay.validator: {every}`): each its
 /// ms, absent the default (topics.zig `default_window_ms`, `default_every_ms`; 0.12.0: always a
 /// market and a validator). Another shape, or a value outside 1 000 ms .. a day: error.BadRoles.
-/// `terms` is not the configuration's (0.16.0): the caller adds the head's (`termsOf`).
+/// `terms` is not here: the caller adds them (`termsOf`: the head's, else the configuration's initial value).
 pub fn rolesOf(a: Allocator, in: Value) error{ BadRoles, OutOfMemory }!topics.Roles {
     return .{
         .market = (try roleMs(a, in, "overlayMarket", "window")) orelse topics.default_window_ms,
@@ -115,10 +118,24 @@ pub fn termsHeadName(a: Allocator, app: []const u8) ![]u8 {
 /// into each topic's beat body as `terms`. No head, or a root that is not a map (an app's cleared
 /// terms: the record `null`): none, and the beat carries no `terms`. Read at every beacon
 /// declaration, as the configuration is.
+///
+/// (0.17.0, shruggr/skein-amm#4) No head: the app record's `config.overlay.terms` (a map) is the
+/// INITIAL value — a token instance born with its admin's default terms beats them before any
+/// program of its app has stepped. The head, once written, wins, its cleared `null` included.
 pub fn termsOf(a: Allocator, s: Store, heads: Heads, app: []const u8) !?Value {
-    const root = (try heads.head(a, try termsHeadName(a, app))) orelse return null;
-    const v = try s.getValue(a, root);
-    return if (v == .map) v else null;
+    if (try heads.head(a, try termsHeadName(a, app))) |root| {
+        const v = try s.getValue(a, root);
+        return if (v == .map) v else null;
+    }
+    return configTerms(try appNamed(a, heads, s, app));
+}
+
+/// An app record's `config.overlay.terms` when it is a map, else null.
+pub fn configTerms(app: ?Value) ?Value {
+    const cf = (app orelse return null).get("config") orelse return null;
+    const ov = cf.get("overlay") orelse return null;
+    const t = ov.get("terms") orelse return null;
+    return if (t == .map) t else null;
 }
 
 fn roleMs(a: Allocator, in: Value, key: []const u8, field: []const u8) error{BadRoles}!?u64 {

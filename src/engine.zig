@@ -54,6 +54,12 @@
 //!                             on `<service>-live` (0.12.0: its body the lookup program's fn
 //!                             "beat"), unliveness and unbeacon on deregister; answered {service, active}.
 //!
+//!   configured topics and    (0.17.0, configured.zig) every step first declares the topics and
+//!   lookups                  lookup services `config.overlay` names (not registered) — liveness and
+//!                            a beacon on `<name>-live`, as a registration's — when the configuration
+//!                            differs from what the head `<app>/configured` says was declared; a
+//!                            dropped name gets unliveness / unbeacon.
+//!
 //! The market / validator switch (0.9.2) is gone (0.12.0, David 2026-10-09: "every skein is
 //! marketplace AND validator from install, always"): a message {fn: "market" | "validator"} is
 //! no function of the engine. A step that changes a registered topic's view digest (an admission,
@@ -91,6 +97,7 @@ const calls = @import("calls.zig");
 const config = @import("config.zig");
 const topics = @import("topics.zig");
 const lookups = @import("lookups.zig");
+const configured = @import("configured.zig");
 
 const cbor = c.cbor;
 const Value = cbor.Value;
@@ -169,7 +176,9 @@ fn emitBeats(a: Allocator, step: Value, st: *@import("state.zig").State) !usize 
     const tl = try topics.entriesOf(a, if (troot) |r| try s.getValue(a, r) else null);
     const services = try lookupNames(a, step);
     const roles = (try rolesNow(a, step)) orelse return 0; // a bad configuration: registering is refused
-    const evs = try topics.beatEvents(a, roles, tl, services, changes, st.lookup_beats.items);
+    // 0.17.0: the configured topics and services beat as the registered ones (configured.zig).
+    const conf = try configuredNow(a, step, tl, services);
+    const evs = try topics.beatEvents(a, roles, try std.mem.concat(a, topics.Entry, &.{ tl, conf.topics }), try std.mem.concat(a, []const u8, &.{ services, try configured.lookupNames(a, conf) }), changes, st.lookup_beats.items);
     for (evs) |e| _ = try vm.emitEvent(a, e);
     return evs.len;
 }
@@ -197,7 +206,9 @@ fn rebeatStep(a: Allocator, step: Value) !void {
     var fields: std.ArrayList(cbor.Entry) = .empty;
     if (try rolesNow(a, step)) |roles| {
         const troot = try vm.head(a, try topics.headName(a, calls.appOf(step)));
-        const tl = try topics.entriesOf(a, if (troot) |r| try s.getValue(a, r) else null);
+        const registered = try topics.entriesOf(a, if (troot) |r| try s.getValue(a, r) else null);
+        // 0.17.0: the configured topics' beacons too (configured.zig).
+        const tl = try std.mem.concat(a, topics.Entry, &.{ registered, (try configuredNow(a, step, registered, try lookupNames(a, step))).topics });
         var loaded = try ev_.load(a, step);
         const beats = try a.alloc(@import("state.zig").Beat, tl.len);
         for (tl, beats) |e, *b| b.* = try loaded.st.beat(e.topic);
@@ -206,6 +217,52 @@ fn rebeatStep(a: Allocator, step: Value) !void {
         try fields.append(a, .{ .key = "beats", .value = .{ .uint = evs.len } });
     } else try fields.append(a, .{ .key = "error", .value = .{ .text = "rebeat: the configuration's roles are config.overlay.market {window: <ms>} and config.overlay.validator {every: <ms>}, each from 1000 ms to a day" } });
     _ = try vm.finish(a, s, try resultRecord(a, "rebeat", fields.items));
+}
+
+/// What the configuration beats now (configured.zig `of`): its topics and lookup services beside the
+/// registered ones (`registered`, `services`), and its terms. No app record (a genesis-wired engine): nothing.
+fn configuredNow(a: Allocator, step: Value, registered: []const topics.Entry, services: []const []const u8) !configured.Now {
+    const s = vm.store();
+    const app = (try config.appRecord(a, s, ev_.heads(), try config.selfProgram(a, s, step, null))) orelse return .{};
+    return configured.of(a, app, registered, services);
+}
+
+/// 0.17.0 (shruggr/skein-amm#4): the configured topics and lookup services declared — liveness and a
+/// beacon on `<name>-live`, as a registration's (topics.zig `roleEvents`) — on the engine's first
+/// step after it sees the configuration, and again whenever it changes (configured.zig: the head
+/// `<app>/configured` keeps what was declared; a name dropped from the configuration gets unliveness
+/// and unbeacon). A change of `config.overlay.terms` re-declares the registered topics' beacons too
+/// (their bodies carry the terms while the head `<app>/terms` is unset). Nothing configured and
+/// nothing declared before: nothing written. → the events emitted.
+fn declareConfigured(a: Allocator, step: Value) !usize {
+    const s = vm.store();
+    const app = calls.appOf(step);
+    const troot = try vm.head(a, try topics.headName(a, app));
+    const registered = try topics.entriesOf(a, if (troot) |r| try s.getValue(a, r) else null);
+    const now = try configuredNow(a, step, registered, try lookupNames(a, step));
+    const head = try configured.headName(a, app);
+    const proot = try vm.head(a, head);
+    const prev: ?Value = if (proot) |r| try s.getValue(a, r) else null;
+    const rec = try configured.recordOf(a, now);
+    if (prev == null and now.topics.len == 0 and now.lookups.len == 0 and now.terms == null) return 0;
+    if (try configured.same(a, prev, rec)) return 0;
+    const roles = (try rolesNow(a, step)) orelse return 0; // a bad configuration: as a register, nothing declared
+    var evs: std.ArrayList(Value) = .empty;
+    for (try configured.dropped(a, try configured.namesOf(a, prev, "topics"), try configured.topicNames(a, now))) |t|
+        try evs.appendSlice(a, try topics.roleEvents(a, false, t, roles, ""));
+    for (try configured.dropped(a, try configured.namesOf(a, prev, "lookups"), try configured.lookupNames(a, now))) |l|
+        try evs.appendSlice(a, try topics.roleEvents(a, false, l, roles, ""));
+    var loaded = try ev_.load(a, step);
+    for (now.topics) |e| try evs.appendSlice(a, try topics.roleEvents(a, true, e.topic, roles, try topics.beatBody(a, try loaded.st.beat(e.topic), roles.terms)));
+    for (now.lookups) |e| try evs.appendSlice(a, try topics.roleEvents(a, true, e.service, roles, try calls.lookupBeat(a, ev_.caller(), step, e.service, e.program)));
+    if (try configured.termsChanged(a, prev, rec)) {
+        const beats = try a.alloc(@import("state.zig").Beat, registered.len);
+        for (registered, beats) |e, *b| b.* = try loaded.st.beat(e.topic);
+        try evs.appendSlice(a, try topics.rebeatEvents(a, roles, registered, beats));
+    }
+    for (evs.items) |e| _ = try vm.emitEvent(a, e);
+    try vm.advance(head, try s.putValue(a, rec));
+    return evs.items.len;
 }
 
 /// The registered lookup services' names (`<app>/lookups`).
@@ -400,6 +457,8 @@ fn run(a: Allocator) anyerror!void {
     if (eql(u8, in.getText("kind") orelse "", "call")) return routes.call(a, in);
     // The topics, lookup services, programs and the app's name: the app record's (config.zig), else the genesis's.
     const step = try ev_.configured(a, in, null);
+    // 0.17.0: the configured topics and lookups beat, declared on the first step that sees them.
+    _ = try declareConfigured(a, step);
     const args = step.get("args") orelse return error.BadInput;
     const reply: ?Value = if (step.get("reply")) |r| (if (r == .map) r else null) else null;
 

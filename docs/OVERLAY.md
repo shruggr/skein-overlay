@@ -903,7 +903,11 @@ message `{fn: "market" | "validator"}` is no function of the engine.
 **Beats (0.12.0).** David, 2026-10-09: beats are libp2p service discovery;
 they replace SHIP/SLAP on the libp2p network (they are not SHIP/SLAP, and
 no SHIP/SLAP ad is published p2p). Every registered topic beats on
-`<topic>-live`, every registered lookup service on `<service>-live`.
+`<topic>-live`, every registered lookup service on `<service>-live`; and
+(0.17.0, skein-overlay#8) so does every topic and lookup service
+`config.overlay` names, declared on the engine's first step that sees the
+configuration (src/configured.zig: the head `<app>/configured` records what
+was declared; a name the configuration drops is undeclared).
 
 A topic's beat body is dag-cbor `{view: {count, digest}, terms?,
 tipHeight?, tipAnchor?, tailDigest}` (0.14.0: the tip's height and anchor,
@@ -914,14 +918,15 @@ the image. This will be a dynamic, competitive marketplace.") is the root
 record of the head `<app>/terms` (config.zig `termsOf`), a dag-cbor record
 the app writes at runtime (skein-amm: root's `terms` message to
 amm-validator), opaque to the engine and copied as is, read at each beacon
-declaration; no head, or a root that is not a map (the app's cleared terms:
-the record `null`), no field. Terms set: a validator; unset: a market only.
+declaration; a root that is not a map (the app's cleared terms: the record
+`null`), no field; no head: `config.overlay.terms` (0.17.0, the initial
+value: the admin's, given at a create's config), else no field. Terms set: a validator; unset: a market only.
 The beat itself stays for every node either way (the sync needs the view
 digest). A change of the terms re-declares every registered topic's beacon:
 the engine sees no other program's head change in a step of its own, so the
 writer sends the instance itself `{fn: "rebeat"}` in box `<app>` (topics.zig
-`rebeatEvents`). 0.12.1 to 0.15.1 copied `config.overlay.terms`
-(`defaults.overlayTerms`) instead; it is no longer read. `view` is its **view
+`rebeatEvents`). (0.12.1 to 0.15.1 copied `config.overlay.terms` whatever
+the head; 0.16.x did not read it.) `view` is its **view
 digest** (`src/state.zig` `View`): `count`, the topic's admitted-and-unspent
 outputs; `digest`, 32 bytes, the sum mod 2^256 of each such outpoint's hash
 `sha256(txid (32 bytes, internal byte order) ‖ vout (4 bytes,

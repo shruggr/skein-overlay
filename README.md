@@ -4,7 +4,7 @@ The overlay services engine for a [skein](https://github.com/shruggr/skein),
 as an app: BRC-22 submit and BRC-24 lookup, served by the instance's own
 front door, with topic managers and lookup services as programs the engine
 calls. It is also a Zig package: an overlay of your own depends on it for
-the topic and lookup contracts. Version **0.16.1**.
+the topic and lookup contracts. Version **0.17.0**.
 
 ## What it is
 
@@ -20,7 +20,7 @@ the topic and lookup contracts. Version **0.16.1**.
   **every proof**, or **rejected**. Nothing persists unless a topic takes
   it, apart from the request. `/lookup` is a read.
 - **State under its own name.** The engine and its lookup services write
-  only `<app>/state`, `<app>/gossip`, `<app>/topics`, `<app>/lookups` and
+  only `<app>/state`, `<app>/gossip`, `<app>/topics`, `<app>/lookups`, `<app>/configured` and
   each lookup program's index `<app>/ls_<…>`; the app record is `<app>/app`. The chain state is the chain app's `chain/state`, read by
   CID. Two overlay apps on one instance share the chain and nothing else.
 - **Gossip** over libp2p, per topic (0.12.0, David 2026-10-09): `<topic>`,
@@ -29,8 +29,9 @@ the topic and lookup contracts. Version **0.16.1**.
   `<topic>-proof` (the proofs) on its own; `<topic>-live` the beats, the
   runtime's liveness tool (unlogged).
 - **Beats** (0.12.0): every skein is a market and a validator, always. Each
-  registered topic beats on `<topic>-live` with its view digest (and the
-  app's terms, the head `<app>/terms`, when it has written them), and each registered lookup service on `<service>-live`
+  registered or (0.17.0) configured topic beats on `<topic>-live` with its view digest (and the
+  app's terms: the head `<app>/terms` when it has written them, else
+  `config.overlay.terms`), and each registered or configured lookup service on `<service>-live`
   with a body its program gives; the skein keeps liveness on both ("Beats"
   below).
 - **The examples**: `tm_demo` (`bin/topic-demo.wasm`) and `ls_demo`
@@ -347,7 +348,7 @@ kept in `<app>/topics`). docs/OVERLAY.md "Register a topic" has the rest.
 Beats are libp2p service discovery (David, 2026-10-09: they replace
 SHIP/SLAP on the libp2p network; they are not SHIP/SLAP, and no SHIP/SLAP ad
 is published p2p). Every topic manager and every lookup service the engine
-runs as registered beats on its own topic, named after itself:
+runs, registered or (0.17.0) configured, beats on its own topic, named after itself:
 `<topic>-live`, `<service>-live`.
 
 - **A topic's body** is dag-cbor `{view: {count, digest}, terms?,
@@ -355,11 +356,13 @@ runs as registered beats on its own topic, named after itself:
   below):
   `terms` (0.16.0) is the root record of the head `<app>/terms`, a
   dag-cbor record the app writes at runtime (skein-amm: root's `terms`
-  message), opaque to the engine and copied as is; no head (or the record
-  `null`, cleared), no field: a market only. A change of the head
-  re-declares every registered topic's beacon, on the message `{fn:
-  "rebeat"}` the writer sends the instance itself in box `<app>`.
-  (0.12.1 to 0.15.1: `config.overlay.terms`, no longer read.) `view` is the topic's
+  message), opaque to the engine and copied as is; the record `null`
+  (cleared), no field: a market only. No head: `config.overlay.terms`
+  (0.17.0), the INITIAL value (the admin's, given at a create's config —
+  a token instance beats its default terms before any program of its app
+  has stepped); neither, no field. A change of the head
+  re-declares every registered and configured topic's beacon, on the message `{fn:
+  "rebeat"}` the writer sends the instance itself in box `<app>`. `view` is the topic's
   **view digest**: `count` the topic's admitted-and-unspent outputs, and
   `digest` (32 bytes) the sum mod 2^256 of `sha256(txid ‖ vout)` over them
   (txid 32 bytes in internal byte order, vout 4 bytes little-endian, each
@@ -536,7 +539,7 @@ the anchors and answers the sync protocol's frames (0.15.0).
 
 | | |
 |---|---|
-| this app and package | 0.16.1 (tag `v0.16.1`) |
+| this app and package | 0.17.0 (tag `v0.17.0`) |
 | skein-sdk | v0.12.0, by tag URL and hash in `build.zig.zon` (modules `chain` and, for the engine, `sk`; bsvz comes through it) |
 | requires | `chain/1` (shruggr/skein-chain 0.3.0) |
 | skein | log format 10, the BEEF envelope beside the pointer record (shruggr/skein#146); the routes / filters / roles manifest (shruggr/skein#143); skein's equivs pin this repo by commit |
@@ -837,6 +840,23 @@ from the record; none yet, an empty state on the configured network):
 behaviour change. (skein-chain 0.7.0's chain state names the host chain's
 `headers` and `heights` roots, read through the host/chain exception: the
 same layout, nothing here changes.)
+
+0.17.0 (shruggr/skein-overlay#8, for shruggr/skein-amm#4: one token
+instance per token id, its topic from its config at birth): a topic in
+`config.overlay.topics` and a lookup service in `config.overlay.lookups`
+beat as a registered one does — liveness and a beacon on `<name>-live`,
+the same bodies — declared on the engine's first step after it sees the
+configuration (src/configured.zig; the head `<app>/configured`, `{kind:
+"overlay-configured", topics, lookups, terms?}`, keeps what was declared:
+the same configuration again declares nothing; a changed one declares
+every configured name again and undeclares a dropped one), re-declared on a
+view change and by `rebeat` as a registered one, and kept across a restart
+as every beacon is (the host folds them from the log). A name registered
+too is the registration's. `config.overlay.terms` is accepted again, as
+the beat's INITIAL terms: the head `<app>/terms` wins once written (its
+`null` too); a change of the configured terms re-declares the registered
+topics' beacons too. skein's install check accepts the field (`terms`: a
+map; shruggr/skein, the same build). No wire or kernel change.
 
 ## Contributing
 
