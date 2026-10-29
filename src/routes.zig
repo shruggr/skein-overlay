@@ -38,6 +38,10 @@
 //!                                   each frame of the sync protocol: one dag-cbor frame in, one answered
 //!                                   (`syncAnswer`), over the three reads above; nothing written, nothing logged
 //!
+//! A call of fn "register" / "deregister" / "registerLookup" / "deregisterLookup" (0.18.0,
+//! skein-overlay#10) is no route: a program of the instance registering in its own step, the
+//! message in `<app>/register`'s work (registry.zig `byCall`) → {fn, result} | {fn, error}.
+//!
 //! Every request is appended, and the front door's step calls these (#68).
 //! A submit over HTTP is BRC-22 (0.9.1, shruggr/skein#112, David 2026-10-07: "the HTTP
 //! `/submit` route is BRC-22 or it does not exist"; 0.7.1's route restored): the handler runs the
@@ -65,6 +69,7 @@ const submit_mod = @import("submit.zig");
 const gossip_mod = @import("gossip.zig");
 const calls = @import("calls.zig");
 const state = @import("state.zig");
+const registry = @import("registry.zig");
 
 const cbor = c.cbor;
 const Value = cbor.Value;
@@ -249,6 +254,9 @@ fn load(a: Allocator, in: Value) !State {
 pub fn call(a: Allocator, call_in: Value) !void {
     const func = call_in.getText("fn") orelse return error.BadInput;
     const arg = try vm.callArg(a, call_in);
+    // 0.18.0 (skein-overlay#10): a registration by a program of the instance, in its step — the
+    // message form's in the box `<app>/register` (registry.zig `byCall`).
+    if (registry.isRegistration(func)) return vm.answer(a, try registry.byCall(a, ev_.effects(), call_in, func, arg));
     // The topics, lookup services and programs: the app record's (#72, config.zig; the route names the
     // engine's program record), else the genesis's.
     const in = try ev_.configured(a, call_in, arg);

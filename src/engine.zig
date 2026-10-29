@@ -46,6 +46,8 @@
 //!                             the topic's view digest); answered {topic, active}; with
 //!                             `seed` (0.7.8), the held seeds judged under the topic
 //!                             (submit.zig `seed`), answered {…, seeded, missing, untaken?}.
+//!                             The same four are taken as a call too (0.18.0, skein-overlay#10;
+//!                             registry.zig `byCall`): from a program of the instance in its step.
 //!   registerLookup /          a message in the box `<app>/register` only, as register (0.11.0, David
 //!   deregisterLookup          2026-10-08: "separate registration calls"): {fn: "registerLookup", args:
 //!                             {service, program, topics?}} or {fn: "deregisterLookup", args:
@@ -98,6 +100,7 @@ const config = @import("config.zig");
 const topics = @import("topics.zig");
 const lookups = @import("lookups.zig");
 const configured = @import("configured.zig");
+const registry = @import("registry.zig");
 
 const cbor = c.cbor;
 const Value = cbor.Value;
@@ -108,21 +111,10 @@ pub fn main() u8 {
     return vm.main("overlay", run);
 }
 
-fn uints(a: Allocator, xs: []const u32) ![]Value {
-    const out = try a.alloc(Value, xs.len);
-    for (xs, out) |x, *o| o.* = .{ .uint = x };
-    return out;
-}
-
-fn resultRecord(a: Allocator, op: []const u8, fields: []const cbor.Entry) !Value {
-    var es: std.ArrayList(cbor.Entry) = .empty;
-    try es.appendSlice(a, &.{
-        .{ .key = "kind", .value = .{ .text = "overlay-result" } },
-        .{ .key = "op", .value = .{ .text = op } },
-    });
-    try es.appendSlice(a, fields);
-    return .{ .map = es.items };
-}
+const resultRecord = registry.resultRecord;
+const cids = registry.cids;
+const hexes = registry.hexes;
+const steakOf = registry.steakOf;
 
 /// A peer's `<topic>-admit` verdict (#74), admitted by the route as a `peer-admit` event: recorded
 /// under the head `<app>/gossip` (key topic ‖ txid ‖ from). Nothing is admitted from it.
@@ -187,12 +179,7 @@ fn emitBeats(a: Allocator, step: Value, st: *@import("state.zig").State) !usize 
 /// beat's terms (0.16.0): the record of the head `<app>/terms` the app writes (config.zig `termsOf`),
 /// read now, at each beacon declaration.
 fn rolesNow(a: Allocator, step: Value) !?topics.Roles {
-    var r = config.rolesOf(a, step) catch |e| switch (e) {
-        error.BadRoles => return null,
-        else => |x| return x,
-    };
-    r.terms = try config.termsOf(a, vm.store(), ev_.heads(), calls.appOf(step));
-    return r;
+    return registry.roles(a, ev_.effects(), step);
 }
 
 /// `rebeat` (0.16.0): the message `{fn: "rebeat"}` in box `<app>` from the instance itself, sent by
@@ -267,11 +254,7 @@ fn declareConfigured(a: Allocator, step: Value) !usize {
 
 /// The registered lookup services' names (`<app>/lookups`).
 fn lookupNames(a: Allocator, step: Value) ![]const []const u8 {
-    const root = try vm.head(a, try lookups.headName(a, calls.appOf(step)));
-    const ll = try lookups.entriesOf(a, if (root) |r| try vm.store().getValue(a, r) else null);
-    const out = try a.alloc([]const u8, ll.len);
-    for (ll, out) |l, *o| o.* = l.service;
-    return out;
+    return registry.lookupNames(a, ev_.effects(), step);
 }
 
 /// The answers to submitters this step made, for its result record (shruggr/skein#112).
@@ -279,176 +262,50 @@ fn answersField(fields: *std.ArrayList(cbor.Entry), a: Allocator) !void {
     if (ev_.answers.items.len > 0) try fields.append(a, .{ .key = "answers", .value = .{ .array = ev_.answers.items } });
 }
 
-/// A topic's beat body as the state holds its beat now (0.12.0, 0.14.0, topics.zig `beatBody`), with the
-/// terms (0.16.0: the head `<app>/terms`'s record, `rolesNow`): the register's `topic` (none: the empty view).
-fn topicBeat(a: Allocator, step: Value, fargs: Value, roles: topics.Roles) ![]const u8 {
-    const t = fargs.getText("topic") orelse return topics.beatBody(a, .{}, roles.terms);
-    if (t.len == 0) return topics.beatBody(a, .{}, roles.terms);
-    var loaded = try ev_.load(a, step);
-    return topics.beatBody(a, try loaded.st.beat(t), roles.terms);
-}
-
 /// `register {topic, program}` / `deregister {topic}` (topics.zig, shruggr/skein#120): a message in
 /// the box `<app>/register` (one box per function class, shruggr/skein#128, 0.7.5), `{fn, args}`, from
-/// whoever its row admits; in any other box refused (`bad-args`); the app is the step's. The set written under
-/// `<app>/topics` and the events emitted when it changes; the answer `{fn, request, replyTo,
-/// result: {topic, active} | error: {code, message}}` (skein docs/APPS.md §4) to the sender when a
-/// message can reach it. A refusal writes and emits nothing.
+/// whoever its row admits; in any other box refused (`bad-args`); the app is the step's. What it does
+/// is registry.zig `topic` (as a call from a program of the instance, 0.18.0); the answer `{fn,
+/// request, replyTo, result: {topic, active} | error: {code, message}}` (skein docs/APPS.md §4) to the
+/// sender when a message can reach it. A refusal writes and emits nothing.
 fn registration(a: Allocator, step: Value, args: Value, body: Value, func: []const u8) !void {
-    const s = vm.store();
-    const head = try topics.headName(a, calls.appOf(step));
-    const root = try vm.head(a, head);
-    const rec: ?Value = if (root) |r| try s.getValue(a, r) else null;
-    const list = try topics.entriesOf(a, rec);
     const fargs: Value = body.get("args") orelse .{ .map = &.{} };
-    // The roles: always a market and a validator (0.12.0), at config.overlay.market / .validator's ms or the defaults.
-    const roles: ?topics.Roles = try rolesNow(a, step); // null: error.BadRoles
-    const change: topics.Change = if (!topics.mayRegister(args, calls.appOf(step)))
-        .{ .refused = try topics.notHere(a, func, args, calls.appOf(step)) }
-    else if (roles == null)
-        .{ .refused = try std.fmt.allocPrint(a, "{s}: the configuration's roles are config.overlay.market {{window: <ms>}} and config.overlay.validator {{every: <ms>}}, each from 1000 ms to a day", .{func}) }
-    else if (eql(u8, func, "register"))
-        try topics.withRoles(a, try topics.register(a, list, fargs, step.get("programs") orelse return error.BadConfig, try config.selfRole(a, s, step, null)), true, roles.?, try topicBeat(a, step, fargs, roles.?))
-    else
-        try topics.withRoles(a, try topics.deregister(a, list, fargs), false, roles.?, "");
+    const gate: ?[]const u8 = if (!topics.mayRegister(args, calls.appOf(step))) try topics.notHere(a, func, args, calls.appOf(step)) else null;
     const message = args.getCid("message") orelse return error.BadInput;
-    var ans: std.ArrayList(cbor.Entry) = .empty;
-    try ans.appendSlice(a, &.{
-        .{ .key = "fn", .value = .{ .text = func } },
-        .{ .key = "request", .value = .{ .cid = message } },
-        .{ .key = "replyTo", .value = .{ .cid = message } },
-    });
-    var fields: std.ArrayList(cbor.Entry) = .empty;
-    switch (change) {
-        .refused => |why| {
-            try ans.append(a, .{ .key = "error", .value = .{ .map = try a.dupe(cbor.Entry, &.{
-                .{ .key = "code", .value = .{ .text = "bad-args" } },
-                .{ .key = "message", .value = .{ .text = why } },
-            }) } });
-            try fields.append(a, .{ .key = "error", .value = .{ .text = why } });
-        },
-        .done => |d| {
-            if (d.list) |l| {
-                const rc = try s.putValue(a, try topics.recordOf(a, l));
-                try vm.advance(head, rc);
-                try fields.append(a, .{ .key = "topics", .value = .{ .cid = rc } });
-            }
-            for (d.events) |ev| _ = try vm.emitEvent(a, ev);
-            var answer = d.answer;
-            if (d.seed) |seeds| answer = try seeding(a, step, d.list orelse list, answer, seeds, &fields, roles.?);
-            try ans.append(a, .{ .key = "result", .value = answer });
-            try fields.appendSlice(a, &.{
-                .{ .key = "topic", .value = d.answer.get("topic").? },
-                .{ .key = "active", .value = d.answer.get("active").? },
-                .{ .key = "changed", .value = .{ .boolean = d.list != null } },
-            });
-        },
-    }
-    if (args.getBytes("sender")) |sender| if (try ev_.reaches(a, step, sender)) {
-        _ = try vm.send(a, sender, topics.answerBox(args, calls.appOf(step)), .{ .map = ans.items });
-    };
-    _ = try vm.finish(a, s, try resultRecord(a, func, fields.items));
+    const done = try registry.topic(a, ev_.effects(), step, fargs, func, gate);
+    return answered(a, step, args, func, message, done);
 }
 
 /// `registerLookup {service, program, topics?}` / `deregisterLookup {service}` (0.11.0, lookups.zig):
-/// a message in the box `<app>/register`, as register (refused `bad-args` elsewhere). The set written
-/// under `<app>/lookups` when it changes, and (0.12.0) the service's beacon on `<service>-live`
-/// declared (its body the program's fn "beat", calls.zig `lookupBeat`) or ended; the answer `{fn,
-/// request, replyTo, result: {service, active} | error: {code, message}}` to the sender when a
-/// message can reach it. A refusal writes and emits nothing.
+/// a message in the box `<app>/register`, as register (refused `bad-args` elsewhere); registry.zig
+/// `lookup`. The answer `{fn, request, replyTo, result: {service, active} | error: {code, message}}`
+/// to the sender when a message can reach it. A refusal writes and emits nothing.
 fn lookupRegistration(a: Allocator, step: Value, args: Value, body: Value, func: []const u8) !void {
-    const s = vm.store();
-    const head = try lookups.headName(a, calls.appOf(step));
-    const root = try vm.head(a, head);
-    const list = try lookups.entriesOf(a, if (root) |r| try s.getValue(a, r) else null);
     const fargs: Value = body.get("args") orelse .{ .map = &.{} };
-    const roles: ?topics.Roles = try rolesNow(a, step); // null: error.BadRoles
-    const change: lookups.Change = if (!topics.mayRegister(args, calls.appOf(step)))
-        .{ .refused = try topics.notHere(a, func, args, calls.appOf(step)) }
-    else if (roles == null)
-        .{ .refused = try std.fmt.allocPrint(a, "{s}: the configuration's roles are config.overlay.market {{window: <ms>}} and config.overlay.validator {{every: <ms>}}, each from 1000 ms to a day", .{func}) }
-    else if (eql(u8, func, "registerLookup"))
-        try lookups.register(a, list, fargs, step.get("programs") orelse return error.BadConfig)
-    else
-        try lookups.deregister(a, list, fargs);
+    const gate: ?[]const u8 = if (!topics.mayRegister(args, calls.appOf(step))) try topics.notHere(a, func, args, calls.appOf(step)) else null;
     const message = args.getCid("message") orelse return error.BadInput;
+    const done = try registry.lookup(a, ev_.effects(), step, fargs, func, gate);
+    return answered(a, step, args, func, message, done);
+}
+
+/// A registration message's answer to its sender (when a message reaches it) and the step's result record.
+fn answered(a: Allocator, step: Value, args: Value, func: []const u8, message: []const u8, done: registry.Done) !void {
     var ans: std.ArrayList(cbor.Entry) = .empty;
     try ans.appendSlice(a, &.{
         .{ .key = "fn", .value = .{ .text = func } },
         .{ .key = "request", .value = .{ .cid = message } },
         .{ .key = "replyTo", .value = .{ .cid = message } },
     });
-    var fields: std.ArrayList(cbor.Entry) = .empty;
-    switch (change) {
-        .refused => |why| {
-            try ans.append(a, .{ .key = "error", .value = .{ .map = try a.dupe(cbor.Entry, &.{
-                .{ .key = "code", .value = .{ .text = "bad-args" } },
-                .{ .key = "message", .value = .{ .text = why } },
-            }) } });
-            try fields.append(a, .{ .key = "error", .value = .{ .text = why } });
-        },
-        .done => |d| {
-            if (d.list) |l| {
-                const rc = try s.putValue(a, try lookups.recordOf(a, l));
-                try vm.advance(head, rc);
-                try fields.append(a, .{ .key = "lookups", .value = .{ .cid = rc } });
-                // Liveness and the beacon on `<service>-live` (0.12.0, 0.12.1), as a topic's.
-                const service = d.answer.getText("service").?;
-                const reg = eql(u8, func, "registerLookup");
-                const beat = if (reg) try calls.lookupBeat(a, ev_.caller(), try config.withLookups(a, step, l), service, fargs.getText("program") orelse "") else "";
-                for (try topics.roleEvents(a, reg, service, roles.?, beat)) |ev| _ = try vm.emitEvent(a, ev);
-            }
-            try ans.append(a, .{ .key = "result", .value = d.answer });
-            try fields.appendSlice(a, &.{
-                .{ .key = "service", .value = d.answer.get("service").? },
-                .{ .key = "active", .value = d.answer.get("active").? },
-                .{ .key = "changed", .value = .{ .boolean = d.list != null } },
-            });
-        },
-    }
+    if (done.refused) |why| {
+        try ans.append(a, .{ .key = "error", .value = .{ .map = try a.dupe(cbor.Entry, &.{
+            .{ .key = "code", .value = .{ .text = "bad-args" } },
+            .{ .key = "message", .value = .{ .text = why } },
+        }) } });
+    } else try ans.append(a, .{ .key = "result", .value = done.result.? });
     if (args.getBytes("sender")) |sender| if (try ev_.reaches(a, step, sender)) {
         _ = try vm.send(a, sender, topics.answerBox(args, calls.appOf(step)), .{ .map = ans.items });
     };
-    _ = try vm.finish(a, s, try resultRecord(a, func, fields.items));
-}
-
-/// A register's `seed` (0.7.8, submit.zig `seed`): each seed the chain state holds judged under the
-/// topic just registered, with the configuration as it is with the set `list` (the one this step
-/// wrote); the records kept, the state saved. → the answer with `seeded`, `missing` (and `untaken`
-/// when a held seed is taken by nothing); the result record gets them and `state`.
-fn seeding(a: Allocator, step: Value, list: []const topics.Entry, answer: Value, seeds: []const [32]u8, fields: *std.ArrayList(cbor.Entry), roles: topics.Roles) !Value {
-    const topic = answer.getText("topic").?;
-    const in = try config.withTopics(a, step, list);
-    var loaded = try ev_.load(a, in);
-    loaded.st.now = @intCast(step.getUint("at") orelse 0);
-    const cx = submit.Ctx{ .a = a, .caller = ev_.caller(), .wire = try ev_.wire(in), .st = &loaded.st, .in = in };
-    const sd = try submit.seed(cx, topic, seeds);
-    for (sd.records) |r| try vm.keep(r);
-    // The view the seeds changed: the beacons re-declared (0.12.0), over the set this step wrote.
-    const beats = try topics.beatEvents(a, roles, list, try lookupNames(a, step), try loaded.st.beatChanges(), loaded.st.lookup_beats.items);
-    for (beats) |e| _ = try vm.emitEvent(a, e);
-    if (beats.len > 0) try fields.append(a, .{ .key = "beats", .value = .{ .uint = beats.len } });
-    const new_state = try loaded.st.save();
-    if (loaded.head == null or !eql(u8, loaded.head.?, new_state)) try vm.advance(try ev_.stateHead(a, in), new_state);
-    var out: std.ArrayList(cbor.Entry) = .empty;
-    try out.appendSlice(a, answer.map);
-    try out.appendSlice(a, &.{
-        .{ .key = "seeded", .value = .{ .array = try hexes(a, sd.seeded) } },
-        .{ .key = "missing", .value = .{ .array = try hexes(a, sd.missing) } },
-    });
-    if (sd.untaken.len > 0) try out.append(a, .{ .key = "untaken", .value = .{ .array = try hexes(a, sd.untaken) } });
-    try fields.appendSlice(a, out.items[answer.map.len..]);
-    if (sd.admissions.len > 0) {
-        const xs = try a.alloc(Value, sd.admissions.len);
-        for (sd.admissions, xs) |adm, *x| x.* = .{ .map = try a.dupe(cbor.Entry, &.{
-            .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &c.header.toHex(adm.txid)) } },
-            .{ .key = "steak", .value = try steakOf(a, adm.topics, adm.applied) },
-        }) };
-        try fields.append(a, .{ .key = "admissions", .value = .{ .array = xs } });
-    }
-    if (sd.watches.len > 0) try fields.append(a, .{ .key = "watches", .value = .{ .array = try cids(a, sd.watches) } });
-    try fields.append(a, .{ .key = "state", .value = .{ .cid = new_state } });
-    return .{ .map = out.items };
+    _ = try vm.finish(a, vm.store(), try resultRecord(a, func, done.fields));
 }
 
 fn run(a: Allocator) anyerror!void {
@@ -590,28 +447,6 @@ fn run(a: Allocator) anyerror!void {
     if (loaded.head == null or !eql(u8, loaded.head.?, new_state)) try vm.advance(try ev_.stateHead(a, step), new_state);
     try fields.append(a, .{ .key = "state", .value = .{ .cid = new_state } });
     _ = try vm.finish(a, s, try resultRecord(a, op, fields.items));
-}
-
-fn cids(a: Allocator, xs: []const []const u8) ![]Value {
-    const out = try a.alloc(Value, xs.len);
-    for (xs, out) |x, *o| o.* = .{ .cid = x };
-    return out;
-}
-
-fn hexes(a: Allocator, xs: []const [32]u8) ![]Value {
-    const out = try a.alloc(Value, xs.len);
-    for (xs, out) |x, *o| o.* = .{ .text = try a.dupe(u8, &c.header.toHex(x)) };
-    return out;
-}
-
-fn steakOf(a: Allocator, topics_: []const []const u8, applied: []const @import("state.zig").Applied) !Value {
-    var steak: std.ArrayList(cbor.Entry) = .empty;
-    for (topics_, applied) |t, ap| try steak.append(a, .{ .key = t, .value = .{ .map = try a.dupe(cbor.Entry, &.{
-        .{ .key = "outputsToAdmit", .value = .{ .array = try uints(a, ap.outputs_to_admit) } },
-        .{ .key = "coinsToRetain", .value = .{ .array = try uints(a, ap.coins_to_retain) } },
-        .{ .key = "coinsRemoved", .value = .{ .array = try uints(a, ap.coins_removed) } },
-    }) } });
-    return .{ .map = steak.items };
 }
 
 /// `resume {txid}` (skein-overlay#1), a message from the instance itself in the app's box: a parent a

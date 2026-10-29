@@ -4,7 +4,7 @@ The overlay services engine for a [skein](https://github.com/shruggr/skein),
 as an app: BRC-22 submit and BRC-24 lookup, served by the instance's own
 front door, with topic managers and lookup services as programs the engine
 calls. It is also a Zig package: an overlay of your own depends on it for
-the topic and lookup contracts. Version **0.17.0**.
+the topic and lookup contracts. Version **0.18.0**.
 
 ## What it is
 
@@ -343,6 +343,24 @@ else 40 000 and 30 000 ms; neither can be turned off (the owner's switch
 of 0.9.2, `{fn: "market" | "validator"}`, is gone, and with it the switch
 kept in `<app>/topics`). docs/OVERLAY.md "Register a topic" has the rest.
 
+**By call** (0.18.0, skein-overlay#10): a registration is also taken as a
+call from a program of the instance, in its step (an in-VM call, skein
+docs/VM.md "Calls") — `call(<the engine>, "register", {topic, program,
+seed?})`, likewise `deregister`, `registerLookup`, `deregisterLookup`, the
+`arg` what the message's `args` is. So an app's own program registers the
+topics it derives (skein-amm: a token's `tm_color_<id>`, `ls_color_<id>`,
+`ls_amm_<id>` from its deploy) in the step that derives them, without a
+message from root. It does what the message does — the set, the events
+emitted on the calling step, `seed` judged, the records kept on it — with
+no box and no role check: only a program of the instance can call in a
+step. The engine's app is the calling step's: its thread's program's app
+record, whose role `overlay` is the engine. Answered `{fn, result: {topic |
+service, active, seeded?, missing?, untaken?}}`, or `{fn, error: {code:
+"bad-args", message}}` with the message form's words; the result record
+(op the fn) carries the call's `caller`. A kernel call (no step: it writes
+nothing), or a thread whose program is of no app with an overlay engine,
+is answered `bad-args`.
+
 ### Beats
 
 Beats are libp2p service discovery (David, 2026-10-09: they replace
@@ -471,7 +489,8 @@ the anchors at that height until a proof at or below it lands.
 
 Lookup services have their own pair of calls (0.11.0; David Case,
 2026-10-08: separate from the topics'), in the same box `<app>/register`,
-gated the same way:
+gated the same way (or, 0.18.0, as a call from a program of the instance,
+as `register`):
 
 ```
 {fn: "registerLookup",   args: {service, program, topics?}}   program: the role in `programs` that answers it
@@ -539,7 +558,7 @@ the anchors and answers the sync protocol's frames (0.15.0).
 
 | | |
 |---|---|
-| this app and package | 0.17.0 (tag `v0.17.0`) |
+| this app and package | 0.18.0 (tag `v0.18.0`) |
 | skein-sdk | v0.12.0, by tag URL and hash in `build.zig.zon` (modules `chain` and, for the engine, `sk`; bsvz comes through it) |
 | requires | `chain/1` (shruggr/skein-chain 0.3.0) |
 | skein | log format 10, the BEEF envelope beside the pointer record (shruggr/skein#146); the routes / filters / roles manifest (shruggr/skein#143); skein's equivs pin this repo by commit |
@@ -857,6 +876,13 @@ the beat's INITIAL terms: the head `<app>/terms` wins once written (its
 `null` too); a change of the configured terms re-declares the registered
 topics' beacons too. skein's install check accepts the field (`terms`: a
 map; shruggr/skein, the same build). No wire or kernel change.
+
+0.18.0 (shruggr/skein-overlay#10, for shruggr/skein-amm#5): `register`,
+`deregister`, `registerLookup` and `deregisterLookup` are also taken as a
+call from a program of the instance in its step ("Register a topic", "By
+call"): the same code as the message in `<app>/register` (src/registry.zig,
+the box path unchanged), the engine's app the calling thread's, answered
+`{fn, result}` or `{fn, error}`. No wire, manifest, host or kernel change.
 
 ## Contributing
 

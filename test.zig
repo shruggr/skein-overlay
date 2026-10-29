@@ -30,6 +30,7 @@ const topics_mod = @import("src/topics.zig");
 const calls = @import("src/calls.zig");
 const routes = @import("src/routes.zig");
 const configured = @import("src/configured.zig");
+const registry = @import("src/registry.zig");
 
 const bsvz = c.bsvz;
 const beef = c.beef;
@@ -4104,6 +4105,337 @@ test "the sync protocol (0.15.0, skein-overlay#5): fn sync a filter on the libp2
         try expectSyncError(try syncAsk(a, &st, ""), "not dag-cbor");
         try expectSyncError(try syncAsk(a, &st, try cbor.encode(a, .{ .text = "tm_demo" })), "no topic");
     }
+}
+
+// ---------------------------------------------------------------- register by call (0.18.0)
+
+/// A registration's effects in memory (registry.zig `Fx`): the heads a map (a head moved reads back
+/// moved, as in a step), the events and kept records collected, the overlay's state under
+/// `<app>/state` over the Instance's chain state, the Instance's topic and lookup programs and wire.
+const FakeFx = struct {
+    inst: *Instance,
+    hm: *HeadMap,
+    events: std.ArrayList(Value) = .empty,
+    kept: std.ArrayList([]const u8) = .empty,
+
+    fn advance(ctx: *anyopaque, name: []const u8, cid: []const u8) anyerror!void {
+        const self: *FakeFx = @ptrCast(@alignCast(ctx));
+        try self.hm.m.put(self.inst.a, try self.inst.a.dupe(u8, name), try self.inst.a.dupe(u8, cid));
+    }
+    fn emit(ctx: *anyopaque, a: Allocator, ev: Value) anyerror![]const u8 {
+        const self: *FakeFx = @ptrCast(@alignCast(ctx));
+        try self.events.append(self.inst.a, ev);
+        return a.dupe(u8, &cbor.cidOf(try cbor.encode(a, ev)));
+    }
+    fn keep(ctx: *anyopaque, cid: []const u8) anyerror!void {
+        const self: *FakeFx = @ptrCast(@alignCast(ctx));
+        try self.kept.append(self.inst.a, try self.inst.a.dupe(u8, cid));
+    }
+    fn load(ctx: *anyopaque, a: Allocator, in: Value) anyerror!registry.Loaded {
+        const self: *FakeFx = @ptrCast(@alignCast(ctx));
+        const s = self.inst.ms.store();
+        const ch = try a.create(state.Chain);
+        ch.* = try c.open(a, s, self.inst.chain_root, .regtest);
+        const h = self.hm.m.get(try std.fmt.allocPrint(a, "{s}/state", .{calls.appOf(in)}));
+        var st = try state.State.load(a, s, h, ch);
+        st.now = self.inst.now;
+        return .{ .st = st, .head = h };
+    }
+    fn wire(ctx: *anyopaque, _: Value) anyerror!submit.Wire {
+        const self: *FakeFx = @ptrCast(@alignCast(ctx));
+        return self.inst.wire_.wire();
+    }
+    fn fx(self: *FakeFx) registry.Fx {
+        return .{ .ctx = self, .store = self.inst.ms.store(), .heads = self.hm.heads(), .caller = self.inst.caller(), .advanceFn = advance, .emitFn = emit, .keepFn = keep, .loadFn = load, .wireFn = wire };
+    }
+    /// The events emitted since `from`, by name.
+    fn names(self: *FakeFx, a: Allocator, from: usize) ![]const []const u8 {
+        const out = try a.alloc([]const u8, self.events.items.len - from);
+        for (self.events.items[from..], out) |e, *o| o.* = e.getText("event").?;
+        return out;
+    }
+};
+
+/// An app `overlay` installed as an install writes it: the engine (role `overlay`), the demo topic and
+/// lookup programs, and `setup`, the app's own program whose thread calls the engine in its step.
+const CallApp = struct { engine: []const u8, setup: []const u8, thread: []const u8 };
+
+fn callApp(a: Allocator, s: Store, hm: *HeadMap, inst: *Instance) !CallApp {
+    const engine = try s.putValue(a, try mapOf(a, &.{
+        .{ .key = "kind", .value = .{ .text = "program" } },
+        .{ .key = "name", .value = .{ .text = "overlay" } },
+        .{ .key = "app", .value = .{ .text = "overlay" } },
+    }));
+    const setup = try s.putValue(a, try mapOf(a, &.{
+        .{ .key = "kind", .value = .{ .text = "program" } },
+        .{ .key = "name", .value = .{ .text = "setup" } },
+        .{ .key = "app", .value = .{ .text = "overlay" } },
+    }));
+    try hm.m.put(a, "overlay/app", try s.putValue(a, try mapOf(a, &.{
+        .{ .key = "kind", .value = .{ .text = "app" } },
+        .{ .key = "name", .value = .{ .text = "overlay" } },
+        .{ .key = "programs", .value = try mapOf(a, &.{
+            .{ .key = "overlay", .value = .{ .cid = engine } },
+            .{ .key = "setup", .value = .{ .cid = setup } },
+            .{ .key = "topic-demo", .value = .{ .cid = inst.topic_prog } },
+            .{ .key = "lookup-demo", .value = .{ .cid = inst.lookup_prog } },
+        }) },
+        .{ .key = "config", .value = try mapOf(a, &.{.{ .key = "overlay", .value = try mapOf(a, &.{}) }}) },
+    })));
+    const thread = try s.putValue(a, try mapOf(a, &.{
+        .{ .key = "kind", .value = .{ .text = "thread" } },
+        .{ .key = "program", .value = .{ .cid = setup } },
+    }));
+    return .{ .engine = engine, .setup = setup, .thread = thread };
+}
+
+/// The input an in-VM call from a step gives the engine (skein docs/VM.md "Calls", kernel
+/// scheduler.zig `hCall`): `caller` the calling step's thread, `step` its thread, step, entry, at.
+/// `thread` null: a kernel call (no step).
+fn callInput(a: Allocator, func: []const u8, arg: Value, thread: ?[]const u8) !Value {
+    var es: std.ArrayList(cbor.Entry) = .empty;
+    try es.appendSlice(a, &.{
+        .{ .key = "kind", .value = .{ .text = "call" } },
+        .{ .key = "fn", .value = .{ .text = func } },
+        .{ .key = "arg", .value = .{ .bytes = try cbor.encode(a, arg) } },
+        .{ .key = "now", .value = .{ .uint = 5000 } },
+        .{ .key = "self", .value = try mapOf(a, &.{.{ .key = "identity", .value = .{ .bytes = &(.{0x02} ++ .{0x11} ** 32) } }}) },
+        .{ .key = "programs", .value = try mapOf(a, &.{}) },
+        .{ .key = "defaults", .value = try mapOf(a, &.{.{ .key = "walletNetwork", .value = .{ .text = "regtest" } }}) },
+    });
+    if (thread) |t| try es.appendSlice(a, &.{
+        .{ .key = "caller", .value = .{ .bytes = t } },
+        .{ .key = "step", .value = try mapOf(a, &.{
+            .{ .key = "thread", .value = .{ .cid = t } },
+            .{ .key = "step", .value = .{ .uint = 1 } },
+            .{ .key = "entry", .value = .{ .cid = &cbor.cidOf("the entry") } },
+            .{ .key = "at", .value = .{ .uint = 5000 } },
+        }) },
+    });
+    return .{ .map = es.items };
+}
+
+fn byCall(a: Allocator, f: *FakeFx, func: []const u8, arg: Value, thread: ?[]const u8) !Value {
+    const in = try callInput(a, func, arg, thread);
+    // As the engine reads it: the call's `arg` bytes decoded (routes.zig `call`).
+    return registry.byCall(a, f.fx(), in, func, try cbor.decode(a, in.getBytes("arg").?));
+}
+
+test "register / registerLookup / deregister by call (0.18.0, skein-overlay#10): from a program of the instance in its step, what the message in <app>/register does; the engine's app the calling thread's; the answer {fn, result}; the record kept with the caller" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = c.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var inst = try Instance.init(a, &ms);
+    const s = ms.store();
+    var hm = HeadMap{};
+    const app = try callApp(a, s, &hm, &inst);
+    var f = FakeFx{ .inst = &inst, .hm = &hm };
+
+    try std.testing.expect(registry.isRegistration("register") and registry.isRegistration("deregisterLookup"));
+    try std.testing.expect(!registry.isRegistration("submit") and !registry.isRegistration("lookup"));
+    // The step a call is read as: the calling thread's app, its engine the app's role `overlay`, the step's `at`.
+    const step = (try registry.callStep(a, s, hm.heads(), try callInput(a, "register", .null, app.thread))).?;
+    try std.testing.expectEqualStrings("overlay", calls.appOf(step));
+    try std.testing.expectEqualSlices(u8, app.engine, step.getCid("engine").?);
+    try std.testing.expectEqual(@as(u64, 5000), step.getUint("at").?);
+    try std.testing.expectEqualStrings("overlay", try config.selfRole(a, s, step, null));
+
+    // register {topic, program}: the set under `overlay/topics`, subscribe ×2 (the engine's role), liveness + beacon.
+    const reg = try byCall(a, &f, "register", try mapOf(a, &.{
+        .{ .key = "topic", .value = .{ .text = "tm_call" } },
+        .{ .key = "program", .value = .{ .text = "topic-demo" } },
+    }), app.thread);
+    try std.testing.expectEqualStrings("register", reg.getText("fn").?);
+    try std.testing.expect(reg.get("error") == null and reg.get("request") == null);
+    const result = reg.get("result").?;
+    try std.testing.expectEqualStrings("tm_call", result.getText("topic").?);
+    try std.testing.expect(result.get("active").?.boolean);
+    const set = try topics_mod.entriesOf(a, try s.getValue(a, hm.m.get("overlay/topics").?));
+    try std.testing.expectEqual(@as(usize, 1), set.len);
+    try std.testing.expectEqualStrings("tm_call", set[0].topic);
+    try std.testing.expectEqualStrings("topic-demo", set[0].program);
+    const evs = try f.names(a, 0);
+    try std.testing.expectEqual(@as(usize, 4), evs.len);
+    for (evs, [_][]const u8{ "subscribe", "subscribe", "liveness", "beacon" }) |got, want| try std.testing.expectEqualStrings(want, got);
+    try std.testing.expectEqualStrings("overlay", f.events.items[0].getText("program").?);
+    try std.testing.expectEqualStrings("tm_call-live", f.events.items[3].getText("topic").?);
+    // The record kept on the step: op register, the set, changed, and the call's caller.
+    try std.testing.expectEqual(@as(usize, 1), f.kept.items.len);
+    const rec = try s.getValue(a, f.kept.items[0]);
+    try std.testing.expectEqualStrings("overlay-result", rec.getText("kind").?);
+    try std.testing.expectEqualStrings("register", rec.getText("op").?);
+    try std.testing.expect(rec.get("changed").?.boolean);
+    try std.testing.expectEqualSlices(u8, hm.m.get("overlay/topics").?, rec.getCid("topics").?);
+    try std.testing.expectEqualSlices(u8, app.thread, rec.getBytes("caller").?);
+    // Served from the next step or call on, as a registration by message is.
+    const now = try config.resolve(a, s, hm.heads(), try withThread(a, s, try mapOf(a, &.{}), app.engine), null);
+    try std.testing.expect((try calls.configObject(a, now, "overlayTopics")).contains("tm_call"));
+
+    // Again: idempotent — nothing written or emitted, still active.
+    const again = try byCall(a, &f, "register", try mapOf(a, &.{
+        .{ .key = "topic", .value = .{ .text = "tm_call" } },
+        .{ .key = "program", .value = .{ .text = "topic-demo" } },
+    }), app.thread);
+    try std.testing.expect(again.get("result").?.get("active").?.boolean);
+    try std.testing.expectEqual(@as(usize, 4), f.events.items.len);
+    try std.testing.expect(!(try s.getValue(a, f.kept.items[1])).get("changed").?.boolean);
+
+    // registerLookup {service, program}: the set under `overlay/lookups`, liveness + beacon on `<service>-live`.
+    const lreg = try byCall(a, &f, "registerLookup", try mapOf(a, &.{
+        .{ .key = "service", .value = .{ .text = "ls_call" } },
+        .{ .key = "program", .value = .{ .text = "lookup-demo" } },
+    }), app.thread);
+    try std.testing.expectEqualStrings("registerLookup", lreg.getText("fn").?);
+    try std.testing.expectEqualStrings("ls_call", lreg.get("result").?.getText("service").?);
+    try std.testing.expect(lreg.get("result").?.get("active").?.boolean);
+    const lset = try lookups_mod.entriesOf(a, try s.getValue(a, hm.m.get("overlay/lookups").?));
+    try std.testing.expectEqual(@as(usize, 1), lset.len);
+    try std.testing.expectEqualStrings("ls_call", lset[0].service);
+    const levs = try f.names(a, 4);
+    try std.testing.expectEqual(@as(usize, 2), levs.len);
+    try std.testing.expectEqualStrings("liveness", levs[0]);
+    try std.testing.expectEqualStrings("beacon", levs[1]);
+    try std.testing.expectEqualStrings("ls_call-live", f.events.items[5].getText("topic").?);
+    try std.testing.expectEqual(@as(usize, 1), inst.count("beat")); // the lookup program's fn beat, its body
+
+    // deregister {topic} and deregisterLookup {service}: the sets without them, the ends emitted.
+    const dereg = try byCall(a, &f, "deregister", try mapOf(a, &.{.{ .key = "topic", .value = .{ .text = "tm_call" } }}), app.thread);
+    try std.testing.expect(!dereg.get("result").?.get("active").?.boolean);
+    try std.testing.expectEqual(@as(usize, 0), (try topics_mod.entriesOf(a, try s.getValue(a, hm.m.get("overlay/topics").?))).len);
+    const devs = try f.names(a, 6);
+    try std.testing.expectEqual(@as(usize, 4), devs.len);
+    for (devs, [_][]const u8{ "unsubscribe", "unsubscribe", "unliveness", "unbeacon" }) |got, want| try std.testing.expectEqualStrings(want, got);
+    const ldereg = try byCall(a, &f, "deregisterLookup", try mapOf(a, &.{.{ .key = "service", .value = .{ .text = "ls_call" } }}), app.thread);
+    try std.testing.expect(!ldereg.get("result").?.get("active").?.boolean);
+    try std.testing.expectEqual(@as(usize, 0), (try lookups_mod.entriesOf(a, try s.getValue(a, hm.m.get("overlay/lookups").?))).len);
+    const ldevs = try f.names(a, 10);
+    try std.testing.expectEqual(@as(usize, 2), ldevs.len);
+    try std.testing.expectEqualStrings("unliveness", ldevs[0]);
+    try std.testing.expectEqualStrings("unbeacon", ldevs[1]);
+}
+
+test "register by call with seed (0.18.0): a held deploy judged under the topic just registered — seeded, admitted, the state advanced, the records kept on the step" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = c.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var inst = try Instance.init(a, &ms);
+    const s = ms.store();
+    var hm = HeadMap{};
+    const app = try callApp(a, s, &hm, &inst);
+    var f = FakeFx{ .inst = &inst, .hm = &hm };
+
+    // The chain app holds fund (mined) → t1 (mints a token) → t2 (moves it), never submitted to this overlay.
+    const x = try chain3(a, &inst);
+    const both = try beef.serialize(a, .{ .version = beef.V2, .bumps = x.f.bumps, .entries = try a.dupe(beef.Entry, &.{
+        x.f.entry,
+        .{ .txid = x.t1.txid, .format = .raw, .raw = x.t1.raw, .tx = x.t1.tx },
+        .{ .txid = x.t2.txid, .format = .raw, .raw = x.t2.raw, .tx = x.t2.tx },
+    }) });
+    _ = try inst.ingest(both);
+    _ = try inst.chainStatus(x.t1.txid, "RECEIVED", null);
+    _ = try inst.chainStatus(x.t2.txid, "RECEIVED", null);
+
+    const absent: [32]u8 = .{0xee} ** 32;
+    const ans = try byCall(a, &f, "register", try mapOf(a, &.{
+        .{ .key = "topic", .value = .{ .text = "tm_seed" } },
+        .{ .key = "program", .value = .{ .text = "topic-demo" } },
+        .{ .key = "seed", .value = .{ .array = try a.dupe(Value, &.{ .{ .text = try a.dupe(u8, &hdr.toHex(x.t2.txid)) }, .{ .text = try a.dupe(u8, &hdr.toHex(absent)) } }) } },
+    }), app.thread);
+    const result = ans.get("result").?;
+    try std.testing.expect(result.get("active").?.boolean);
+    const seeded = result.getArray("seeded").?;
+    try std.testing.expectEqual(@as(usize, 1), seeded.len);
+    try std.testing.expectEqualStrings(&hdr.toHex(x.t2.txid), seeded[0].text);
+    try std.testing.expectEqual(@as(usize, 1), result.getArray("missing").?.len);
+    try std.testing.expect(result.get("untaken") == null);
+    // The overlay's state advanced under `overlay/state`: t2 admitted under the new topic.
+    var loaded = try FakeFx.load(&f, a, try mapOf(a, &.{.{ .key = "app", .value = .{ .text = "overlay" } }}));
+    try std.testing.expect(try loaded.st.isApplied("tm_seed", x.t2.txid));
+    try std.testing.expect(!(try loaded.st.isApplied("tm_demo", x.t2.txid)));
+    // Kept on the step: the seeding's records, then the result record (state, admissions, the caller).
+    try std.testing.expect(f.kept.items.len > 1);
+    const rec = try s.getValue(a, f.kept.items[f.kept.items.len - 1]);
+    try std.testing.expectEqualStrings("register", rec.getText("op").?);
+    try std.testing.expectEqualSlices(u8, hm.m.get("overlay/state").?, rec.getCid("state").?);
+    try std.testing.expectEqual(@as(usize, 2), rec.getArray("admissions").?.len);
+    try std.testing.expectEqualSlices(u8, app.thread, rec.getBytes("caller").?);
+    // The ingest and the watch for each unproven admission, as by message.
+    try std.testing.expectEqualStrings("watch", inst.wire_.last().body.getText("fn").?);
+}
+
+test "a registration by call refused (0.18.0): bad args answered bad-args with the message form's words, nothing written or emitted; a kernel call (no step) and a thread of no overlay app refused; the box path's gate unchanged" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = c.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var inst = try Instance.init(a, &ms);
+    const s = ms.store();
+    var hm = HeadMap{};
+    const app = try callApp(a, s, &hm, &inst);
+    var f = FakeFx{ .inst = &inst, .hm = &hm };
+
+    const expectRefused = struct {
+        fn of(v: Value, func: []const u8, message: []const u8) !void {
+            try std.testing.expectEqualStrings(func, v.getText("fn").?);
+            try std.testing.expect(v.get("result") == null);
+            const e = v.get("error").?;
+            try std.testing.expectEqualStrings("bad-args", e.getText("code").?);
+            try std.testing.expectEqualStrings(message, e.getText("message").?);
+        }
+    }.of;
+    // No program: the message form's refusal (topics.zig `register`), word for word.
+    const bad = try mapOf(a, &.{.{ .key = "topic", .value = .{ .text = "tm_x" } }});
+    const by_message = (try topics_mod.register(a, &.{}, bad, try mapOf(a, &.{}), "overlay")).refused;
+    try expectRefused(try byCall(a, &f, "register", bad, app.thread), "register", by_message);
+    // An unknown role; registerLookup with no service.
+    try expectRefused(try byCall(a, &f, "register", try mapOf(a, &.{
+        .{ .key = "topic", .value = .{ .text = "tm_x" } },
+        .{ .key = "program", .value = .{ .text = "nope" } },
+    }), app.thread), "register", "register: program nope is not a role in programs");
+    const lbad = try byCall(a, &f, "registerLookup", try mapOf(a, &.{.{ .key = "program", .value = .{ .text = "lookup-demo" } }}), app.thread);
+    try std.testing.expectEqualStrings("bad-args", lbad.get("error").?.getText("code").?);
+    try std.testing.expect(hm.m.get("overlay/topics") == null and hm.m.get("overlay/lookups") == null);
+    try std.testing.expectEqual(@as(usize, 0), f.events.items.len);
+    // Each refusal's record kept on the step, its error and the caller.
+    try std.testing.expectEqual(@as(usize, 3), f.kept.items.len);
+    const rec = try s.getValue(a, f.kept.items[0]);
+    try std.testing.expectEqualStrings(by_message, rec.getText("error").?);
+    try std.testing.expectEqualSlices(u8, app.thread, rec.getBytes("caller").?);
+
+    // A kernel call (no step: it writes nothing): refused, nothing kept.
+    try expectRefused(try byCall(a, &f, "register", try mapOf(a, &.{
+        .{ .key = "topic", .value = .{ .text = "tm_x" } },
+        .{ .key = "program", .value = .{ .text = "topic-demo" } },
+    }), null), "register", "register: by call only from a step (a kernel call writes nothing)");
+    try std.testing.expectEqual(@as(usize, 3), f.kept.items.len);
+    // A thread whose program is of no app with an overlay engine: refused, the record kept.
+    const loose = try s.putValue(a, try mapOf(a, &.{ .{ .key = "kind", .value = .{ .text = "program" } }, .{ .key = "name", .value = .{ .text = "loose" } } }));
+    const lt = try s.putValue(a, try mapOf(a, &.{ .{ .key = "kind", .value = .{ .text = "thread" } }, .{ .key = "program", .value = .{ .cid = loose } } }));
+    try expectRefused(try byCall(a, &f, "register", try mapOf(a, &.{
+        .{ .key = "topic", .value = .{ .text = "tm_x" } },
+        .{ .key = "program", .value = .{ .text = "topic-demo" } },
+    }), lt), "register", "register: by call, the calling thread's program is of no app with an overlay engine (role `overlay`)");
+    try std.testing.expectEqual(@as(usize, 4), f.kept.items.len);
+    try std.testing.expect(hm.m.get("overlay/topics") == null);
+
+    // The message form's gate (registry.zig `topic` with the box's refusal): refused, nothing written.
+    const step = (try registry.callStep(a, s, hm.heads(), try callInput(a, "register", .null, app.thread))).?;
+    const box_args = try mapOf(a, &.{.{ .key = "box", .value = .{ .text = "overlay" } }});
+    try std.testing.expect(!topics_mod.mayRegister(box_args, "overlay"));
+    const why = try topics_mod.notHere(a, "register", box_args, "overlay");
+    const gated = try registry.topic(a, f.fx(), step, try mapOf(a, &.{
+        .{ .key = "topic", .value = .{ .text = "tm_x" } },
+        .{ .key = "program", .value = .{ .text = "topic-demo" } },
+    }), "register", why);
+    try std.testing.expectEqualStrings(why, gated.refused.?);
+    try std.testing.expect(gated.result == null);
+    try std.testing.expect(hm.m.get("overlay/topics") == null);
+    try std.testing.expectEqual(@as(usize, 0), f.events.items.len);
 }
 
 test {

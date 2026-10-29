@@ -13,6 +13,7 @@ const calls = @import("calls.zig");
 const gossip = @import("gossip.zig");
 const state = @import("state.zig");
 const submit = @import("submit.zig");
+const registry = @import("registry.zig");
 
 const cbor = c.cbor;
 const Value = cbor.Value;
@@ -134,4 +135,27 @@ pub fn load(a: Allocator, in: Value) !struct { st: state.State, head: ?[]const u
     ch.* = try c.open(a, s, try vm.head(a, state.chain_head), try network(in));
     const h = try vm.head(a, try stateHead(a, in));
     return .{ .st = try state.State.load(a, s, h, ch), .head = h };
+}
+
+fn advanceImpl(_: *anyopaque, name: []const u8, cid: []const u8) anyerror!void {
+    return vm.advance(name, cid);
+}
+fn emitImpl(_: *anyopaque, a: Allocator, ev: Value) anyerror![]const u8 {
+    return vm.emitEvent(a, ev);
+}
+fn keepImpl(_: *anyopaque, cid: []const u8) anyerror!void {
+    return vm.keep(cid);
+}
+fn loadImpl(_: *anyopaque, a: Allocator, in: Value) anyerror!registry.Loaded {
+    const l = try load(a, in);
+    return .{ .st = l.st, .head = l.head };
+}
+fn wireImpl(_: *anyopaque, in: Value) anyerror!submit.Wire {
+    return wire(in);
+}
+
+/// A registration's effects (registry.zig), over the `skein` imports: the step's (or, by call, the
+/// calling step's) head moves, events and kept records.
+pub fn effects() registry.Fx {
+    return .{ .ctx = &dummy, .store = vm.store(), .heads = heads(), .caller = caller(), .advanceFn = advanceImpl, .emitFn = emitImpl, .keepFn = keepImpl, .loadFn = loadImpl, .wireFn = wireImpl };
 }
