@@ -15,6 +15,16 @@
 //!   {kind: "admittance", topic, txid, outputsToAdmit: [output index], coinsToRetain: [input index], ancillaryTxids?: [txid hex]}
 //!
 //! identify(tx: cid, previousCoins, offChain?) → {outputsToAdmit, coinsToRetain, ancillaryTxids}.
+//!
+//! **Missing parents** (0.19.0; David 2026-10-30: "we don't mark items which are undecided as
+//! invalid"): a topic manager that cannot decide because it cannot read an input's source (not in
+//! the submitted BEEF, not held) FAILS, as any refusal fails (an error: the program exits 1, its
+//! last stderr line the caller's error), with the error `MissingParents` naming every source it
+//! lacks: the line `topic: MissingParents: <txid hex>[,<txid hex>…]`. `identify` returns
+//! `missingParents(call.lacking())` (or its own list). It is no verdict: the engine pauses the
+//! submission, wants those transactions, and judges it again as each arrives; nothing is recorded
+//! as rejected. Admitted and rejected stay the only verdicts. `needsOf` reads the list back out of
+//! the caller's error text.
 //! `ancillaryTxids` (skein-overlay#4; go-overlay-services' AdmittanceInstructions.AncillaryTxids)
 //! names transactions the topic read and relied on that it does not admit — for a 1Sat ordinal
 //! transfer, the funding parents that fix the satoshi's offset. Each must be one the topic could
@@ -83,6 +93,19 @@ pub const Call = struct {
         return Transaction.parse(self.arena, raw) catch null;
     }
 
+    /// The input sources this call cannot read (not in the BEEF, not held), each once, in input
+    /// order: what a topic manager that cannot decide without them names (`missingParents`).
+    pub fn lacking(self: Call) ![][32]u8 {
+        var out: std.ArrayList([32]u8) = .empty;
+        outer: for (self.tx.inputs) |in| {
+            const t = in.previous_outpoint.txid.bytes;
+            for (out.items) |x| if (std.mem.eql(u8, &x, &t)) continue :outer;
+            if (self.transaction(t) != null) continue;
+            try out.append(self.arena, t);
+        }
+        return out.items;
+    }
+
     /// The output an input spends, when its source transaction is readable.
     pub fn sourceOutput(self: Call, input_index: usize) ?c.bsvz.transaction.Output {
         if (input_index >= self.tx.inputs.len) return null;
@@ -103,6 +126,55 @@ pub const Metadata = struct {
 };
 
 pub const Identify = fn (a: std.mem.Allocator, call: Call) anyerror!Instructions;
+
+/// The error name a topic manager that cannot decide fails with (0.19.0).
+pub const missing_parents = "MissingParents";
+
+var needs_buf: std.ArrayList([32]u8) = .empty;
+
+/// Fail the call as undecided: `needs` are the input sources it could not read (all of them; it
+/// need not classify them). → `error.MissingParents`; `main` writes the line
+/// `topic: MissingParents: <hex>,<hex>…`, and a native caller reads them with `lastNeeds`.
+pub fn missingParents(needs: []const [32]u8) error{MissingParents} {
+    needs_buf.clearRetainingCapacity();
+    needs_buf.appendSlice(std.heap.page_allocator, needs) catch {};
+    return error.MissingParents;
+}
+
+/// The transactions the last `missingParents` named (a native caller's read; the VM's is the
+/// error line).
+pub fn lastNeeds() []const [32]u8 {
+    return needs_buf.items;
+}
+
+/// The error text of a call that failed with `MissingParents`: `MissingParents: <hex>,<hex>…`.
+pub fn missingText(a: std.mem.Allocator, needs: []const [32]u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(a, missing_parents ++ ": ");
+    for (needs, 0..) |n, i| {
+        if (i > 0) try out.append(a, ',');
+        try out.appendSlice(a, &c.header.toHex(n));
+    }
+    return out.items;
+}
+
+/// The transactions a failed call's error text names as missing parents (`MissingParents: <hex>,…`
+/// anywhere in it, as the kernel prefixes it: `call <program>.identify: topic: MissingParents: …`),
+/// or null when the error is another (a refusal).
+pub fn needsOf(a: std.mem.Allocator, text: []const u8) !?[][32]u8 {
+    const tag = missing_parents ++ ": ";
+    const at = std.mem.indexOf(u8, text, tag) orelse return null;
+    var rest = std.mem.trim(u8, text[at + tag.len ..], " \r\n");
+    var out: std.ArrayList([32]u8) = .empty;
+    while (rest.len > 0) {
+        const end = std.mem.indexOfScalar(u8, rest, ',') orelse rest.len;
+        const h = std.mem.trim(u8, rest[0..end], " ");
+        try out.append(a, c.header.fromHex(h) catch return null);
+        rest = if (end < rest.len) rest[end + 1 ..] else "";
+    }
+    if (out.items.len == 0) return null;
+    return out.items;
+}
 
 fn uintList(a: std.mem.Allocator, v: ?Value) ![]u32 {
     const items = if (v) |x| (if (x == .array) x.array else return error.BadArgs) else return &.{};
@@ -208,7 +280,8 @@ pub fn describe(a: std.mem.Allocator, comptime Program: type, func: []const u8, 
 }
 
 /// The program's main: a call of fn "identify" (its answer the admittance record), or of fn
-/// "metadata" / "documentation" (the program's own, else the default).
+/// "metadata" / "documentation" (the program's own, else the default). A `MissingParents` failure
+/// ends the call with exit 1 and the line `topic: MissingParents: <hex>,…` (0.19.0).
 pub fn main(comptime identify: Identify) u8 {
     const vm = @import("sk");
     const S = struct {
@@ -220,6 +293,14 @@ pub fn main(comptime identify: Identify) u8 {
             if (std.mem.eql(u8, func, "identify")) return vm.answer(a, try judge(a, vm.store(), identify, arg));
             try vm.answer(a, try describe(a, @import("root"), func, arg));
         }
+        fn guarded(a: std.mem.Allocator) anyerror!void {
+            run(a) catch |e| {
+                if (e != error.MissingParents) return e;
+                const line = try std.mem.concat(a, u8, &.{ "topic: ", try missingText(a, lastNeeds()), "\n" });
+                std.Io.File.stderr().writeStreamingAll(vm.io(), line) catch {};
+                return error.Undecided;
+            };
+        }
     };
-    return vm.main("topic", S.run);
+    return vm.mainQuiet("topic", S.guarded, error.Undecided);
 }

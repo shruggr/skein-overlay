@@ -411,6 +411,55 @@ nothing already relayed and awaits the next proof (a reorg's). No
 deadline: abandonment is the chain app's, and reaches the watch as a
 `rejected` answer.
 
+### Undecided: a topic manager's MissingParents (0.19.0)
+
+David 2026-10-30: "My only real concern is that we don't mark items which
+are undecided as invalid, which would be a persistent state." A verdict is
+admitted or rejected; nothing else. A topic manager that cannot decide —
+it cannot read an input's source: not in the BEEF, not held — **fails**,
+as a refusal fails (the call exits 1; its last stderr line is the caller's
+error), with the error `MissingParents` and the sources it lacks:
+
+```
+topic: MissingParents: <txid hex>[,<txid hex>…]
+```
+
+(topic.zig: `return topic.missingParents(try call.lacking())`; `needsOf`
+reads the list back out of `call <program>.identify: topic: …`.) It names
+all of them; it need not classify them. The engine catches that error
+alone: in the walk, every transaction's `MissingParents` sources are
+gathered; after the walk, those neither in the BEEF nor held by the chain
+app make the **whole submission pause** — the paused event of "Paused on a
+missing parent" below, `waiting` them, wants against the peers that
+announced it. Each wanted transaction arrives as its own proven BEEF (the
+door), is judged (and itself may be undecided: it pauses, and its own
+parents are wanted from the peers its subject is wanted from), and when
+the chain app answers for it, the paused submission is **resumed**
+(`resume`, never resubmitted) and judged again from the start of the walk:
+still undecided → paused again with what it still lacks; decided →
+admitted or rejected as any submission. No timeout, no expiry. Nothing is
+recorded or answered as rejected while undecided.
+
+A topic that decides with the BEEF and what the instance holds asks for
+nothing: a mined funding parent is never wanted. A submission one of whose
+inputs spends a transaction that is itself paused here (undecided, or
+waiting on its own parents) waits on it with no want (`held`, as a parent
+in flight, skein-overlay#6: judged now its topic would read that parent's
+outputs as no coins) and is routed again when that transaction is decided:
+admitted (the chain app's answer), or dropped (taken by nothing, refused,
+judged before: `resume` sent to those holding on it).
+
+The want's answer path (confirmed 0.19.0): the host (skein
+src/host/sync.ts) asks each want's peer — no peer: the topic's mesh — on
+`/skein/overlay/sync/1.0.0` with `{kind: "tx", topic, txid}`; the peer's
+engine answers from `holds` — a transaction its state reaches (admitted,
+retained, ancillary, judged) — with its chain state's Atomic BEEF of it
+(`beefFor`); the host hands that to the receive row
+`/skein/overlay/beef/1.0.0` (filter `kernel.beef` → `submit`) as from that
+peer. Nothing on it assumes anything else. A source no peer's state
+reaches (a funding parent) is never answered; its want stands until the
+submission is decided (then `unwant`).
+
 ### Paused on a missing parent (skein-overlay#1)
 
 A submission whose BEEF lacks a parent (above, "Missing parents pause") is

@@ -4,7 +4,7 @@ The overlay services engine for a [skein](https://github.com/shruggr/skein),
 as an app: BRC-22 submit and BRC-24 lookup, served by the instance's own
 front door, with topic managers and lookup services as programs the engine
 calls. It is also a Zig package: an overlay of your own depends on it for
-the topic and lookup contracts. Version **0.18.0**.
+the topic and lookup contracts. Version **0.19.0**.
 
 ## What it is
 
@@ -67,7 +67,10 @@ its own submission handed to the chain app, the answer not in) pauses on
 it the same way, with no want — nothing to ask anyone for — and is routed
 again when the chain app answers for that parent: judged with the parent's
 outputs admitted, refused on the merits if the parent was rejected, or
-paused again for what it still lacks (skein-overlay#6). The pause is
+paused again for what it still lacks (skein-overlay#6). A transaction a
+topic manager cannot decide — it fails `MissingParents`, naming the input
+sources it cannot read — pauses the same way and wants those (0.19.0): no
+verdict, nothing rejected, judged again as each arrives. The pause is
 internal: the submitter hears nothing of it. A
 transaction admitted on `accepted` sends the app itself a `watch`, which
 waits for `proven` (publishes `-proof`) or `rejected` (unwinds); with a
@@ -558,7 +561,7 @@ the anchors and answers the sync protocol's frames (0.15.0).
 
 | | |
 |---|---|
-| this app and package | 0.18.0 (tag `v0.18.0`) |
+| this app and package | 0.19.0 (tag `v0.19.0`) |
 | skein-sdk | v0.12.0, by tag URL and hash in `build.zig.zon` (modules `chain` and, for the engine, `sk`; bsvz comes through it) |
 | requires | `chain/1` (shruggr/skein-chain 0.3.0) |
 | skein | log format 10, the BEEF envelope beside the pointer record (shruggr/skein#146); the routes / filters / roles manifest (shruggr/skein#143); skein's equivs pin this repo by commit |
@@ -883,6 +886,31 @@ call from a program of the instance in its step ("Register a topic", "By
 call"): the same code as the message in `<app>/register` (src/registry.zig,
 the box path unchanged), the engine's app the calling thread's, answered
 `{fn, result}` or `{fn, error}`. No wire, manifest, host or kernel change.
+
+0.19.0 (David 2026-10-30: "we don't mark items which are undecided as
+invalid"): **undecided is not rejected.** Admitted and rejected stay the
+only verdicts. A topic manager that cannot decide because it cannot read
+an input's source (not in the BEEF, not held) fails as a refusal fails,
+with the error `MissingParents` naming every source it lacks (topic.zig
+`missingParents`, `Call.lacking`; the line `topic: MissingParents:
+<hex>,…`). The engine catches that error: the whole submission pauses
+(the existing pause, `waiting` the named sources minus what is in the BEEF
+or held), wants them from the peers that announced it, and is judged again
+from the start of the walk as each arrives (a `resume`, never a
+resubmission); paused again with what it still lacks; no timeout. Nothing
+is recorded or answered as rejected while it is undecided. A topic that
+decides with the BEEF and what is held asks for nothing (a mined funding
+parent is never wanted). A submission spending a transaction that is
+itself paused here waits on it, with no want (`held`, as a parent in
+flight), and is routed again when that one is decided. The want's answer
+path is unchanged: the host asks the announcing peer on
+`/skein/overlay/sync/1.0.0` (`{kind: "tx"}`), the peer's engine answers
+its chain state's Atomic BEEF of a transaction its state reaches, and the
+host hands it to `/skein/overlay/beef/1.0.0` through `kernel.beef`. The
+pre-SPV `missingParents` scan stays for BEEF bytes the door does not see
+(a gossip `submit {beef}`); the door makes it unreachable for an envelope.
+The caller's error buffer (`sk`) holds 64 KiB. No wire, manifest, host or
+kernel change.
 
 ## Contributing
 

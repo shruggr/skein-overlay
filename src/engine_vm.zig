@@ -40,9 +40,14 @@ fn callerImpl(_: *anyopaque, a: Allocator, program: []const u8, func: []const u8
     return vm.call(a, program, func, arg);
 }
 
-/// The overlay's calls of topics and lookup services (#50), over the `call` import.
+fn errorImpl(_: *anyopaque) []const u8 {
+    return vm.lastError();
+}
+
+/// The overlay's calls of topics and lookup services (#50), over the `call` import; a failed call's
+/// text is the `error` import's (0.19.0: a topic's `MissingParents` line).
 pub fn caller() calls.Caller {
-    return .{ .ctx = &dummy, .callFn = callerImpl };
+    return .{ .ctx = &dummy, .callFn = callerImpl, .errorFn = errorImpl };
 }
 
 var self_key: []const u8 = "";

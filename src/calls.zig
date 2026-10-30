@@ -28,9 +28,21 @@ const Allocator = std.mem.Allocator;
 pub const Caller = struct {
     ctx: *anyopaque,
     callFn: *const fn (ctx: *anyopaque, a: Allocator, program: []const u8, func: []const u8, arg: Value) anyerror!Value,
+    /// The last failed call's error text (the callee's last stderr line, as the kernel reports it:
+    /// `call <program>.<fn>: …`), read when `call` failed; none: only the error's name is known.
+    errorFn: ?*const fn (ctx: *anyopaque) []const u8 = null,
 
     pub fn call(self: Caller, a: Allocator, program: []const u8, func: []const u8, arg: Value) !Value {
         return self.callFn(self.ctx, a, program, func, arg);
+    }
+
+    /// The text of the error the last `call` failed with: the callee's, else the error's name.
+    pub fn errorText(self: Caller, e: anyerror) []const u8 {
+        if (self.errorFn) |f| {
+            const t = f(self.ctx);
+            if (t.len > 0) return t;
+        }
+        return @errorName(e);
     }
 };
 

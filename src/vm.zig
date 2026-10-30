@@ -30,7 +30,9 @@ pub const sk = struct {
     pub extern "skein" fn @"await"(cid: [*]const u8, cid_len: u32) i32;
 };
 
-var last_error: [1024]u8 = undefined;
+/// The last failed import's error (a failed call's: its callee's last stderr line). 64 KiB: a
+/// topic manager's `MissingParents` line names every source it lacks (0.19.0).
+var last_error: [65536]u8 = undefined;
 var last_error_len: usize = 0;
 
 pub fn failed() error{ImportFailed} {
@@ -159,7 +161,27 @@ pub fn main(comptime name: []const u8, comptime run: fn (std.mem.Allocator) anye
     defer arena_state.deinit();
     run(arena_state.allocator()) catch |e| {
         var buf: [1400]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, name ++ ": {s}{s}{s}\n", .{ @errorName(e), if (last_error_len > 0) ": " else "", last_error[0..last_error_len] }) catch name ++ ": error\n";
+        const msg = std.fmt.bufPrint(&buf, name ++ ": {s}{s}{s}\n", .{ @errorName(e), if (last_error_len > 0) ": " else "", last_error[0..@min(last_error_len, 1024)] }) catch name ++ ": error\n";
+        std.Io.File.stderr().writeStreamingAll(io(), msg) catch {};
+        return 1;
+    };
+    return 0;
+}
+
+/// `main`, except that `quiet` (an error `run` returns after writing its own last stderr line, as
+/// topic.zig's `MissingParents`) ends the step with exit 1 and nothing more on stderr.
+pub fn mainQuiet(comptime name: []const u8, comptime run: fn (std.mem.Allocator) anyerror!void, comptime quiet: anyerror) u8 {
+    const S = struct {
+        fn wrapped(a: std.mem.Allocator) anyerror!void {
+            return run(a);
+        }
+    };
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.wasm_allocator);
+    defer arena_state.deinit();
+    S.wrapped(arena_state.allocator()) catch |e| {
+        if (e == quiet) return 1;
+        var buf: [1400]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, name ++ ": {s}{s}{s}\n", .{ @errorName(e), if (last_error_len > 0) ": " else "", last_error[0..@min(last_error_len, 1024)] }) catch name ++ ": error\n";
         std.Io.File.stderr().writeStreamingAll(io(), msg) catch {};
         return 1;
     };

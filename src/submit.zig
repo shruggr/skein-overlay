@@ -63,6 +63,12 @@
 //! parent's outputs admitted (or refused on the merits, the parent rejected),
 //! or paused again for what it still lacks.
 //!
+//! 0.19.0 (David 2026-10-30, "undecided is not rejected"): a topic's `identify` that fails
+//! `MissingParents` (topic.zig) is no verdict. The walk gathers the sources it names; those neither
+//! in the BEEF nor held pause the whole submission as a missing parent does (wanted, resumed on each
+//! arrival, judged again); nothing is recorded as rejected. A parent that is itself paused here is
+//! waited on as one in flight (`State.isUnsettled`), with no want.
+//!
 //! shruggr/skein#112 (0.7.2): a submission is a message, `{fn: "submit",
 //! args: {beef, topics, offChainValues?}}`, into a box a row routes to the
 //! engine (`received`); POST /submit is the other path (0.9.1: BRC-22,
@@ -242,6 +248,8 @@ pub fn route(a: Allocator, caller: calls.Caller, st: *State, in: Value, beef: In
     for (walked) |*w| w.* = .empty;
     var items: std.ArrayList(Item) = .empty;
     var why: std.ArrayList(u8) = .empty;
+    // 0.19.0: the sources a topic could not decide without (its `MissingParents` failure).
+    var needs: std.ArrayList([32]u8) = .empty;
     for (d.txs) |dt| {
         const is_subject = std.mem.eql(u8, &dt.txid, &sub.txid);
         if (!is_subject and try st.isPending(dt.txid)) continue; // its own submission's
@@ -252,6 +260,11 @@ pub fn route(a: Allocator, caller: calls.Caller, st: *State, in: Value, beef: In
             const prog = (try calls.configuredProgram(in, served, t)) orelse continue;
             const previous = try st.previousCoinsWith(t, tx.tx, w.items);
             const ins = identify(a, caller, prog, t, tx, previous, if (is_subject) off else null) catch |e| {
+                // Undecided (0.19.0): no verdict, nothing recorded; the submission pauses on them.
+                if (try missingOf(a, caller, e)) |ns| {
+                    for (ns) |n| if (!contains(needs.items, n)) try needs.append(a, n);
+                    continue;
+                }
                 if (is_subject) try why.print(a, "{s}{s}: {s}", .{ if (why.items.len > 0) "; " else "", t, @errorName(e) });
                 continue;
             };
@@ -267,11 +280,37 @@ pub fn route(a: Allocator, caller: calls.Caller, st: *State, in: Value, beef: In
             try items.append(a, .{ .txid = dt.txid, .judged = judged.items, .subject = is_subject });
         if (is_subject) break;
     }
+    if (needs.items.len > 0) {
+        // What a topic could not read and the instance does not hold: wanted; the whole submission
+        // paused on them, judged again from the start of the walk as each arrives (0.19.0).
+        var lacking_now: std.ArrayList([32]u8) = .empty;
+        for (needs.items) |n| {
+            if (inBeef(d, n) or try st.ch.holds(n)) continue;
+            try lacking_now.append(a, n);
+        }
+        if (lacking_now.items.len > 0)
+            return .{ .paused = .{ .event = try pausedEvent(a, sub.txid, beef, topics, lacking_now.items, &.{}, off, source), .txid = sub.txid, .waiting = lacking_now.items } };
+        // A topic named only transactions that are here: not undecided after all; it took nothing.
+        try why.print(a, "{s}MissingParents of transactions held here", .{if (why.items.len > 0) "; " else ""});
+    }
     if (items.items.len == 0) {
         if (dupes > 0) return .{ .unchanged = sub.txid };
         return .{ .nothing = if (why.items.len > 0) why.items else "NotAdmitted: no topic admitted an output or consumed a previous coin" };
     }
     return .{ .admit = .{ .event = try event(a, sub.txid, beef, items.items, off, source), .txid = sub.txid } };
+}
+
+/// The transactions a topic's failed `identify` names as missing parents (topic.zig
+/// `MissingParents`, 0.19.0) — the VM's call fails `ImportFailed` with the callee's error line; a
+/// native caller's with `MissingParents` — or null when the failure is another (a refusal).
+fn missingOf(a: Allocator, caller: calls.Caller, e: anyerror) !?[][32]u8 {
+    if (e != error.ImportFailed and e != error.MissingParents) return null;
+    return topic_mod.needsOf(a, caller.errorText(e));
+}
+
+fn inBeef(d: state.Decoded, txid: [32]u8) bool {
+    for (d.txs) |t| if (eql(u8, &t.txid, &txid)) return true;
+    return false;
 }
 
 fn contains(xs: []const [32]u8, x: [32]u8) bool {
@@ -592,7 +631,7 @@ fn pause(cx: Ctx, ev: Value, txid: [32]u8) !Begun {
     // A parent in flight at the route the chain app answered for since: its resume went out before
     // this pause was recorded, so it is sent now (skein-overlay#6).
     var resumes: std.ArrayList([]const u8) = .empty;
-    for (held) |h| if (!(try st.isInFlight(h))) {
+    for (held) |h| if (!(try st.isUnsettled(h))) {
         try resumes.append(a, try cx.wire.send(a, calls.appOf(cx.in), try resumeBody(a, txid)));
         break;
     };
@@ -1111,6 +1150,10 @@ fn unpauseIf(cx: Ctx, txid: [32]u8) !void {
     if (try cx.st.isPaused(txid)) {
         _ = try wakeWaiters(cx, txid);
         try unpause(cx.st, txid);
+        // 0.19.0: submissions paused on this one while it was itself paused (`held`) are routed
+        // again: it is decided now (taken by nothing, refused, judged before).
+        var rs: std.ArrayList([]const u8) = .empty;
+        try resumeHeld(cx, txid, &rs);
     }
 }
 

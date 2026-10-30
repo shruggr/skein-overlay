@@ -219,7 +219,7 @@ const Instance = struct {
     /// The topics a submission requests (X-Topics, or the gossip message's).
     topics: []const []const u8 = &.{"tm_demo"},
     /// How the topic program judges: tm_demo's identify, or it naming ancillary txids (skein-overlay#4).
-    identify_: enum { demo, funding, unknown } = .demo,
+    identify_: enum { demo, funding, unknown, strict } = .demo,
     calls_: std.StringHashMapUnmanaged(usize) = .empty,
     wire_: *FakeWire,
     out_: *FakeOut,
@@ -268,6 +268,7 @@ const Instance = struct {
                 .demo => topic.judge(a, self.current, demo.identify, arg),
                 .funding => topic.judge(a, self.current, fundingIdentify, arg),
                 .unknown => topic.judge(a, self.current, unknownIdentify, arg),
+                .strict => topic.judge(a, self.current, demo.identifyStrict, arg),
             };
         }
         if (std.mem.eql(u8, program, self.lookup_prog)) {
@@ -278,8 +279,14 @@ const Instance = struct {
         }
         return error.UnknownProgram;
     }
+    /// A failed call's text, as the VM's caller reads the callee's last stderr line: a topic's
+    /// `MissingParents` line (0.19.0), else nothing (the error's name).
+    fn errorImpl(ctx: *anyopaque) []const u8 {
+        const self: *Instance = @ptrCast(@alignCast(ctx));
+        return std.mem.concat(self.a, u8, &.{ "call topic-demo.identify: topic: ", topic.missingText(self.a, topic.lastNeeds()) catch return "" }) catch "";
+    }
     fn caller(self: *Instance) calls.Caller {
-        return .{ .ctx = self, .callFn = callImpl };
+        return .{ .ctx = self, .callFn = callImpl, .errorFn = errorImpl };
     }
     fn count(self: *Instance, func: []const u8) usize {
         return self.calls_.get(func) orelse 0;
@@ -338,8 +345,8 @@ const Instance = struct {
     }
 
     /// A step: the context over the store as it stands, then the state saved.
-    fn cx(self: *Instance, st: *state.State, with_out: bool) submit.Ctx {
-        return .{ .a = self.a, .caller = self.caller(), .wire = self.wire_.wire(), .out = if (with_out) self.out_.out() else null, .st = st, .in = self.in, .thread = &cbor.cidOf("the thread"), .gossip = self.gossip_ };
+    fn cx(self: *Instance, st: *state.State, with_out: bool) !submit.Ctx {
+        return .{ .a = self.a, .caller = self.caller(), .wire = self.wire_.wire(), .out = if (with_out) self.out_.out() else null, .st = st, .in = self.in, .thread = try self.a.dupe(u8, &cbor.cidOf("the thread")), .gossip = self.gossip_ };
     }
     fn load(self: *Instance) !state.State {
         self.current = self.ms.store();
@@ -354,7 +361,7 @@ const Instance = struct {
     fn begin(self: *Instance, event: Value) ![]const u8 {
         const ev = try cbor.decode(self.a, try cbor.encode(self.a, event));
         var st = try self.load();
-        const b = try submit.begin(self.cx(&st, true), ev);
+        const b = try submit.begin((try self.cx(&st, true)), ev);
         self.events = try st.wantEvents();
         self.ov_root = try st.save();
         self.begun = b;
@@ -368,7 +375,7 @@ const Instance = struct {
     fn answer(self: *Instance, txid: [32]u8, ans: submit.Answer) !submit.Stepped {
         const t = self.threads.get(txid).?;
         var st = try self.load();
-        const done = try submit.answered(self.cx(&st, true), t.ev, t.ingest, ans);
+        const done = try submit.answered((try self.cx(&st, true)), t.ev, t.ingest, ans);
         self.events = try st.wantEvents();
         self.view_changes = try st.beatChanges();
         self.lookup_beats = st.lookup_beats.items;
@@ -385,13 +392,13 @@ const Instance = struct {
     /// A watch as its message names it (shruggr/skein#112: with the submission's source, `proven`).
     fn watchStartOf(self: *Instance, w: submit.Watch) !submit.Stepped {
         var st = try self.load();
-        const done = try submit.watchStart(self.cx(&st, true), w);
+        const done = try submit.watchStart((try self.cx(&st, true)), w);
         self.ov_root = try st.save();
         return done;
     }
     fn watchedOf(self: *Instance, w: submit.Watch, ans: submit.Answer) !submit.Stepped {
         var st = try self.load();
-        const done = try submit.watched(self.cx(&st, true), w, ans);
+        const done = try submit.watched((try self.cx(&st, true)), w, ans);
         self.view_changes = try st.beatChanges();
         self.lookup_beats = st.lookup_beats.items;
         self.ov_root = try st.save();
@@ -401,7 +408,7 @@ const Instance = struct {
     /// A peer's `-admit` for `txid` seen (the `peer-admit` step's want half, shruggr/skein#112).
     fn admitSeen(self: *Instance, txid: [32]u8, peer: []const u8) !void {
         var st = try self.load();
-        try submit.admitSeen(self.cx(&st, true), "tm_demo", txid, peer);
+        try submit.admitSeen((try self.cx(&st, true)), "tm_demo", txid, peer);
         self.events = try st.wantEvents();
         self.ov_root = try st.save();
     }
@@ -409,7 +416,7 @@ const Instance = struct {
     /// A submission by message (shruggr/skein#112): the step on `{fn: "submit", args}` from `source`.
     fn received(self: *Instance, args: Value, source: Value) !submit.Resumed {
         var st = try self.load();
-        const r = try submit.received(self.cx(&st, true), args, source);
+        const r = try submit.received((try self.cx(&st, true)), args, source);
         self.events = try st.wantEvents();
         self.ov_root = try st.save();
         return r;
@@ -418,7 +425,7 @@ const Instance = struct {
     /// A `resume` step (skein-overlay#1): the paused submission of this subject routed again.
     fn resumed(self: *Instance, txid: [32]u8) !submit.Resumed {
         var st = try self.load();
-        const r = try submit.resumed(self.cx(&st, true), txid);
+        const r = try submit.resumed((try self.cx(&st, true)), txid);
         self.events = try st.wantEvents();
         self.ov_root = try st.save();
         return r;
@@ -444,7 +451,7 @@ const Instance = struct {
     /// A `wait` message's step (0.9.1): `w` about `txid`.
     fn waitOn(self: *Instance, txid: [32]u8, w: []const u8) !@typeInfo(@typeInfo(@TypeOf(submit.waitOn)).@"fn".return_type.?).error_union.payload {
         var st = try self.load();
-        const r = try submit.waitOn(self.cx(&st, true), txid, w);
+        const r = try submit.waitOn((try self.cx(&st, true)), txid, w);
         self.ov_root = try st.save();
         return r;
     }
@@ -3283,7 +3290,7 @@ test "seeding a registered topic (0.7.8): a held seed judged under the new topic
     const seedStep = struct {
         fn run(i: *Instance, cfg: Value, seeds: []const [32]u8) !submit.Seeding {
             var st = try i.load();
-            var cx_ = i.cx(&st, false);
+            var cx_ = try i.cx(&st, false);
             cx_.in = cfg;
             const sd = try submit.seed(cx_, "tm_seed", seeds);
             i.ov_root = try st.save();
@@ -4440,4 +4447,208 @@ test "a registration by call refused (0.18.0): bad args answered bad-args with t
 
 test {
     _ = configured;
+}
+
+// ---------------------------------------------------------------- undecided is not rejected (0.19.0)
+
+/// `t` mined alone at `height` (after `prev`): its header, and its Atomic BEEF (`t` and its BUMP).
+const MinedAlone = struct { header: [80]u8, beef: []const u8 };
+
+fn minedAlone(a: Allocator, prev: [80]u8, height: u32, t: Spent) !MinedAlone {
+    const h = mine(hdr.hash(&prev), t.txid, 1_700_000_000 + height * 600);
+    const bumps = try a.dupe(bsvz.spv.MerklePath, &.{try bsvz.spv.MerklePath.parse(a, try soloPath(a, height, t.txid))});
+    const b = try beef.serialize(a, .{ .version = beef.V2, .atomic = t.txid, .bumps = bumps, .entries = try a.dupe(beef.Entry, &.{.{ .txid = t.txid, .format = .raw_with_bump, .bump = 0, .raw = t.raw, .tx = t.tx }}) });
+    return .{ .header = h, .beef = b };
+}
+
+/// The fund's own Atomic BEEF (mined at 1).
+fn fundBeef(a: Allocator, f: Fund) ![]const u8 {
+    return beef.serialize(a, .{ .version = beef.V2, .atomic = f.txid, .bumps = f.bumps, .entries = try a.dupe(beef.Entry, &.{f.entry}) });
+}
+
+/// The chain under the strict rule: fund F (mined at 1, no token), t1 a mint from F (mined at 2),
+/// t2 spending t1's token (mined at 3). Headers 1..3 held; nothing else.
+const Strict = struct { k: Keys, f: Fund, t1: Spent, t2: Spent, b1: []const u8, b2: []const u8, bf: []const u8 };
+
+fn strictChain(a: Allocator, inst: *Instance) !Strict {
+    inst.identify_ = .strict;
+    const k = try keys(0x42);
+    const f = try fund(a, 0x33, 1, &k.p2pkh);
+    const t1 = try spend(a, &f.tx, 0, &.{ .{ 1, &k.token }, .{ 9_000, &k.p2pkh } }, k.priv);
+    const t2 = try spend(a, &t1.tx, 0, &.{.{ 1, &k.token }}, k.priv);
+    const m1 = try minedAlone(a, f.h1, 2, t1);
+    const m2 = try minedAlone(a, m1.header, 3, t2);
+    try inst.headers(&.{ &f.h1, &m1.header, &m2.header });
+    return .{ .k = k, .f = f, .t1 = t1, .t2 = t2, .b1 = m1.beef, .b2 = m2.beef, .bf = try fundBeef(a, f) };
+}
+
+/// Nothing recorded as rejected: no submitter heard `rejected`, the chain state rejects nothing.
+fn expectNothingRejected(inst: *Instance) !void {
+    for (inst.wire_.answers.items) |x| {
+        const r = x.body.get("result") orelse continue;
+        try std.testing.expect(!std.mem.eql(u8, r.getText("state") orelse "", "rejected"));
+    }
+    var st = try inst.load();
+    try std.testing.expectEqual(@as(usize, 0), try st.ch.map("rejected").count());
+}
+
+const UndecidedRun = struct { root: []const u8, wants: []const []const u8 };
+
+fn undecidedRun(a: Allocator, ms: *c.store.MemStore) !UndecidedRun {
+    var inst = try Instance.init(a, ms);
+    const x = try strictChain(a, &inst);
+    const pb = peerId('B');
+    var wants: std.ArrayList([]const u8) = .empty;
+
+    // ------------------------------------------------ t2 alone (mined): the topic cannot read t1 — undecided, no verdict
+    const r2 = try inst.routeFrom(x.b2, try fromStream(a, pb));
+    try std.testing.expect(r2 == .paused);
+    try std.testing.expectEqual(@as(usize, 1), inst.count("identify")); // judged: the topic said MissingParents
+    try std.testing.expectEqual(@as(usize, 1), r2.paused.waiting.len);
+    try std.testing.expectEqualSlices(u8, &x.t1.txid, &r2.paused.waiting[0]);
+    try std.testing.expect(r2.paused.event.get("held") == null);
+    _ = try inst.begin(r2.paused.event);
+    try std.testing.expect(inst.begun.paused);
+    try std.testing.expectEqual(@as(usize, 0), inst.begun.ingests.len); // nothing to the chain app
+    try std.testing.expectEqual(@as(usize, 1), inst.begun.wants.len);
+    try std.testing.expectEqualStrings(&hdr.toHex(x.t1.txid), inst.begun.wants[0].getText("txid").?);
+    try std.testing.expectEqualSlices(u8, pb, inst.begun.wants[0].getBytes("peer").?);
+    for (inst.begun.wants) |w| try wants.append(a, try cbor.encode(a, w));
+    try std.testing.expect(!(try inst.applied(x.t2.txid)));
+    try expectNothingRejected(&inst);
+
+    // The same BEEF again from B: the route ignores it (B is asked already); judged again, undecided again.
+    var st = try inst.load();
+    try std.testing.expect(try st.wantsFrom(x.t2.txid, &.{x.t1.txid}, &.{"tm_demo"}, pb));
+
+    // ------------------------------------------------ B answers the want: t1 (mined) — itself undecided (needs F)
+    inst.topics = try submit.wantedTopics(a, &st, x.t1.txid);
+    const r1 = try inst.routeFrom(x.b1, try fromStream(a, pb));
+    try std.testing.expect(r1 == .paused);
+    try std.testing.expectEqualSlices(u8, &x.f.txid, &r1.paused.waiting[0]);
+    _ = try inst.begin(r1.paused.event);
+    try std.testing.expectEqual(@as(usize, 1), inst.begun.wants.len);
+    try std.testing.expectEqualStrings(&hdr.toHex(x.f.txid), inst.begun.wants[0].getText("txid").?);
+    for (inst.begun.wants) |w| try wants.append(a, try cbor.encode(a, w));
+    st = try inst.load();
+    try std.testing.expect(try st.isPaused(x.t1.txid) and try st.isPaused(x.t2.txid));
+    try std.testing.expect(try st.hasWant(x.t1.txid, "tm_demo", pb)); // t2's want stands: t1 is not decided
+    try expectNothingRejected(&inst);
+
+    // t2 resubmitted meanwhile (another peer's gossip): its parent t1 undecided here — waits on it, held, no new want.
+    const judged = inst.count("identify");
+    const r2b = try inst.routeFrom(x.b2, try fromGossip(a, peerId('C')));
+    try std.testing.expect(r2b == .paused);
+    try std.testing.expectEqualStrings(&hdr.toHex(x.t1.txid), r2b.paused.event.getArray("held").?[0].text);
+    try std.testing.expectEqual(judged, inst.count("identify")); // not judged: its parent is undecided here
+
+    // ------------------------------------------------ F arrives (mined; no token: takes nothing, but wanted — ingested)
+    inst.topics = try submit.wantedTopics(a, &st, x.f.txid);
+    const rf = try inst.routeFrom(x.bf, try fromStream(a, pb));
+    try std.testing.expect(rf == .admit);
+    try std.testing.expect(rf.admit.event.getBool("wanted").?);
+    _ = try inst.begin(rf.admit.event);
+    _ = try inst.ingest(x.bf);
+    const gf = try inst.answer(x.f.txid, .{ .proven = .{} });
+    try std.testing.expectEqual(@as(usize, 1), gf.resumes.len);
+    try expectNothingRejected(&inst);
+
+    // t1 resumed (never resubmitted): judged again — decided, a mint — admitted; t2 resumed on its admission.
+    inst.topics = &.{"tm_demo"};
+    const res1 = try inst.resumed(x.t1.txid);
+    try std.testing.expect(res1 == .launch);
+    try expectUints(&.{0}, res1.launch.getArray("topics").?[0].get("outputsToAdmit"));
+    _ = try inst.begin(res1.launch);
+    _ = try inst.ingest(x.b1);
+    const g1 = try inst.answer(x.t1.txid, .{ .proven = .{} });
+    try std.testing.expect(g1.admitted);
+    try std.testing.expectEqual(@as(usize, 1), g1.resumes.len);
+    const res2 = try inst.resumed(x.t2.txid);
+    try std.testing.expect(res2 == .launch);
+    try expectUints(&.{0}, res2.launch.getArray("topics").?[0].get("previousCoins"));
+    _ = try inst.begin(res2.launch);
+    _ = try inst.ingest(x.b2);
+    const g2 = try inst.answer(x.t2.txid, .{ .proven = .{} });
+    try std.testing.expect(g2.admitted and g2.done);
+    try std.testing.expect(try inst.applied(x.t1.txid) and try inst.applied(x.t2.txid));
+    st = try inst.load();
+    try std.testing.expectEqual(@as(usize, 0), try st.map("wants").count());
+    try std.testing.expect(!(try st.isPending(x.t1.txid)) and !(try st.isPending(x.t2.txid)));
+    try expectNothingRejected(&inst);
+    return .{ .root = inst.ov_root.?, .wants = wants.items };
+}
+
+test "undecided is not rejected (0.19.0, David 2026-10-30): a topic's MissingParents pauses the submission and wants the parent; each arrival resumes it, judged again; admitted at the end; nothing rejected; replayed, identical" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms1 = c.store.MemStore.init(std.testing.allocator);
+    defer ms1.deinit();
+    var ms2 = c.store.MemStore.init(std.testing.allocator);
+    defer ms2.deinit();
+    const one = try undecidedRun(a, &ms1);
+    const two = try undecidedRun(a, &ms2);
+    try std.testing.expectEqualSlices(u8, one.root, two.root);
+    try std.testing.expectEqual(one.wants.len, two.wants.len);
+    for (one.wants, two.wants) |x, y| try std.testing.expectEqualSlices(u8, x, y);
+    try std.testing.expectEqual(ms1.count(), ms2.count());
+}
+
+test "decided with what is here (0.19.0): a mined funding-only transaction and a mint with its parent in the BEEF never want; a spend of a token that is no coin is still rejected" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = c.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var inst = try Instance.init(a, &ms);
+    const x = try strictChain(a, &inst);
+
+    // F alone (mined, no token output, its own parent unknown here): taken by nothing, at once — no pause, no want.
+    const rf = try inst.route(x.bf);
+    try std.testing.expect(rf == .nothing);
+    var st = try inst.load();
+    try std.testing.expectEqual(@as(usize, 0), try st.map("wants").count());
+
+    // A mint with its funding parent in the BEEF: decided from the BEEF alone — admitted, no want.
+    const mint = try spend(a, &x.f.tx, 0, &.{ .{ 1, &x.k.token }, .{ 9_000, &x.k.p2pkh } }, x.k.priv);
+    const mb = try withFund(a, x.f, mint);
+    _ = try inst.submitted(mb);
+    try std.testing.expectEqual(@as(usize, 0), inst.begun.wants.len);
+    _ = try inst.ingest(mb);
+    _ = try inst.chainStatus(mint.txid, "RECEIVED", null);
+    try std.testing.expect((try inst.answer(mint.txid, .accepted)).admitted);
+
+    // A spend of the mint's token, then a second spend of the same token: the second's source is
+    // readable and no coin of the topic (spent) — the topic decides: refused, nothing paused or wanted.
+    const s1 = try spend(a, &mint.tx, 0, &.{.{ 1, &x.k.token }}, x.k.priv);
+    _ = try inst.submitted(try atomic(a, s1));
+    _ = try inst.ingest(try atomic(a, s1));
+    _ = try inst.chainStatus(s1.txid, "RECEIVED", null);
+    try std.testing.expect((try inst.answer(s1.txid, .accepted)).admitted);
+    const s2 = try spend(a, &mint.tx, 0, &.{.{ 2, &x.k.token }}, x.k.priv);
+    const r = try inst.route(try atomic(a, s2));
+    try std.testing.expect(r == .nothing);
+    try std.testing.expect(std.mem.indexOf(u8, r.nothing, "SpendsNoCoin") != null);
+    st = try inst.load();
+    try std.testing.expect(!(try st.isPending(s2.txid)));
+    try std.testing.expectEqual(@as(usize, 0), try st.map("wants").count());
+}
+
+test "the topic contract's MissingParents (0.19.0): the error line names every source it lacks; the engine reads it back; another error is a refusal" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const t1: [32]u8 = .{0x11} ** 32;
+    const t2: [32]u8 = .{0x22} ** 32;
+    try std.testing.expectEqual(error.MissingParents, topic.missingParents(&.{ t1, t2 }));
+    try std.testing.expectEqual(@as(usize, 2), topic.lastNeeds().len);
+    const text = try topic.missingText(a, topic.lastNeeds());
+    try std.testing.expectEqualStrings("MissingParents: " ++ ("11" ** 32) ++ "," ++ ("22" ** 32), text);
+    const line = try std.mem.concat(a, u8, &.{ "call color-topic.identify: topic: ", text });
+    const back = (try topic.needsOf(a, line)).?;
+    try std.testing.expectEqual(@as(usize, 2), back.len);
+    try std.testing.expectEqualSlices(u8, &t1, &back[0]);
+    try std.testing.expectEqualSlices(u8, &t2, &back[1]);
+    try std.testing.expect((try topic.needsOf(a, "call color-topic.identify: topic: NotAdmitted")) == null);
+    try std.testing.expect((try topic.needsOf(a, "MissingParents: zz")) == null);
 }

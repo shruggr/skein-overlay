@@ -459,6 +459,14 @@ pub const State = struct {
         return rec.getCid("ingest") != null;
     }
 
+    /// Whether this transaction is not settled here yet (0.19.0): in flight, or itself a paused
+    /// submission (undecided, or waiting on its own parents). A child spending it waits on it, with
+    /// no want (`heldParents`): judged now, its topic would read the parent's outputs as no coins.
+    pub fn isUnsettled(self: *State, txid: [32]u8) !bool {
+        const rec = (try self.pendingRecord(txid)) orelse return false;
+        return rec.getCid("ingest") != null or rec.get("waiting") != null;
+    }
+
     /// The paused submissions waiting on `txid` as a parent in flight (skein-overlay#6: their
     /// event's `held`; no want stands for it), each once, in key order.
     pub fn heldWaitersOf(self: *State, txid: [32]u8) ![][32]u8 {
@@ -1379,7 +1387,7 @@ pub fn heldParents(a: Allocator, st: *State, d: Decoded) ![][32]u8 {
         const tx = Transaction.parse(a, t.raw) catch return error.InvalidBeef;
         for (tx.inputs) |in| {
             const src = in.previous_outpoint.txid.bytes;
-            if (!(try st.isInFlight(src))) continue;
+            if (!(try st.isUnsettled(src))) continue;
             for (out.items) |x| {
                 if (std.mem.eql(u8, &x, &src)) break;
             } else try out.append(a, src);
