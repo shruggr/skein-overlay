@@ -4652,3 +4652,25 @@ test "the topic contract's MissingParents (0.19.0): the error line names every s
     try std.testing.expect((try topic.needsOf(a, "call color-topic.identify: topic: NotAdmitted")) == null);
     try std.testing.expect((try topic.needsOf(a, "MissingParents: zz")) == null);
 }
+
+test "unheld (0.19.0): a parent's block in the store but neither in the BEEF nor held by the chain app is not read — the topic is undecided, as in a replay whose store holds what came later" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = c.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var inst = try Instance.init(a, &ms);
+    const x = try strictChain(a, &inst);
+    // t1's block is in the store (another instance's, or a later entry's in a replay); the chain app holds nothing.
+    _ = try ms.store().putBitcoin(a, .tx, x.t1.raw);
+    const r = try inst.routeFrom(x.b2, try fromStream(a, peerId('B')));
+    try std.testing.expect(r == .paused);
+    try std.testing.expectEqualSlices(u8, &x.t1.txid, &r.paused.waiting[0]);
+    // Its topic-call named it: `unheld`.
+    _ = try ms.store().putBitcoin(a, .tx, x.t2.raw);
+    const st = try inst.load();
+    const sub = try state.subjectOf(a, st.store, x.t2.txid);
+    // Not named: read — t1's token is no coin of the topic: decided, refused.
+    try std.testing.expectError(error.SpendsNoCoin, submit.identify(a, inst.caller(), inst.topic_prog, "tm_demo", sub, &.{}, null, &.{}));
+    try std.testing.expectError(error.MissingParents, submit.identify(a, inst.caller(), inst.topic_prog, "tm_demo", sub, &.{}, null, &.{x.t1.txid}));
+}

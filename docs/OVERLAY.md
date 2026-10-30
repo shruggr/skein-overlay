@@ -425,7 +425,12 @@ topic: MissingParents: <txid hex>[,<txid hex>…]
 ```
 
 (topic.zig: `return topic.missingParents(try call.lacking())`; `needsOf`
-reads the list back out of `call <program>.identify: topic: …`.) It names
+reads the list back out of `call <program>.identify: topic: …`.) What the
+topic can read is what the instance has: the topic-call's `unheld` names
+the input sources neither in the BEEF nor held by the chain app, and
+`Call.transaction` returns null for them whatever the store holds (reads
+are global by CID; a replay's store holds blocks that came later — without
+it, a replay judged a transaction the live run found undecided). It names
 all of them; it need not classify them. The engine catches that error
 alone: in the walk, every transaction's `MissingParents` sources are
 gathered; after the walk, those neither in the BEEF nor held by the chain

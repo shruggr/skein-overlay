@@ -909,8 +909,13 @@ its chain state's Atomic BEEF of a transaction its state reaches, and the
 host hands it to `/skein/overlay/beef/1.0.0` through `kernel.beef`. The
 pre-SPV `missingParents` scan stays for BEEF bytes the door does not see
 (a gossip `submit {beef}`); the door makes it unreachable for an envelope.
-The caller's error buffer (`sk`) holds 64 KiB. No wire, manifest, host or
-kernel change.
+The topic-call carries `unheld` (a field the brief did not foresee): the
+input sources neither in the BEEF nor held by the chain app, which
+`Call.transaction` treats as unreadable whatever the store holds — reads
+are global by CID, and a replay's store holds blocks that came later, so
+"can the topic read it" must be the instance's chain state, the same live
+and in a replay. The caller's error buffer (`sk`) holds 64 KiB. No wire,
+manifest, host or kernel change.
 
 ## Contributing
 

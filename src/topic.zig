@@ -4,10 +4,13 @@
 //! transaction, nothing persists) and, only if its previous coins moved
 //! before the entry was processed, again in that step (submit.zig) — with
 //!
-//!   {kind: "topic-call", topic, tx: <bitcoin-tx CID>, previousCoins: [input index], offChainValues?: bytes}
+//!   {kind: "topic-call", topic, tx: <bitcoin-tx CID>, previousCoins: [input index], offChainValues?: bytes, unheld?: [txid hex]}
 //!
 //! where previousCoins are the inputs spending outputs live in the topic
-//! (BRC-22 step 4). No BEEF crosses into the topic: it reads the transaction
+//! (BRC-22 step 4), and `unheld` (0.19.0) the input sources the instance does
+//! not have — neither in the submitted BEEF nor held by the chain app — which
+//! `Call.transaction` / `sourceOutput` / `lacking` treat as unreadable whatever
+//! the store holds (a replay's store holds what came later). No BEEF crosses into the topic: it reads the transaction
 //! and its inputs' source outputs as records, through `get` (in the submit's
 //! call, through the call's in-memory overlay, where the BEEF was decoded).
 //! The call's answer (dag-cbor on stdout):
@@ -86,9 +89,16 @@ pub const Call = struct {
     /// Inputs spending outputs live in the topic.
     previous_coins: []const u32,
     off_chain_values: ?[]const u8 = null,
+    /// The input sources the engine knows the instance does not have (0.19.0, the topic-call's
+    /// `unheld`): neither in the submitted BEEF nor held by the chain app. Never read, though a
+    /// block of one may be in the store (reads are global by CID, and a replay's store holds what
+    /// came later): what the topic reads must be what the instance has, the same in a replay.
+    unheld: []const [32]u8 = &.{},
 
-    /// A transaction by txid, read through `get` (in the submit's call, its overlay), or null.
+    /// A transaction by txid, read through `get` (in the submit's call, its overlay), or null —
+    /// null for one the engine names `unheld`.
     pub fn transaction(self: Call, txid: [32]u8) ?Transaction {
+        for (self.unheld) |u| if (std.mem.eql(u8, &u, &txid)) return null;
         const raw = self.store.tryGet(self.arena, &c.store.hashCid(.tx, txid)) orelse return null;
         return Transaction.parse(self.arena, raw) catch null;
     }
@@ -217,6 +227,7 @@ pub fn callOf(a: std.mem.Allocator, s: Store, args: Value) !Call {
         .tx = Transaction.parse(a, raw) catch return error.BadTransaction,
         .previous_coins = try uintList(a, args.get("previousCoins")),
         .off_chain_values = args.getBytes("offChainValues"),
+        .unheld = try txidList(a, args.get("unheld")),
     };
 }
 

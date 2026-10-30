@@ -126,7 +126,7 @@ fn uintList(a: Allocator, v: ?Value) ![]u32 {
 pub const Judged = struct { topic: []const u8, previous: []const u32, ins: topic_mod.Instructions };
 
 /// Call a topic's program (fn "identify") on the transaction's CID → its instructions.
-pub fn identify(a: Allocator, caller: calls.Caller, program: []const u8, topic: []const u8, sub: state.Subject, previous: []const u32, off: ?[]const u8) !topic_mod.Instructions {
+pub fn identify(a: Allocator, caller: calls.Caller, program: []const u8, topic: []const u8, sub: state.Subject, previous: []const u32, off: ?[]const u8, unheld: []const [32]u8) !topic_mod.Instructions {
     var es: std.ArrayList(cbor.Entry) = .empty;
     try es.appendSlice(a, &.{
         .{ .key = "kind", .value = .{ .text = "topic-call" } },
@@ -135,7 +135,26 @@ pub fn identify(a: Allocator, caller: calls.Caller, program: []const u8, topic: 
         .{ .key = "previousCoins", .value = .{ .array = try uints(a, previous) } },
     });
     if (off) |o| try es.append(a, .{ .key = "offChainValues", .value = .{ .bytes = o } });
+    if (unheld.len > 0) {
+        const xs = try a.alloc(Value, unheld.len);
+        for (unheld, xs) |u, *v| v.* = try hexText(a, u);
+        try es.append(a, .{ .key = "unheld", .value = .{ .array = xs } });
+    }
     return topic_mod.instructionsOf(a, try caller.call(a, program, "identify", .{ .map = es.items }));
+}
+
+/// The input sources of `tx` the instance does not have (0.19.0): neither a transaction of the
+/// submitted BEEF (`d`, none: a step's re-judgement or a seed) nor held by the chain app. Each once.
+fn unheldOf(a: Allocator, st: *State, d: ?state.Decoded, tx: c.bsvz.transaction.Transaction) ![]const [32]u8 {
+    var out: std.ArrayList([32]u8) = .empty;
+    for (tx.inputs) |in| {
+        const t = in.previous_outpoint.txid.bytes;
+        if (contains(out.items, t)) continue;
+        if (d) |dd| if (inBeef(dd, t)) continue;
+        if (try st.ch.holds(t)) continue;
+        try out.append(a, t);
+    }
+    return out.items;
 }
 
 pub const Routed = union(enum) {
@@ -259,7 +278,7 @@ pub fn route(a: Allocator, caller: calls.Caller, st: *State, in: Value, beef: In
             if (try st.isApplied(t, dt.txid)) continue;
             const prog = (try calls.configuredProgram(in, served, t)) orelse continue;
             const previous = try st.previousCoinsWith(t, tx.tx, w.items);
-            const ins = identify(a, caller, prog, t, tx, previous, if (is_subject) off else null) catch |e| {
+            const ins = identify(a, caller, prog, t, tx, previous, if (is_subject) off else null, try unheldOf(a, st, d, tx.tx)) catch |e| {
                 // Undecided (0.19.0): no verdict, nothing recorded; the submission pauses on them.
                 if (try missingOf(a, caller, e)) |ns| {
                     for (ns) |n| if (!contains(needs.items, n)) try needs.append(a, n);
@@ -1340,7 +1359,7 @@ fn admitItem(cx: Ctx, ev: Value, it: EventItem, beef: []const u8, records: *std.
             .{ .outputs_to_admit = try uintList(a, j.get("outputsToAdmit")), .coins_to_retain = try uintList(a, j.get("coinsToRetain")), .ancillary_txids = try hexList(a, j.get("ancillaryTxids")) }
         else blk: {
             const prog = (try calls.configuredProgram(cx.in, served, t.*)) orelse continue;
-            break :blk identify(a, cx.caller, prog, t.*, sub, previous, if (it.subject) ev.getBytes("offChainValues") else null) catch continue;
+            break :blk identify(a, cx.caller, prog, t.*, sub, previous, if (it.subject) ev.getBytes("offChainValues") else null, try unheldOf(a, st, null, sub.tx)) catch continue;
         };
         ap.* = st.apply(sub, t.*, previous, ins, beef) catch |e| switch (e) {
             error.BadInstructions, error.UnknownAncillary => continue,
@@ -1432,7 +1451,7 @@ pub fn seed(cx: Ctx, topic: []const u8, seeds: []const [32]u8) !Seeding {
         for (try heldAncestry(a, st, topic, s_, &seen)) |t| {
             const sub = try state.subjectOf(a, st.store, t);
             const previous = try st.previousCoins(topic, sub.tx);
-            const ins = identify(a, cx.caller, prog, topic, sub, previous, null) catch continue;
+            const ins = identify(a, cx.caller, prog, topic, sub, previous, null, try unheldOf(a, st, null, sub.tx)) catch continue;
             check(a, st.store, sub.tx, previous, ins) catch continue;
             if (!state.takes(previous, ins)) continue;
             const bytes = try state.beefFor(st.ch, t);
