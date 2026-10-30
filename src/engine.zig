@@ -33,9 +33,6 @@
 //!   a rebeat                  the message {fn: "rebeat"} in box `<app>` from the instance itself
 //!                             (0.16.0): sent by the app's program that wrote the head `<app>/terms`
 //!                             (the beat's terms); every registered topic's beacon re-declared.
-//!   a peer's admit            the `peer-admit` event an `admit` message on `<topic>` (or one on a
-//!                             `-admit` route, before 0.12.0) admits (box `<app>`): recorded under
-//!                             `<app>/gossip`.
 //!   register / deregister     a message in the box `<app>/register` only (one box per function
 //!                             class, shruggr/skein#128, 0.7.5; refused `bad-args` elsewhere),
 //!                             {fn: "register", args: {topic, program, seed?}} or {fn: "deregister",
@@ -82,7 +79,6 @@
 //!   {kind: "overlay-result", op: "submit" | "answer" | "watch" | "watched", txid, ingest?, heard?,
 //!    admitted?, steak?, unapplied?, watch?, awaiting?, published?, beats?, answers?, refs, state}
 //!   {kind: "overlay-result", op: "received" | "resume", txid?, outcome, …, answers?, state}
-//!   {kind: "overlay-result", op: "peer-admit", topic, txid, record, state}
 //!   {kind: "overlay-result", op: "register" | "deregister", topic, active, changed, topics?,
 //!    seeded?, missing?, untaken?, admissions?, watches?, state?}
 //!   {kind: "overlay-result", op: "registerLookup" | "deregisterLookup", service, active, changed,
@@ -115,46 +111,6 @@ const resultRecord = registry.resultRecord;
 const cids = registry.cids;
 const hexes = registry.hexes;
 const steakOf = registry.steakOf;
-
-/// A peer's `<topic>-admit` verdict (#74), admitted by the route as a `peer-admit` event: recorded
-/// under the head `<app>/gossip` (key topic ‖ txid ‖ from). Nothing is admitted from it.
-fn peerAdmitted(a: Allocator, step: Value, ev: Value) !void {
-    const s = vm.store();
-    const head = try gossip.stateHead(a, calls.appOf(step));
-    var gs = try gossip.State.load(a, s, try vm.head(a, head));
-    const rec = try gs.record(ev);
-    try vm.keep(rec);
-    const new_state = try gs.save();
-    try vm.advance(head, new_state);
-    // shruggr/skein#112: a submission of that transaction paused here wants its parents from that peer too.
-    var fields: std.ArrayList(cbor.Entry) = .empty;
-    if (ev.getBytes("peer")) |peer| {
-        const txid = c.header.fromHex(ev.getText("txid") orelse return error.BadEvent) catch return error.BadEvent;
-        var loaded = try ev_.load(a, step);
-        const cx = submit.Ctx{ .a = a, .caller = ev_.caller(), .wire = try ev_.wire(step), .st = &loaded.st, .in = step };
-        try submit.admitSeen(cx, ev.getText("topic") orelse return error.BadEvent, txid, peer);
-        const wanted = try emitWants(a, &loaded.st);
-        if (wanted > 0) {
-            const ns = try loaded.st.save();
-            try vm.advance(try ev_.stateHead(a, step), ns);
-            try fields.append(a, .{ .key = "wanted", .value = .{ .uint = wanted } });
-        }
-    }
-    try fields.appendSlice(a, &.{
-        .{ .key = "topic", .value = .{ .text = ev.getText("topic") orelse "" } },
-        .{ .key = "txid", .value = .{ .text = ev.getText("txid") orelse "" } },
-        .{ .key = "record", .value = .{ .cid = rec } },
-        .{ .key = "state", .value = .{ .cid = new_state } },
-    });
-    _ = try vm.finish(a, s, try resultRecord(a, "peer-admit", fields.items));
-}
-
-/// The step's want / unwant events (state.zig `wantEvents`, shruggr/skein#112), emitted. → how many.
-fn emitWants(a: Allocator, st: *@import("state.zig").State) !usize {
-    const evs = try st.wantEvents();
-    for (evs) |w| _ = try vm.emitEvent(a, w);
-    return evs.len;
-}
 
 /// The beacons the step re-declares (0.12.0, topics.zig `beatEvents`): each registered topic whose beat
 /// (view digest, tip anchor, tail) it changed, each registered lookup service its hooks gave a new body; emitted. → how
@@ -325,7 +281,6 @@ fn run(a: Allocator) anyerror!void {
     if (args.getCid("event")) |ec| {
         ev = try s.getValue(a, ec);
         const kind = ev.getText("kind") orelse return error.BadEvent;
-        if (eql(u8, kind, "peer-admit")) return peerAdmitted(a, step, ev);
         // POST /submit's submission (0.7.3): the message step's, its source from the event.
         if (eql(u8, kind, "submission")) {
             const m = try submit.submissionOf(a, ev, args.getText("box") orelse calls.appOf(step));
@@ -369,7 +324,6 @@ fn run(a: Allocator) anyerror!void {
         .st = st,
         .in = step,
         .thread = step.getCid("thread"),
-        .gossip = try ev_.gossipState(a, step),
     };
 
     var fields: std.ArrayList(cbor.Entry) = .empty;
@@ -381,10 +335,7 @@ fn run(a: Allocator) anyerror!void {
         done = .{ .txid = try submit.txidOf(ev), .awaiting = begun.ingests, .done = begun.ingests.len == 0, .resumes = begun.resumes };
         if (begun.ingests.len > 0) ingest = begun.ingests[begun.ingests.len - 1];
         try fields.append(a, .{ .key = "ingests", .value = .{ .array = try cids(a, begun.ingests) } });
-        if (begun.paused) try fields.appendSlice(a, &.{
-            .{ .key = "waiting", .value = .{ .array = try hexes(a, begun.waiting) } },
-            .{ .key = "wanted", .value = .{ .uint = begun.wants.len } },
-        });
+        if (begun.paused) try fields.append(a, .{ .key = "waiting", .value = .{ .array = try hexes(a, begun.waiting) } });
     } else if (eql(u8, op, "answer")) {
         ingest = reply.?.getCid("replyTo") orelse return error.BadInput;
         const body = try s.getValue(a, reply.?.getCid("body") orelse return error.BadInput);
@@ -437,8 +388,6 @@ fn run(a: Allocator) anyerror!void {
         for (done.awaiting) |m| try vm.awaitRecord(m);
         try fields.append(a, .{ .key = "awaiting", .value = .{ .boolean = true } });
     }
-    const wanted = try emitWants(a, st);
-    if (wanted > 0 and !eql(u8, op, "submit")) try fields.append(a, .{ .key = "wanted", .value = .{ .uint = wanted } });
     const beats = try emitBeats(a, step, st);
     if (beats > 0) try fields.append(a, .{ .key = "beats", .value = .{ .uint = beats } });
     try answersField(&fields, a);
@@ -517,11 +466,11 @@ fn messageSource(a: Allocator, step: Value, args: Value) !Value {
 }
 
 fn stepCtx(a: Allocator, step: Value, st: *@import("state.zig").State) !submit.Ctx {
-    return .{ .a = a, .caller = ev_.caller(), .wire = try ev_.wire(step), .st = st, .in = step, .thread = step.getCid("thread"), .gossip = try ev_.gossipState(a, step) };
+    return .{ .a = a, .caller = ev_.caller(), .wire = try ev_.wire(step), .st = st, .in = step, .thread = step.getCid("thread") };
 }
 
 /// A routed submission acted on (a resume, a submission by message): its thread launched, or paused,
-/// or answered; the step's want events emitted; the state saved; the result kept.
+/// or answered; the state saved; the result kept.
 fn settled(a: Allocator, step: Value, loaded: anytype, outcome: submit.Resumed, fields: *std.ArrayList(cbor.Entry), op: []const u8) !void {
     const s = vm.store();
     switch (outcome) {
@@ -551,8 +500,6 @@ fn settled(a: Allocator, step: Value, loaded: anytype, outcome: submit.Resumed, 
         }),
         .woke => try fields.append(a, .{ .key = "outcome", .value = .{ .text = "woke" } }),
     }
-    const wanted = try emitWants(a, &loaded.st);
-    if (wanted > 0) try fields.append(a, .{ .key = "wanted", .value = .{ .uint = wanted } });
     const beats = try emitBeats(a, step, &loaded.st);
     if (beats > 0) try fields.append(a, .{ .key = "beats", .value = .{ .uint = beats } });
     try answersField(fields, a);

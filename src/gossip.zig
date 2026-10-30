@@ -1,39 +1,29 @@
 //! The standard overlay gossip (#74): per overlay topic `<topic>` an overlay
-//! runs, three GossipSub topics (David, 2026-10-09: "tm_X: submit AND admit
-//! as two message KINDS on the one topic (one mesh)"; the proof and the
-//! liveness topics separate).
+//! runs, three GossipSub topics.
 //!
-//!   <topic>        one mesh, two kinds of message, each dag-cbor with `kind`:
-//!                    {kind: "submit", beef: bytes}   the raw submission (the BEEF as
-//!                        received). Published by an overlay after it **admits** a
-//!                        submission that did not arrive by gossip on that topic (HTTP;
-//!                        GossipSub already forwarded one that did), whichever gate
-//!                        admitted it (#73). Judged on arrival by the overlay's `submit`
-//!                        (routes.zig).
+//!   <topic>        the announcements (0.20.0, David 2026-10-30: "announce, then fetch"):
 //!                    {kind: "admit", txid (hex), topics: {<topic>: {outputsToAdmit: [vout],
-//!                        coinsToRetain: [input index]}}}   this overlay's verdict, for
-//!                        submitters to count — the STEAK and the txid only, no BEEF.
-//!                        Received: recorded as a `peer-admit` record under the head
-//!                        `<app>/gossip`; never admits anything.
-//!                  Until 0.12.0 the verdict had a topic of its own, `<topic>-admit`; a
-//!                  message there (a route to `peerAdmit`) is still read the same way.
-//!   <topic>-proof  the proof of an admitted transaction, published when the
-//!                  chain app answers that it is proven (once: a reorg's
-//!                  re-proof is the chain app's, not re-published here):
+//!                        coinsToRetain: [input index]}}}   this overlay's verdict — the STEAK and
+//!                        the txid only, no BEEF — published once by the step that admits a
+//!                        transaction, whatever path it came by. It is the HOST's to read: a node
+//!                        that hears one fetches the BEEF from the announcing peer (the sync
+//!                        protocol's `tx` request, skein src/host/sync.ts) unless it holds the
+//!                        transaction, and hands it in through the receive row; once it admits
+//!                        it, it publishes its own `admit`. The host does not deliver admits to
+//!                        the instance: one that reaches the engine's `<topic>` route anyway is
+//!                        ignored, nothing admitted (routes.zig).
+//!                  Before 0.20.0 the mesh carried the BEEF too ({kind: "submit", beef}) and a
+//!                  received admit was recorded under the head `<app>/gossip`; both are gone.
+//!   <topic>-proof  the proof of an admitted transaction, published every time the chain app
+//!                  answers that it is proven (0.20.0: a reorg's new proof too):
 //!                    {txid (hex), blockHash (hex), blockHeight, bump: bytes (BRC-74, this txid's path alone)}
 //!                  Received (`peerProof`): checked against this instance's
 //!                  own chain state (the chain app's, read only) and admitted
 //!                  as the `proof` event in box `chain` — the chain app's
 //!                  event row, the same as the host's broadcaster admits (#65).
-//!                  Separate: people waiting on a proof do not track admittance.
+//!                  A proof that came this way is not published again (GossipSub forwarded it).
 //!   <topic>-live   the liveness beats (topics.zig `roleEvents`): the runtime's
 //!                  beacon and liveness tool, unlogged; nothing here.
-//!
-//! A `submit` message's BEEF is inside its dag-cbor body, where the kernel's
-//! door does not look (it decodes a byte string that starts with a BEEF
-//! pattern: a libp2p body is one byte string): the engine decodes and checks
-//! it itself (submit.zig `Input.bytes`), as for a body framed with off-chain
-//! values.
 //!
 //! Statuses never propagate. Publishing is a message to the libp2p provider
 //! (`publish {topic, body}`, docs/MESSAGES.md "The providers"), emitted from
@@ -43,14 +33,13 @@
 //! Config: `config.overlay.gossip` (genesis-wired: `defaults.overlayGossip`,
 //! a JSON object in a string), `{"<topic>": false}` turns a topic's
 //! publishing off; a topic not named publishes (the default is on).
-//! Receiving is the subscriptions `<topic>` (fn `submit`) and `<topic>-proof`
-//! (fn `peerProof`) a register emits (topics.zig), or an installed app's
-//! routes derived from config.overlay.
+//! Receiving is the subscriptions `<topic>` (fn `submit`: the host's, see
+//! above) and `<topic>-proof` (fn `peerProof`) a register emits (topics.zig), or
+//! an installed app's routes derived from config.overlay.
 const std = @import("std");
 const c = @import("chain");
 const st_mod = @import("state.zig");
 const calls = @import("calls.zig");
-const submit = @import("submit.zig");
 
 const cbor = c.cbor;
 const Value = cbor.Value;
@@ -59,14 +48,7 @@ const Chain = st_mod.Chain;
 const Allocator = std.mem.Allocator;
 const eql = std.mem.eql;
 
-/// The verdict's own topic until 0.12.0 (now a kind on `<topic>`); read still where routed.
-pub const admit_suffix = "-admit";
 pub const proof_suffix = "-proof";
-
-/// The head the peer-admit records live under: `<app>/gossip` → `{kind: "overlay-gossip", maps: {peerAdmits: root | null}}`.
-pub fn stateHead(a: Allocator, app: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(a, "{s}/gossip", .{app});
-}
 
 /// Whether this overlay publishes for `topic` (defaults.overlayGossip; on unless `false`).
 pub fn enabled(a: Allocator, in: Value, topic: []const u8) !bool {
@@ -87,7 +69,7 @@ pub fn baseOf(gossip_topic: []const u8, suffix: []const u8) ?[]const u8 {
 /// Where a publish goes: the libp2p provider (vm.zig's emits a message to it; a test's records it).
 pub const Out = struct {
     ctx: *anyopaque,
-    /// Publish `body` (dag-cbor bytes: a `submit` or `admit` message on <topic>, a proof on -proof) on `topic`.
+    /// Publish `body` (dag-cbor bytes: an `admit` message on <topic>, a proof on -proof) on `topic`.
     publishFn: *const fn (ctx: *anyopaque, a: Allocator, topic: []const u8, body: []const u8) anyerror!void,
 
     pub fn publish(self: Out, a: Allocator, topic: []const u8, body: []const u8) !void {
@@ -110,17 +92,8 @@ fn uintList(a: Allocator, v: ?Value) ![]u32 {
 
 // ---------------------------------------------------------------- the messages
 
-/// The kinds of message on `<topic>` (0.12.0, David 2026-10-09: one mesh, two kinds).
-pub const submit_kind = "submit";
+/// The kind of the message on `<topic>`.
 pub const admit_kind = "admit";
-
-/// A `submit` message on `<topic>`: {kind: "submit", beef: bytes} (dag-cbor), the BEEF as received.
-pub fn submitBody(a: Allocator, beef: []const u8) ![]const u8 {
-    return cbor.encode(a, .{ .map = try a.dupe(cbor.Entry, &.{
-        .{ .key = "kind", .value = .{ .text = submit_kind } },
-        .{ .key = "beef", .value = .{ .bytes = beef } },
-    }) });
-}
 
 /// An `admit` message on `<topic>`: {kind: "admit", txid, topics: {<topic>: {outputsToAdmit,
 /// coinsToRetain}}} (dag-cbor).
@@ -135,27 +108,9 @@ pub fn admitBody(a: Allocator, txid: [32]u8, topic: []const u8, outputs_to_admit
     }) });
 }
 
-/// A message on `<topic>`, by its `kind`: a submission's BEEF bytes, or a verdict (its body, read
-/// by `parseAdmit`). Not dag-cbor, not a map, another or no kind: error.BadMessage.
-pub const Message = union(enum) { submit: []const u8, admit: []const u8 };
-
-pub fn messageOf(a: Allocator, body: []const u8) !Message {
-    const v = cbor.decode(a, body) catch return error.BadMessage;
-    if (v != .map) return error.BadMessage;
-    const kind = v.getText("kind") orelse return error.BadMessage;
-    if (eql(u8, kind, submit_kind)) {
-        const b = v.getBytes("beef") orelse return error.BadMessage;
-        if (b.len == 0) return error.BadMessage;
-        return .{ .submit = b };
-    }
-    if (eql(u8, kind, admit_kind)) return .{ .admit = body };
-    return error.BadMessage;
-}
-
 pub const Admit = struct { txid: [32]u8, outputs_to_admit: []const u32, coins_to_retain: []const u32 };
 
-/// An `admit` message's body (or a `<topic>-admit` one's, before 0.12.0) read for `topic`: its txid
-/// and that topic's STEAK entry.
+/// An `admit` message's body read for `topic`: its txid and that topic's STEAK entry.
 pub fn parseAdmit(a: Allocator, body: []const u8, topic: []const u8) !Admit {
     const v = cbor.decode(a, body) catch return error.BadMessage;
     if (v != .map) return error.BadMessage;
@@ -222,46 +177,13 @@ pub fn checkProof(a: Allocator, ch: *Chain, p: Proof, via: []const u8) !union(en
 
 // ---------------------------------------------------------------- what a step publishes
 
-/// Where a submission came from (the submit event's `source`, routes.zig, submit.zig):
-/// {transport: "libp2p" | "mailbox" | "http", topic? (a libp2p topic), protocol? (a libp2p stream
-/// protocol: the answer to a want, skein-overlay#1), from? (the libp2p peer that published it or
-/// sent it on the stream: bytes, the peer ID's multihash), sender?, box? (a submission by message,
-/// or over HTTP on a session: whom its answers go to, and in which box), request: <the message's
-/// or the request record's CID>}.
-pub const Source = struct { transport: []const u8 = "", topic: []const u8 = "", protocol: []const u8 = "", from: ?[]const u8 = null, request: ?[]const u8 = null };
-
-pub fn sourceOf(ev: Value) Source {
-    const s = ev.get("source") orelse return .{};
-    return .{
-        .transport = s.getText("transport") orelse "",
-        .topic = s.getText("topic") orelse "",
-        .protocol = s.getText("protocol") orelse "",
-        .from = if (eql(u8, s.getText("transport") orelse "", "libp2p")) s.getBytes("from") else null,
-        .request = s.getCid("request"),
-    };
-}
-
-/// What one admission publishes, per topic that admitted it with gossip on, both on `<topic>`: the
-/// raw submission, a `submit` message (the submit event's `beef`: the BEEF as received; not when it
-/// arrived by gossip on that topic), then the verdict, an `admit` message (the raw submission not
-/// either when it came on a stream, the answer to a want, skein-overlay#1: its holders published it
-/// long since). `subject`: the transaction is the submission's subject; a transaction admitted
-/// before it from the same BEEF (skein-overlay#1) publishes its verdict only — the raw submission
-/// goes with the subject's, and a peer judges what it carries oldest first itself. → how many
-/// messages.
-pub fn admitted(a: Allocator, out: Out, st: *st_mod.State, in: Value, ev: Value, txid: [32]u8, subject: bool, topics: []const []const u8, applied: []const st_mod.Applied) !usize {
-    const src = sourceOf(ev);
+/// What one admission publishes, per topic that admitted it with gossip on: its verdict, an
+/// `admit` message on `<topic>` (0.20.0: never the BEEF; a peer fetches it). → how many messages.
+pub fn admitted(a: Allocator, out: Out, st: *st_mod.State, in: Value, txid: [32]u8, topics: []const []const u8, applied: []const st_mod.Applied) !usize {
     var n: usize = 0;
     for (topics, applied) |t, ap| {
         if (ap.records.len == 0 or !(try st.isApplied(t, txid))) continue;
         if (!try enabled(a, in, t)) continue;
-        if (subject and !(eql(u8, src.transport, "libp2p") and (eql(u8, src.topic, t) or src.protocol.len > 0))) {
-            // The BEEF as received: from the door's envelope (shruggr/skein#146: `wireOf` gives the
-            // exact bytes back from the blocks), or the bytes the event carries.
-            const b = if (submit.Input.of(ev.get("beef"))) |i| try i.wire(a, st.store) else (try st.ch.beefOf(txid)) orelse return error.UnknownTransaction;
-            try out.publish(a, t, try submitBody(a, b));
-            n += 1;
-        }
         try out.publish(a, t, try admitBody(a, txid, t, ap.outputs_to_admit, ap.coins_to_retain));
         n += 1;
     }
@@ -269,7 +191,8 @@ pub fn admitted(a: Allocator, out: Out, st: *st_mod.State, in: Value, ev: Value,
 }
 
 /// The chain app answered that `txid` is proven (not by a proof that came by gossip on `-proof`:
-/// `via`): `<topic>-proof` for each served topic that admitted it, with gossip on. The BUMP is this
+/// `via`) — each time it does (0.20.0: a reorg's new proof too): `<topic>-proof` for each served
+/// topic that admitted it, with gossip on. The BUMP is this
 /// txid's path alone, rebuilt from the chain state's merkle nodes (`State.proofFor`). → how many
 /// messages.
 pub fn proven(a: Allocator, out: Out, st: *st_mod.State, in: Value, txid: [32]u8) !usize {
@@ -289,84 +212,3 @@ pub fn proven(a: Allocator, out: Out, st: *st_mod.State, in: Value, txid: [32]u8
     }
     return n;
 }
-
-// ---------------------------------------------------------------- peers' admits, recorded
-
-/// The peer-admit event an `admit` message is admitted as (box `<app>`), and the record the engine keeps:
-/// {kind: "peer-admit", topic, txid (hex), from: bytes(33) (the publisher's peer key), peer?: bytes
-/// (its peer ID's multihash, the message's `from`: whom a want is asked of, shruggr/skein#112),
-/// outputsToAdmit, coinsToRetain}.
-pub fn peerAdmitRecord(a: Allocator, topic: []const u8, m: Admit, from: []const u8, peer: ?[]const u8) !Value {
-    var es: std.ArrayList(cbor.Entry) = .empty;
-    try es.appendSlice(a, &.{
-        .{ .key = "kind", .value = .{ .text = "peer-admit" } },
-        .{ .key = "topic", .value = .{ .text = topic } },
-        .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &c.header.toHex(m.txid)) } },
-        .{ .key = "from", .value = .{ .bytes = from } },
-    });
-    if (peer) |p| try es.append(a, .{ .key = "peer", .value = .{ .bytes = p } });
-    try es.appendSlice(a, &.{
-        .{ .key = "outputsToAdmit", .value = .{ .array = try uints(a, m.outputs_to_admit) } },
-        .{ .key = "coinsToRetain", .value = .{ .array = try uints(a, m.coins_to_retain) } },
-    });
-    return .{ .map = es.items };
-}
-
-/// The gossip state (head `<app>/gossip`): the map `peerAdmits`, key tp ‖ txid ‖ from → the peer-admit record.
-pub const State = struct {
-    arena: Allocator,
-    store: Store,
-    peer_admits: c.store.Map,
-
-    pub fn load(a: Allocator, s: Store, state: ?[]const u8) !State {
-        const maps = try c.store.Maps.create(a, s);
-        var root: ?[]const u8 = null;
-        if (state) |sc| {
-            const v = try s.getValue(a, sc);
-            if (!eql(u8, v.getText("kind") orelse "", "overlay-gossip")) return error.BadState;
-            root = (v.get("maps") orelse return error.BadState).getCid("peerAdmits");
-        }
-        return .{ .arena = a, .store = s, .peer_admits = maps.map(root) };
-    }
-
-    pub fn key(a: Allocator, topic: []const u8, txid: [32]u8, from: []const u8) ![]u8 {
-        return std.mem.concat(a, u8, &.{ try st_mod.topicPrefix(a, topic), &txid, from });
-    }
-
-    /// Record a peer's admit (a later one from the same peer for the same transaction replaces it). → the record's CID.
-    pub fn record(self: *State, rec: Value) ![]const u8 {
-        const topic = rec.getText("topic") orelse return error.BadEvent;
-        const txid = c.header.fromHex(rec.getText("txid") orelse return error.BadEvent) catch return error.BadEvent;
-        const from = rec.getBytes("from") orelse return error.BadEvent;
-        const rc = try self.store.putValue(self.arena, rec);
-        try self.peer_admits.putLink(try key(self.arena, topic, txid, from), rc);
-        return rc;
-    }
-
-    /// The peers that admitted `txid` under `topic`: their peer-admit records' CIDs.
-    pub fn admitsOf(self: *State, topic: []const u8, txid: [32]u8) ![]const []const u8 {
-        const kvs = try self.peer_admits.prefixed(try std.mem.concat(self.arena, u8, &.{ try st_mod.topicPrefix(self.arena, topic), &txid }));
-        const out = try self.arena.alloc([]const u8, kvs.len);
-        for (kvs, out) |kv, *o| o.* = if (kv.value == .cid) kv.value.cid else return error.BadIndex;
-        return out;
-    }
-
-    /// The peers whose `-admit` for `txid` under `topic` was seen: their peer IDs (the records'
-    /// `peer`; a record without one, from before 0.7.2, names none).
-    pub fn peersOf(self: *State, topic: []const u8, txid: [32]u8) ![]const []const u8 {
-        var out: std.ArrayList([]const u8) = .empty;
-        for (try self.admitsOf(topic, txid)) |rc| {
-            const p = (try self.store.getValue(self.arena, rc)).getBytes("peer") orelse continue;
-            try st_mod.addPeer(self.arena, &out, p);
-        }
-        return out.items;
-    }
-
-    pub fn save(self: *State) ![]const u8 {
-        try self.peer_admits.flush();
-        return self.store.putValue(self.arena, .{ .map = try self.arena.dupe(cbor.Entry, &.{
-            .{ .key = "kind", .value = .{ .text = "overlay-gossip" } },
-            .{ .key = "maps", .value = .{ .map = try self.arena.dupe(cbor.Entry, &.{.{ .key = "peerAdmits", .value = if (self.peer_admits.root) |r| .{ .cid = r } else .null }}) } },
-        }) });
-    }
-};

@@ -124,13 +124,6 @@ pub fn stateHead(a: Allocator, in: Value) ![]const u8 {
     return std.fmt.allocPrint(a, "{s}/state", .{calls.appOf(in)});
 }
 
-/// The peers' admits (`<app>/gossip`, read only here): whom a pause's parents are wanted from.
-pub fn gossipState(a: Allocator, in: Value) !*gossip.State {
-    const g = try a.create(gossip.State);
-    g.* = try gossip.State.load(a, vm.store(), try vm.head(a, try gossip.stateHead(a, calls.appOf(in))));
-    return g;
-}
-
 /// The overlay's state (`<app>/state`) over the chain app's (`chain/state`, read only), as the store
 /// sees them now; `head` the overlay state's CID it loaded.
 pub fn load(a: Allocator, in: Value) !struct { st: state.State, head: ?[]const u8 } {

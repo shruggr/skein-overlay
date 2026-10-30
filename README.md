@@ -4,7 +4,7 @@ The overlay services engine for a [skein](https://github.com/shruggr/skein),
 as an app: BRC-22 submit and BRC-24 lookup, served by the instance's own
 front door, with topic managers and lookup services as programs the engine
 calls. It is also a Zig package: an overlay of your own depends on it for
-the topic and lookup contracts. Version **0.19.0**.
+the topic and lookup contracts. Version **0.20.0**.
 
 ## What it is
 
@@ -20,14 +20,16 @@ the topic and lookup contracts. Version **0.19.0**.
   **every proof**, or **rejected**. Nothing persists unless a topic takes
   it, apart from the request. `/lookup` is a read.
 - **State under its own name.** The engine and its lookup services write
-  only `<app>/state`, `<app>/gossip`, `<app>/topics`, `<app>/lookups`, `<app>/configured` and
+  only `<app>/state`, `<app>/topics`, `<app>/lookups`, `<app>/configured` and
   each lookup program's index `<app>/ls_<…>`; the app record is `<app>/app`. The chain state is the chain app's `chain/state`, read by
   CID. Two overlay apps on one instance share the chain and nothing else.
-- **Gossip** over libp2p, per topic (0.12.0, David 2026-10-09): `<topic>`,
-  one mesh for two kinds of dag-cbor message, `{kind: "submit", beef}` (the
-  raw submission) and `{kind: "admit", txid, topics}` (the verdict);
-  `<topic>-proof` (the proofs) on its own; `<topic>-live` the beats, the
-  runtime's liveness tool (unlogged).
+- **Gossip** over libp2p, per topic: announce, then fetch (0.20.0, David
+  2026-10-30). `<topic>` carries `{kind: "admit", txid, topics}` (the
+  verdict, no BEEF), published once by the step that admits a transaction;
+  the host reads it and fetches the BEEF from the announcing peer (the sync
+  protocol's `tx`), so bytes spread one hop at a time and each node fetches
+  once. `<topic>-proof` carries every proof the chain app takes (a reorg's
+  too); `<topic>-live` the beats, the runtime's liveness tool (unlogged).
 - **Beats** (0.12.0): every skein is a market and a validator, always. Each
   registered or (0.17.0) configured topic beats on `<topic>-live` with its view digest (and the
   app's terms: the head `<app>/terms` when it has written them, else
@@ -52,30 +54,27 @@ first and judges every transaction of the requested topics before the
 subject; each one a topic takes is ingested through the chain app on its
 own and admitted, in order, on its own answer (skein-overlay#1). A
 submission whose parent is neither in the BEEF nor held pauses, however it
-came: it is noted pending, waiting on those parents, and the engine records
-a want per (parent, topic, peer?) — `{event: "want", txid, topic, peer?}`
-(shruggr/skein#112). With a peer (a gossip pause: the publisher, and every
-peer whose `admit` for it was seen, more as admits arrive) the host asks
-that peer on a direct stream; without one (a submission by message or
-HTTP) it asks peers from its mesh for the topic. Each want that ends is
-cleared by `{event: "unwant", txid, topic, peer?}`. A peer answers a want
-on the stream `/skein/overlay/beef/1.0.0` (one Atomic BEEF per frame, the
-wanted txid its subject; no reply frame), routed to `submit` as a
-submission from that peer; when the parent is in, the paused one is routed
-again. A submission whose parent is held but not yet admitted (in flight:
-its own submission handed to the chain app, the answer not in) pauses on
-it the same way, with no want — nothing to ask anyone for — and is routed
-again when the chain app answers for that parent: judged with the parent's
-outputs admitted, refused on the merits if the parent was rejected, or
-paused again for what it still lacks (skein-overlay#6). A transaction a
+came: it is noted pending, waiting on those parents (the index `waits`).
+Nothing is asked of anyone for them (0.20.0: the `want` / `unwant` events
+are gone): a parent arrives by any path — a later submission, a BEEF the
+host fetched on a peer's admit or from a peer's tail list, a pull of mined
+history, or inside a later BEEF — and when it is in, the paused one is
+routed again. A submission whose parent is held but not yet admitted (in
+flight: its own submission handed to the chain app, the answer not in)
+pauses on it the same way and is routed again when the chain app answers
+for that parent: judged with the parent's outputs admitted, refused on the
+merits if the parent was rejected, or paused again for what it still lacks
+(skein-overlay#6). A transaction a
 topic manager cannot decide — it fails `MissingParents`, naming the input
-sources it cannot read — pauses the same way and wants those (0.19.0): no
-verdict, nothing rejected, judged again as each arrives. The pause is
-internal: the submitter hears nothing of it. A
-transaction admitted on `accepted` sends the app itself a `watch`, which
-waits for `proven` (publishes `-proof`) or `rejected` (unwinds); with a
-submitter to answer, each proof is relayed and a new watch waits for the
-next (a reorg's). Not built: the decided direction of shruggr/skein#31
+sources it cannot read — pauses the same way on those (0.19.0): no
+verdict, nothing rejected, judged again as each arrives; one whose sources
+exist nowhere stays one undecided record (David: "not a big deal"). The
+pause is internal: the submitter hears nothing of it. Every admitted
+transaction sends the app itself a `watch`, which waits for `proven`
+(publishes `-proof`) or `rejected` (unwinds); each proof is published
+(0.20.0: a reorg's new proof too, not one that came by gossip on `-proof`)
+and relayed to a submitter if there is one, and a new watch waits for the
+next. Not built: the decided direction of shruggr/skein#31
 ("Decided 2026-10-02 (night)"): a reference to a transaction is a
 registration for the life of the transaction, and a judgement is re-run
 when the chain state it depended on changes.
@@ -177,7 +176,7 @@ the judgement (`UnknownAncillary`). The engine keeps them on the
 admittance (`ancillary`, a `mentions` ref each), and the read
 `GET /holds?txid=` answers `{txid, tx, via: "admitted" | "retained" |
 "ancillary" | "judged", outpoint?: {txid, vout}, beef?}` (or `{}`) for a
-peer's want: `judged` is a transaction the topic took that admitted no
+peer's `tx` request: `judged` is a transaction the topic took that admitted no
 output of it, and `beef` the chain state's Atomic BEEF of it, hex
 (docs/OVERLAY.md "Holds").
 
@@ -282,17 +281,20 @@ handler, and no sender; who may run a function is `roles`.
   only a key holding root runs it (a message from any other key is
   recorded and runs nothing). Root may grant the function to others with
   an app role of its own; the manifest declares none.
-- The derived routes on `<app>` take the libp2p routes' admits (a gossiped
-  or streamed submission's routed event, a peer's admit; the `event`
-  route) and the engine's own `watch`, `resume` and `wait` (the `mailbox`
-  route, by the host's loopback). The engine takes only the instance's
+- The derived routes on `<app>` take the receive row's admits (a fetched
+  submission's routed event; the `event` route) and the engine's own
+  `watch`, `resume` and `wait` (the `mailbox` route, by the host's loopback). The engine takes only the instance's
   own messages there (`NotFromThisInstance` otherwise). An app that puts
   another program on its box `<app>` overrides the derived mailbox route
   and breaks those: keep `<app>` the engine's.
-- The libp2p route `/skein/overlay/beef/1.0.0` is the want-answer stream
-  (shruggr/skein#112): a peer the engine wants a parent from answers on
-  it, one Atomic BEEF per frame; the door decodes it (`kernel.beef`)
-  and `submit` takes it as a submission from that peer. Keep it in your
+- The libp2p route `/skein/overlay/beef/1.0.0` is the receive row: the
+  host's own entry, not served to peers (0.20.0, David 2026-10-30: a node
+  takes BEEFs only from paths it chose — HTTP submit, the mesh it joined,
+  replies to requests it made; skein's host never handles it inbound). The
+  host writes into it each BEEF it fetched (on a peer's admit, from a
+  peer's tail list, in a pull of mined history), one Atomic BEEF per
+  frame; the door decodes it (`kernel.beef`) and `submit` takes it as a
+  submission from that peer, judged by every served topic. Keep it in your
   manifest for catch-up to work.
 - The name rule: every head your programs write is under your app's name.
   Install under another name (`amm`, say) and its state is `amm/state`,
@@ -320,15 +322,12 @@ Both are idempotent and answer `{topic, active}`; an unknown role is
 refused. The set is the engine's own head `<app>/topics` (`{kind:
 "overlay-topics", topics: [{topic, program}]}`), served beside the declared
 topics from the next step or call. `register` emits `subscribe {topic,
-program, fn}` for `<topic>` (`submit`: one mesh, two kinds of message,
-`{kind: "submit", beef}` and `{kind: "admit", txid, topics}`, the function
-reads the kind) and `<topic>-proof` (`peerProof`), `program` the engine's
-own role, no door filter (the bodies are dag-cbor: a `submit` message's
-BEEF is inside it, where the door does not look, and the engine decodes
-and checks it itself, as for a body framed with off-chain values);
-`deregister` emits `unsubscribe {topic}` for the two (skein #119): the
-host subscribes and routes by them. Until 0.12.0 the verdicts had a third
-topic, `<topic>-admit` (`peerAdmit`). Who may call is your manifest's
+program, fn}` for `<topic>` (`submit`: the announcements mesh, whose
+`admit` messages the host reads and does not deliver; the engine ignores
+anything that reaches it there, 0.20.0) and `<topic>-proof` (`peerProof`),
+`program` the engine's own role, no door filter; `deregister` emits
+`unsubscribe {topic}` for the two (skein #119): the host subscribes and
+routes by them. Who may call is your manifest's
 `roles` for the route's handler `register` (the function the engine runs
 is the body's `fn`). The engine takes
 them only in the box `register` (`<app>/register`, one box per function
@@ -342,7 +341,9 @@ emits `liveness {topic: "<topic>-live", window}` and `beacon {topic:
 "<topic>-live", every, body}` (the body below); a deregister emits
 `unliveness` and `unbeacon`. `window` and `every` are
 `config.overlay.market: {window}` and `config.overlay.validator: {every}`,
-else 40 000 and 30 000 ms; neither can be turned off (the owner's switch
+else 300 000 and 120 000 ms (0.20.0: a beat about every two minutes, a
+window of a few beats; the host publishes on its timer only, a re-declared
+body is what the next beat carries); neither can be turned off (the owner's switch
 of 0.9.2, `{fn: "market" | "validator"}`, is gone, and with it the switch
 kept in `<app>/topics`). docs/OVERLAY.md "Register a topic" has the rest.
 
@@ -473,16 +474,37 @@ stream. A read: the current state only, nothing written, nothing logged.
     → {kind: "admitted", topic, blocks: [{height, blockHash, txids, bump}], nextHeight}   (hex, as /admitted)
 {kind: "tx", topic, txid}
     → {kind: "tx", txid, beef?: bytes}                                                   (absent: not held)
+{kind: "tail", topic}                                                                    (0.20.0)
+    → {kind: "tail", topic, txids: [hex, display order]}
 anything else, a topic not served here, a frame that is not dag-cbor → {kind: "error", message}
 ```
 
 `agreedHeight` is the highest height in the peer's locator where our anchor
 equals theirs (absent: none; an empty locator asks for none). The ranges
 take `/admitted`'s defaults and bounds; `tx` is `/holds` over the served
-topics, with the chain state's Atomic BEEF as bytes. The pulling half (the
-beat trigger, the locator, the ranged pulls checked against the headers,
-the fetches into `/skein/overlay/beef/1.0.0`, the wants) is the host's
-(skein `src/host/sync.ts`).
+topics, with the chain state's Atomic BEEF as bytes. `tail` is the topic's
+admitted transactions it does not have mined — the set the beat's
+`tailDigest` is over — in admission order (the applied record's time, then
+the txid); it is read by scanning the topic's judgements, no index kept.
+
+The host's half (skein `src/host/sync.ts`; 0.20.0, David 2026-10-30), with
+no timer, retry or backoff anywhere:
+
+- **Announce, then fetch.** A peer's `admit` on `<topic>`: unless the
+  instance holds the txid or a fetch of it is under way, the host asks that
+  peer `{kind: "tx"}` and hands the BEEF to the receive row. Per txid it
+  keeps the set of peers that announced it: on a failure the next; set
+  exhausted, it waits for a new admit. Admitted, the node publishes its own
+  admit. Nothing of a peer's admit is logged in the instance.
+- **Mined history.** A peer's beat whose tip anchor is not ours starts a
+  catch-up from it (the locator, ranged pulls checked against our headers,
+  each lacking transaction fetched): one per (topic, peer) at a time,
+  restarted only when that peer's beat changes.
+- **The unmined tail.** A peer's beat whose mined side equals ours and
+  whose `tailDigest` is not ours: the host asks its `tail` and fetches what
+  it lacks the same way. Same guard.
+- **Restarts.** The host keeps a per-topic peer list (host.db) and asks
+  those peers at once on start, without waiting for a beat.
 
 Not built: a reorg that replaces a block the engine hears no proof for (a
 block with nothing of the topic's in it, or a proof never re-sent) leaves
@@ -561,7 +583,7 @@ the anchors and answers the sync protocol's frames (0.15.0).
 
 | | |
 |---|---|
-| this app and package | 0.19.0 (tag `v0.19.0`) |
+| this app and package | 0.20.0 (tag `v0.20.0`) |
 | skein-sdk | v0.12.0, by tag URL and hash in `build.zig.zon` (modules `chain` and, for the engine, `sk`; bsvz comes through it) |
 | requires | `chain/1` (shruggr/skein-chain 0.3.0) |
 | skein | log format 10, the BEEF envelope beside the pointer record (shruggr/skein#146); the routes / filters / roles manifest (shruggr/skein#143); skein's equivs pin this repo by commit |
@@ -916,6 +938,25 @@ are global by CID, and a replay's store holds blocks that came later, so
 "can the topic read it" must be the instance's chain state, the same live
 and in a replay. The caller's error buffer (`sk`) holds 64 KiB. No wire,
 manifest, host or kernel change.
+
+0.20.0 (David 2026-10-30, "announce, then fetch"; shruggr/skein-overlay
+sync issue): the `<topic>` mesh carries only `admit {kind, txid, topics}`,
+published once by the admitting step; the `submit {beef}` message is gone
+(never published; one that arrives is ignored). A received admit is the
+host's: the `peer-admit` event, its record, the head `<app>/gossip` and
+the `<topic>-admit` route (`peerAdmit`) are gone, and the engine ignores
+whatever reaches its `<topic>` route. The `want` / `unwant` events are
+gone, with the state's `wants` map (`txid ‖ tp ‖ peer?`): a paused
+submission is indexed by the map `waits` (`parent ‖ subject`) and resumed
+when its parent arrives by any path; the pause itself, `held`, undecided
+and `unheld` are unchanged. The receive row `/skein/overlay/beef/1.0.0`
+is the host's own entry (not served to peers); a BEEF there is judged by
+every served topic. Every proof the chain app takes is published on
+`<topic>-proof`, a reorg's new one too (each watch hands over to one for
+the next proof, with or without a submitter); one that came by gossip is
+not. The sync protocol gains `{kind: "tail", topic}`. The beat defaults
+are 120 000 ms (beat) and 300 000 ms (window). The manifest's routes are
+unchanged; its description says the above.
 
 ## Contributing
 

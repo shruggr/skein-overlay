@@ -10,7 +10,7 @@
 //!
 //! The record, the root of `<app>/state`:
 //!
-//!   {kind: "overlay-state", maps: {admitted, applied, pending, wants, views, ancillary, mined, placed, anchors, tips}}
+//!   {kind: "overlay-state", maps: {admitted, applied, pending, waits, views, ancillary, mined, placed, anchors, tips}}
 //!
 //! The maps (keys bytes, ordered bytewise; `tp` = len ‖ topic):
 //!   admitted   tp ‖ txid ‖ vout → admittance record {kind: "admitted", topic, txid, vout, script, satoshis, admittedAt, tx, ancillary?, refs}
@@ -29,11 +29,11 @@
 //!                parents neither in its BEEF nor held, or in flight (handed to the chain app in a
 //!                submission and not yet admitted, skein-overlay#6) (`waiting`: their txids, hex;
 //!                `event`: the submit event to route again, its `held` the ones in flight)
-//!   wants      wanted txid ‖ tp ‖ peer? → [subject txid (bytes)]   a want (skein-overlay#1, shruggr/skein#112):
-//!                a parent the paused submissions `subject` wait on, wanted under the topic `tp`,
-//!                to be asked of `peer` (the libp2p peer ID's multihash, a gossip message's
-//!                `from`), which announced one of them or something needing it; no peer (a
-//!                submission by message or HTTP): the host asks peers from its mesh for the topic
+//!   waits      parent txid ‖ subject txid → true   (0.20.0; `wants` before): the paused submission
+//!                `subject` waits on that parent, neither in its BEEF nor held (in flight ones are
+//!                its event's `held`); nothing is asked of anyone for it — the parent arrives by any
+//!                path (a submission, a peer's admit fetched by the host, a pull), is ingested whether
+//!                a topic takes it or not, and resumes the subject
 //!   views      tp → bytes(40): count (8 bytes, big-endian) ‖ digest (32 bytes)   the topic's VIEW
 //!                DIGEST (0.12.0, David 2026-10-09): `count` the topic's admitted-and-unspent
 //!                outputs, `digest` an order-independent running digest of them — each outpoint's
@@ -92,7 +92,7 @@ pub const Network = c.chain.Network;
 /// The head the chain state lives under: the chain app's (its name is `chain`).
 pub const chain_head = "chain/state";
 
-pub const map_names = [_][]const u8{ "admitted", "applied", "pending", "wants", "views", "ancillary", "mined", "placed", "anchors", "tips" };
+pub const map_names = [_][]const u8{ "admitted", "applied", "pending", "waits", "views", "ancillary", "mined", "placed", "anchors", "tips" };
 
 /// A transaction's place in its block, as the chain state proves it (`mined`, `placed`).
 pub const Placed = struct { height: u32, offset: u64, block: [32]u8 };
@@ -269,38 +269,6 @@ pub fn topicPrefix(a: Allocator, t: []const u8) ![]u8 {
     return store_mod.nameKey(a, t, &.{});
 }
 
-/// `peer` onto `out` unless there already.
-pub fn addPeer(a: Allocator, out: *std.ArrayList([]const u8), peer: []const u8) !void {
-    for (out.items) |p| if (std.mem.eql(u8, p, peer)) return;
-    try out.append(a, peer);
-}
-
-/// A want (shruggr/skein#112): the wanted txid, the topic it is wanted under, the peer to ask (none:
-/// the host asks peers from its mesh for the topic).
-pub const Want = struct { txid: [32]u8, topic: []const u8, peer: ?[]const u8 };
-
-/// A `wants` key read back: txid ‖ tp ‖ peer.
-pub fn wantOf(key: []const u8) !Want {
-    if (key.len < 34) return error.BadIndex;
-    const n = key[32];
-    if (n == 0 or key.len < 33 + @as(usize, n)) return error.BadIndex;
-    const rest = key[33 + @as(usize, n) ..];
-    return .{ .txid = key[0..32].*, .topic = key[33 .. 33 + @as(usize, n)], .peer = if (rest.len > 0) rest else null };
-}
-
-/// The event of a want (`kind` "want") or of its end ("unwant"): `{event, txid (hex), topic, peer?
-/// (bytes: the libp2p peer ID's multihash)}`.
-pub fn wantEvent(a: Allocator, kind: []const u8, w: Want) !Value {
-    var es: std.ArrayList(cbor.Entry) = .empty;
-    try es.appendSlice(a, &.{
-        .{ .key = "event", .value = .{ .text = kind } },
-        .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &hdr.toHex(w.txid)) } },
-        .{ .key = "topic", .value = .{ .text = w.topic } },
-    });
-    if (w.peer) |p| try es.append(a, .{ .key = "peer", .value = .{ .bytes = p } });
-    return .{ .map = es.items };
-}
-
 fn cat(a: Allocator, parts: []const []const u8) ![]u8 {
     return std.mem.concat(a, u8, parts);
 }
@@ -339,8 +307,6 @@ pub const State = struct {
     ch: *Chain,
     /// The step's time (ms): admittances and judgements are stamped with it.
     now: i64 = 0,
-    /// The wants this step touched, and whether each stood before (`wantEvents`).
-    want_log: std.ArrayList(struct { key: []const u8, stood: bool }) = .empty,
     /// The topics whose beat this step touched, and each one's beat before its first touch (`beatChanges`).
     beat_log: std.ArrayList(struct { topic: []const u8, before: Beat }) = .empty,
     /// The topics whose anchors this step must compute again, from which height, and the span they
@@ -487,150 +453,42 @@ pub const State = struct {
         return out.items;
     }
 
-    // ------------------------------------------------------------ wanted parents (skein-overlay#1)
+    // ------------------------------------------------------------ waited-on parents (skein-overlay#1; 0.20.0)
 
-    fn subjectsValue(self: *State, subs: []const [32]u8) !store_mod.MValue {
-        const vs = try self.arena.alloc(store_mod.MValue, subs.len);
-        for (subs, vs) |s_, *o| o.* = .{ .bytes = try self.arena.dupe(u8, &s_) };
-        return .{ .array = vs };
+    /// A `waits` key: parent txid ‖ subject txid.
+    fn waitKey(self: *State, parent: [32]u8, subject: [32]u8) ![]u8 {
+        return cat(self.arena, &.{ &parent, &subject });
     }
 
-    fn subjects(self: *State, v: store_mod.MValue) ![][32]u8 {
-        const xs = if (v == .array) v.array else return error.BadIndex;
-        const out = try self.arena.alloc([32]u8, xs.len);
-        for (xs, out) |x, *o| o.* = if (x == .bytes and x.bytes.len == 32) x.bytes[0..32].* else return error.BadIndex;
-        return out;
+    /// Note that the paused submission `subject` waits on `parent` (missing here: neither in its BEEF
+    /// nor held). Nothing is asked of anyone (0.20.0): the parent arrives by any path.
+    pub fn wait(self: *State, parent: [32]u8, subject: [32]u8) !void {
+        try self.map("waits").put(try self.waitKey(parent, subject), .{ .bool = true });
     }
 
-    /// A want's key: txid ‖ tp ‖ peer (no peer: nothing after the topic).
-    pub fn wantKey(self: *State, txid: [32]u8, t: []const u8, peer: ?[]const u8) ![]u8 {
-        return cat(self.arena, &.{ &txid, try topicPrefix(self.arena, t), peer orelse "" });
-    }
-
-    /// Whether the want (`txid`, `topic`, `peer`) stands (null: the want with no peer).
-    pub fn hasWant(self: *State, txid: [32]u8, t: []const u8, peer: ?[]const u8) !bool {
-        return self.map("wants").has(try self.wantKey(txid, t, peer));
-    }
-
-    /// The step's journal of wants it touched: whether each stood before its first touch. The
-    /// `want` / `unwant` events are the difference at the end of the step (`wantEvents`).
-    fn touchWant(self: *State, key: []const u8) !void {
-        for (self.want_log.items) |x| if (std.mem.eql(u8, x.key, key)) return;
-        try self.want_log.append(self.arena, .{ .key = try self.arena.dupe(u8, key), .stood = try self.map("wants").has(key) });
-    }
-
-    fn putWant(self: *State, key: []const u8, subs: []const [32]u8) !void {
-        try self.touchWant(key);
-        try self.map("wants").put(key, try self.subjectsValue(subs));
-    }
-
-    fn dropWant(self: *State, key: []const u8) !void {
-        try self.touchWant(key);
-        _ = try self.map("wants").remove(key);
-    }
-
-    /// Note that the paused submission `subject` waits on `txid`, wanted under `topic` from `peer`
-    /// (null: from no peer — the host asks its mesh for the topic).
-    pub fn want(self: *State, txid: [32]u8, t: []const u8, peer: ?[]const u8, subject: [32]u8) !void {
-        const key = try self.wantKey(txid, t, peer);
-        const cur = try self.map("wants").get(key);
-        var subs: std.ArrayList([32]u8) = .empty;
-        if (cur) |v| for (try self.subjects(v)) |x| {
-            if (std.mem.eql(u8, &x, &subject)) return;
-            try subs.append(self.arena, x);
-        };
-        try subs.append(self.arena, subject);
-        try self.putWant(key, subs.items);
-    }
-
-    /// Whether `peer` is asked for every one of `waiting` under each of `topics` on `subject`'s behalf already.
-    pub fn wantsFrom(self: *State, subject: [32]u8, waiting: []const [32]u8, topics: []const []const u8, peer: []const u8) !bool {
-        for (waiting) |w| for (topics) |t| {
-            const v = (try self.map("wants").get(try self.wantKey(w, t, peer))) orelse return false;
-            for (try self.subjects(v)) |x| {
-                if (std.mem.eql(u8, &x, &subject)) break;
-            } else return false;
-        };
-        return true;
-    }
-
-    pub fn isWanted(self: *State, txid: [32]u8) !bool {
-        return (try self.map("wants").prefixed(&txid)).len > 0;
-    }
-
-    /// The peers wants for `txid` stand against (those that announced something needing it), each
-    /// once, in key order; a want with no peer is not one.
-    pub fn wantedFrom(self: *State, txid: [32]u8) ![]const []const u8 {
-        var out: std.ArrayList([]const u8) = .empty;
-        for (try self.map("wants").prefixed(&txid)) |kv| {
-            const k = try wantOf(kv.key);
-            if (k.peer) |p| try addPeer(self.arena, &out, p);
-        }
-        return out.items;
+    /// Whether a paused submission waits on `txid` (it is ingested when it arrives, taken by a topic or not).
+    pub fn isWaitedOn(self: *State, txid: [32]u8) !bool {
+        return (try self.map("waits").prefixed(&txid)).len > 0;
     }
 
     /// The paused submissions waiting on `txid` (each once, in key order).
     pub fn waitersOf(self: *State, txid: [32]u8) ![][32]u8 {
-        var out: std.ArrayList([32]u8) = .empty;
-        for (try self.map("wants").prefixed(&txid)) |kv| {
-            _ = try wantOf(kv.key);
-            outer: for (try self.subjects(kv.value)) |x| {
-                for (out.items) |y| if (std.mem.eql(u8, &x, &y)) continue :outer;
-                try out.append(self.arena, x);
-            }
-        }
-        return out.items;
-    }
-
-    /// The peers `subject`'s wants on `waiting` stand against (those that announced it, or
-    /// something needing it), each once, in key order; `none`: whether one of them has no peer.
-    pub fn peersOf(self: *State, subject: [32]u8, waiting: []const [32]u8) !struct { peers: []const []const u8, none: bool } {
-        var out: std.ArrayList([]const u8) = .empty;
-        var none = false;
-        for (waiting) |w| for (try self.map("wants").prefixed(&w)) |kv| {
-            for (try self.subjects(kv.value)) |x| {
-                if (!std.mem.eql(u8, &x, &subject)) continue;
-                const k = try wantOf(kv.key);
-                if (k.peer) |p| try addPeer(self.arena, &out, p) else none = true;
-                break;
-            }
-        };
-        return .{ .peers = out.items, .none = none };
-    }
-
-    /// `subject`'s wants (on each of `waiting`) cleared: the subject out of each want's value, a
-    /// want left with no subject removed.
-    pub fn unwant(self: *State, subject: [32]u8, waiting: []const [32]u8) !void {
-        for (waiting) |w| for (try self.map("wants").prefixed(&w)) |kv| {
-            var rest: std.ArrayList([32]u8) = .empty;
-            var had = false;
-            for (try self.subjects(kv.value)) |x| {
-                if (std.mem.eql(u8, &x, &subject)) had = true else try rest.append(self.arena, x);
-            }
-            if (!had) continue;
-            if (rest.items.len == 0) try self.dropWant(kv.key) else try self.putWant(kv.key, rest.items);
-        };
-    }
-
-    /// `txid` has arrived (the chain app answered for it): its waiters, each once, and every want
-    /// for it (whatever the topic and peer) removed.
-    pub fn takeWants(self: *State, txid: [32]u8) ![][32]u8 {
-        const out = try self.waitersOf(txid);
-        for (try self.map("wants").prefixed(&txid)) |kv| try self.dropWant(kv.key);
+        const kvs = try self.map("waits").prefixed(&txid);
+        const out = try self.arena.alloc([32]u8, kvs.len);
+        for (kvs, out) |kv, *o| o.* = if (kv.key.len == 64) kv.key[32..64].* else return error.BadIndex;
         return out;
     }
 
-    /// The step's want events (shruggr/skein#112): for each want it touched, `{event: "want", txid,
-    /// topic, peer?}` if it stands now and did not before, `{event: "unwant", …}` if it stood and
-    /// does not now; nothing for one that stood before and stands still. In the order first touched.
-    pub fn wantEvents(self: *State) ![]Value {
-        var out: std.ArrayList(Value) = .empty;
-        for (self.want_log.items) |x| {
-            const now = try self.map("wants").has(x.key);
-            if (now == x.stood) continue;
-            try out.append(self.arena, try wantEvent(self.arena, if (now) "want" else "unwant", try wantOf(x.key)));
-        }
-        return out.items;
+    /// `subject`'s waits (on each of `waiting`) cleared.
+    pub fn unwait(self: *State, subject: [32]u8, waiting: []const [32]u8) !void {
+        for (waiting) |w| _ = try self.map("waits").remove(try self.waitKey(w, subject));
+    }
+
+    /// `txid` has arrived (the chain app answered for it): its waiters, each once, and every wait on it removed.
+    pub fn takeWaiters(self: *State, txid: [32]u8) ![][32]u8 {
+        const out = try self.waitersOf(txid);
+        for (out) |w| _ = try self.map("waits").remove(try self.waitKey(txid, w));
+        return out;
     }
 
     // ------------------------------------------------------------ judgements
@@ -862,6 +720,33 @@ pub const State = struct {
             .genesis = std.mem.readInt(u32, b[40..44], .big),
             .tip = std.mem.readInt(u32, b[44..48], .big),
         } else null };
+    }
+
+    /// The topic's tail as transactions (0.20.0: the sync's `tail` read): those it judged (its
+    /// `applied`) that it does not have mined (no `placed`), in admission order — the applied
+    /// record's `at`, then the txid. The outputs they admitted are what the beat's `tailDigest`
+    /// folds. Read by scanning the topic's judgements: no index is kept for it.
+    pub fn tailTxids(self: *State, t: []const u8) ![]const [32]u8 {
+        const a = self.arena;
+        const tp = try topicPrefix(a, t);
+        const Item = struct { at: u64, txid: [32]u8 };
+        var items: std.ArrayList(Item) = .empty;
+        for (try self.map("applied").prefixed(tp)) |kv| {
+            if (kv.key.len != tp.len + 32 or kv.value != .cid) return error.BadIndex;
+            const txid = kv.key[tp.len..][0..32].*;
+            if (try self.map("placed").has(kv.key)) continue;
+            const rec = try self.record(kv.value.cid);
+            try items.append(a, .{ .at = rec.getUint("at") orelse 0, .txid = txid });
+        }
+        std.mem.sort(Item, items.items, {}, struct {
+            fn lt(_: void, x: Item, y: Item) bool {
+                if (x.at != y.at) return x.at < y.at;
+                return std.mem.order(u8, &x.txid, &y.txid) == .lt;
+            }
+        }.lt);
+        const out = try a.alloc([32]u8, items.items.len);
+        for (items.items, out) |it, *o| o.* = it.txid;
+        return out;
     }
 
     fn putTips(self: *State, t: []const u8, tail: View, span: ?Span) !void {

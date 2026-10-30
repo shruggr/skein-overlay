@@ -34,7 +34,7 @@
 //! The two roles (shruggr/skein#120; 0.12.0, David 2026-10-09: "every skein
 //! is marketplace AND validator from install, always"): registering a topic
 //! is the one act that drives both — topics.zig `withRoles`. The values are
-//! the configuration's, else 40 000 ms and 30 000 ms; neither can be off (the
+//! the configuration's, else 300 000 ms and 120 000 ms (0.20.0); neither can be off (the
 //! owner's switch of 0.9.2 is gone).
 //!
 //! Beside the declared topics, the engine serves the topics registered at

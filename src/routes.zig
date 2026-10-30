@@ -8,19 +8,16 @@
 //!                                   → the STEAK {topic: {outputsToAdmit, coinsToRetain, coinsRemoved}}: BRC-22,
 //!                                   synchronous (0.9.1, shruggr/skein#112) — the request waits on the
 //!                                   submission's thread; 503 + Retry-After when nothing is decided
-//!   libp2p:<topic>    fn "submit"   one mesh, two kinds (0.12.0; `gossip` below, gossip.zig): {kind: "submit",
-//!                                   beef} the same submit as a GossipSub message (#57), the message's topic
-//!                                   requested; {kind: "admit", txid, topics} a peer's verdict (#74), recorded
-//!                                   as a `peer-admit` record, never admitting → {verdict, admit?}
-//!   libp2p:<topic>-admit   fn "peerAdmit"   a peer's verdict on its own topic, before 0.12.0: read
-//!                                           as an `admit` message is
+//!   libp2p:<topic>    fn "submit"   the announcements mesh (gossip.zig): its `admit` messages are the
+//!                                   host's (0.20.0: announce, then fetch); one that reaches the engine,
+//!                                   or anything else there, is ignored, nothing admitted → {verdict: "ignore"}
 //!   libp2p:<topic>-proof   fn "peerProof"   a peer's proof (#74): checked against the chain state,
 //!                                           admitted as the `proof` event in box `chain` → {verdict, admit?}
-//!   libp2p:/skein/overlay/beef/1.0.0   fn "submit"   a direct stream (skein-overlay#1, shruggr/skein#112):
-//!                                           a peer answering a want, one Atomic BEEF per frame (the
-//!                                           wanted txid its subject), submitted as from that peer
-//!                                           with the topics its waiters requested; a mined one no one
-//!                                           waits on (a pull, 0.14.0), with every served topic → {verdict, admit?}
+//!   libp2p:/skein/overlay/beef/1.0.0   fn "submit"   the receive row (0.20.0: the host's own entry, not
+//!                                           served to peers — skein's host never handles it inbound): one
+//!                                           Atomic BEEF per frame the host fetched (a peer's admit, a
+//!                                           peer's tail list, a pull of mined history), submitted as
+//!                                           from the peer it came from, with every served topic → {verdict, admit?}
 //!   POST /lookup      fn "lookup"   {service, query} (JSON) → {type: "output-list", outputs: [{beef, outputIndex, context?}]}
 //!                                   X-Aggregation: yes → the compact octet-stream form (count, [txid, index, context], one BEEF)
 //!   GET  /listTopicManagers, /listLookupServiceProviders         fn "listTopicManagers" / "listLookupServiceProviders"
@@ -36,7 +33,8 @@
 //!                                   {topic, blocks: [{height, blockHash, txids, bump}], nextHeight}
 //!   libp2p:/skein/overlay/sync/1.0.0   fn "sync"   (0.15.0, skein-overlay#5, shruggr/skein#154) a filter on
 //!                                   each frame of the sync protocol: one dag-cbor frame in, one answered
-//!                                   (`syncAnswer`), over the three reads above; nothing written, nothing logged
+//!                                   (`syncAnswer`), over the three reads above and the tail (0.20.0);
+//!                                   nothing written, nothing logged
 //!
 //! A call of fn "register" / "deregister" / "registerLookup" / "deregisterLookup" (0.18.0,
 //! skein-overlay#10) is no route: a program of the instance registering in its own step, the
@@ -262,8 +260,6 @@ pub fn call(a: Allocator, call_in: Value) !void {
     const in = try ev_.configured(a, call_in, arg);
     const out = if (eql(u8, func, "submit"))
         try submit(a, in, arg)
-    else if (eql(u8, func, "peerAdmit"))
-        try peerAdmit(a, in, arg)
     else if (eql(u8, func, "peerProof"))
         try peerProof(a, in, arg)
     else if (eql(u8, func, "lookup"))
@@ -316,7 +312,7 @@ fn served(a: Allocator, requested: []const []const u8, map: std.json.ObjectMap) 
 fn submit(a: Allocator, in: Value, req: Value) !Value {
     if (eql(u8, req.getText("transport") orelse "", "libp2p")) {
         if (req.getText("protocol") != null) return stream(a, in, req);
-        return gossip(a, in, req);
+        return gossip(a, req);
     }
     const sub = switch (try httpRequest(a, req)) {
         .refused => |answer| return answer,
@@ -538,51 +534,28 @@ pub fn submitBox(a: Allocator, app: []const u8) ![]const u8 {
     return std.fmt.allocPrint(a, "{s}/{s}", .{ app, submit_box });
 }
 
-/// A GossipSub message on `libp2p:<topic>` (#57; one mesh, two kinds since 0.12.0, David
-/// 2026-10-09; gossip.zig): its dag-cbor body's `kind` says which.
-///
-///   submit  {kind: "submit", beef: bytes}: the same submit, the message's topic the one requested,
-///           its `beef` the BEEF (no off-chain values; inside the body, so the engine decodes and
-///           checks it itself, submit.zig `Input.bytes`), and the route's half runs unchanged. The
-///           answer is the libp2p handler contract (skein docs/MESSAGES.md, "libp2p"): accept,
-///           admitting the submit event in box `<app>` (routed after the message's own `p2p` event:
-///           the app's row from `event` launches the same engine thread a submission launches), so
-///           the verdict goes back at once — GossipSub's validator waits on nothing further;
-///           ignore — no forward, no penalty — when nothing is new or the BEEF is refused (a
-///           refusal may be this instance's missing headers, not the publisher's fault).
-///   admit   {kind: "admit", txid, topics}: a peer's verdict, recorded as `peerAdmit` records one
-///           arriving on `<topic>-admit` (before 0.12.0).
-///
-/// Anything else (not dag-cbor, no or another kind) is ignored. The topic is the message's; it is
-/// served when the configuration names it: declared (`config.overlay.topics`) or registered
-/// (`<app>/topics`, config.zig adds them), as for `peerProof`.
-fn gossip(a: Allocator, in: Value, req: Value) !Value {
-    const t = req.getText("topic") orelse return verdictOf(a, "ignore", "not a topic message");
-    const body = req.getBytes("body") orelse "";
-    if (body.len == 0) return verdictOf(a, "ignore", "Missing or empty body");
-    const m = gossip_mod.messageOf(a, body) catch return verdictOf(a, "ignore", "not a submit or admit message (dag-cbor {kind: \"submit\" | \"admit\", …})");
-    const topics = try served(a, &.{t}, try configMap(a, in, "overlayTopics"));
-    if (topics.len == 0) return verdictOf(a, "ignore", "the topic is not served here");
-    switch (m) {
-        .admit => |b| return admitOf(a, in, req, t, b),
-        .submit => |b| {
-            var st = try load(a, in);
-            return libp2pRouted(a, in, &st, .{ .bytes = b }, topics, try sourceOf(a, req, t), req);
-        },
-    }
+/// A GossipSub message on `libp2p:<topic>` (gossip.zig; 0.20.0, David 2026-10-30: "announce, then
+/// fetch"). The mesh carries `admit` announcements, which are the host's: it reads them and fetches
+/// the BEEF from the announcing peer, handing it in through the receive row. Nothing on `<topic>` is
+/// the instance's: an `admit` that reaches the engine anyway (a host before 0.20.0), the gone
+/// `submit` kind (a peer before 0.20.0), anything else — ignored (no forward, no penalty), nothing
+/// admitted.
+fn gossip(a: Allocator, req: Value) !Value {
+    _ = req.getText("topic") orelse return verdictOf(a, "ignore", "not a topic message");
+    return verdictOf(a, "ignore", "the <topic> mesh carries the host's announcements: nothing here for the instance (skein-overlay 0.20.0)");
 }
 
-/// The route's half for a libp2p submission (a topic message, a stream frame) → its verdict.
-/// skein-overlay#1: a BEEF lacking parents is accepted as any submission (its thread pauses it and
-/// records the wants against the peer); ignored when that peer is asked for them on its behalf already.
-fn libp2pRouted(a: Allocator, in: Value, st: *State, beef: submit_mod.Input, topics: []const []const u8, source: Value, req: Value) !Value {
+/// The route's half for a BEEF on the receive row → its verdict. skein-overlay#1: a BEEF lacking
+/// parents is accepted as any submission (its thread pauses it); ignored when it is paused already on
+/// the same parents.
+fn libp2pRouted(a: Allocator, in: Value, st: *State, beef: submit_mod.Input, topics: []const []const u8, source: Value) !Value {
     const routed = switch (try submit_mod.route(a, ev_.caller(), st, in, beef, topics, null, source)) {
         .refused => |why| return verdictOf(a, "ignore", why),
         .nothing => |why| return verdictOf(a, "ignore", why),
         .unchanged => return verdictOf(a, "ignore", "already judged"),
         .pending => return verdictOf(a, "ignore", "already submitted: awaiting the chain app"),
-        .paused => |p| if (try samePause(st, p.txid, p.waiting) and try st.wantsFrom(p.txid, p.waiting, topics, req.getBytes("from") orelse ""))
-            return verdictOf(a, "ignore", "already submitted by this peer: waiting for its parents")
+        .paused => |p| if (try samePause(st, p.txid, p.waiting))
+            return verdictOf(a, "ignore", "already submitted: waiting for its parents")
         else
             p.event,
         .admit => |x| x.event,
@@ -590,48 +563,24 @@ fn libp2pRouted(a: Allocator, in: Value, st: *State, beef: submit_mod.Input, top
     return accepting(a, routed, calls.appOf(in));
 }
 
-/// A frame on the direct stream `/skein/overlay/beef/1.0.0` (skein-overlay#1, shruggr/skein#112):
-/// a peer answering a want, one Atomic BEEF per frame, the wanted txid its subject. Submitted as
-/// from that peer (the stream's remote, `from`), with the topics the paused submissions waiting on
-/// it requested (`wantedTopics`); it may itself pause and want. Not wanted here: ignore. The answer
-/// is the route's verdict as for a topic message (no reply frame: no `body`).
+/// A frame on the receive row `/skein/overlay/beef/1.0.0` (0.20.0: the host's own entry, never
+/// served to peers): one Atomic BEEF the host fetched — on a peer's admit, from a peer's tail list,
+/// in a pull of mined history — submitted as from the peer it came from (the record's `from`), with
+/// every served topic (the host fetched it for a topic this overlay serves; a topic that takes
+/// nothing of it judges nothing). It may itself pause. The answer is the route's verdict (no reply
+/// frame: no `body`).
 fn stream(a: Allocator, in: Value, req: Value) !Value {
     // shruggr/skein#146: the door's envelope (the route's `kernel.beef`), or the bytes as received.
     const beef: submit_mod.Input = submit_mod.Input.of(req.get("body")) orelse .{ .bytes = "" };
     if (beef == .bytes and beef.bytes.len == 0) return verdictOf(a, "ignore", "Missing or empty BEEF body");
-    const subject = switch (beef) {
-        .envelope => |e| envelopeSubject(a, vm.store(), e) catch return verdictOf(a, "ignore", "Invalid BEEF"),
-        .bytes => |b| (c.beef.parse(a, b) catch return verdictOf(a, "ignore", "Invalid BEEF")).subject() orelse return verdictOf(a, "ignore", "Invalid BEEF: no subject"),
-    };
     var st = try load(a, in);
-    var topics = try served(a, try submit_mod.wantedTopics(a, &st, subject), try configMap(a, in, "overlayTopics"));
-    // A pull (0.14.0, shruggr/skein#150): a mined transaction no one here waits on, judged by every served topic.
-    if (topics.len == 0 and minedSubject(a, vm.store(), beef, subject)) topics = try calls.servedTopics(a, in);
-    if (topics.len == 0) return verdictOf(a, "ignore", "not wanted here, and not mined");
-    return libp2pRouted(a, in, &st, beef, topics, try sourceOf(a, req, null), req);
+    const topics = try calls.servedTopics(a, in);
+    if (topics.len == 0) return verdictOf(a, "ignore", "no topic is served here");
+    return libp2pRouted(a, in, &st, beef, topics, try sourceOf(a, req, null));
 }
 
-/// Whether the BEEF proves its subject mined: a BUMP names it (the door checked the BUMPs against the
-/// chain state's headers; bytes are checked when routed).
-pub fn minedSubject(a: Allocator, s: c.store.Store, beef: submit_mod.Input, subject: [32]u8) bool {
-    switch (beef) {
-        .envelope => |e| {
-            const d = state.decodeRecord(a, s, e) catch return false;
-            for (d.proven) |p| if (eql(u8, &p.txid, &subject)) return true;
-            return false;
-        },
-        .bytes => |b| {
-            const parsed = c.beef.parse(a, b) catch return false;
-            const entry = parsed.find(subject) orelse return false;
-            return entry.format == .raw_with_bump;
-        },
-    }
-}
-
-/// Where a submission came from, carried on its entry (#74: an admission re-publishes it on `<topic>`
-/// unless it arrived by gossip on that topic, or on a stream): {transport, topic? (the libp2p
-/// topic), protocol? (a libp2p stream's), from? (the libp2p peer: whom its wants are asked of,
-/// skein-overlay#1), request}.
+/// Where a submission came from, carried on its entry: {transport, topic? (the libp2p topic),
+/// protocol? (a libp2p stream's), from? (the libp2p peer it came from), request}.
 fn sourceOf(a: Allocator, req: Value, topic: ?[]const u8) !Value {
     var es: std.ArrayList(cbor.Entry) = .empty;
     const transport = req.getText("transport") orelse "http";
@@ -643,26 +592,6 @@ fn sourceOf(a: Allocator, req: Value, topic: ?[]const u8) !Value {
     }
     if (req.getCid("request")) |rc| try es.append(a, .{ .key = "request", .value = .{ .cid = rc } });
     return .{ .map = es.items };
-}
-
-/// A peer's verdict on `libp2p:<topic>-admit` (#74; before 0.12.0 — now an `admit` message on
-/// `<topic>`, `gossip`): {txid, topics: {<topic>: {outputsToAdmit, coinsToRetain}}}. Read as one on
-/// `<topic>` is (`admitOf`). Ignore when not an `-admit` topic.
-fn peerAdmit(a: Allocator, in: Value, req: Value) !Value {
-    if (!eql(u8, req.getText("transport") orelse "", "libp2p")) return failure(a, 400, "peerAdmit takes libp2p topic messages");
-    const gt = req.getText("topic") orelse return verdictOf(a, "ignore", "not a topic message");
-    const t = gossip_mod.baseOf(gt, gossip_mod.admit_suffix) orelse return verdictOf(a, "ignore", "not an -admit topic");
-    return admitOf(a, in, req, t, req.getBytes("body") orelse "");
-}
-
-/// A peer's verdict for `t` (#74). Never admits anything: accept admits a `peer-admit` event (box
-/// `<app>`) the engine records under the head `<app>/gossip` (gossip.zig), a read for a lookup or
-/// a UI. Ignore when the topic is not served here or the body is not that shape.
-fn admitOf(a: Allocator, in: Value, req: Value, t: []const u8, body: []const u8) !Value {
-    if (!(try configMap(a, in, "overlayTopics")).contains(t)) return verdictOf(a, "ignore", "the topic is not served here");
-    const from = req.getBytes("key") orelse return verdictOf(a, "ignore", "no publisher key");
-    const m = gossip_mod.parseAdmit(a, body, t) catch |e| return verdictOf(a, "ignore", @errorName(e));
-    return accepting(a, try gossip_mod.peerAdmitRecord(a, t, m, from, req.getBytes("from")), calls.appOf(in));
 }
 
 /// A peer's proof on `libp2p:<topic>-proof` (#74): {txid, blockHash, blockHeight, bump}. The proof-in
@@ -965,6 +894,9 @@ fn syncError(a: Allocator, message: []const u8) !Value {
 ///       → {kind: "admitted", topic, blocks: [{height, blockHash, txids, bump}], nextHeight}   (hex, as /admitted)
 ///   {kind: "tx", topic, txid}
 ///       → {kind: "tx", txid, beef?: bytes}                                                   (absent: not held)
+///   {kind: "tail", topic}                                                                    (0.20.0)
+///       → {kind: "tail", topic, txids: [hex, display order]}: the topic's admitted transactions it
+///         does not have mined (the set the beat's `tailDigest` is over), in admission order
 ///   anything else, a topic not served here, a frame that is not dag-cbor → {kind: "error", message}
 pub fn syncAnswer(a: Allocator, st: *State, served_topics: []const []const u8, frame: []const u8) !Value {
     const req = cbor.decode(a, frame) catch return syncError(a, "not dag-cbor");
@@ -981,6 +913,7 @@ fn syncOf(a: Allocator, st: *State, served_topics: []const []const u8, req: Valu
     if (eql(u8, kind, "locator")) return syncLocator(a, st, t, req);
     if (eql(u8, kind, "admitted")) return syncAdmitted(a, st, t, req);
     if (eql(u8, kind, "tx")) return syncTx(a, st, served_topics, req);
+    if (eql(u8, kind, "tail")) return syncTail(a, st, t);
     return syncError(a, try std.fmt.allocPrint(a, "no request {s}", .{if (req.get("kind")) |k| (if (k == .text) k.text else "?") else "undefined"}));
 }
 
@@ -1065,6 +998,19 @@ fn syncTx(a: Allocator, st: *State, served_topics: []const []const u8, req: Valu
         } else |_| {}
     }
     return .{ .map = es.items };
+}
+
+/// The topic's tail as transactions (0.20.0, state.zig `tailTxids`): the host asks it when a peer's
+/// beat shows a tail digest unlike ours while the mined side agrees, and fetches what it lacks.
+fn syncTail(a: Allocator, st: *State, t: []const u8) !Value {
+    const txids = try st.tailTxids(t);
+    const xs = try a.alloc(Value, txids.len);
+    for (txids, xs) |x, *v| v.* = .{ .text = try a.dupe(u8, &c.header.toHex(x)) };
+    return .{ .map = try a.dupe(cbor.Entry, &.{
+        .{ .key = "kind", .value = .{ .text = "tail" } },
+        .{ .key = "topic", .value = .{ .text = t } },
+        .{ .key = "txids", .value = .{ .array = xs } },
+    }) };
 }
 
 /// A `Held` as the read answers it: `{txid, tx: <tx CID>, via, outpoint?: {txid, vout}}`.

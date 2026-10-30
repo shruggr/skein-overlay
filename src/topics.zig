@@ -39,7 +39,7 @@
 //! window}` and `beacon {topic: <topic>-live, every, body}`; a deregister that
 //! changes it emits `unliveness` and `unbeacon` (`withRoles`). `window` and
 //! `every` are `config.overlay.market: {window}` and `config.overlay.validator:
-//! {every}`, else 40 000 and 30 000 ms (config.zig `rolesOf`): defaults, never
+//! {every}`, else 300 000 and 120 000 ms (0.20.0; config.zig `rolesOf`): defaults, never
 //! off. Nothing at a start or re-read: the intents stand in the log.
 //!
 //! The beat (0.12.0, David 2026-10-09: "beats ARE libp2p service discovery;
@@ -414,8 +414,8 @@ pub fn deregister(a: Allocator, list: []const Entry, args: Value) !Change {
 pub const role_min_ms: u64 = 1000;
 pub const role_max_ms: u64 = 86_400_000;
 
-/// The window and the beat when the configuration names none (0.12.0): a liveness window of 40 s,
-/// a beat every 30 s (the values the owner's switch on the Mandala tokens page asked for, until
-/// 0.12.0 removed the switch).
-pub const default_window_ms: u64 = 40_000;
-pub const default_every_ms: u64 = 30_000;
+/// The window and the beat when the configuration names none (0.20.0, David 2026-10-30: 30 s was
+/// "too chatty"): a beat about every two minutes, a liveness window of a few beats (5 min). The host
+/// publishes a beacon on its timer only; a re-declared body replaces what the next beat carries.
+pub const default_window_ms: u64 = 300_000;
+pub const default_every_ms: u64 = 120_000;
