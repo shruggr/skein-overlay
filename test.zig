@@ -2026,6 +2026,25 @@ test "rebeat re-declares the liveness window (0.20.1, 2026-11-04): the pair a re
             try std.testing.expectEqual(roles.validator, re[2 * i + 1].getUint("every").?);
         }
     }
+    // 0.20.2: the lookup services' liveness alone (their beacon bodies are their programs'), the
+    // registered then the CONFIGURED ones (config.overlay.lookups, registered by nobody: the rack's
+    // discovery keeps ls_color from its manifest), each `<service>-live` with the market's window now.
+    const app: Value = try mapOf(a, &.{.{ .key = "config", .value = try mapOf(a, &.{.{ .key = "overlay", .value = try mapOf(a, &.{
+        .{ .key = "lookups", .value = try mapOf(a, &.{ .{ .key = "ls_color", .value = .{ .text = "color-lookup" } }, .{ .key = "ls_reg", .value = .{ .text = "x" } } }) },
+    }) }}) }});
+    const regd = [_][]const u8{"ls_reg"};
+    const conf = try configured.of(a, app, &.{}, &regd);
+    const confNames = try configured.lookupNames(a, conf);
+    try std.testing.expectEqual(@as(usize, 1), confNames.len); // ls_reg is the registration's
+    const roles = topics_mod.Roles{ .market = 300_000 };
+    const lev = try topics_mod.rebeatLookupEvents(a, roles, &regd, confNames);
+    try std.testing.expectEqual(@as(usize, 2), lev.len);
+    for (lev, [_][]const u8{ "ls_reg-live", "ls_color-live" }) |e, want| {
+        try std.testing.expectEqualStrings("liveness", e.getText("event").?);
+        try std.testing.expectEqualStrings(want, e.getText("topic").?);
+        try std.testing.expectEqual(@as(u64, 300_000), e.getUint("window").?);
+        try std.testing.expect(e.get("body") == null);
+    }
     // A lookup service's liveness alone (its beacon body is its program's): `<service>-live`, the window now.
     const l = try topics_mod.livenessEvent(a, "ls_x", 300_000);
     try std.testing.expectEqualStrings("liveness", l.getText("event").?);

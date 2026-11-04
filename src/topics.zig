@@ -67,8 +67,9 @@
 //! message `{fn: "rebeat"}` the writer sends the instance itself in box
 //! `<app>` (engine.zig `rebeatStep`), and (0.20.1) its liveness with the
 //! market's window now, the same pair a register declares (`livePair`), and
-//! each registered lookup service's liveness (its beacon body is its
-//! program's: left as it stands). (`origin` is the host's.)
+//! each registered (0.20.2: and configured) lookup service's liveness
+//! (`rebeatLookupEvents`; its beacon body is its program's: left as it
+//! stands). (`origin` is the host's.)
 //!
 //! Each registered lookup service beats too, on `<service>-live` (lookups.zig;
 //! `registerLookup` declares its beacon, `deregisterLookup` ends it, every
@@ -418,6 +419,18 @@ pub fn beatEvents(a: Allocator, roles: Roles, topics: []const Entry, services: [
 pub fn rebeatEvents(a: Allocator, roles: Roles, topics: []const Entry, beats: []const st_mod.Beat) ![]const Value {
     var out: std.ArrayList(Value) = .empty;
     for (topics, beats) |e, b| try out.appendSlice(a, try livePair(a, e.topic, roles, try beatBody(a, b, roles.terms)));
+    return out.items;
+}
+
+/// The liveness a `rebeat` re-declares for lookup services (0.20.1 registered; 0.20.2 configured
+/// too, `config.overlay.lookups`, as a registration's: the rack's discovery keeps `ls_color` from its
+/// manifest, registered by nobody): `liveness {topic: <service>-live, window: roles.market}` per
+/// service, the registered (`registered`) then the configured (`configured`, the registered left out).
+/// Their beacons are their programs' (the body fn "beat" answers): not re-declared here.
+pub fn rebeatLookupEvents(a: Allocator, roles: Roles, registered: []const []const u8, configured: []const []const u8) ![]const Value {
+    var out: std.ArrayList(Value) = .empty;
+    for (registered) |svc| try out.append(a, try livenessEvent(a, svc, roles.market));
+    for (configured) |svc| try out.append(a, try livenessEvent(a, svc, roles.market));
     return out.items;
 }
 

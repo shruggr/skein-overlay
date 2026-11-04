@@ -385,7 +385,7 @@ runs, registered or (0.17.0) configured, beats on its own topic, named after its
   has stepped); neither, no field. A change of the head
   re-declares every registered and configured topic's liveness and beacon
   (0.20.1: the same pair a register declares, the market's window now) and
-  each registered lookup service's liveness, on the message `{fn:
+  each registered (0.20.2: and configured) lookup service's liveness, on the message `{fn:
   "rebeat"}` the writer sends the instance itself in box `<app>`. `view` is the topic's
   **view digest**: `count` the topic's admitted-and-unspent outputs, and
   `digest` (32 bytes) the sum mod 2^256 of `sha256(txid ‖ vout)` over them
@@ -970,6 +970,12 @@ beacon — one helper (topics.zig `livePair`) for the register and the
 rebeat — and each registered lookup service gets its `liveness` (its
 beacon body is its program's: left as it stands). The result is `{op:
 "rebeat", beats, windows}`. No wire, manifest, host or kernel change.
+
+0.20.2 (2026-11-04): `rebeat` re-declares the liveness of the CONFIGURED
+lookup services too (`config.overlay.lookups`, registered by nobody — the
+rack's discovery keeps `ls_color` from the 1Color manifest), with the same
+window as the registered ones (topics.zig `rebeatLookupEvents`); their
+beacons are still their programs'. No wire, manifest, host or kernel change.
 
 ## Contributing
 
