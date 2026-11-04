@@ -65,7 +65,10 @@
 //! stays for every node (the sync needs the view digest). A change of the
 //! terms re-declares every registered topic's beacon (`rebeatEvents`), on the
 //! message `{fn: "rebeat"}` the writer sends the instance itself in box
-//! `<app>` (engine.zig `rebeatStep`). (`origin` is the host's.)
+//! `<app>` (engine.zig `rebeatStep`), and (0.20.1) its liveness with the
+//! market's window now, the same pair a register declares (`livePair`), and
+//! each registered lookup service's liveness (its beacon body is its
+//! program's: left as it stands). (`origin` is the host's.)
 //!
 //! Each registered lookup service beats too, on `<service>-live` (lookups.zig;
 //! `registerLookup` declares its beacon, `deregisterLookup` ends it, every
@@ -304,18 +307,34 @@ pub const live_suffix = "-live";
 /// validator; `body` the topic's beat body, `beatBody`: the frame carries the sender's identity key,
 /// the gossip message the peer id); on deregister, `unliveness` and `unbeacon`.
 pub fn roleEvents(a: Allocator, subscribe: bool, topic: []const u8, roles: Roles, body: []const u8) ![]const Value {
-    const t: Value = .{ .text = try std.mem.concat(a, u8, &.{ topic, live_suffix }) };
-    var out: std.ArrayList(Value) = .empty;
-    try out.append(a, .{ .map = if (subscribe) try a.dupe(cbor.Entry, &.{
+    if (subscribe) return livePair(a, topic, roles, body);
+    return a.dupe(Value, &.{ try unlivenessEvent(a, topic), try unbeaconEvent(a, topic) });
+}
+
+/// The pair a name keeps on `<name>-live` (0.20.1): `liveness {topic, window: roles.market}` then
+/// `beacon {topic, every: roles.validator, body}` — what a register declares (`roleEvents`) and what a
+/// `rebeat` re-declares (`rebeatEvents`), one code so the two cannot drift (2026-11-04: the rack's
+/// instances kept a 40 s window under 120 s beats because rebeat re-declared the beacon only).
+pub fn livePair(a: Allocator, name: []const u8, roles: Roles, body: []const u8) ![]const Value {
+    return a.dupe(Value, &.{ try livenessEvent(a, name, roles.market), try beaconEvent(a, name, roles.validator, body) });
+}
+
+/// `liveness {topic: <name>-live, window}`: declared, or re-declared with a new window (an app's new
+/// liveness for the same topic replaces its previous one, skein src/host/liveness.ts).
+pub fn livenessEvent(a: Allocator, name: []const u8, window: u64) !Value {
+    return .{ .map = try a.dupe(cbor.Entry, &.{
         .{ .key = "event", .value = .{ .text = "liveness" } },
-        .{ .key = "topic", .value = t },
-        .{ .key = "window", .value = .{ .uint = roles.market } },
-    }) else try a.dupe(cbor.Entry, &.{
+        .{ .key = "topic", .value = .{ .text = try std.mem.concat(a, u8, &.{ name, live_suffix }) } },
+        .{ .key = "window", .value = .{ .uint = window } },
+    }) };
+}
+
+/// `unliveness {topic: <name>-live}`.
+pub fn unlivenessEvent(a: Allocator, name: []const u8) !Value {
+    return .{ .map = try a.dupe(cbor.Entry, &.{
         .{ .key = "event", .value = .{ .text = "unliveness" } },
-        .{ .key = "topic", .value = t },
-    }) });
-    try out.append(a, if (subscribe) try beaconEvent(a, topic, roles.validator, body) else try unbeaconEvent(a, topic));
-    return out.items;
+        .{ .key = "topic", .value = .{ .text = try std.mem.concat(a, u8, &.{ name, live_suffix }) } },
+    }) };
 }
 
 /// `beacon {topic: <name>-live, every, body}`: declared, or re-declared with a new body (an app's
@@ -392,13 +411,14 @@ pub fn beatEvents(a: Allocator, roles: Roles, topics: []const Entry, services: [
     return out.items;
 }
 
-/// The beacons a `rebeat` re-declares (0.16.0): one per registered topic (`topics`), its body over
-/// its beat now (`beats`, one per topic, in order) with `roles.terms` — the terms changed, so every
-/// topic's body did.
+/// What a `rebeat` re-declares (0.16.0; 0.20.1 the liveness too): per topic (`topics`), in order, the
+/// pair a register declares (`livePair`): `liveness` with the market's window now, then the beacon,
+/// its body over its beat now (`beats`, one per topic) with `roles.terms` — the terms changed, so every
+/// topic's body did; a window declared under an older default is replaced by the current one.
 pub fn rebeatEvents(a: Allocator, roles: Roles, topics: []const Entry, beats: []const st_mod.Beat) ![]const Value {
-    const out = try a.alloc(Value, topics.len);
-    for (topics, beats, out) |e, b, *o| o.* = try beaconEvent(a, e.topic, roles.validator, try beatBody(a, b, roles.terms));
-    return out;
+    var out: std.ArrayList(Value) = .empty;
+    for (topics, beats) |e, b| try out.appendSlice(a, try livePair(a, e.topic, roles, try beatBody(a, b, roles.terms)));
+    return out.items;
 }
 
 /// `deregister {topic}`.

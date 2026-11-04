@@ -32,7 +32,8 @@
 //!                             answered at once (submit.zig `waitOn`).
 //!   a rebeat                  the message {fn: "rebeat"} in box `<app>` from the instance itself
 //!                             (0.16.0): sent by the app's program that wrote the head `<app>/terms`
-//!                             (the beat's terms); every registered topic's beacon re-declared.
+//!                             (the beat's terms); every registered topic's liveness and beacon
+//!                             re-declared, each registered lookup service's liveness (0.20.1).
 //!   register / deregister     a message in the box `<app>/register` only (one box per function
 //!                             class, shruggr/skein#128, 0.7.5; refused `bad-args` elsewhere),
 //!                             {fn: "register", args: {topic, program, seed?}} or {fn: "deregister",
@@ -141,23 +142,29 @@ fn rolesNow(a: Allocator, step: Value) !?topics.Roles {
 /// `rebeat` (0.16.0): the message `{fn: "rebeat"}` in box `<app>` from the instance itself, sent by
 /// the app's program that wrote the head `<app>/terms` (skein-amm's amm-validator, on root's `terms`):
 /// the engine sees no other program's head change in a step of its own, so the writer tells it.
-/// Every registered topic's beacon is re-declared with its beat body now (`topics.rebeatEvents`: the
-/// terms the head's, or none); the lookup services' beacons are their programs' and stay. Nothing
-/// is written. Result `{op: "rebeat", beats}`, or `{op, error}` on a bad configuration.
+/// Every registered topic's liveness and beacon are re-declared (0.20.1: the liveness too, the pair a
+/// register declares, `topics.rebeatEvents`): the market's window now, the beat body now (the terms the
+/// head's, or none). Each registered lookup service's liveness is re-declared with the window now; its
+/// beacon is its program's (the body its fn "beat" answers, not at hand here) and stays. Nothing is
+/// written. Result `{op: "rebeat", beats, windows}` (beacons and liveness windows re-declared), or
+/// `{op, error}` on a bad configuration.
 fn rebeatStep(a: Allocator, step: Value) !void {
     const s = vm.store();
     var fields: std.ArrayList(cbor.Entry) = .empty;
     if (try rolesNow(a, step)) |roles| {
         const troot = try vm.head(a, try topics.headName(a, calls.appOf(step)));
         const registered = try topics.entriesOf(a, if (troot) |r| try s.getValue(a, r) else null);
+        const services = try lookupNames(a, step);
         // 0.17.0: the configured topics' beacons too (configured.zig).
-        const tl = try std.mem.concat(a, topics.Entry, &.{ registered, (try configuredNow(a, step, registered, try lookupNames(a, step))).topics });
+        const tl = try std.mem.concat(a, topics.Entry, &.{ registered, (try configuredNow(a, step, registered, services)).topics });
         var loaded = try ev_.load(a, step);
         const beats = try a.alloc(@import("state.zig").Beat, tl.len);
         for (tl, beats) |e, *b| b.* = try loaded.st.beat(e.topic);
         const evs = try topics.rebeatEvents(a, roles, tl, beats);
         for (evs) |e| _ = try vm.emitEvent(a, e);
-        try fields.append(a, .{ .key = "beats", .value = .{ .uint = evs.len } });
+        for (services) |svc| _ = try vm.emitEvent(a, try topics.livenessEvent(a, svc, roles.market));
+        try fields.append(a, .{ .key = "beats", .value = .{ .uint = tl.len } });
+        try fields.append(a, .{ .key = "windows", .value = .{ .uint = tl.len + services.len } });
     } else try fields.append(a, .{ .key = "error", .value = .{ .text = "rebeat: the configuration's roles are config.overlay.market {window: <ms>} and config.overlay.validator {every: <ms>}, each from 1000 ms to a day" } });
     _ = try vm.finish(a, s, try resultRecord(a, "rebeat", fields.items));
 }

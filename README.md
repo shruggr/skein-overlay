@@ -383,7 +383,9 @@ runs, registered or (0.17.0) configured, beats on its own topic, named after its
   (0.17.0), the INITIAL value (the admin's, given at a create's config —
   a token instance beats its default terms before any program of its app
   has stepped); neither, no field. A change of the head
-  re-declares every registered and configured topic's beacon, on the message `{fn:
+  re-declares every registered and configured topic's liveness and beacon
+  (0.20.1: the same pair a register declares, the market's window now) and
+  each registered lookup service's liveness, on the message `{fn:
   "rebeat"}` the writer sends the instance itself in box `<app>`. `view` is the topic's
   **view digest**: `count` the topic's admitted-and-unspent outputs, and
   `digest` (32 bytes) the sum mod 2^256 of `sha256(txid ‖ vout)` over them
@@ -957,6 +959,17 @@ the next proof, with or without a submitter); one that came by gossip is
 not. The sync protocol gains `{kind: "tail", topic}`. The beat defaults
 are 120 000 ms (beat) and 300 000 ms (window). The manifest's routes are
 unchanged; its description says the above.
+
+0.20.1 (2026-11-04): `rebeat` re-declares the liveness window too. A
+topic's window was declared once, at registration, so an instance
+registered before 0.20.0 kept the old 40 000 ms window under 0.20.0's
+120 000 ms beats (a peer's beat listed for 40 s of every 120). On `{fn:
+"rebeat"}` every registered and configured topic now gets `liveness
+{topic: <topic>-live, window}` with the market's window now beside its
+beacon — one helper (topics.zig `livePair`) for the register and the
+rebeat — and each registered lookup service gets its `liveness` (its
+beacon body is its program's: left as it stands). The result is `{op:
+"rebeat", beats, windows}`. No wire, manifest, host or kernel change.
 
 ## Contributing
 

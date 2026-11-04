@@ -1972,7 +1972,8 @@ test "the beat's terms (0.16.0): the head <app>/terms's record, opaque, copied i
     const reg_body = try cbor.decode(a, (try topics_mod.roleEvents(a, true, "tm_a", roles, try topics_mod.beatBody(a, .{}, roles.terms)))[1].getBytes("body").?);
     try std.testing.expect(reg_body.get("terms") != null);
 
-    // After a change (the rebeat): every registered topic's beacon, its body over its beat now, the new terms.
+    // After a change (the rebeat): every registered topic's liveness (0.20.1: the market's window now)
+    // then its beacon, its body over its beat now, the new terms.
     const changed = try mapOf(a, &.{
         .{ .key = "lpFeeBps", .value = .{ .uint = 30 } },
         .{ .key = "validatorFeeBps", .value = .{ .uint = 5 } },
@@ -1981,8 +1982,17 @@ test "the beat's terms (0.16.0): the head <app>/terms's record, opaque, copied i
     try hm.m.put(a, "overlay/terms", try s.putValue(a, changed));
     roles.terms = try config.termsOf(a, s, hm.heads(), "overlay");
     const re = try topics_mod.rebeatEvents(a, roles, &reg, &beats);
-    try std.testing.expectEqual(@as(usize, 2), re.len);
-    for (re, reg, beats) |e, r, b| {
+    try std.testing.expectEqual(@as(usize, 4), re.len);
+    for (0..reg.len) |i| {
+        const l = re[2 * i];
+        try std.testing.expectEqualStrings("liveness", l.getText("event").?);
+        try std.testing.expectEqualStrings(try std.mem.concat(a, u8, &.{ reg[i].topic, "-live" }), l.getText("topic").?);
+        try std.testing.expectEqual(topics_mod.default_window_ms, l.getUint("window").?);
+    }
+    for (0..reg.len) |i| {
+        const e = re[2 * i + 1];
+        const r = reg[i];
+        const b = beats[i];
         try std.testing.expectEqualStrings("beacon", e.getText("event").?);
         try std.testing.expectEqualStrings(try std.mem.concat(a, u8, &.{ r.topic, "-live" }), e.getText("topic").?);
         try std.testing.expectEqual(topics_mod.default_every_ms, e.getUint("every").?);
@@ -1994,7 +2004,33 @@ test "the beat's terms (0.16.0): the head <app>/terms's record, opaque, copied i
     try hm.m.put(a, "overlay/terms", try s.putValue(a, .null));
     roles.terms = try config.termsOf(a, s, hm.heads(), "overlay");
     try std.testing.expect(roles.terms == null);
-    for (try topics_mod.rebeatEvents(a, roles, &reg, &beats)) |e| try std.testing.expect((try cbor.decode(a, e.getBytes("body").?)).get("terms") == null);
+    for (try topics_mod.rebeatEvents(a, roles, &reg, &beats)) |e| if (e.getBytes("body")) |bb| try std.testing.expect((try cbor.decode(a, bb)).get("terms") == null);
+}
+
+test "rebeat re-declares the liveness window (0.20.1, 2026-11-04): the pair a register declares, the market's window now, so a window declared under an older default is replaced" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const reg = [_]topics_mod.Entry{ .{ .topic = "tm_a", .program = "p" }, .{ .topic = "tm_b", .program = "p" } };
+    const beats = [_]state.Beat{ .{}, .{} };
+    // A configured window (config.overlay.market) and the defaults: each rebeat carries the window now.
+    for ([_]topics_mod.Roles{ .{}, .{ .market = 45_000, .validator = 15_000 } }) |roles| {
+        const re = try topics_mod.rebeatEvents(a, roles, &reg, &beats);
+        try std.testing.expectEqual(@as(usize, 2 * reg.len), re.len);
+        for (reg, 0..) |r, i| {
+            // Exactly what a register of the same topic declares (`roleEvents`, one helper `livePair`).
+            const on = try topics_mod.roleEvents(a, true, r.topic, roles, try topics_mod.beatBody(a, beats[i], roles.terms));
+            try std.testing.expectEqual(@as(usize, 2), on.len);
+            for (on, re[2 * i .. 2 * i + 2]) |want, got| try std.testing.expectEqualSlices(u8, try cbor.encode(a, want), try cbor.encode(a, got));
+            try std.testing.expectEqual(roles.market, re[2 * i].getUint("window").?);
+            try std.testing.expectEqual(roles.validator, re[2 * i + 1].getUint("every").?);
+        }
+    }
+    // A lookup service's liveness alone (its beacon body is its program's): `<service>-live`, the window now.
+    const l = try topics_mod.livenessEvent(a, "ls_x", 300_000);
+    try std.testing.expectEqualStrings("liveness", l.getText("event").?);
+    try std.testing.expectEqualStrings("ls_x-live", l.getText("topic").?);
+    try std.testing.expectEqual(@as(u64, 300_000), l.getUint("window").?);
 }
 
 /// fund (mined) → t1 (mints a token) → t2 (spends it into a new one), both unproven.
