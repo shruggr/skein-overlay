@@ -373,6 +373,10 @@ pub const State = struct {
         /// A paused submission's waiters (0.9.1): the `wait` messages of the HTTP requests waiting on
         /// it, each answered (`replyTo`) when the pause ends.
         wakes: []const []const u8 = &.{},
+        /// The outpoints a transaction handed to the chain app spends (0.20.5): kept with its
+        /// record so a later submission spending one of them is refused while it is in flight
+        /// (`inFlightSpender`), before the chain app holds it.
+        spends: []const [36]u8 = &.{},
     };
 
     pub fn putPending(self: *State, txid: [32]u8, p: Pending) !void {
@@ -397,6 +401,11 @@ pub const State = struct {
             const ws = try a.alloc(Value, p.wakes.len);
             for (p.wakes, ws) |w, *o| o.* = .{ .cid = w };
             try fields.append(a, .{ .key = "wakes", .value = .{ .array = ws } });
+        }
+        if (p.spends.len > 0) {
+            const xs = try a.alloc(Value, p.spends.len);
+            for (p.spends, xs) |op, *o| o.* = .{ .bytes = try a.dupe(u8, &op) };
+            try fields.append(a, .{ .key = "spends", .value = .{ .array = xs } });
         }
         try self.map("pending").putLink(&txid, try self.store.putValue(a, .{ .map = fields.items }));
     }
@@ -433,6 +442,32 @@ pub const State = struct {
     pub fn isUnsettled(self: *State, txid: [32]u8) !bool {
         const rec = (try self.pendingRecord(txid)) orelse return false;
         return rec.getCid("ingest") != null or rec.get("waiting") != null;
+    }
+
+    /// A pending record's `spends` read back (0.20.5).
+    pub fn spendsOf(self: *State, rec: Value) ![]const [36]u8 {
+        const xs = rec.getArray("spends") orelse return &.{};
+        const out = try self.arena.alloc([36]u8, xs.len);
+        for (xs, out) |x, *o| o.* = if (x == .bytes and x.bytes.len == 36) x.bytes[0..36].* else return error.BadState;
+        return out;
+    }
+
+    /// Whether a transaction other than `except`, in flight in a submission of this engine (handed
+    /// to the chain app, its answer not yet acted on) and not rejected by the chain state, spends
+    /// `op` (0.20.5, David 2026-11-06: one held spender per coin; the chain state does not hold it
+    /// yet when the next submission is routed).
+    pub fn inFlightSpender(self: *State, op: [36]u8, except: [32]u8) !bool {
+        for (try self.map("pending").prefixed("")) |kv| {
+            if (kv.key.len != 32 or kv.value != .cid) continue;
+            if (std.mem.eql(u8, kv.key, &except)) continue;
+            const rec = try self.record(kv.value.cid);
+            if (rec.getCid("ingest") == null) continue;
+            for (try self.spendsOf(rec)) |s| if (std.mem.eql(u8, &s, &op)) {
+                if (try self.ch.map("rejected").has(kv.key[0..32])) break;
+                return true;
+            };
+        }
+        return false;
     }
 
     /// The paused submissions waiting on `txid` as a parent in flight (skein-overlay#6: their
@@ -1289,7 +1324,10 @@ pub fn heldParents(a: Allocator, st: *State, d: Decoded) ![][32]u8 {
 /// reached from it through the merkle nodes; every other transaction's inputs come from a
 /// transaction decoded before it or held by the chain app, read through `get`, with their scripts
 /// verified; a txid-only entry names a transaction the chain holds. A subject the chain has
-/// rejected, or spending an output a proven transaction spends, is refused. → the subject.
+/// rejected, or spending an output a proven transaction spends, is refused. An unproven subject
+/// spending an output another transaction the chain holds spends, not rejected, is refused too
+/// (`DoubleSpend`, 0.20.5, David 2026-11-06: one held spender per coin); a proven subject is not
+/// (its proof displaces an unmined spender: the chain state rejects the loser). → the subject.
 /// `door`: the kernel's door proved the BUMPs (shruggr/skein#121: a pointer record, `decodeRecord`):
 /// they are not proven again.
 pub fn verifyDecoded(a: Allocator, s: Store, ch: *Chain, d: Decoded, door: bool) !Subject {
@@ -1327,14 +1365,25 @@ pub fn verifyDecoded(a: Allocator, s: Store, ch: *Chain, d: Decoded, door: bool)
     }
     const subject = try subjectOf(a, s, d.subject);
     if (try ch.map("rejected").has(&d.subject)) return error.TransactionRejected;
+    const proven = try subjectProven(ch, d);
     for (subject.tx.inputs) |in| {
         const op = store_mod.outpointKey(in.previous_outpoint.txid.bytes, in.previous_outpoint.index);
         for (try ch.spendersOf(op)) |other| {
             if (std.mem.eql(u8, &other, &d.subject)) continue;
-            if ((try ch.status(other)) == .proven) return error.DoubleSpend;
+            switch (try ch.status(other)) {
+                .proven => return error.DoubleSpend,
+                .unproven => if (!proven) return error.DoubleSpend,
+                .rejected => {},
+            }
         }
     }
     return subject;
+}
+
+/// Whether the decoded BEEF's subject is proven: by a BUMP of the BEEF, or in the chain state.
+pub fn subjectProven(ch: *Chain, d: Decoded) !bool {
+    if (provenAt(d, d.subject) != null) return true;
+    return (try ch.status(d.subject)) == .proven;
 }
 
 // ---------------------------------------------------------------- a submission's bytes, kept

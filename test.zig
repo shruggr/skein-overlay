@@ -4686,7 +4686,9 @@ test "decided with what is here (0.19.0): a mined funding-only transaction and a
     try std.testing.expect((try inst.answer(mint.txid, .accepted)).admitted);
 
     // A spend of the mint's token, then a second spend of the same token: the second's source is
-    // readable and no coin of the topic (spent) — the topic decides: refused, nothing paused or wanted.
+    // readable and no coin of the topic (spent) — refused, nothing paused or wanted. 0.20.5: refused
+    // at intake already (`DoubleSpend`: the first spender is held, unproven, not rejected), before
+    // the topic is asked.
     const s1 = try spend(a, &mint.tx, 0, &.{.{ 1, &x.k.token }}, x.k.priv);
     _ = try inst.submitted(try atomic(a, s1));
     _ = try inst.ingest(try atomic(a, s1));
@@ -4694,8 +4696,8 @@ test "decided with what is here (0.19.0): a mined funding-only transaction and a
     try std.testing.expect((try inst.answer(s1.txid, .accepted)).admitted);
     const s2 = try spend(a, &mint.tx, 0, &.{.{ 2, &x.k.token }}, x.k.priv);
     const r = try inst.route(try atomic(a, s2));
-    try std.testing.expect(r == .nothing);
-    try std.testing.expect(std.mem.indexOf(u8, r.nothing, "SpendsNoCoin") != null);
+    try std.testing.expect(r == .refused);
+    try std.testing.expectEqualStrings("DoubleSpend", r.refused);
     st = try inst.load();
     try std.testing.expect(!(try st.isPending(s2.txid)));
     try std.testing.expectEqual(@as(usize, 0), try st.map("waits").count());
@@ -4740,4 +4742,136 @@ test "unheld (0.19.0): a parent's block in the store but neither in the BEEF nor
     // Not named: read — t1's token is no coin of the topic: decided, refused.
     try std.testing.expectError(error.SpendsNoCoin, submit.identify(a, inst.caller(), inst.topic_prog, "tm_demo", sub, &.{}, null, &.{}));
     try std.testing.expectError(error.MissingParents, submit.identify(a, inst.caller(), inst.topic_prog, "tm_demo", sub, &.{}, null, &.{x.t1.txid}));
+}
+
+test "one held spender per coin (0.20.5, David 2026-11-06): a second unmined spender refused at intake while the first is in flight and once the chain app holds it; free again when the first is rejected; a proven spender displaces an unmined one" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = c.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var inst = try Instance.init(a, &ms);
+    const k = try keys(0x42);
+    const f = try fund(a, 0x55, 1, &k.p2pkh);
+    try inst.headers(&.{&f.h1});
+    const t1 = try spend(a, &f.tx, 0, &.{ .{ 1, &k.token }, .{ 9_000, &k.p2pkh } }, k.priv);
+    try std.testing.expect((try inst.admitted(try withFund(a, f, t1), t1.txid)).admitted);
+    const sa = try spend(a, &t1.tx, 0, &.{.{ 1, &k.token }}, k.priv);
+    const sb = try spend(a, &t1.tx, 0, &.{.{ 2, &k.token }}, k.priv);
+    const alice: [33]u8 = .{0x03} ++ .{0xa1} ** 32;
+
+    // (a) The incident's order: A routed and handed to the chain app (pending, not held by it yet);
+    // B routed before any chain answer — refused, by the route and by message; nothing of B kept.
+    const ra = try inst.route(try atomic(a, sa));
+    _ = try inst.begin(ra.admit.event);
+    try std.testing.expect(try inst.pending(sa.txid));
+    var ch = try inst.chain();
+    try std.testing.expect(!(try ch.holds(sa.txid)));
+    const rb = try inst.route(try atomic(a, sb));
+    try std.testing.expectEqualStrings("DoubleSpend", rb.refused);
+    const mb = try a.dupe(u8, &cbor.cidOf("message B"));
+    const byb = try inst.received(try submitArgs(a, try atomic(a, sb)), try byMessage(a, &alice, mb));
+    try std.testing.expectEqualStrings("DoubleSpend", byb.dropped);
+    const ans_b = inst.wire_.lastAnswer();
+    try std.testing.expectEqualStrings("rejected", ans_b.getText("state").?);
+    try std.testing.expectEqualStrings("DoubleSpend", ans_b.getText("reason").?);
+    try std.testing.expect(!(try inst.pending(sb.txid)));
+    // A itself again, in flight: its own submission, not a competitor.
+    try std.testing.expect((try inst.route(try atomic(a, sa))) == .pending);
+    // A admitted on its answer, its lookup hooks run.
+    const admitted0 = inst.count("admitted");
+    const spent0 = inst.count("spent");
+    _ = try inst.ingest(try atomic(a, sa));
+    _ = try inst.chainStatus(sa.txid, "RECEIVED", null);
+    const da = try inst.answer(sa.txid, .accepted);
+    try std.testing.expect(da.admitted and da.done);
+    try std.testing.expectEqualSlices(u32, &.{0}, da.applied[0].coins_to_retain);
+    try std.testing.expectEqual(admitted0 + 1, inst.count("admitted"));
+    try std.testing.expectEqual(spent0 + 1, inst.count("spent"));
+
+    // (b) B after A is held by the chain app (no longer pending here): refused.
+    try std.testing.expect(!(try inst.pending(sa.txid)));
+    try std.testing.expectEqualStrings("DoubleSpend", (try inst.route(try atomic(a, sb))).refused);
+
+    // (c) A rejected by the chain app: the coin is free; B submitted again is admitted.
+    _ = try inst.chainStatus(sa.txid, "REJECTED", null);
+    try std.testing.expect((try inst.watched(sa.txid, .{ .rejected = "REJECTED" })).unapplied.len > 0);
+    try std.testing.expect(!(try inst.applied(sa.txid)));
+    const rb2 = try inst.route(try atomic(a, sb));
+    _ = try inst.begin(rb2.admit.event);
+    _ = try inst.ingest(try atomic(a, sb));
+    _ = try inst.chainStatus(sb.txid, "RECEIVED", null);
+    const db = try inst.answer(sb.txid, .accepted);
+    try std.testing.expect(db.admitted and db.done);
+    try std.testing.expectEqualSlices(u32, &.{0}, db.applied[0].coins_to_retain);
+    try std.testing.expect(try inst.applied(sb.txid));
+
+    // (d) A proven spender against an unmined held one: C (unmined) admitted; D, mined at height 2,
+    // is not refused — admitted at its proof, retaining the coin; the chain state rejects C, whose
+    // watch takes its judgement out.
+    const sc = try spend(a, &sb.tx, 0, &.{.{ 1, &k.token }}, k.priv);
+    try std.testing.expect((try inst.admitted(try atomic(a, sc), sc.txid)).admitted);
+    const sd = try spend(a, &sb.tx, 0, &.{.{ 3, &k.token }}, k.priv);
+    const h2 = mine(hdr.hash(&f.h1), sd.txid, 1_700_001_200);
+    try inst.headers(&.{&h2});
+    const dbump = try a.dupe(bsvz.spv.MerklePath, &.{try bsvz.spv.MerklePath.parse(a, try soloPath(a, 2, sd.txid))});
+    const dbeef = try beef.serialize(a, .{ .version = beef.V2, .bumps = dbump, .entries = try a.dupe(beef.Entry, &.{.{ .txid = sd.txid, .format = .raw_with_bump, .bump = 0, .raw = sd.raw, .tx = sd.tx }}) });
+    const rd = try inst.route(dbeef);
+    try std.testing.expect(rd == .admit);
+    _ = try inst.begin(rd.admit.event);
+    try std.testing.expectEqual(c.state.Status.proven, try inst.ingest(dbeef));
+    ch = try inst.chain();
+    try std.testing.expectEqual(c.state.Status.rejected, try ch.status(sc.txid));
+    const dd = try inst.answer(sd.txid, .{ .proven = .{} });
+    try std.testing.expect(dd.admitted and dd.done);
+    try std.testing.expectEqualSlices(u32, &.{0}, dd.applied[0].coins_to_retain);
+    try std.testing.expect(try inst.applied(sd.txid));
+    try std.testing.expect((try inst.watched(sc.txid, .{ .rejected = "double-spent" })).unapplied.len > 0);
+    try std.testing.expect(!(try inst.applied(sc.txid)));
+}
+
+test "a truthful answer (0.20.5): a submission whose admission applied nothing in any topic is answered rejected, with no watch; nothing it holds is touched" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = c.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var inst = try Instance.init(a, &ms);
+    const k = try keys(0x42);
+    const f = try fund(a, 0x66, 1, &k.p2pkh);
+    try inst.headers(&.{&f.h1});
+    const t1 = try spend(a, &f.tx, 0, &.{ .{ 1, &k.token }, .{ 9_000, &k.p2pkh } }, k.priv);
+    try std.testing.expect((try inst.admitted(try withFund(a, f, t1), t1.txid)).admitted);
+    const alice: [33]u8 = .{0x03} ++ .{0xa1} ** 32;
+    const m1 = try a.dupe(u8, &cbor.cidOf("message E"));
+
+    // E burns the token (no token output; consumes the coin): taken at the route, previous [0].
+    const se = try spend(a, &t1.tx, 0, &.{.{ 1, &k.p2pkh }}, k.priv);
+    const r = try inst.received(try submitArgs(a, try atomic(a, se)), try byMessage(a, &alice, m1));
+    try std.testing.expect(r == .launch);
+    _ = try inst.begin(r.launch);
+    // Before E's answer, the chain app comes to hold another spender of the coin (not by this
+    // engine's route): at admission E's previous coins are none, and no topic takes it.
+    const sf = try spend(a, &t1.tx, 0, &.{.{ 2, &k.p2pkh }}, k.priv);
+    _ = try inst.ingest(try atomic(a, sf));
+    _ = try inst.ingest(try atomic(a, se));
+    _ = try inst.chainStatus(se.txid, "RECEIVED", null);
+    const answers0 = inst.wire_.answers.items.len;
+    const sent0 = inst.wire_.sent.items.len;
+    const done = try inst.answer(se.txid, .accepted);
+    try std.testing.expect(done.done);
+    try std.testing.expect(!(try inst.applied(se.txid)));
+    try std.testing.expect(!(try inst.pending(se.txid)));
+    try std.testing.expectEqual(answers0 + 1, inst.wire_.answers.items.len);
+    const ans = inst.wire_.lastAnswer();
+    try std.testing.expectEqualStrings("rejected", ans.getText("state").?);
+    try std.testing.expectEqualStrings(&hdr.toHex(se.txid), ans.getText("txid").?);
+    try std.testing.expect(std.mem.startsWith(u8, ans.getText("reason").?, "NotAdmitted"));
+    // No watch follows it.
+    try std.testing.expectEqual(@as(usize, 0), done.watches.len);
+    for (inst.wire_.sent.items[sent0..]) |s| try std.testing.expect(!std.mem.eql(u8, s.body.getText("fn") orelse "", "watch"));
+    // The coin's own admission is untouched (t1 still applied, its token still in the topic).
+    try std.testing.expect(try inst.applied(t1.txid));
+    var ch = try inst.chain();
+    try std.testing.expectEqual(c.state.Status.unproven, try ch.status(se.txid));
 }

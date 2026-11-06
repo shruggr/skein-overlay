@@ -991,6 +991,18 @@ emits each with `emitEvent`, in order, in the same step, for the
 that is not a map with a text `event` is passed over. No wire, manifest,
 host or kernel change.
 
+0.20.5 (2026-11-06): ONE HELD SPENDER PER COIN (David 2026-11-06). An
+unproven submission is refused at intake (`DoubleSpend`, as for a proven
+competitor before) when any of its inputs already has another spender that
+is held and not rejected: held by the chain app, or in flight in another
+submission of this engine (handed to the chain app, not yet answered; the
+outpoints it spends are kept on its pending record as `spends`). A
+rejection of the first frees the coin; a proven submission is not refused
+(it displaces the unmined one). And a TRUTHFUL ANSWER: a submission whose
+admission applied nothing in any topic is answered `rejected` (`NotAdmitted:
+…`, the reason the route gives a transaction no topic takes), with no watch;
+nothing it holds is touched. No wire, manifest, host or kernel change.
+
 ## Contributing
 
 Work is tracked in shruggr/skein; start at issue

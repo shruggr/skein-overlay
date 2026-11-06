@@ -285,7 +285,15 @@ write cache), and the chain state, read only (`head("chain/state")`):
   or held by the chain app, with their scripts verified;
 - a subject the chain app has rejected is refused (`TransactionRejected`),
   and so is one spending an output a proven transaction spends
-  (`DoubleSpend`).
+  (`DoubleSpend`);
+- one spender per coin (0.20.5): an UNPROVEN subject is refused
+  (`DoubleSpend`) when an input already has another spender that is held
+  and not rejected — held by the chain app (its `spendersOf`), or in flight
+  here: handed to the chain app by another submission of this engine and not
+  yet answered (the `spends` its pending record keeps,
+  `State.inFlightSpender`). The same transaction again is never its own
+  competitor. A PROVEN subject is not refused by this: its proof displaces an
+  unmined spender (the chain state rejects the loser).
 
 In a test build the SDK's `chain/src/beef.zig` counts its parses
 (`beef.parses`); this repo's test.zig asserts one parse per submit of bytes (a pointer record is read, not parsed).

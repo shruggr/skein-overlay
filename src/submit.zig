@@ -253,6 +253,13 @@ pub fn route(a: Allocator, caller: calls.Caller, st: *State, in: Value, beef: In
         else => return .{ .refused = @errorName(e) },
     };
     if (try st.isPending(sub.txid) and !(try st.isPaused(sub.txid))) return .{ .pending = sub.txid };
+    // 0.20.5 (David 2026-11-06, one held spender per coin): an unproven subject spending an output a
+    // transaction in flight here spends — handed to the chain app by another submission, not yet
+    // held by it — is refused as the chain state's spender would be (`verifyDecoded`).
+    if (!(try state.subjectProven(st.ch, d))) for (sub.tx.inputs) |inp| {
+        const op = c.store.outpointKey(inp.previous_outpoint.txid.bytes, inp.previous_outpoint.index);
+        if (try st.inFlightSpender(op, sub.txid)) return .{ .refused = @errorName(error.DoubleSpend) };
+    };
     const served = try calls.configObject(a, in, "overlayTopics");
     var dupes: usize = 0;
     for (topics) |t| {
@@ -566,19 +573,28 @@ pub fn begin(cx: Ctx, ev: Value) !Begun {
     var bytes: ?[]const u8 = null;
     var ms: std.ArrayList([]const u8) = .empty;
     var has_subject = false;
+    var parsed: ?c.beef.Beef = null;
     for (its) |it| {
         has_subject = has_subject or it.subject;
-        const b: Input = if (it.subject) beef else blk: {
-            if (bytes == null) bytes = try beef.wire(a, cx.st.store);
-            break :blk .{ .bytes = try state.atomicFor(a, bytes.?, it.txid) };
-        };
+        if (bytes == null) bytes = try beef.wire(a, cx.st.store);
+        const b: Input = if (it.subject) beef else .{ .bytes = try state.atomicFor(a, bytes.?, it.txid) };
+        if (parsed == null) parsed = c.beef.parse(a, bytes.?) catch return error.BadEvent;
         const m = try cx.wire.send(a, chain_box, try ingestBody(a, b));
-        try cx.st.putPending(it.txid, .{ .thread = cx.thread, .submission = txid, .ingest = m });
+        try cx.st.putPending(it.txid, .{ .thread = cx.thread, .submission = txid, .ingest = m, .spends = try spendsIn(a, parsed.?, it.txid) });
         try ms.append(a, m);
     }
     // A paused submission whose subject no topic takes now: no longer paused.
     if (!has_subject and try cx.st.isPaused(txid)) try unpause(cx.st, txid);
     return .{ .ingests = ms.items };
+}
+
+/// The outpoints a transaction of the BEEF spends (0.20.5: kept on its pending record).
+fn spendsIn(a: Allocator, b: c.beef.Beef, txid: [32]u8) ![]const [36]u8 {
+    const at = b.indexOf(txid) orelse return error.BadEvent;
+    const tx = b.entries[at].tx orelse return error.BadEvent;
+    const out = try a.alloc([36]u8, tx.inputs.len);
+    for (tx.inputs, out) |inp, *o| o.* = c.store.outpointKey(inp.previous_outpoint.txid.bytes, inp.previous_outpoint.index);
+    return out;
 }
 
 /// A paused submission recorded (0.20.0): its pending record with its event and the parents it
@@ -680,7 +696,7 @@ fn wakeWaiters(cx: Ctx, txid: [32]u8) !usize {
 pub fn waitOn(cx: Ctx, txid: [32]u8, w: []const u8) !enum { waiting, answered } {
     if (try cx.st.isPaused(txid)) {
         const rec = (try cx.st.pendingRecord(txid)).?;
-        var p = try pendingOf(rec);
+        var p = try pendingOf(cx.st, rec);
         p.waiting = try hexList(cx.a, rec.get("waiting"));
         p.event = rec.getCid("event");
         const prior = try wakesOf(cx.a, rec);
@@ -883,8 +899,9 @@ fn ours(rec: Value, subject_hex: []const u8) bool {
     return eql(u8, rec.getText("submission") orelse rec.getText("txid") orelse "", subject_hex);
 }
 
-fn pendingOf(rec: Value) !State.Pending {
+fn pendingOf(st: *State, rec: Value) !State.Pending {
     return .{
+        .spends = try st.spendsOf(rec),
         .thread = rec.getCid("thread"),
         .submission = if (rec.getText("submission")) |h| c.header.fromHex(h) catch return error.BadState else null,
         .ingest = rec.getCid("ingest"),
@@ -922,7 +939,7 @@ pub fn answered(cx: Ctx, ev: Value, ingest: []const u8, ans: Answer) !Stepped {
         out.txid = it.txid;
         switch (ans) {
             .accepted, .proven => {
-                var p = try pendingOf(rec);
+                var p = try pendingOf(cx.st, rec);
                 if (p.heard == null or ans == .proven) {
                     p.heard = @tagName(ans);
                     if (ans == .proven) p.via = ans.proven.via;
@@ -967,6 +984,14 @@ pub fn answered(cx: Ctx, ev: Value, ingest: []const u8, ans: Answer) !Stepped {
         const proven = eql(u8, heard, "proven");
         // The submitter's answers: the subject's, when a topic took it.
         const answering = it.subject and subjectTaken(ev) and submitterOf(source) != null;
+        // 0.20.5: a subject whose admission applied nothing in any topic (its previous coins moved
+        // since the route and no topic takes it now) is answered `rejected`, as the route answers a
+        // transaction no topic takes; no watch follows it, as none follows a rejected submission.
+        if (it.subject and appliedNothing(adm)) {
+            if (answering) try answerRejected(cx, source, it.txid, not_admitted);
+            try resumeWaiters(cx, it.txid, &resumes);
+            continue;
+        }
         if (answering) {
             try answerAdmitted(cx, source, adm, if (proven) "proven" else "pending");
             if (proven) try answerProof(cx, source, it.txid, proof_result);
@@ -1009,6 +1034,12 @@ pub fn answered(cx: Ctx, ev: Value, ingest: []const u8, ans: Answer) !Stepped {
     out.awaiting = awaiting.items;
     out.done = awaiting.items.len == 0;
     return out;
+}
+
+/// Whether an admission recorded no judgement in any topic (none took anything, none had judged it before).
+fn appliedNothing(adm: Admission) bool {
+    for (adm.applied) |ap| if (ap.dupe or ap.records.len > 0) return false;
+    return true;
 }
 
 /// `txid` has come (the chain app answered for it: admitted or rejected): each paused submission
