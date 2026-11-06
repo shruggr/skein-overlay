@@ -977,6 +977,10 @@ rack's discovery keeps `ls_color` from the 1Color manifest), with the same
 window as the registered ones (topics.zig `rebeatLookupEvents`); their
 beacons are still their programs'. No wire, manifest, host or kernel change.
 
+0.20.3 (2026-11-05): a re-pin on skein-sdk 0.13.0 (the tree's `floor`,
+`Map.floor`, `Map.range`); nothing in the engine changes. No wire,
+manifest, host or kernel change.
+
 ## Contributing
 
 Work is tracked in shruggr/skein; start at issue
