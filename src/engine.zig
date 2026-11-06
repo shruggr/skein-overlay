@@ -65,7 +65,9 @@
 //! marketplace AND validator from install, always"): a message {fn: "market" | "validator"} is
 //! no function of the engine. A step that changes a registered topic's view digest (an admission,
 //! a rejection, a seed) re-declares its beacon with the new body, and one whose lookup hooks
-//! answered new beat bodies re-declares those services' beacons (topics.zig `beatEvents`).
+//! answered new beat bodies re-declares those services' beacons (topics.zig `beatEvents`). The
+//! events the lookup hooks asked for (0.20.4, `lookup.Service.emit`) are emitted in the same step,
+//! in order, before the beacons.
 //!
 //! The state is the overlay's own, under its app's name (state.zig: `<app>/state`), over the
 //! chain app's (`chain/state`), read only. The topics and lookup services are the app's (#72,
@@ -131,6 +133,11 @@ fn emitBeats(a: Allocator, step: Value, st: *@import("state.zig").State) !usize 
     const evs = try topics.beatEvents(a, roles, try std.mem.concat(a, topics.Entry, &.{ tl, conf.topics }), try std.mem.concat(a, []const u8, &.{ services, try configured.lookupNames(a, conf) }), changes, st.lookup_beats.items);
     for (evs) |e| _ = try vm.emitEvent(a, e);
     return evs.len;
+}
+
+/// The events the step's lookup hooks asked for (0.20.4, `Service.emit`), emitted in order.
+fn emitHookEvents(a: Allocator, st: *@import("state.zig").State) !void {
+    for (st.lookup_events.items) |e| _ = try vm.emitEvent(a, e);
 }
 
 /// The engine's roles (config.zig `rolesOf`; null: a bad configuration, error.BadRoles) with the
@@ -399,6 +406,7 @@ fn run(a: Allocator) anyerror!void {
         for (done.awaiting) |m| try vm.awaitRecord(m);
         try fields.append(a, .{ .key = "awaiting", .value = .{ .boolean = true } });
     }
+    try emitHookEvents(a, st);
     const beats = try emitBeats(a, step, st);
     if (beats > 0) try fields.append(a, .{ .key = "beats", .value = .{ .uint = beats } });
     try answersField(&fields, a);
@@ -511,6 +519,7 @@ fn settled(a: Allocator, step: Value, loaded: anytype, outcome: submit.Resumed, 
         }),
         .woke => try fields.append(a, .{ .key = "outcome", .value = .{ .text = "woke" } }),
     }
+    try emitHookEvents(a, &loaded.st);
     const beats = try emitBeats(a, step, &loaded.st);
     if (beats > 0) try fields.append(a, .{ .key = "beats", .value = .{ .uint = beats } });
     try answersField(fields, a);

@@ -981,6 +981,16 @@ beacons are still their programs'. No wire, manifest, host or kernel change.
 `Map.floor`, `Map.range`); nothing in the engine changes. No wire,
 manifest, host or kernel change.
 
+0.20.4 (2026-11-05): a lookup hook may hand back EVENTS as it hands back
+beats. The hook's answer `{kind: "lookup-hooked", fn, beats?, events?}`:
+`events` is an array of maps, each an event the hook asks to be emitted
+(`{event: <name>, topic: <text>, …fields}`), collected by
+`lookup.Service.emit(event)` as `Service.beat` collects beats. The engine
+emits each with `emitEvent`, in order, in the same step, for the
+`admitted`, `spent` and `rejected` hooks (and a register's seeds); an entry
+that is not a map with a text `event` is passed over. No wire, manifest,
+host or kernel change.
+
 ## Contributing
 
 Work is tracked in shruggr/skein; start at issue

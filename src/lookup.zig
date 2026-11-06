@@ -15,10 +15,13 @@
 //!   fn "rejected"  {kind: "lookup-hook", app, service, topic, tx: <CID>}
 //!
 //! (each may be a no-op). A hook answers `{kind: "lookup-hooked", fn, beats?:
-//! {<service>: bytes}}`: `beats` (0.12.0), when the hook changed what a
+//! {<service>: bytes}, events?: [map]}`: `beats` (0.12.0), when the hook changed what a
 //! service it serves says on its beat (`Service.beat`), the new body per
 //! service name — the engine re-declares that service's beacon on
-//! `<service>-live` with it (a registered service; topics.zig `beatEvents`).
+//! `<service>-live` with it (a registered service; topics.zig `beatEvents`);
+//! `events` (0.20.4), the events the hook asks to be emitted (`Service.emit`),
+//! each `{event: <name>, topic: <text>, …fields}` — the engine emits each, in
+//! order, in the same step.
 //! The body at the declaration (`registerLookup`) is fn "beat"'s:
 //!
 //!   fn "beat"      {kind: "lookup-beat", app, service, program}  →  {kind: "lookup-beat", body: bytes}
@@ -124,7 +127,16 @@ pub const Service = struct {
     /// The beat bodies a hook set (`beat`), in order: the hook's answer carries them (0.12.0).
     beats: std.ArrayList(Beat) = .empty,
 
+    /// The events a hook asked to be emitted (`emit`), in order: the hook's answer carries them (0.20.4).
+    events: std.ArrayList(Value) = .empty,
+
     pub const Beat = struct { service: []const u8, body: []const u8 };
+
+    /// A hook's word that `event` (`{event: <name>, topic: <text>, …fields}`) be emitted (0.20.4): the
+    /// engine emits it with the step, after the events of the hooks called before it.
+    pub fn emit(self: *Service, event: Value) !void {
+        try self.events.append(self.arena, event);
+    }
 
     /// A hook's word that `service` (a name this program serves) now beats `body` on
     /// `<service>-live` (0.12.0): the engine re-declares its beacon (a later one for the same name
@@ -330,6 +342,7 @@ pub fn handle(a: Allocator, spec: Spec, s: Store, network: c.chain.Network, stat
         for (svc.beats.items, bs) |b, *o| o.* = .{ .key = b.service, .value = .{ .bytes = b.body } };
         try es.append(a, .{ .key = "beats", .value = .{ .map = bs } });
     }
+    if (svc.events.items.len > 0) try es.append(a, .{ .key = "events", .value = .{ .array = svc.events.items } });
     return .{ .answer = .{ .map = es.items }, .state = if (svc.dirty()) try svc.save() else null };
 }
 

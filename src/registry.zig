@@ -251,6 +251,8 @@ fn seeding(a: Allocator, fx: Fx, step: Value, list: []const topics.Entry, answer
     const cx = submit.Ctx{ .a = a, .caller = fx.caller, .wire = try fx.wire(in), .st = &loaded.st, .in = in };
     const sd = try submit.seed(cx, t, seeds);
     for (sd.records) |r| try fx.keep(r);
+    // The events the seeds' lookup hooks asked for (0.20.4), in order.
+    for (loaded.st.lookup_events.items) |e| _ = try fx.emit(a, e);
     // The view the seeds changed: the beacons re-declared (0.12.0), over the set this step wrote.
     const beats = try topics.beatEvents(a, rl, list, try lookupNames(a, fx, step), try loaded.st.beatChanges(), loaded.st.lookup_beats.items);
     for (beats) |e| _ = try fx.emit(a, e);

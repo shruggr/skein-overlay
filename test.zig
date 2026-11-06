@@ -230,6 +230,10 @@ const Instance = struct {
     /// The view changes (0.12.0) and lookup beats of the last thread or watch step.
     view_changes: []const state.BeatChange = &.{},
     lookup_beats: []const state.LookupBeat = &.{},
+    /// The events the last thread or watch step's lookup hooks asked for (0.20.4).
+    lookup_events: []const Value = &.{},
+    /// The lookup program's spec the dispatch table runs (ls_demo's unless a test sets another).
+    ls_spec: lookup.Spec = ls.spec,
 
     fn init(a: Allocator, ms: *c.store.MemStore) !Instance {
         const tp = try a.dupe(u8, &cbor.cidOf("topic-demo"));
@@ -269,7 +273,7 @@ const Instance = struct {
         }
         if (std.mem.eql(u8, program, self.lookup_prog)) {
             try std.testing.expectEqualStrings("overlay", arg.getText("app").?);
-            const h = try lookup.handle(a, ls.spec, self.current, .regtest, self.ls_state, self.chain_root, func, arg);
+            const h = try lookup.handle(a, self.ls_spec, self.current, .regtest, self.ls_state, self.chain_root, func, arg);
             if (h.state) |sc| self.ls_state = sc;
             return h.answer;
         }
@@ -373,6 +377,7 @@ const Instance = struct {
         const done = try submit.answered((try self.cx(&st, true)), t.ev, t.ingest, ans);
         self.view_changes = try st.beatChanges();
         self.lookup_beats = st.lookup_beats.items;
+        self.lookup_events = st.lookup_events.items;
         self.ov_root = try st.save();
         return done;
     }
@@ -395,6 +400,7 @@ const Instance = struct {
         const done = try submit.watched((try self.cx(&st, true)), w, ans);
         self.view_changes = try st.beatChanges();
         self.lookup_beats = st.lookup_beats.items;
+        self.lookup_events = st.lookup_events.items;
         self.ov_root = try st.save();
         return done;
     }
@@ -1897,6 +1903,107 @@ test "lookup beats (0.12.0, David 2026-10-09): <service>-live for each registere
     try std.testing.expectEqualStrings("ls_x-live", off[0].getText("topic").?);
     try std.testing.expectEqualStrings("unbeacon", off[1].getText("event").?);
     try std.testing.expectEqualStrings("ls_x-live", off[1].getText("topic").?);
+}
+
+test "lookup hook events (0.20.4): a hook's `events` emitted by the engine in order, for admitted, spent and rejected; an entry that is not a map with a text `event` passed over" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = c.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+
+    // ls_demo's hooks, each also asking for one event naming the hook (and one entry that is no event).
+    const P = struct {
+        fn ev(a_: Allocator, svc: *lookup.Service, hook_: []const u8, txid: [32]u8) !void {
+            try svc.emit(.{ .map = try a_.dupe(cbor.Entry, &.{
+                .{ .key = "event", .value = .{ .text = "pool" } },
+                .{ .key = "topic", .value = .{ .text = "ls_demo" } },
+                .{ .key = "hook", .value = .{ .text = hook_ } },
+                .{ .key = "txid", .value = .{ .text = try a_.dupe(u8, &hdr.toHex(txid)) } },
+            }) });
+            try svc.emit(.{ .map = try a_.dupe(cbor.Entry, &.{.{ .key = "topic", .value = .{ .text = "ls_demo" } }}) });
+            try svc.emit(.{ .text = "not a map" });
+        }
+        fn admitted(a_: Allocator, svc: *lookup.Service, t: []const u8, tx: lookup.Tx, o: []const u32, r: []const u32) anyerror!void {
+            try ls.spec.admitted.?(a_, svc, t, tx, o, r);
+            try ev(a_, svc, "admitted", tx.txid);
+        }
+        fn spent(a_: Allocator, svc: *lookup.Service, t: []const u8, op: lookup.Outpoint, tx: lookup.Tx) anyerror!void {
+            try ls.spec.spent.?(a_, svc, t, op, tx);
+            try ev(a_, svc, "spent", op.txid);
+        }
+        fn rejected(a_: Allocator, svc: *lookup.Service, t: []const u8, tx: lookup.Tx) anyerror!void {
+            try ls.spec.rejected.?(a_, svc, t, tx);
+            try ev(a_, svc, "rejected", tx.txid);
+        }
+    };
+    var spec = ls.spec;
+    spec.admitted = P.admitted;
+    spec.spent = P.spent;
+    spec.rejected = P.rejected;
+
+    var inst = try Instance.init(a, &ms);
+    inst.ls_spec = spec;
+    const k = try keys(0x42);
+    const f = try fund(a, 0x11, 2, &k.p2pkh);
+    try inst.headers(&.{&f.h1});
+
+    const t1 = try spend(a, &f.tx, 0, &.{ .{ 1, &k.token }, .{ 9_000, &k.p2pkh } }, k.priv);
+    _ = try inst.admitted(try withFund(a, f, t1), t1.txid);
+    try std.testing.expectEqual(@as(usize, 1), inst.lookup_events.len);
+    try std.testing.expectEqualStrings("pool", inst.lookup_events[0].getText("event").?);
+    try std.testing.expectEqualStrings("ls_demo", inst.lookup_events[0].getText("topic").?);
+    try std.testing.expectEqualStrings("admitted", inst.lookup_events[0].getText("hook").?);
+
+    // A spend: the admitted hook's event, then the spent hook's, in the order the hooks ran.
+    const t2 = try spend(a, &t1.tx, 0, &.{.{ 1, &k.token }}, k.priv);
+    inst.now = 2000;
+    _ = try inst.admitted(try atomic(a, t2), t2.txid);
+    try std.testing.expectEqual(@as(usize, 2), inst.lookup_events.len);
+    try std.testing.expectEqualStrings("admitted", inst.lookup_events[0].getText("hook").?);
+    try std.testing.expectEqualStrings(&hdr.toHex(t2.txid), inst.lookup_events[0].getText("txid").?);
+    try std.testing.expectEqualStrings("spent", inst.lookup_events[1].getText("hook").?);
+    try std.testing.expectEqualStrings(&hdr.toHex(t1.txid), inst.lookup_events[1].getText("txid").?);
+
+    // A rejection heard by the watch: the rejected hook's event.
+    inst.now = 3000;
+    _ = try inst.watchStart(t2.txid);
+    _ = try inst.chainStatus(t2.txid, "DOUBLE_SPEND_ATTEMPTED", null);
+    _ = try inst.watched(t2.txid, .{ .rejected = "DOUBLE_SPEND_ATTEMPTED" });
+    try std.testing.expectEqual(@as(usize, 1), inst.lookup_events.len);
+    try std.testing.expectEqualStrings("rejected", inst.lookup_events[0].getText("hook").?);
+
+    // The hook's answer: `events` as the hook gave them; calls.zig keeps only maps with a text `event`.
+    var raw_tx: [10]u8 = .{ 1, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    var h1: [32]u8 = undefined;
+    var h2: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&raw_tx, &h1, .{});
+    std.crypto.hash.sha2.Sha256.hash(&h1, &h2, .{});
+    const tc = try a.dupe(u8, &c.store.hashCid(.tx, h2));
+    try ms.store().putBlock(tc, &raw_tx);
+    const hooked = try lookup.handle(a, spec, ms.store(), .regtest, null, null, "rejected", try mapOf(a, &.{
+        .{ .key = "kind", .value = .{ .text = "lookup-hook" } },
+        .{ .key = "app", .value = .{ .text = "overlay" } },
+        .{ .key = "service", .value = .{ .text = "ls_demo" } },
+        .{ .key = "program", .value = .{ .text = "lookup-demo" } },
+        .{ .key = "topic", .value = .{ .text = "tm_demo" } },
+        .{ .key = "tx", .value = .{ .cid = tc } },
+    }));
+    try std.testing.expectEqual(@as(usize, 3), hooked.answer.getArray("events").?.len);
+    var got: std.ArrayList(Value) = .empty;
+    try calls.eventsOf(a, hooked.answer, &got);
+    try std.testing.expectEqual(@as(usize, 1), got.items.len);
+    try std.testing.expectEqualStrings("rejected", got.items[0].getText("hook").?);
+    // A hook that asks for none: no `events` field.
+    const plain = try lookup.handle(a, ls.spec, ms.store(), .regtest, null, null, "rejected", try mapOf(a, &.{
+        .{ .key = "kind", .value = .{ .text = "lookup-hook" } },
+        .{ .key = "app", .value = .{ .text = "overlay" } },
+        .{ .key = "service", .value = .{ .text = "ls_demo" } },
+        .{ .key = "program", .value = .{ .text = "lookup-demo" } },
+        .{ .key = "topic", .value = .{ .text = "tm_demo" } },
+        .{ .key = "tx", .value = .{ .cid = tc } },
+    }));
+    try std.testing.expect(plain.answer.get("events") == null);
 }
 
 test "the beat's terms (0.16.0): the head <app>/terms's record, opaque, copied into each topic's beat body as `terms`; no head, no field; a change re-declares every topic's beacon; config.overlay.terms is no more" {

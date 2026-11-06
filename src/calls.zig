@@ -159,37 +159,52 @@ pub fn beatsOf(a: Allocator, answer: Value, out: *std.ArrayList(st.LookupBeat)) 
     for (bs.map) |e| if (e.value == .bytes) try out.append(a, .{ .service = e.key, .body = e.value.bytes });
 }
 
+/// The events a hook's answer carries (`{events: [map]}`, lookup.zig, 0.20.4), onto `out` in order.
+/// An entry that is not a map with a text `event` is passed over.
+pub fn eventsOf(a: Allocator, answer: Value, out: *std.ArrayList(Value)) !void {
+    const es = answer.get("events") orelse return;
+    if (es != .array) return;
+    for (es.array) |e| if (e == .map and e.getText("event") != null) try out.append(a, e);
+}
+
+/// A hook's answer: its beat bodies onto `st.lookup_beats`, its events onto `st.lookup_events`.
+fn hooked(a: Allocator, answer: Value, out: *st.State) !void {
+    try beatsOf(a, answer, &out.lookup_beats);
+    try eventsOf(a, answer, &out.lookup_events);
+}
+
 /// A topic admitted a transaction (in the step that recorded it): each of its lookup programs'
 /// (once each, `hookTargets`) `admitted(topic, tx, outputsToAdmit, coinsRetained)`, then
 /// `spent(topic, outpoint, spendingTx)` for each previous coin it consumed. The beat bodies the
-/// hooks answer go onto `beats` (0.12.0).
-pub fn hookAdmitted(a: Allocator, caller: Caller, in: Value, topic: []const u8, sub: st.Subject, previous: []const u32, applied: st.Applied, beats: *std.ArrayList(st.LookupBeat)) !void {
+/// hooks answer go onto `out.lookup_beats` (0.12.0), their events onto `out.lookup_events` (0.20.4).
+pub fn hookAdmitted(a: Allocator, caller: Caller, in: Value, topic: []const u8, sub: st.Subject, previous: []const u32, applied: st.Applied, out: *st.State) !void {
     for (try hookTargets(a, in, topic)) |l| {
-        try beatsOf(a, try caller.call(a, l.program, "admitted", try hookArg(a, in, l, topic, &.{
+        try hooked(a, try caller.call(a, l.program, "admitted", try hookArg(a, in, l, topic, &.{
             .{ .key = "tx", .value = .{ .cid = sub.cid } },
             .{ .key = "outputsToAdmit", .value = .{ .array = try uints(a, applied.outputs_to_admit) } },
             .{ .key = "coinsRetained", .value = .{ .array = try uints(a, applied.coins_to_retain) } },
-        })), beats);
+        })), out);
         for (previous) |p| {
             const in_ = sub.tx.inputs[p];
-            try beatsOf(a, try caller.call(a, l.program, "spent", try hookArg(a, in, l, topic, &.{
+            try hooked(a, try caller.call(a, l.program, "spent", try hookArg(a, in, l, topic, &.{
                 .{ .key = "outpoint", .value = .{ .map = try a.dupe(cbor.Entry, &.{
                     .{ .key = "tx", .value = .{ .cid = try a.dupe(u8, &store_mod.hashCid(.tx, in_.previous_outpoint.txid.bytes)) } },
                     .{ .key = "vout", .value = .{ .uint = in_.previous_outpoint.index } },
                 }) } },
                 .{ .key = "spendingTx", .value = .{ .cid = sub.cid } },
-            })), beats);
+            })), out);
         }
     }
 }
 
 /// The judgements a rejection removed (`State.unapply`): each topic's lookup programs' (once each,
-/// `hookTargets`) `rejected(topic, tx)`. The beat bodies the hooks answer go onto `beats` (0.12.0).
-pub fn hookRejected(a: Allocator, caller: Caller, in: Value, gone: []const st.Unapplied, beats: *std.ArrayList(st.LookupBeat)) !void {
+/// `hookTargets`) `rejected(topic, tx)`. The beat bodies the hooks answer go onto `out.lookup_beats`
+/// (0.12.0), their events onto `out.lookup_events` (0.20.4).
+pub fn hookRejected(a: Allocator, caller: Caller, in: Value, gone: []const st.Unapplied, out: *st.State) !void {
     for (gone) |g| {
         const tc = try a.dupe(u8, &store_mod.hashCid(.tx, g.txid));
         for (try hookTargets(a, in, g.topic)) |l| {
-            try beatsOf(a, try caller.call(a, l.program, "rejected", try hookArg(a, in, l, g.topic, &.{.{ .key = "tx", .value = .{ .cid = tc } }})), beats);
+            try hooked(a, try caller.call(a, l.program, "rejected", try hookArg(a, in, l, g.topic, &.{.{ .key = "tx", .value = .{ .cid = tc } }})), out);
         }
     }
 }

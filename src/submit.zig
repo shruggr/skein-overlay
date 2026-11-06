@@ -933,7 +933,7 @@ pub fn answered(cx: Ctx, ev: Value, ingest: []const u8, ans: Answer) !Stepped {
             .rejected => |why| {
                 try st.dropPending(it.txid);
                 const u = try st.unapply(try calls.servedTopics(a, cx.in), it.txid);
-                try calls.hookRejected(a, cx.caller, cx.in, u, &cx.st.lookup_beats);
+                try calls.hookRejected(a, cx.caller, cx.in, u, cx.st);
                 try unapplied.appendSlice(a, u);
                 try resumeWaiters(cx, it.txid, &resumes);
                 if (it.subject and subjectTaken(ev)) try answerRejected(cx, source, it.txid, why);
@@ -1261,7 +1261,7 @@ pub fn watched(cx: Ctx, w: Watch, ans: Answer) !Stepped {
 /// Rejected: each served topic's judgement of it removed, their lookup services told.
 fn unwind(cx: Ctx, txid: [32]u8, out: *Stepped) !void {
     out.unapplied = try cx.st.unapply(try calls.servedTopics(cx.a, cx.in), txid);
-    try calls.hookRejected(cx.a, cx.caller, cx.in, out.unapplied, &cx.st.lookup_beats);
+    try calls.hookRejected(cx.a, cx.caller, cx.in, out.unapplied, cx.st);
 }
 
 /// The submission's BEEF as handed, named by each `applied` record (for internalizing;
@@ -1303,7 +1303,7 @@ fn admitItem(cx: Ctx, ev: Value, it: EventItem, beef: []const u8, records: *std.
         };
         if (ap.records.len == 0) continue;
         try records.appendSlice(a, ap.records);
-        try calls.hookAdmitted(a, cx.caller, cx.in, t.*, sub, previous, ap.*, &cx.st.lookup_beats);
+        try calls.hookAdmitted(a, cx.caller, cx.in, t.*, sub, previous, ap.*, cx.st);
     }
     return .{ .txid = it.txid, .topics = topics, .applied = applied };
 }
@@ -1397,7 +1397,7 @@ pub fn seed(cx: Ctx, topic: []const u8, seeds: []const [32]u8) !Seeding {
             };
             if (ap.records.len == 0) continue;
             try records.appendSlice(a, ap.records);
-            try calls.hookAdmitted(a, cx.caller, cx.in, topic, sub, previous, ap, &cx.st.lookup_beats);
+            try calls.hookAdmitted(a, cx.caller, cx.in, topic, sub, previous, ap, cx.st);
             try admissions.append(a, .{ .txid = t, .topics = try a.dupe([]const u8, &.{topic}), .applied = try a.dupe(state.Applied, &.{ap}) });
             if ((try st.ch.status(t)) != .proven) {
                 const m = try cx.wire.send(a, chain_box, try ingestBody(a, .{ .bytes = bytes }));
