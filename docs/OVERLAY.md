@@ -1070,9 +1070,85 @@ names keeps one index ("The lookup contract", below).
 - `{kind: "overlay-result", op: "registerLookup" | "deregisterLookup",
   service, active, changed, lookups?}` (`lookups`: the set's new record),
   or `{op, error}` for a refusal;
+- `{kind: "overlay-result", op: "reindex", service, stage: "walking" |
+  "done" | "refused" | "error", cursor?, txid?, transactions, steps, from,
+  to?, error?}` (below, "Reindex a lookup service");
 - `{op, error}` when the step fails.
 
 A topic whose instructions do not fit the transaction admits nothing.
+
+### Reindex a lookup service (0.23.0)
+
+A lookup's index is derived state: everything in it is computed from the
+transactions its topics admitted, which the instance holds with their
+proofs. When a lookup's record shape changes, root re-derives the index in
+place — same instance, same log, no peer:
+
+```
+{fn: "reindex", args: {service: "<a lookup service's name>"}}    in the box <app>/reindex
+```
+
+The box's route is `{address: "reindex", handler: "overlay.reindex"}`,
+gated by root (`roles: {root: [..., "reindex"]}`); an app built on the
+engine lists the same route and role in its manifest. The message starts a
+thread of the engine (src/reindex.zig, engine.zig `reindexStep`):
+
+1. **Refused** (root answered `{fn: "reindex", request, replyTo, error:
+   {code: "bad-args", message}}`, nothing written): another box; no
+   `service`; a service neither configured nor registered here; a service
+   listening to no topic served here; a program that does not take fn
+   `reindex` (built against an engine before 0.23.0); **a reindex of the
+   service already running** (`reindex in progress`).
+2. **Begun:** the lookup program's fn `reindex` `begin` names the head
+   `<app>/<index>.reindex` the empty index (whatever an earlier reindex left
+   there is dropped); the service is entered as running in the head
+   `<app>/reindex`; the thread rests on a deadline at its step's time + 1 ms
+   (the runtime's waker answers it: the kernel's `deadline` intention).
+3. **One transaction per step.** Woken, the thread reads its cursor from
+   the result record its last step kept (the input's `tip`) and walks the
+   next transaction: per topic the service listens to, the transactions
+   `mined` names by (height, offset) past the cursor, then the topic's tail
+   (`tailTxids`: admitted, not mined, by admission time) not walked yet — a
+   candidate that spends a tail transaction not walked yet gives way to it, so
+   a parent comes before its child. The program's hooks run over it as its
+   admission ran them, from the topic's applied record: `admitted`
+   (`outputsToAdmit`, `coinsRetained`), then `spent` for each previous coin
+   (retained and removed, in input order), each argument with `reindex:
+   true`, so the program's state is `<app>/<index>.reindex`; what they answer
+   (beats, events) is dropped. The cursor moves past it and the thread rests
+   again.
+4. **The switch.** The step whose walk finds nothing left in any topic calls
+   fn `reindex` `switch`: the index's own head names the new index,
+   `<app>/<index>.reindex` the empty one (the kernel has no removal of a
+   head); the service's entry in `<app>/reindex` moves to `last`; root is
+   answered `{fn: "reindex", request, replyTo, result: {service,
+   transactions, steps, from, to}}` (`from`, `to`: the first and last steps'
+   times, ms).
+
+While it runs, every read answers from the index's own head, unchanged, and
+the live hooks keep writing it. The walk reads `mined` and the tail again at
+every step, so a transaction admitted while the thread rests is walked
+before the switch; the switch is the same step as the check that finds
+nothing left, so no admission comes between them, and one after it writes
+the new index. A rejection while the reindex runs reaches the program's
+reindex state too (its `rejected` hook with `reindex: true`; the head
+`<app>/reindex` names the programs, `State.reindexing`), since the walk may
+have passed the transaction. An error in a step (a hook's, a read's) ends the
+thread there: fn `reindex` `abort` (`.reindex` the empty index again), the
+entry moved to `last` with `error`, root answered `error: {code: "failed",
+message}`; the index's head untouched. A step that traps (out of fuel) ends
+the thread with nothing written: its entry stays in `running`, so a later
+reindex of the service is refused (`reindex in progress`).
+
+The record of `<app>/reindex`:
+
+```
+{kind: "overlay-reindex", running: {<service>: {thread, role, from}},
+ last: {<service>: {service, transactions, steps, from, to} | {service, error, transactions, steps, from, to}}}
+```
+
+A hook is re-run at the reindex's step: its input's `now` is that step's
+time, not the admission's.
 
 ## The topic contract
 
@@ -1161,6 +1237,13 @@ program's names that listens to the topic), and `program`, the role in
 | `spent` | `{kind: "lookup-hook", app, service, program, topic, outpoint: {tx: <CID>, vout}, spendingTx: <CID>}` | for each previous coin that transaction consumed (retained or removed) |
 | `rejected` | `{kind: "lookup-hook", app, service, program, topic, tx: <CID>}` | a judgement of that topic was removed by a rejection |
 | `lookup` | `{kind: "lookup-call", app, service, program, query}` | `POST /lookup`: a read |
+| `reindex` | `{kind: "lookup-reindex", app, service, program, op: "begin" \| "switch" \| "abort"}` → `{kind: "lookup-reindexed", op, index, root?}` | (0.23.0) the engine's reindex thread ("Reindex a lookup service"): begin names `<app>/<index>.reindex` the empty index; switch names the index's head what `.reindex` names (`root`) and `.reindex` the empty index; abort only the latter (`lookup.reindexOp`) |
+
+A hook's argument may carry `reindex: true` (0.23.0): the reindex thread's
+call. `lookup.main` then reads and advances `<app>/<index>.reindex` instead
+of the index's own head; nothing else differs, so a hook that writes only
+through its `Service` (its maps, advanced by `main`) and reads no head is
+re-runnable into a fresh index as it is.
 
 A hook may be a no-op. It answers `{kind: "lookup-hooked", fn, beats?:
 {<service>: bytes}, events?: [map]}`: `beats` the new beat bodies it set

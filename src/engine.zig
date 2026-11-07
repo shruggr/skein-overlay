@@ -101,6 +101,7 @@ const topics = @import("topics.zig");
 const lookups = @import("lookups.zig");
 const configured = @import("configured.zig");
 const registry = @import("registry.zig");
+const reindex = @import("reindex.zig");
 
 const cbor = c.cbor;
 const Value = cbor.Value;
@@ -310,6 +311,9 @@ fn run(a: Allocator) anyerror!void {
         const body = try s.getValue(a, bc);
         // A submission (shruggr/skein#112): from anyone a row admits, in any box routed here.
         if (eql(u8, body.getText("fn") orelse "", "submit")) return submissionStep(a, step, body, try messageSource(a, step, args));
+        // 0.23.0: root's reindex of a lookup service (the box `<app>/reindex`, gated by root), and the
+        // steps of its thread (woken by its deadline: the same message is its origin).
+        if (eql(u8, body.getText("fn") orelse "", "reindex")) return reindexStep(a, step, args, body);
         // Register or deregister a topic: taken only in the box `<app>/register` (one box per
         // function class, skein #128, 0.7.5); in any other, refused (`bad-args`).
         switch (topics.asked(body)) {
@@ -415,6 +419,176 @@ fn run(a: Allocator) anyerror!void {
     if (loaded.head == null or !eql(u8, loaded.head.?, new_state)) try vm.advance(try ev_.stateHead(a, step), new_state);
     try fields.append(a, .{ .key = "state", .value = .{ .cid = new_state } });
     _ = try vm.finish(a, s, try resultRecord(a, op, fields.items));
+}
+
+// ---------------------------------------------------------------- reindex (0.23.0, reindex.zig)
+
+/// The result record the thread's last step kept (the input's `tip`: the update, its `kept`, the
+/// last of them: what `vm.finish` kept), or null on the thread's first step.
+fn priorResult(a: Allocator, step: Value) !?Value {
+    const s = vm.store();
+    const tip = try s.getValue(a, step.getCid("tip") orelse return null);
+    const kept = tip.getArray("kept") orelse return null;
+    if (kept.len == 0 or kept[kept.len - 1] != .cid) return null;
+    return try s.getValue(a, kept[kept.len - 1].cid);
+}
+
+/// Root's answer: `{fn: "reindex", request, replyTo, result | error: {code, message}}` to the
+/// message's sender, in the box it came in, when a message reaches it.
+fn reindexAnswer(a: Allocator, step: Value, args: Value, field: []const u8, v: Value) !void {
+    const message = args.getCid("message") orelse return;
+    const sender = args.getBytes("sender") orelse return;
+    if (!(try ev_.reaches(a, step, sender))) return;
+    _ = try vm.send(a, sender, args.getText("box") orelse calls.appOf(step), .{ .map = try a.dupe(cbor.Entry, &.{
+        .{ .key = "fn", .value = .{ .text = "reindex" } },
+        .{ .key = "request", .value = .{ .cid = message } },
+        .{ .key = "replyTo", .value = .{ .cid = message } },
+        .{ .key = field, .value = v },
+    }) });
+}
+
+fn errValue(a: Allocator, code: []const u8, message: []const u8) !Value {
+    return .{ .map = try a.dupe(cbor.Entry, &.{
+        .{ .key = "code", .value = .{ .text = code } },
+        .{ .key = "message", .value = .{ .text = message } },
+    }) };
+}
+
+/// A reindex refused at its first step: root answered `bad-args`, nothing written.
+fn reindexRefused(a: Allocator, step: Value, args: Value, service: []const u8, why: []const u8) !void {
+    try reindexAnswer(a, step, args, "error", try errValue(a, "bad-args", why));
+    _ = try vm.finish(a, vm.store(), try resultRecord(a, "reindex", &.{
+        .{ .key = "service", .value = .{ .text = service } },
+        .{ .key = "stage", .value = .{ .text = "refused" } },
+        .{ .key = "error", .value = .{ .text = why } },
+    }));
+}
+
+fn uintOf(v: Value, key: []const u8) u64 {
+    return v.getUint(key) orelse 0;
+}
+
+/// One step of a reindex's thread (reindex.zig): root's message `{fn: "reindex", args: {service}}`
+/// (step 1), then each wake of its deadline — one transaction walked, or (nothing left) the switch.
+/// The result record carries `{service, stage: "walking" | "done" | "refused" | "error", cursor?,
+/// transactions, steps, from, to?}`; the cursor is what the next step reads back (`priorResult`).
+fn reindexStep(a: Allocator, step: Value, args: Value, body: Value) !void {
+    const s = vm.store();
+    const app = calls.appOf(step);
+    // An answer looped back (root's key the instance's own, a one-key host): not a request.
+    if (body.get("replyTo") != null) {
+        _ = try vm.finish(a, s, try resultRecord(a, "reindex", &.{.{ .key = "stage", .value = .{ .text = "answer" } }}));
+        return;
+    }
+    const at = step.getUint("at") orelse return error.BadInput;
+    const thread = step.getCid("thread") orelse return error.BadInput;
+    const rhead = try reindex.headName(a, app);
+    const rroot = try vm.head(a, rhead);
+    const rec: ?Value = if (rroot) |r| try s.getValue(a, r) else null;
+
+    const prior = try priorResult(a, step);
+    if (prior == null) {
+        // Root's message (the route's function `reindex`, gated by root).
+        const service = if (body.get("args")) |x| x.getText("service") orelse "" else "";
+        if (!reindex.isBox(args, app)) return reindexRefused(a, step, args, service, try std.fmt.allocPrint(a, "reindex: not taken in box {s}; send it in {s}/{s}", .{ args.getText("box") orelse app, app, reindex.box }));
+        if (service.len == 0) return reindexRefused(a, step, args, service, "reindex: want {fn: \"reindex\", args: {service: <a lookup service's name>}}");
+        const t = (try reindex.targetOf(a, step, service)) orelse return reindexRefused(a, step, args, service, try std.fmt.allocPrint(a, "reindex: {s} is not a lookup service configured or registered here", .{service}));
+        if (reindex.running(rec, service) != null) return reindexRefused(a, step, args, service, "reindex in progress");
+        if (t.topics.len == 0) return reindexRefused(a, step, args, service, try std.fmt.allocPrint(a, "reindex: {s} listens to no topic served here", .{service}));
+        _ = calls.reindexCall(a, ev_.caller(), step, t.listeners[0], "begin") catch |e| return reindexRefused(a, step, args, service, try std.fmt.allocPrint(a, "reindex: {s}'s program does not take fn reindex ({s}): built against skein-overlay before 0.23.0?", .{ service, ev_.caller().errorText(e) }));
+        try vm.advance(rhead, try s.putValue(a, try reindex.withRunning(a, rec, service, thread, t.role, at)));
+        try vm.deadline(@intCast(at + 1));
+        _ = try vm.finish(a, s, try resultRecord(a, "reindex", &.{
+            .{ .key = "service", .value = .{ .text = service } },
+            .{ .key = "stage", .value = .{ .text = "walking" } },
+            .{ .key = "cursor", .value = try reindex.cursorValue(a, try reindex.start(a, t.topics)) },
+            .{ .key = "transactions", .value = .{ .uint = 0 } },
+            .{ .key = "steps", .value = .{ .uint = 1 } },
+            .{ .key = "from", .value = .{ .uint = at } },
+        }));
+        return;
+    }
+    // Woken: one transaction, or the switch.
+    const p = prior.?;
+    if (!eql(u8, p.getText("stage") orelse "", "walking")) {
+        // A wake after the thread's work is done (it rests on nothing then): nothing to do.
+        _ = try vm.finish(a, s, try resultRecord(a, "reindex", &.{.{ .key = "stage", .value = .{ .text = "late" } }}));
+        return;
+    }
+    const service = p.getText("service") orelse return error.BadInput;
+    const from = uintOf(p, "from");
+    const steps = uintOf(p, "steps") + 1;
+    var transactions = uintOf(p, "transactions");
+    walked: {
+        const t = (reindex.targetOf(a, step, service) catch break :walked) orelse break :walked;
+        var loaded = ev_.load(a, step) catch break :walked;
+        loaded.st.now = @intCast(at);
+        const cur = reindex.cursorOf(a, p.get("cursor") orelse break :walked) catch break :walked;
+        const item = (reindex.next(a, &loaded.st, cur) catch |e| return reindexFailed(a, step, args, rec, service, t, steps, from, at, transactions, @errorName(e))) orelse {
+            // Nothing left in any topic: the switch, in this step.
+            _ = calls.reindexCall(a, ev_.caller(), step, t.listeners[0], "switch") catch |e| return reindexFailed(a, step, args, rec, service, t, steps, from, at, transactions, ev_.caller().errorText(e));
+            const result: Value = .{ .map = try a.dupe(cbor.Entry, &.{
+                .{ .key = "service", .value = .{ .text = service } },
+                .{ .key = "transactions", .value = .{ .uint = transactions } },
+                .{ .key = "steps", .value = .{ .uint = steps } },
+                .{ .key = "from", .value = .{ .uint = from } },
+                .{ .key = "to", .value = .{ .uint = at } },
+            }) };
+            try vm.advance(rhead, try s.putValue(a, try reindex.withDone(a, rec, service, result)));
+            try reindexAnswer(a, step, args, "result", result);
+            _ = try vm.finish(a, s, try resultRecord(a, "reindex", &.{
+                .{ .key = "service", .value = .{ .text = service } },
+                .{ .key = "stage", .value = .{ .text = "done" } },
+                .{ .key = "transactions", .value = .{ .uint = transactions } },
+                .{ .key = "steps", .value = .{ .uint = steps } },
+                .{ .key = "from", .value = .{ .uint = from } },
+                .{ .key = "to", .value = .{ .uint = at } },
+            }));
+            return;
+        };
+        const did = reindex.walk(a, ev_.caller(), step, &loaded.st, t, cur, item) catch |e| return reindexFailed(a, step, args, rec, service, t, steps, from, at, transactions, ev_.caller().errorText(e));
+        if (did) transactions += 1;
+        try vm.deadline(@intCast(at + 1));
+        _ = try vm.finish(a, s, try resultRecord(a, "reindex", &.{
+            .{ .key = "service", .value = .{ .text = service } },
+            .{ .key = "stage", .value = .{ .text = "walking" } },
+            .{ .key = "cursor", .value = try reindex.cursorValue(a, try reindex.advance(a, cur, item)) },
+            .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &c.header.toHex(item.txid)) } },
+            .{ .key = "transactions", .value = .{ .uint = transactions } },
+            .{ .key = "steps", .value = .{ .uint = steps } },
+            .{ .key = "from", .value = .{ .uint = from } },
+        }));
+        return;
+    }
+    // The service or the thread's own record is no longer readable: ended as an error.
+    const t = (try reindex.targetOf(a, step, service)) orelse reindex.Target{ .service = service, .role = "", .program = "", .topics = &.{}, .listeners = &.{} };
+    return reindexFailed(a, step, args, rec, service, t, steps, from, at, transactions, "reindex: the service or the walk's cursor is no longer readable");
+}
+
+/// A reindex ended by an error at this step: the program's fn "reindex" `abort` (its partial index
+/// dropped), the service's entry done with `error`, root answered `failed`; the index's head untouched.
+fn reindexFailed(a: Allocator, step: Value, args: Value, rec: ?Value, service: []const u8, t: reindex.Target, steps: u64, from: u64, at: u64, transactions: u64, why: []const u8) !void {
+    const s = vm.store();
+    if (t.listeners.len > 0) _ = calls.reindexCall(a, ev_.caller(), step, t.listeners[0], "abort") catch {};
+    const result: Value = .{ .map = try a.dupe(cbor.Entry, &.{
+        .{ .key = "service", .value = .{ .text = service } },
+        .{ .key = "error", .value = .{ .text = why } },
+        .{ .key = "transactions", .value = .{ .uint = transactions } },
+        .{ .key = "steps", .value = .{ .uint = steps } },
+        .{ .key = "from", .value = .{ .uint = from } },
+        .{ .key = "to", .value = .{ .uint = at } },
+    }) };
+    try vm.advance(try reindex.headName(a, calls.appOf(step)), try s.putValue(a, try reindex.withDone(a, rec, service, result)));
+    try reindexAnswer(a, step, args, "error", try errValue(a, "failed", why));
+    _ = try vm.finish(a, s, try resultRecord(a, "reindex", &.{
+        .{ .key = "service", .value = .{ .text = service } },
+        .{ .key = "stage", .value = .{ .text = "error" } },
+        .{ .key = "error", .value = .{ .text = why } },
+        .{ .key = "transactions", .value = .{ .uint = transactions } },
+        .{ .key = "steps", .value = .{ .uint = steps } },
+        .{ .key = "from", .value = .{ .uint = from } },
+        .{ .key = "to", .value = .{ .uint = at } },
+    }));
 }
 
 /// `resume {txid}` (skein-overlay#1), a message from the instance itself in the app's box: a parent a

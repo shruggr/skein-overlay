@@ -319,6 +319,9 @@ pub const State = struct {
     lookup_beats: std.ArrayList(LookupBeat) = .empty,
     /// The events this step's lookup hooks asked to be emitted, in order (0.20.4, calls.zig `eventsOf`).
     lookup_events: std.ArrayList(Value) = .empty,
+    /// The lookup programs (their roles) a reindex is running for (0.23.0, reindex.zig; the head
+    /// `<app>/reindex`): a rejection's `rejected` hook reaches each one's reindex state too (calls.zig).
+    reindexing: []const []const u8 = &.{},
 
     /// The state the record names (null: a new one), over the chain state `ch`.
     pub fn load(arena: Allocator, s: Store, state: ?[]const u8, ch: *Chain) !State {

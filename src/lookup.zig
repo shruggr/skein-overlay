@@ -14,7 +14,19 @@
 //!   fn "spent"     {kind: "lookup-hook", app, service, topic, outpoint: {tx: <CID>, vout}, spendingTx: <CID>}
 //!   fn "rejected"  {kind: "lookup-hook", app, service, topic, tx: <CID>}
 //!
-//! (each may be a no-op). A hook answers `{kind: "lookup-hooked", fn, beats?:
+//! (each may be a no-op). A hook's argument with `reindex: true` (0.23.0) is the engine's reindex
+//! thread re-running it over the topic's admitted history: the service's state is then the head
+//! `<app>/<index>.reindex`, not its index's own (which keeps answering), and the engine discards
+//! what it answers (beats, events). The thread moves the heads with
+//!
+//!   fn "reindex"   {kind: "lookup-reindex", app, service, program, op: "begin" | "switch" | "abort"}
+//!                    → {kind: "lookup-reindexed", op, index, root?}
+//!
+//! (`reindexOp`): begin names `.reindex` the empty index, switch names the index's head what
+//! `.reindex` names and `.reindex` the empty index again, abort only the latter. A hook writes
+//! nothing but the state record `main` advances; it reads no head.
+//!
+//! A hook answers `{kind: "lookup-hooked", fn, beats?:
 //! {<service>: bytes}, events?: [map]}`: `beats` (0.12.0), when the hook changed what a
 //! service it serves says on its beat (`Service.beat`), the new body per
 //! service name — the engine re-declares that service's beacon on
@@ -97,6 +109,21 @@ pub const Outpoint = struct { txid: [32]u8, vout: u32 };
 pub fn headName(a: Allocator, app: []const u8, service: []const u8) ![]u8 {
     if (std.mem.startsWith(u8, service, "ls_")) return std.mem.concat(a, u8, &.{ app, "/", service });
     return std.mem.concat(a, u8, &.{ app, "/ls_", service });
+}
+
+/// A reindex's head (0.23.0): `<head>.reindex` beside the index's head `head` (`headName`). The
+/// engine's reindex thread has the hooks write it (the hook argument's `reindex: true`) while the
+/// index's own head keeps answering, and fn "reindex" `switch` moves the index's head to it.
+pub const reindex_suffix = ".reindex";
+
+pub fn reindexHead(a: Allocator, head: []const u8) ![]u8 {
+    return std.mem.concat(a, u8, &.{ head, reindex_suffix });
+}
+
+/// Whether a hook's argument is the reindex thread's (`reindex: true`): its state is the head
+/// `<head>.reindex`, not the index's own.
+pub fn isReindex(arg: Value) bool {
+    return arg.getBool("reindex") orelse false;
 }
 
 /// The app a call names (`app`; none: "overlay").
@@ -309,6 +336,39 @@ pub fn answerRecord(a: Allocator, spec: Spec, svc: *Service, ch: *Chain, args: V
     }
 }
 
+/// A reindex operation (0.23.0), fn "reindex" `{kind: "lookup-reindex", app, service, program, op}`,
+/// called by the engine in its reindex thread's step: `begin` (the head `<head>.reindex` named to the
+/// empty index: whatever an earlier reindex left there is dropped), `switch` (the index's head named
+/// to what `<head>.reindex` names — the empty index if nothing — and `<head>.reindex` to the empty
+/// index), `abort` (`<head>.reindex` to the empty index; the index's head untouched). The kernel has
+/// no removal of a head: "removed" is the head naming the empty index. `live` and `partial` are the
+/// heads' records now; the answer `{kind: "lookup-reindexed", op, index, root?}` (root: the index's
+/// record after a switch) and the records to name: `live` (the index's head; null: unmoved) and
+/// `partial` (`<head>.reindex`'s).
+pub const Reindexed = struct { answer: Value, live: ?[]const u8 = null, partial: []const u8 };
+
+pub fn reindexOp(a: Allocator, spec: Spec, s: Store, arg: Value, partial: ?[]const u8) !Reindexed {
+    if (!std.mem.eql(u8, arg.getText("kind") orelse "", "lookup-reindex")) return error.BadArgs;
+    const op = arg.getText("op") orelse return error.BadArgs;
+    const service = arg.getText("service") orelse return error.BadArgs;
+    const index = try indexOf(a, spec, arg);
+    var empty_svc = try Service.loadIndex(a, s, service, index, spec.maps, null);
+    const empty = try empty_svc.save();
+    var es: std.ArrayList(cbor.Entry) = .empty;
+    try es.appendSlice(a, &.{
+        .{ .key = "kind", .value = .{ .text = "lookup-reindexed" } },
+        .{ .key = "op", .value = .{ .text = op } },
+        .{ .key = "index", .value = .{ .text = index } },
+    });
+    if (std.mem.eql(u8, op, "begin") or std.mem.eql(u8, op, "abort")) return .{ .answer = .{ .map = es.items }, .partial = empty };
+    if (!std.mem.eql(u8, op, "switch")) return error.BadArgs;
+    const root = partial orelse empty;
+    // Read back: the record a switch names is an index of this program's.
+    _ = try Service.loadIndex(a, s, service, index, spec.maps, root);
+    try es.append(a, .{ .key = "root", .value = .{ .cid = root } });
+    return .{ .answer = .{ .map = es.items }, .live = root, .partial = empty };
+}
+
 /// What a call of the service comes to: its answer, and its state record if a hook changed it.
 pub const Handled = struct { answer: Value, state: ?[]const u8 = null };
 
@@ -361,11 +421,20 @@ pub fn main(comptime spec: Spec) u8 {
             if (std.mem.eql(u8, func, "metadata") or std.mem.eql(u8, func, "documentation"))
                 return vm.answer(a, try describe(a, @import("root"), func, arg));
             const head = try headName(a, appOf(arg), try indexOf(a, spec, arg));
+            // 0.23.0: a reindex — fn "reindex" moves the heads, its hooks write `<head>.reindex`.
+            if (std.mem.eql(u8, func, "reindex")) {
+                const rh = try reindexHead(a, head);
+                const r = try reindexOp(a, spec, vm.store(), arg, try vm.head(a, rh));
+                if (r.live) |l| try vm.advance(head, l);
+                try vm.advance(rh, r.partial);
+                return vm.answer(a, r.answer);
+            }
+            const state_head = if (isReindex(arg) and !std.mem.eql(u8, func, "lookup") and !std.mem.eql(u8, func, "beat")) try reindexHead(a, head) else head;
             const chain_state = if (std.mem.eql(u8, func, "lookup")) try vm.head(a, chain_head) else null;
             const net_name = if (in.get("defaults")) |d| d.getText("walletNetwork") orelse "main" else "main";
             const network = c.chain.Network.parse(net_name) orelse return error.BadConfig;
-            const h = try handle(a, spec, vm.store(), network, try vm.head(a, head), chain_state, func, arg);
-            if (h.state) |sc| try vm.advance(head, sc);
+            const h = try handle(a, spec, vm.store(), network, try vm.head(a, state_head), chain_state, func, arg);
+            if (h.state) |sc| try vm.advance(state_head, sc);
             try vm.answer(a, h.answer);
         }
     };
