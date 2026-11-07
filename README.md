@@ -435,7 +435,9 @@ Per topic the engine keeps BRC-136's anchor chain, in `<app>/state`:
   topic's genesis height (`anchor(genesis-1)` is 32 zero bytes), all in
   internal byte order.
 - The genesis height is the lowest height a transaction the topic judged is
-  mined at; the tip, the highest. Every height between has an anchor.
+  mined at; the tip, the highest. Every height between is in the chain, but
+  a row is kept only at a height with a mined transaction the topic judged
+  (0.22.0): the heights between are folded from the chain's headers.
 - The tail is the outputs the topic admitted in transactions not mined, as
   a view digest (count and sum).
 
@@ -450,9 +452,10 @@ Three http reads give the same answers to an app that chooses to publish
 them:
 
 - `GET /anchors?topic=&heights=h1,h2,…` → `{topic, genesisHeight,
-  tipHeight, anchors: [{height, anchor}]}` for the heights in the span
-  (anchor hex, internal byte order). Without `heights`: the locator's — tip,
-  tip-1, tip-2, tip-4, tip-8 … then genesis. Before anything is mined:
+  tipHeight, anchors: [{height, anchor}]}` for the heights named where a row
+  is kept (anchor hex, internal byte order). Without `heights`: the locator's
+  — tip, tip-1, tip-2, tip-4, tip-8 … then genesis, each taken down to the
+  nearest kept row (0.22.0). Before anything is mined:
   `{topic, anchors: []}`.
 - `GET /admitted?topic=&fromHeight=&toHeight=&limit=` → `{topic, blocks:
   [{height, blockHash, txids, bump}], nextHeight}`: only heights with
@@ -1017,6 +1020,18 @@ out of fuel near 800 KB. skein-sdk v0.14.0.
 0.21.1 (2026-11-07): a re-pin on skein-sdk v0.15.0 (its store map's `rangeBack`, a
 window read greatest first and stopped at a limit, for the lookups built on this
 engine). The engine and the demo modules are the same bytes as 0.21.0's.
+
+0.22.0 (2026-11-07): THE DATA MODEL, THINNER (David 2026-11-07). `anchors`
+keeps a row only at a height where the topic has a mined transaction (the
+proof is the trigger, as before); the chain still runs through every height,
+the heights between folded from the chain's headers with a zero root, so the
+anchor at a kept height is BRC-136's as before. `/anchors` answers the heights
+named where a row is kept; the locator's heights (tip, tip-1, tip-2, tip-4 …
+genesis) are each taken down to the nearest kept row. The admittance record
+no longer copies the output's `script` and `satoshis` (the transaction it
+links holds them; nothing read them). `placed` stays (without it a reorg's new
+proof leaves the engine no way to find the `mined` row it wrote for the
+transaction, short of a scan of the topic's `mined`).
 
 ## Contributing
 

@@ -767,9 +767,10 @@ fn heightParam(a: Allocator, req: Value, name: []const u8) !union(enum) { ok: ?u
 }
 
 /// A topic's anchors (0.14.0, shruggr/skein#150; state.zig `anchorAt`): `?topic=` served here,
-/// `?heights=` a comma list of heights (none: the locator's, `state.locatorHeights`). → `{topic,
+/// `?heights=` a comma list of heights (none: the locator's, `State.locator`). → `{topic,
 /// genesisHeight, tipHeight, anchors: [{height, anchor (hex, internal byte order)}]}` for the heights
-/// within its span, in the order named; before a transaction it judged is mined, `{topic, anchors: []}`.
+/// named where it keeps an anchor (0.22.0: a height with a mined transaction it judged), in the order
+/// named; before a transaction it judged is mined, `{topic, anchors: []}`.
 fn anchors(a: Allocator, in: Value, req: Value) !Value {
     const t = switch (try servedTopic(a, in, req)) {
         .ok => |x| x,
@@ -800,7 +801,7 @@ pub fn anchorsAnswer(a: Allocator, st: *State, t: []const u8, heights: ?[]const 
             .{ .key = "genesisHeight", .value = .{ .uint = sp.genesis } },
             .{ .key = "tipHeight", .value = .{ .uint = sp.tip } },
         });
-        for (heights orelse try state.locatorHeights(a, sp)) |h| {
+        for (heights orelse try st.locator(t, sp)) |h| {
             const x = (try st.anchorAt(t, h)) orelse continue;
             try out.append(a, .{ .map = try a.dupe(cbor.Entry, &.{
                 .{ .key = "height", .value = .{ .uint = h } },

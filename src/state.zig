@@ -13,7 +13,8 @@
 //!   {kind: "overlay-state", maps: {admitted, applied, pending, waits, views, ancillary, mined, placed, anchors, tips}}
 //!
 //! The maps (keys bytes, ordered bytewise; `tp` = len ‖ topic):
-//!   admitted   tp ‖ txid ‖ vout → admittance record {kind: "admitted", topic, txid, vout, script, satoshis, admittedAt, tx, ancillary?, refs}
+//!   admitted   tp ‖ txid ‖ vout → admittance record {kind: "admitted", topic, txid, vout, admittedAt, tx, ancillary?, refs}
+//!                (0.22.0: no `script` or `satoshis`; the output is read from the transaction `tx` links)
 //!                (ancillary: the tx CIDs of the transactions the topic named in `ancillaryTxids`,
 //!                 skein-overlay#4; each a `mentions` ref)
 //!   applied    tp ‖ txid → applied record {kind: "applied", topic, txid, outputsToAdmit, coinsToRetain, coinsRemoved, at, tx, beef, refs}
@@ -53,8 +54,10 @@
 //!                the topic judged, mined at that height and offset in its block, as the chain state proves it
 //!   placed     tp ‖ txid → height (u32 BE) ‖ offset (u64 BE) ‖ block hash   where the topic has it mined
 //!   anchors    tp ‖ height (u32 BE) → root ‖ anchor   BRC-136: root(H) over the txids `mined` at H in block
-//!                order, anchor(H) = sha256d(anchor(H-1) ‖ blockhash(H) ‖ root(H)), every height from the
-//!                topic's genesis (its lowest mined height) to its tip (its highest)
+//!                order, anchor(H) = sha256d(anchor(H-1) ‖ blockhash(H) ‖ root(H)) over every height from the
+//!                topic's genesis (its lowest mined height) to its tip (its highest); a row is kept only at a
+//!                height where the topic has a mined transaction (0.22.0), the heights between folded from
+//!                the chain's headers with a zero root
 //!   tips       tp → tail (40 bytes, as a view) ‖ [genesis (u32 BE) ‖ tip (u32 BE)]   the outputs it admitted in
 //!                transactions not mined, and its span (none before anything it judged is mined)
 //!
@@ -608,15 +611,12 @@ pub const State = struct {
         const sorted = try a.dupe(u32, ins.outputs_to_admit);
         std.mem.sort(u32, sorted, {}, std.sort.asc(u32));
         for (sorted) |vout| {
-            const out = sub.tx.outputs[vout];
             var fields: std.ArrayList(cbor.Entry) = .empty;
             try fields.appendSlice(a, &.{
                 .{ .key = "kind", .value = .{ .text = "admitted" } },
                 .{ .key = "topic", .value = .{ .text = t } },
                 .{ .key = "txid", .value = .{ .text = txid_hex } },
                 .{ .key = "vout", .value = .{ .uint = vout } },
-                .{ .key = "script", .value = .{ .bytes = out.locking_script.bytes } },
-                .{ .key = "satoshis", .value = .{ .uint = @intCast(out.satoshis) } },
                 .{ .key = "admittedAt", .value = .{ .uint = @intCast(@max(self.now, 0)) } },
                 .{ .key = "tx", .value = .{ .cid = sub.cid } },
             });
@@ -802,11 +802,29 @@ pub const State = struct {
     }
 
     /// The topic's root and anchor at `height` (`anchors`: tp ‖ height (u32 BE) → root ‖ anchor), or
-    /// null outside its span.
+    /// null at a height where it has no mined transaction (0.22.0: rows only there) or outside its span.
     pub fn anchorAt(self: *State, t: []const u8, height: u32) !?struct { root: [32]u8, anchor: [32]u8 } {
         const v = (try self.map("anchors").get(try cat(self.arena, &.{ try topicPrefix(self.arena, t), &store_mod.be32(height) }))) orelse return null;
         const b = if (v == .bytes and v.bytes.len == 64) v.bytes else return error.BadIndex;
         return .{ .root = b[0..32].*, .anchor = b[32..64].* };
+    }
+
+    /// The heights of the locator (0.22.0): `locatorHeights` over the span (tip, tip-1, tip-2, tip-4 …
+    /// genesis), each taken down to the nearest height the topic keeps an anchor at (one with a mined
+    /// transaction), once each, highest first.
+    pub fn locator(self: *State, t: []const u8, span: Span) ![]const u32 {
+        const a = self.arena;
+        const tp = try topicPrefix(a, t);
+        var out: std.ArrayList(u32) = .empty;
+        for (try locatorHeights(a, span)) |h| {
+            const kv = (try self.map("anchors").floor(try cat(a, &.{ tp, &store_mod.be32(h) }))) orelse continue;
+            if (kv.key.len != tp.len + 4 or !std.mem.startsWith(u8, kv.key, tp)) continue;
+            const x = std.mem.readInt(u32, kv.key[tp.len..][0..4], .big);
+            if (x < span.genesis) continue;
+            if (out.items.len > 0 and out.items[out.items.len - 1] <= x) continue;
+            try out.append(a, x);
+        }
+        return out.items;
     }
 
     /// The txids the topic judged that are mined at `height`, in block order (`mined`: tp ‖ height
@@ -908,35 +926,52 @@ pub const State = struct {
     /// The anchors of each topic this step placed or removed a mined transaction of, computed again
     /// from the lowest height it touched to its tip (BRC-136: root(H) over the txids it judged mined
     /// at H in block order; anchor(H) = sha256d(anchor(H-1) ‖ blockhash(H) ‖ root(H)), anchor(genesis
-    /// - 1) = 32 zero bytes); the anchors outside its span now removed.
+    /// - 1) = 32 zero bytes). A row is kept only at a height where the topic has a mined transaction
+    /// (0.22.0, David 2026-11-07): the heights between are folded from the chain's headers (root: 32
+    /// zero bytes), so the anchor at a kept height is BRC-136's; rows outside its span, or at a height
+    /// that holds nothing now, removed.
     pub fn settleAnchors(self: *State) !void {
         if (self.dirty.items.len == 0) return;
         const a = self.arena;
         const dirty = try a.dupe(@TypeOf(self.dirty.items[0]), self.dirty.items);
         self.dirty.clearRetainingCapacity();
+        const zero: [32]u8 = .{0} ** 32;
         for (dirty) |d| {
             const tp = try topicPrefix(a, d.topic);
             const span = (try self.tipsOf(d.topic)).span;
             if (d.old) |old| {
-                var h = old.genesis;
-                while (h <= old.tip) : (h += 1) {
+                for (try self.map("anchors").range(try cat(a, &.{ tp, &store_mod.be32(old.genesis) }), try cat(a, &.{ tp, &store_mod.be32(old.tip), &.{0} }))) |kv| {
+                    const h = std.mem.readInt(u32, kv.key[tp.len..][0..4], .big);
                     const inside = if (span) |sp| h >= sp.genesis and h <= sp.tip else false;
-                    if (!inside) _ = try self.map("anchors").remove(try cat(a, &.{ tp, &store_mod.be32(h) }));
+                    if (!inside) _ = try self.map("anchors").remove(kv.key);
                 }
             }
             const sp = span orelse continue;
-            var h = @max(d.from, sp.genesis);
-            if (h > sp.tip) continue;
-            var prev: [32]u8 = .{0} ** 32;
-            if (h > sp.genesis) prev = if (try self.anchorAt(d.topic, h - 1)) |x| x.anchor else blk: {
-                h = sp.genesis;
-                break :blk .{0} ** 32;
+            const h0 = @max(d.from, sp.genesis);
+            if (h0 > sp.tip) continue;
+            // The anchor below `h0`: the kept row nearest under it, folded up through the empty heights.
+            var prev: [32]u8 = zero;
+            var h = sp.genesis;
+            if (h0 > sp.genesis) if (try self.map("anchors").floor(try cat(a, &.{ tp, &store_mod.be32(h0 - 1) }))) |kv| {
+                if (kv.key.len == tp.len + 4 and std.mem.startsWith(u8, kv.key, tp)) {
+                    const below = std.mem.readInt(u32, kv.key[tp.len..][0..4], .big);
+                    if (below >= sp.genesis) {
+                        prev = if (kv.value == .bytes and kv.value.bytes.len == 64) kv.value.bytes[32..64].* else return error.BadIndex;
+                        h = below + 1;
+                    }
+                }
             };
             while (h <= sp.tip) : (h += 1) {
                 const at = (try self.ch.chain().at(h)) orelse return error.UnknownHeader;
-                const root = try basmRoot(a, try self.minedAt(d.topic, h));
+                const txids = if (h < h0) &[_][32]u8{} else try self.minedAt(d.topic, h);
+                const root = try basmRoot(a, txids);
                 prev = anchorStep(prev, at.hash, root);
-                try self.map("anchors").put(try cat(a, &.{ tp, &store_mod.be32(h) }), .{ .bytes = try cat(a, &.{ &root, &prev }) });
+                if (h < h0) continue;
+                const key = try cat(a, &.{ tp, &store_mod.be32(h) });
+                if (txids.len > 0)
+                    try self.map("anchors").put(key, .{ .bytes = try cat(a, &.{ &root, &prev }) })
+                else
+                    _ = try self.map("anchors").remove(key);
             }
         }
     }

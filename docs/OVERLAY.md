@@ -576,17 +576,18 @@ submission's thread answers only its own submitter.
 | `ancillary` | ancillary txid ‖ tp ‖ outpoint → admittance record | a transaction an admittance names in `ancillary`, by the admitted output naming it (skein-overlay#4); removed with the admittance |
 | `mined` | tp ‖ height (u32 BE) ‖ offset (u64 BE) → txid | a transaction the topic judged, mined at that height and offset in its block (0.14.0, "Anchors") |
 | `placed` | tp ‖ txid → height (u32 BE) ‖ offset (u64 BE) ‖ block hash | where the topic has it mined |
-| `anchors` | tp ‖ height (u32 BE) → root ‖ anchor (32 + 32 bytes) | every height from the topic's genesis to its tip |
+| `anchors` | tp ‖ height (u32 BE) → root ‖ anchor (32 + 32 bytes) | the heights from the topic's genesis to its tip with a mined transaction it judged (0.22.0; before, every height) |
 | `tips` | tp → tail (40 bytes: count ‖ digest, as a view) ‖ [genesis (u32 BE) ‖ tip (u32 BE)] | the topic's tail and span (no span before anything it judged is mined) |
 
 **Records.**
 
-- **Admittance:** `{kind: "admitted", topic, txid, vout, script, satoshis,
+- **Admittance:** `{kind: "admitted", topic, txid, vout,
   admittedAt, tx: <tx CID>, ancillary?: [<tx CID>], refs: [{to: <tx CID>,
   rel: "admits"}, {to: <ancillary tx CID>, rel: "mentions"}, …]}`.
   `ancillary` is the transactions the topic named in `ancillaryTxids`
   (below, "The topic contract"), absent when it named none; each is a
-  `mentions` ref. A rejection of an ancillary transaction does not reach the
+  `mentions` ref. The output's script and satoshis are read from that
+  transaction (0.22.0: no longer copied into the record). A rejection of an ancillary transaction does not reach the
   admittance: it is evidence, not a dependency (skein docs/VM.md "relation
   kinds").
 - **Applied:** `{kind: "applied", topic, txid, outputsToAdmit,
@@ -663,7 +664,9 @@ for none, the txid for one, else Bitcoin's tree (sha256d, the odd last
 node paired with itself). `anchor(H) = sha256d(anchor(H-1) ‖ blockhash(H) ‖
 root(H))`, internal byte order, `anchor(genesis-1)` 32 zero bytes. The
 genesis is the lowest height a transaction the topic judged is mined at,
-the tip the highest; every height between has an anchor (`anchors`). The
+the tip the highest; the chain runs over every height between, and a row
+(`anchors`) is kept only at a height with a mined transaction the topic
+judged (0.22.0), the heights between folded from the chain's headers. The
 **tail** is the outputs the topic admitted in transactions not mined
 (`tips`, as a view digest).
 

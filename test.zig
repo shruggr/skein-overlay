@@ -3854,8 +3854,10 @@ test "anchors (0.14.0, shruggr/skein#150): BRC-136's root and anchor per height 
         try std.testing.expectEqualSlices(u8, &a4, &b.tip.?.anchor);
         try std.testing.expect(b.tail.eql(viewOf(&.{.{ t4.txid, 0 }})));
         try std.testing.expectEqualSlices(u8, &a2, &(try st.anchorAt("tm_demo", 2)).?.anchor);
-        try std.testing.expectEqualSlices(u8, &zero, &(try st.anchorAt("tm_demo", 3)).?.root);
-        try std.testing.expectEqualSlices(u8, &a3, &(try st.anchorAt("tm_demo", 3)).?.anchor);
+        // 0.22.0: no row at 3 (no mined transaction there); the chain still runs through it (a4 over a3).
+        try std.testing.expect((try st.anchorAt("tm_demo", 3)) == null);
+        try std.testing.expectEqualSlices(u8, &a4, &(try st.anchorAt("tm_demo", 4)).?.anchor);
+        try std.testing.expectEqualSlices(u8, &t3.txid, &(try st.anchorAt("tm_demo", 4)).?.root);
         try std.testing.expect((try st.anchorAt("tm_demo", 1)) == null and (try st.anchorAt("tm_demo", 5)) == null);
         const body = try cbor.decode(a, try topics_mod.beatBody(a, b, null));
         try std.testing.expectEqual(@as(u64, 4), body.getUint("tipHeight").?);
@@ -3889,12 +3891,14 @@ test "anchors (0.14.0, shruggr/skein#150): BRC-136's root and anchor per height 
         try std.testing.expectEqual(@as(u64, 2), an.getUint("genesisHeight").?);
         try std.testing.expectEqual(@as(u64, 4), an.getUint("tipHeight").?);
         const loc = an.getArray("anchors").?;
-        try std.testing.expectEqual(@as(usize, 3), loc.len); // 4, 3, 2
+        try std.testing.expectEqual(@as(usize, 2), loc.len); // 4, 2 (0.22.0: 3 has no row; tip-1 taken down to 2)
         try std.testing.expectEqual(@as(u64, 4), loc[0].getUint("height").?);
         try std.testing.expectEqualStrings(&std.fmt.bytesToHex(a4, .lower), loc[0].getText("anchor").?);
-        try std.testing.expectEqual(@as(u64, 2), loc[2].getUint("height").?);
-        const named = try routes.anchorsAnswer(a, &st, "tm_demo", &.{ 9, 3 });
+        try std.testing.expectEqual(@as(u64, 2), loc[1].getUint("height").?);
+        try std.testing.expectEqualSlices(u32, &.{ 4, 2 }, try st.locator("tm_demo", .{ .genesis = 2, .tip = 4 }));
+        const named = try routes.anchorsAnswer(a, &st, "tm_demo", &.{ 9, 3, 4 });
         try std.testing.expectEqual(@as(usize, 1), named.getArray("anchors").?.len);
+        try std.testing.expectEqual(@as(u64, 4), named.getArray("anchors").?[0].getUint("height").?);
         const ad = try routes.admittedAnswer(a, &st, "tm_demo", 0, std.math.maxInt(u32), 100);
         const blk = ad.getArray("blocks").?[0];
         try std.testing.expectEqualStrings(&hdr.toHex(hdr.hash(&h2)), blk.getText("blockHash").?);
@@ -4058,9 +4062,10 @@ test "the sync protocol (0.15.0, skein-overlay#5): fn sync a filter on the libp2
         try std.testing.expectEqual(@as(u64, 2), all.getUint("genesisHeight").?);
         try std.testing.expectEqual(@as(u64, 4), all.getUint("tipHeight").?);
         try std.testing.expectEqual(@as(u64, 4), all.getUint("agreedHeight").?);
-        // A peer ahead of us (heights past our tip) that agrees below: 3, whatever the order named.
+        // A peer ahead of us (heights past our tip) that agrees below: 2, whatever the order named (0.22.0:
+        // no row at 3, an empty height, so a3 named there agrees on nothing).
         const below = try syncAsk(a, &st, try locatorFrame(a, "tm_demo", &.{ .{ 2, &a2 }, .{ 6, &other }, .{ 4, &other }, .{ 3, &a3 } }));
-        try std.testing.expectEqual(@as(u64, 3), below.getUint("agreedHeight").?);
+        try std.testing.expectEqual(@as(u64, 2), below.getUint("agreedHeight").?);
         // Agreeing only at the genesis.
         const low = try syncAsk(a, &st, try locatorFrame(a, "tm_demo", &.{ .{ 4, &other }, .{ 3, &other }, .{ 2, &a2 } }));
         try std.testing.expectEqual(@as(u64, 2), low.getUint("agreedHeight").?);
