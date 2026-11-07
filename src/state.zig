@@ -967,16 +967,15 @@ pub const State = struct {
             looked += 1;
             const txids = try self.minedAt(t, h);
             if (txids.len == 0) continue;
-            var path: ?merkle.MerklePath = null;
-            for (txids) |x| {
-                var p = (try self.ch.proofFor(x)) orelse return error.MissingProof;
-                if (path) |*q| try q.combine(&p, a) else path = p;
-            }
-            for (path.?.path[0]) |*l| if (l.hash) |hh| for (txids) |x| if (std.mem.eql(u8, &hh.bytes, &x)) {
+            // One BUMP for the block's txids, selected from the chain's tree nodes (no merges).
+            var bumps = self.ch.bumps();
+            for (txids) |x| if (try bumps.add(x) != 0) return error.MissingProof; // all of one block
+            const path = (try bumps.build())[0];
+            for (path.path[0]) |*l| if (l.hash) |hh| for (txids) |x| if (std.mem.eql(u8, &hh.bytes, &x)) {
                 l.txid = true;
             };
             const at = (try self.ch.chain().at(h)) orelse return error.UnknownHeader;
-            try out.append(a, .{ .height = h, .block = at.hash, .txids = txids, .bump = try path.?.bytes(a) });
+            try out.append(a, .{ .height = h, .block = at.hash, .txids = txids, .bump = try path.bytes(a) });
         }
         return .{ .blocks = out.items, .next = null };
     }
@@ -1457,16 +1456,19 @@ pub fn beefFor(ch: *Chain, txid: [32]u8) ![]const u8 {
 /// One BEEF (V2, not atomic) of several transactions the chain holds, with their ancestry back to
 /// proven ones: an aggregated lookup answer's.
 pub fn beefOfMany(ch: *Chain, txids: []const [32]u8) ![]const u8 {
-    var acc = BeefAcc{ .ch = ch };
+    var acc = BeefAcc{ .ch = ch, .bumps = ch.bumps() };
     for (txids) |t| try acc.visit(t);
-    acc.flagLeaves();
-    return beef_mod.serialize(ch.arena, .{ .version = beef_mod.V2, .bumps = acc.bumps.items, .entries = acc.entries.items });
+    const paths = try acc.bumps.build();
+    c.state.flagLeaves(acc.entries.items, paths);
+    return beef_mod.serialize(ch.arena, .{ .version = beef_mod.V2, .bumps = paths, .entries = acc.entries.items });
 }
 
+/// The ancestry walk: proven transactions noted by block (their BUMPs built after, one per block,
+/// selected from the chain's tree nodes: no merges), unproven ones over their parents, parents first.
 const BeefAcc = struct {
     ch: *Chain,
     entries: std.ArrayList(beef_mod.Entry) = .empty,
-    bumps: std.ArrayList(bsvz.spv.MerklePath) = .empty,
+    bumps: Chain.Bumps,
 
     fn visit(acc: *BeefAcc, txid: [32]u8) anyerror!void {
         const a = acc.ch.arena;
@@ -1474,28 +1476,11 @@ const BeefAcc = struct {
         const raw = (try acc.ch.txRaw(txid)) orelse return error.MissingAncestor;
         const tx = try Transaction.parse(a, raw);
         if ((try acc.ch.status(txid)) == .proven) {
-            const p = (try acc.ch.proofFor(txid)) orelse return error.MissingProof;
-            const idx = for (acc.bumps.items, 0..) |*b, i| {
-                if (b.block_height != p.block_height) continue;
-                b.combine(&p, a) catch continue;
-                break i;
-            } else blk: {
-                try acc.bumps.append(a, p);
-                break :blk acc.bumps.items.len - 1;
-            };
+            const idx = try acc.bumps.add(txid);
             try acc.entries.append(a, .{ .txid = txid, .format = .raw_with_bump, .bump = idx, .raw = raw, .tx = tx });
             return;
         }
         for (tx.inputs) |in| try acc.visit(in.previous_outpoint.txid.bytes);
         try acc.entries.append(a, .{ .txid = txid, .format = .raw, .raw = raw, .tx = tx });
-    }
-
-    fn flagLeaves(acc: *BeefAcc) void {
-        for (acc.entries.items) |e| {
-            const bi = e.bump orelse continue;
-            for (acc.bumps.items[bi].path[0]) |*l| if (l.hash) |h| if (std.mem.eql(u8, &h.bytes, &e.txid)) {
-                l.txid = true;
-            };
-        }
     }
 };

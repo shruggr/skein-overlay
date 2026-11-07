@@ -586,7 +586,7 @@ the anchors and answers the sync protocol's frames (0.15.0).
 | | |
 |---|---|
 | this app and package | 0.20.0 (tag `v0.20.0`) |
-| skein-sdk | v0.12.0, by tag URL and hash in `build.zig.zon` (modules `chain` and, for the engine, `sk`; bsvz comes through it) |
+| skein-sdk | v0.14.0, by tag URL and hash in `build.zig.zon` (modules `chain` and, for the engine, `sk`; bsvz comes through it) |
 | requires | `chain/1` (shruggr/skein-chain 0.3.0) |
 | skein | log format 10, the BEEF envelope beside the pointer record (shruggr/skein#146); the routes / filters / roles manifest (shruggr/skein#143); skein's equivs pin this repo by commit |
 
@@ -1002,6 +1002,17 @@ rejection of the first frees the coin; a proven submission is not refused
 admission applied nothing in any topic is answered `rejected` (`NotAdmitted:
 …`, the reason the route gives a transaction no topic takes), with no watch;
 nothing it holds is touched. No wire, manifest, host or kernel change.
+
+0.21.0 (2026-11-07): ONE BUMP PER BLOCK, SELECTED, NO MERGES (David
+2026-11-07). A BEEF out (`beefOfMany`, an aggregated lookup answer's; and
+`beefFor` through the chain state's `beefOf`) walks the ancestry first,
+noting each proven ancestor by its block (skein-sdk 0.14.0
+`State.bumps()`), then builds each block's BUMP once from the chain's tree
+nodes (`merkle.pathsFor`: one descent for all of the block's leaves, each
+node read once). The sync's per-block BUMP (`minedBlocks`) is built the same
+way. `MerklePath.combine` is no longer called: it rebuilt and sorted every
+level per merge, O(K²) and worse for K ancestors in one block, and reads ran
+out of fuel near 800 KB. skein-sdk v0.14.0.
 
 ## Contributing
 
