@@ -469,7 +469,7 @@ fn uintOf(v: Value, key: []const u8) u64 {
 }
 
 /// One step of a reindex's thread (reindex.zig): root's message `{fn: "reindex", args: {service}}`
-/// (step 1), then each wake of its deadline — one transaction walked, or (nothing left) the switch.
+/// (step 1), then each wake of its deadline — one transaction walked, or (nothing left) done.
 /// The result record carries `{service, stage: "walking" | "done" | "refused" | "error", cursor?,
 /// transactions, steps, from, to?}`; the cursor is what the next step reads back (`priorResult`).
 fn reindexStep(a: Allocator, step: Value, args: Value, body: Value) !void {
@@ -495,7 +495,6 @@ fn reindexStep(a: Allocator, step: Value, args: Value, body: Value) !void {
         const t = (try reindex.targetOf(a, step, service)) orelse return reindexRefused(a, step, args, service, try std.fmt.allocPrint(a, "reindex: {s} is not a lookup service configured or registered here", .{service}));
         if (reindex.running(rec, service) != null) return reindexRefused(a, step, args, service, "reindex in progress");
         if (t.topics.len == 0) return reindexRefused(a, step, args, service, try std.fmt.allocPrint(a, "reindex: {s} listens to no topic served here", .{service}));
-        _ = calls.reindexCall(a, ev_.caller(), step, t.listeners[0], "begin") catch |e| return reindexRefused(a, step, args, service, try std.fmt.allocPrint(a, "reindex: {s}'s program does not take fn reindex ({s}): built against skein-overlay before 0.23.0?", .{ service, ev_.caller().errorText(e) }));
         try vm.advance(rhead, try s.putValue(a, try reindex.withRunning(a, rec, service, thread, t.role, at)));
         try vm.deadline(@intCast(at + 1));
         _ = try vm.finish(a, s, try resultRecord(a, "reindex", &.{
@@ -508,7 +507,7 @@ fn reindexStep(a: Allocator, step: Value, args: Value, body: Value) !void {
         }));
         return;
     }
-    // Woken: one transaction, or the switch.
+    // Woken: one transaction, or done.
     const p = prior.?;
     if (!eql(u8, p.getText("stage") orelse "", "walking")) {
         // A wake after the thread's work is done (it rests on nothing then): nothing to do.
@@ -524,9 +523,8 @@ fn reindexStep(a: Allocator, step: Value, args: Value, body: Value) !void {
         var loaded = ev_.load(a, step) catch break :walked;
         loaded.st.now = @intCast(at);
         const cur = reindex.cursorOf(a, p.get("cursor") orelse break :walked) catch break :walked;
-        const item = (reindex.next(a, &loaded.st, cur) catch |e| return reindexFailed(a, step, args, rec, service, t, steps, from, at, transactions, @errorName(e))) orelse {
-            // Nothing left in any topic: the switch, in this step.
-            _ = calls.reindexCall(a, ev_.caller(), step, t.listeners[0], "switch") catch |e| return reindexFailed(a, step, args, rec, service, t, steps, from, at, transactions, ev_.caller().errorText(e));
+        const item = (reindex.next(a, &loaded.st, cur) catch |e| return reindexFailed(a, step, args, rec, service, steps, from, at, transactions, @errorName(e))) orelse {
+            // Nothing left in any topic: done, in this step.
             const result: Value = .{ .map = try a.dupe(cbor.Entry, &.{
                 .{ .key = "service", .value = .{ .text = service } },
                 .{ .key = "transactions", .value = .{ .uint = transactions } },
@@ -546,7 +544,7 @@ fn reindexStep(a: Allocator, step: Value, args: Value, body: Value) !void {
             }));
             return;
         };
-        const did = reindex.walk(a, ev_.caller(), step, &loaded.st, t, cur, item) catch |e| return reindexFailed(a, step, args, rec, service, t, steps, from, at, transactions, ev_.caller().errorText(e));
+        const did = reindex.walk(a, ev_.caller(), step, &loaded.st, t, cur, item) catch |e| return reindexFailed(a, step, args, rec, service, steps, from, at, transactions, ev_.caller().errorText(e));
         if (did) transactions += 1;
         try vm.deadline(@intCast(at + 1));
         _ = try vm.finish(a, s, try resultRecord(a, "reindex", &.{
@@ -561,15 +559,13 @@ fn reindexStep(a: Allocator, step: Value, args: Value, body: Value) !void {
         return;
     }
     // The service or the thread's own record is no longer readable: ended as an error.
-    const t = (try reindex.targetOf(a, step, service)) orelse reindex.Target{ .service = service, .role = "", .program = "", .topics = &.{}, .listeners = &.{} };
-    return reindexFailed(a, step, args, rec, service, t, steps, from, at, transactions, "reindex: the service or the walk's cursor is no longer readable");
+    return reindexFailed(a, step, args, rec, service, steps, from, at, transactions, "reindex: the service or the walk's cursor is no longer readable");
 }
 
-/// A reindex ended by an error at this step: the program's fn "reindex" `abort` (its partial index
-/// dropped), the service's entry done with `error`, root answered `failed`; the index's head untouched.
-fn reindexFailed(a: Allocator, step: Value, args: Value, rec: ?Value, service: []const u8, t: reindex.Target, steps: u64, from: u64, at: u64, transactions: u64, why: []const u8) !void {
+/// A reindex ended by an error at this step (0.23.1, R4): the service's entry done with `error`, root
+/// answered `failed`. Nothing undone, nothing retried: the index stays as far as the walk came.
+fn reindexFailed(a: Allocator, step: Value, args: Value, rec: ?Value, service: []const u8, steps: u64, from: u64, at: u64, transactions: u64, why: []const u8) !void {
     const s = vm.store();
-    if (t.listeners.len > 0) _ = calls.reindexCall(a, ev_.caller(), step, t.listeners[0], "abort") catch {};
     const result: Value = .{ .map = try a.dupe(cbor.Entry, &.{
         .{ .key = "service", .value = .{ .text = service } },
         .{ .key = "error", .value = .{ .text = why } },

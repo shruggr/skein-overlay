@@ -1,49 +1,46 @@
-//! A lookup service's index derived again from the topic's admitted history (0.23.0, David
-//! 2026-11-07): root's message `{fn: "reindex", args: {service}}` in the box `<app>/reindex` (the
-//! route's function `reindex`, gated by root) starts a thread of the engine that walks every
-//! transaction its topics admitted, in admission order, and runs the service's lookup hooks over each
-//! again as admission ran them, into a fresh head; its last step names the index's head the new
-//! index. Same instance, same log; nothing is fetched; no other head is touched.
+//! A lookup service's index derived again from the topic's admitted history (0.23.0; 0.23.1 the
+//! re-cut, David 2026-11-07: "Yes, simple."): root's message `{fn: "reindex", args: {service}}` in the
+//! box `<app>/reindex` (the route's function `reindex`, gated by root) starts a thread of the engine
+//! that walks every transaction its topics admitted, in admission order, and runs the service's
+//! lookup hooks over each again exactly as admission ran them — the same hooks, the same arguments,
+//! the same index head, `at` the time admission gave them. Same instance, same log; nothing is
+//! fetched; no other head is touched. There is one index head: no second head, no switch, no hook
+//! mode. While the walk runs the instance is the host's to keep from the outside (open-exchange: the
+//! router answers 503 "reindexing" for it until the done answer): nothing here knows of that.
 //!
 //! The thread (engine.zig `reindexStep`):
 //!
 //!   step 1   root's message: refused unless the service is configured or registered here
-//!            (`targetOf`) and no reindex of it runs (the record below); else the lookup program's fn
-//!            "reindex" `begin` (lookup.zig: `<head>.reindex` named the empty index), the service
-//!            entered as running, the cursor at the start of each of its topics, and the thread rests
-//!            on a deadline (the step's time + 1 ms: the runtime's waker answers it — the kernel's
+//!            (`targetOf`) and no reindex of it runs (the record below); else the service entered as
+//!            running, the cursor at the start of each of its topics, and the thread rests on a
+//!            deadline (the step's time + 1 ms: the runtime's waker answers it — the kernel's
 //!            `deadline` intention, as a shell's sleep).
 //!   step n   woken: its cursor is the result record its last step kept (the input's `tip`, as the
 //!            chain app reads what it awaits). One transaction (`next`): the program's hooks
-//!            `admitted`, then `spent` for each previous coin, with `reindex: true` (calls.zig
-//!            `hookAdmittedTo`): the same arguments as at admission, from the topic's applied record;
-//!            what they answer (beats, events) dropped. The cursor moves past it; the thread rests again.
-//!   last     `next` finds nothing in any topic: fn "reindex" `switch` (the index's head names the new
-//!            index, `<head>.reindex` the empty one), the service's entry done, root answered
+//!            `admitted`, then `spent` for each previous coin (calls.zig `hookAdmittedTo`): the
+//!            arguments admission gave them, from the topic's applied record, `at` its `at`; what they
+//!            answer (beats, events) is not emitted (the walk re-applies history; it announces
+//!            nothing). The cursor moves past it; the thread rests again.
+//!   last     `next` finds nothing in any topic: the service's entry done, root answered
 //!            `{fn: "reindex", request, replyTo, result: {service, transactions, steps, from, to}}`.
 //!
 //! The order (`next`): per topic, the transactions `mined` names, by (height, offset), past the cursor;
 //! then the topic's tail (`State.tailTxids`: admitted and not mined, by admission time) not walked yet —
-//! read again at every step, so whatever was admitted while the thread rested is walked before the
-//! switch, and the switch is the step that finds nothing left (one step: no admission comes between
-//! the check and the switch; one after it writes the new head). A candidate one of whose inputs spends
-//! a tail transaction not walked yet gives way to that parent (two transactions admitted in one step
-//! share their admission time, and a mined child's proof may land before its parent's): a parent
-//! before its child, as admission ran them.
+//! read again at every step. A candidate one of whose inputs spends a tail transaction not walked yet
+//! gives way to that parent (two transactions admitted in one step share their admission time, and a
+//! mined child's proof may land before its parent's): a parent before its child, as admission ran them.
 //!
-//! While it runs the index's own head answers every read and the live hooks keep writing it; a
-//! rejection's `rejected` hook reaches the reindex's state too (State.reindexing, calls.zig
-//! `hookRejected`). An error in a step (a hook's, a read's) ends the thread at that step: fn "reindex"
-//! `abort` (`<head>.reindex` named the empty index again), the entry done with `error`, root answered
-//! `error: {code: "failed", message}`; the index's head untouched.
+//! An error in a step (a hook's, a read's) ends the thread at that step: the entry done with `error`,
+//! root answered `error: {code: "failed", message}`. Nothing is undone and nothing is retried: the
+//! index stays as far as the walk came (the host keeps the instance shut and logs the error).
 //!
 //! The record of the head `<app>/reindex` (the engine's):
 //!
 //!   {kind: "overlay-reindex", running: {<service>: {thread, role, from}},
 //!    last: {<service>: {transactions, steps, from, to} | {error, steps, from, to}}}
 //!
-//! `running` is what refuses a second reindex of a service ("reindex in progress") and names the
-//! programs a rejection reaches (`roles`); `last` is what each one came to (the host reads it).
+//! `running` is what refuses a second reindex of a service ("reindex in progress") and what a host
+//! reads at its start to know a reindex runs; `last` is what each one came to.
 const std = @import("std");
 const c = @import("chain");
 const calls = @import("calls.zig");
@@ -121,13 +118,6 @@ pub fn running(rec: ?Value, service: []const u8) ?Value {
 pub fn last(rec: ?Value, service: []const u8) ?Value {
     for (entriesOf(rec, "last")) |e| if (eql(u8, e.key, service)) return e.value;
     return null;
-}
-
-/// The roles of the programs a reindex runs for (State.reindexing).
-pub fn roles(a: Allocator, rec: ?Value) ![]const []const u8 {
-    var out: std.ArrayList([]const u8) = .empty;
-    for (entriesOf(rec, "running")) |e| if (e.value.getText("role")) |r| try out.append(a, r);
-    return out.items;
 }
 
 fn without(a: Allocator, es: []const cbor.Entry, key: []const u8) ![]cbor.Entry {
@@ -287,21 +277,22 @@ fn uintList(a: Allocator, v: ?[]const Value) ![]u32 {
 }
 
 /// Walk one transaction: the target's hooks over it as its admission ran them — from the topic's
-/// applied record: `outputsToAdmit`, `coinsToRetain`, and the previous coins (retained and removed, in
-/// input order) for `spent` — with `reindex: true`. A transaction no longer applied (rejected since
-/// `next` found it) is passed over. → whether it was walked.
+/// applied record: `outputsToAdmit`, `coinsToRetain`, the previous coins (retained and removed, in
+/// input order) for `spent`, and `at`, the time it was admitted. A transaction no longer applied
+/// (rejected since `next` found it) is passed over. → whether it was walked.
 pub fn walk(a: Allocator, caller: calls.Caller, in: Value, st: *state.State, t: Target, cur: Cursor, item: Item) !bool {
     const topic = cur.topics[item.topic].topic;
     const rec = (try st.appliedRecord(topic, item.txid)) orelse return false;
     const outs = try uintList(a, rec.getArray("outputsToAdmit"));
     const retained = try uintList(a, rec.getArray("coinsToRetain"));
     const removed = try uintList(a, rec.getArray("coinsRemoved"));
+    const at = rec.getUint("at") orelse return error.BadRecord;
     const previous = try std.mem.concat(a, u32, &.{ retained, removed });
     std.mem.sort(u32, previous, {}, std.sort.asc(u32));
     const l = for (t.topics, t.listeners) |x, y| {
         if (eql(u8, x, topic)) break y;
     } else return error.TopicNotHeard; // the service no longer listens to a topic the walk began on
     const sub = try state.subjectOf(a, st.store, item.txid);
-    try calls.hookAdmittedTo(a, caller, in, l, topic, sub, previous, .{ .outputs_to_admit = outs, .coins_to_retain = retained, .coins_removed = removed }, st, true);
+    try calls.hookAdmittedTo(a, caller, in, l, topic, sub, previous, .{ .outputs_to_admit = outs, .coins_to_retain = retained, .coins_removed = removed }, @intCast(at), st);
     return true;
 }

@@ -14,7 +14,6 @@ const gossip = @import("gossip.zig");
 const state = @import("state.zig");
 const submit = @import("submit.zig");
 const registry = @import("registry.zig");
-const reindex = @import("reindex.zig");
 
 const cbor = c.cbor;
 const Value = cbor.Value;
@@ -133,11 +132,7 @@ pub fn load(a: Allocator, in: Value) !struct { st: state.State, head: ?[]const u
     const ch = try a.create(state.Chain);
     ch.* = try c.open(a, s, try vm.head(a, state.chain_head), try network(in));
     const h = try vm.head(a, try stateHead(a, in));
-    var st = try state.State.load(a, s, h, ch);
-    // 0.23.0: the lookup programs a reindex runs for (a rejection reaches their reindex state too).
-    const rh = try vm.head(a, try reindex.headName(a, calls.appOf(in)));
-    st.reindexing = try reindex.roles(a, if (rh) |r| try s.getValue(a, r) else null);
-    return .{ .st = st, .head = h };
+    return .{ .st = try state.State.load(a, s, h, ch), .head = h };
 }
 
 fn advanceImpl(_: *anyopaque, name: []const u8, cid: []const u8) anyerror!void {

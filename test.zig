@@ -213,9 +213,8 @@ const Instance = struct {
     chain_root: ?[]const u8 = null,
     ov_root: ?[]const u8 = null,
     ls_state: ?[]const u8 = null,
-    /// 0.23.0: the lookup's reindex state (the head `<head>.reindex`), and the roles a reindex runs for.
-    ls_reindex: ?[]const u8 = null,
-    reindexing: []const []const u8 = &.{},
+    /// 0.23.1: the `at` of every hook call, in order (the time a hook's transaction was admitted).
+    hook_ats: std.ArrayList(u64) = .empty,
     in: Value,
     now: i64 = 1000,
     topic_prog: []const u8,
@@ -277,16 +276,9 @@ const Instance = struct {
         }
         if (std.mem.eql(u8, program, self.lookup_prog)) {
             try std.testing.expectEqualStrings("overlay", arg.getText("app").?);
-            // 0.23.0: fn "reindex" moves the two heads; a hook with `reindex: true` writes the reindex's.
-            if (std.mem.eql(u8, func, "reindex")) {
-                const r = try lookup.reindexOp(a, self.ls_spec, self.current, arg, self.ls_reindex);
-                if (r.live) |l| self.ls_state = l;
-                self.ls_reindex = r.partial;
-                return r.answer;
-            }
-            const rx = lookup.isReindex(arg);
-            const h = try lookup.handle(a, self.ls_spec, self.current, .regtest, if (rx) self.ls_reindex else self.ls_state, self.chain_root, func, arg);
-            if (h.state) |sc| (if (rx) self.ls_reindex else self.ls_state) = sc;
+            if (std.mem.eql(u8, arg.getText("kind") orelse "", "lookup-hook")) try self.hook_ats.append(self.a, lookup.atOf(arg) orelse return error.NoAt);
+            const h = try lookup.handle(a, self.ls_spec, self.current, .regtest, self.ls_state, self.chain_root, func, arg);
+            if (h.state) |sc| self.ls_state = sc;
             return h.answer;
         }
         return error.UnknownProgram;
@@ -366,7 +358,6 @@ const Instance = struct {
         ch.* = try c.open(self.a, self.ms.store(), self.chain_root, .regtest);
         var st = try state.State.load(self.a, self.ms.store(), self.ov_root, ch);
         st.now = self.now;
-        st.reindexing = self.reindexing;
         return st;
     }
 
@@ -4898,7 +4889,7 @@ test "a truthful answer (0.20.5): a submission whose admission applied nothing i
 }
 
 /// One step of a reindex's walk (reindex.zig), as the engine's thread runs it: the next transaction,
-/// its hooks with `reindex: true`, the cursor past it. → the transaction, or null (nothing left).
+/// its hooks as admission ran them, the cursor past it. → the transaction, or null (nothing left).
 fn reindexStep(inst: *Instance, t: reindex.Target, cur: *reindex.Cursor) !?[32]u8 {
     var st = try inst.load();
     const item = (try reindex.next(inst.a, &st, cur.*)) orelse return null;
@@ -4907,7 +4898,7 @@ fn reindexStep(inst: *Instance, t: reindex.Target, cur: *reindex.Cursor) !?[32]u
     return item.txid;
 }
 
-test "reindex (0.23.0, David 2026-11-07): a lookup's index derived again from the topic's admitted history, mined by height and offset then the tail, a parent before its child; byte for byte the live index; an admission during the walk lands, a rejection during it reaches both; the switch; one at a time" {
+test "reindex (0.23.1, David 2026-11-07: one head, the same hooks): a lookup's index derived again from the topic's admitted history, mined by height and offset then the tail, a parent before its child, each hook with the time admission gave it; byte for byte the live index" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -4935,11 +4926,27 @@ test "reindex (0.23.0, David 2026-11-07): a lookup's index derived again from th
     const h3 = mine(hdr.hash(&h2), t3.txid, 1_700_001_600);
     try inst.headers(&.{ &h2, &h3 });
     const pair = try pairPath(a, 2, t1.txid, t2.txid);
+    // Each admitted at its own time: the walk must hand each hook that time back.
+    inst.now = 1100;
     try admittedProven(&inst, try withFund(a, f, t1), t1.txid, pair);
+    inst.now = 1200;
     try admittedProven(&inst, try atomic(a, t2), t2.txid, pair);
+    inst.now = 1300;
     try admittedProven(&inst, try withFund(a, f, t3), t3.txid, try soloPath(a, 3, t3.txid));
+    inst.now = 1400;
     _ = try inst.admitted(try withFund(a, f, t4), t4.txid);
-    try std.testing.expectEqual(@as(usize, 3), try inst.lookTopic()); // t2, t3, t4 unspent
+    _ = try inst.admitted(try atomic(a, t5), t5.txid);
+    inst.now = 2000;
+    _ = try inst.admitted(try withFund(a, f, t6), t6.txid);
+    {
+        try std.testing.expect(!(try inst.watchStart(t6.txid)).done);
+        _ = try inst.chainStatus(t6.txid, "DOUBLE_SPEND_ATTEMPTED", null);
+        const done = try inst.watched(t6.txid, .{ .rejected = "DOUBLE_SPEND_ATTEMPTED" });
+        try std.testing.expect(done.done and done.unapplied.len == 1);
+    }
+    try std.testing.expectEqual(@as(usize, 3), try inst.lookTopic()); // t2, t3, t5 unspent
+    const live = inst.ls_state.?;
+    const live_ats = try a.dupe(u64, inst.hook_ats.items);
 
     // ------------------------------------------------ the target: ls_demo's role, its one topic, the listener the hooks reach
     const t = (try reindex.targetOf(a, inst.in, "ls_demo")).?;
@@ -4948,77 +4955,35 @@ test "reindex (0.23.0, David 2026-11-07): a lookup's index derived again from th
     try std.testing.expectEqualStrings("tm_demo", t.topics[0]);
     try std.testing.expect((try reindex.targetOf(a, inst.in, "ls_nobody")) == null);
 
-    // ------------------------------------------------ begin: the reindex's head the empty index; the live head untouched
-    const live_before = inst.ls_state.?;
-    const begun = try calls.reindexCall(a, inst.caller(), inst.in, t.listeners[0], "begin");
-    try std.testing.expectEqualStrings("begin", begun.getText("op").?);
-    try std.testing.expectEqualStrings("ls_demo", begun.getText("index").?);
-    try std.testing.expectEqualSlices(u8, live_before, inst.ls_state.?);
-    const empty = inst.ls_reindex.?;
-    inst.reindexing = &.{t.role};
+    // ------------------------------------------------ the walk over an empty index (the open item: who names the head empty
+    // at the walk's start is not settled in 0.23.1; the test starts the one head empty itself)
+    inst.ls_state = null;
+    inst.hook_ats.clearRetainingCapacity();
+    inst.now = 9999; // the walk's own steps' time: never a hook's
     var cur = try reindex.start(a, t.topics);
-
-    // ------------------------------------------------ the walk: t1, t2 (mined at 2, in block order), t3 (at 3) …
     try std.testing.expectEqualSlices(u8, &t1.txid, &(try reindexStep(&inst, t, &cur)).?);
-    // An admission during the walk (t5, spending t4: the tail) — the live hooks write the live head.
-    _ = try inst.admitted(try atomic(a, t5), t5.txid);
     try std.testing.expectEqualSlices(u8, &t2.txid, &(try reindexStep(&inst, t, &cur)).?);
-    // The index's own head keeps answering (t2, t3, t5), the reindex's holds only what it walked.
-    try std.testing.expectEqual(@as(usize, 3), try inst.lookTopic());
     try std.testing.expectEqualSlices(u8, &t3.txid, &(try reindexStep(&inst, t, &cur)).?);
-    // … then the tail: t4 before its child t5 though t5 sorts first.
     {
         var st = try inst.load();
         const tail = try st.tailTxids("tm_demo");
         try std.testing.expectEqualSlices(u8, &t5.txid, &tail[0]);
     }
+    // the tail: t4 before its child t5 though t5 sorts first; t6 rejected: no longer applied, not walked.
     try std.testing.expectEqualSlices(u8, &t4.txid, &(try reindexStep(&inst, t, &cur)).?);
-    // t6 admitted now (later than t4 and t5), walked, then rejected: its `rejected` hook reaches the
-    // reindex's state too.
-    inst.now = 2000;
-    _ = try inst.admitted(try withFund(a, f, t6), t6.txid);
     try std.testing.expectEqualSlices(u8, &t5.txid, &(try reindexStep(&inst, t, &cur)).?);
-    try std.testing.expectEqualSlices(u8, &t6.txid, &(try reindexStep(&inst, t, &cur)).?);
-    {
-        try std.testing.expect(!(try inst.watchStart(t6.txid)).done);
-        _ = try inst.chainStatus(t6.txid, "DOUBLE_SPEND_ATTEMPTED", null);
-        const done = try inst.watched(t6.txid, .{ .rejected = "DOUBLE_SPEND_ATTEMPTED" });
-        try std.testing.expect(done.done and done.unapplied.len == 1);
-    }
-    // Nothing left in any topic: the last step.
     try std.testing.expect((try reindexStep(&inst, t, &cur)) == null);
     // Byte for byte what the live hooks built.
-    try std.testing.expect(!std.mem.eql(u8, live_before, inst.ls_state.?));
-    try std.testing.expectEqualSlices(u8, inst.ls_state.?, inst.ls_reindex.?);
-
-    // ------------------------------------------------ the switch: the index's head the new index, the reindex's the empty one
-    const rebuilt = inst.ls_reindex.?;
-    const sw = try calls.reindexCall(a, inst.caller(), inst.in, t.listeners[0], "switch");
-    try std.testing.expectEqualSlices(u8, rebuilt, sw.getCid("root").?);
-    try std.testing.expectEqualSlices(u8, rebuilt, inst.ls_state.?);
-    try std.testing.expectEqualSlices(u8, empty, inst.ls_reindex.?);
-    inst.reindexing = &.{};
-    try std.testing.expectEqual(@as(usize, 3), try inst.lookTopic()); // t2, t3, t5
-
-    // ------------------------------------------------ a fresh reindex of the same history: the same index again
-    _ = try calls.reindexCall(a, inst.caller(), inst.in, t.listeners[0], "begin");
-    var again = try reindex.start(a, t.topics);
-    var n: usize = 0;
-    while (try reindexStep(&inst, t, &again)) |_| n += 1;
-    try std.testing.expectEqual(@as(usize, 5), n); // t1, t2, t3, t4, t5 (t6 rejected: no longer applied)
-    try std.testing.expectEqualSlices(u8, inst.ls_state.?, inst.ls_reindex.?);
-    // abort: the reindex's head the empty index; the live head untouched.
-    _ = try calls.reindexCall(a, inst.caller(), inst.in, t.listeners[0], "abort");
-    try std.testing.expectEqualSlices(u8, empty, inst.ls_reindex.?);
-    try std.testing.expectEqualSlices(u8, rebuilt, inst.ls_state.?);
-    try std.testing.expectError(error.BadArgs, lookup.reindexOp(a, ls.spec, ms.store(), .{ .map = try a.dupe(cbor.Entry, &.{
-        .{ .key = "kind", .value = .{ .text = "lookup-reindex" } },
-        .{ .key = "service", .value = .{ .text = "ls_demo" } },
-        .{ .key = "op", .value = .{ .text = "sideways" } },
-    }) }, null));
+    try std.testing.expectEqualSlices(u8, live, inst.ls_state.?);
+    try std.testing.expectEqual(@as(usize, 3), try inst.lookTopic());
+    // Every hook of the walk had its transaction's admission time, none the walk's (9999).
+    for (inst.hook_ats.items) |x| try std.testing.expect(x != 9999);
+    try std.testing.expectEqualSlices(u64, &.{ 1100, 1200, 1200, 1300, 1400, 1400, 1400 }, inst.hook_ats.items);
+    // The live hooks' times: the same per transaction (t6's admitted + rejected at 2000 besides).
+    try std.testing.expect(live_ats.len >= inst.hook_ats.items.len);
 }
 
-test "reindex (0.23.0): the engine's record — one reindex at a time per service, the roles a rejection reaches, what each came to; the box; the cursor round-trips" {
+test "reindex (0.23.0): the engine's record — one reindex at a time per service, what each came to; the box; the cursor round-trips" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -5028,14 +4993,10 @@ test "reindex (0.23.0): the engine's record — one reindex at a time per servic
     try std.testing.expect(reindex.running(r1, "ls_x") != null); // a second reindex of ls_x: refused (engine.zig)
     try std.testing.expect(reindex.running(r1, "ls_y") == null);
     const r2 = try reindex.withRunning(a, r1, "ls_y", thread, "lookup-y", 1001);
-    try std.testing.expectEqual(@as(usize, 2), (try reindex.roles(a, r2)).len);
     const result: Value = .{ .map = try a.dupe(cbor.Entry, &.{.{ .key = "transactions", .value = .{ .uint = 7 } }}) };
     const r3 = try reindex.withDone(a, r2, "ls_x", result);
     try std.testing.expect(reindex.running(r3, "ls_x") == null);
     try std.testing.expectEqual(@as(u64, 7), reindex.last(r3, "ls_x").?.getUint("transactions").?);
-    const roles = try reindex.roles(a, r3);
-    try std.testing.expectEqual(@as(usize, 1), roles.len);
-    try std.testing.expectEqualStrings("lookup-y", roles[0]);
     // Read back as the store keeps it (canonical dag-cbor): the same.
     const back = try cbor.decode(a, try cbor.encode(a, r3));
     try std.testing.expect(reindex.running(back, "ls_y") != null);

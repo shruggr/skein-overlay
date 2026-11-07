@@ -1077,7 +1077,7 @@ names keeps one index ("The lookup contract", below).
 
 A topic whose instructions do not fit the transaction admits nothing.
 
-### Reindex a lookup service (0.23.0)
+### Reindex a lookup service (0.23.0; 0.23.1: one head)
 
 A lookup's index is derived state: everything in it is computed from the
 transactions its topics admitted, which the instance holds with their
@@ -1096,12 +1096,9 @@ thread of the engine (src/reindex.zig, engine.zig `reindexStep`):
 1. **Refused** (root answered `{fn: "reindex", request, replyTo, error:
    {code: "bad-args", message}}`, nothing written): another box; no
    `service`; a service neither configured nor registered here; a service
-   listening to no topic served here; a program that does not take fn
-   `reindex` (built against an engine before 0.23.0); **a reindex of the
-   service already running** (`reindex in progress`).
-2. **Begun:** the lookup program's fn `reindex` `begin` names the head
-   `<app>/<index>.reindex` the empty index (whatever an earlier reindex left
-   there is dropped); the service is entered as running in the head
+   listening to no topic served here; **a reindex of the service already
+   running** (`reindex in progress`).
+2. **Begun:** the service is entered as running in the head
    `<app>/reindex`; the thread rests on a deadline at its step's time + 1 ms
    (the runtime's waker answers it: the kernel's `deadline` intention).
 3. **One transaction per step.** Woken, the thread reads its cursor from
@@ -1110,35 +1107,35 @@ thread of the engine (src/reindex.zig, engine.zig `reindexStep`):
    `mined` names by (height, offset) past the cursor, then the topic's tail
    (`tailTxids`: admitted, not mined, by admission time) not walked yet — a
    candidate that spends a tail transaction not walked yet gives way to it, so
-   a parent comes before its child. The program's hooks run over it as its
-   admission ran them, from the topic's applied record: `admitted`
-   (`outputsToAdmit`, `coinsRetained`), then `spent` for each previous coin
-   (retained and removed, in input order), each argument with `reindex:
-   true`, so the program's state is `<app>/<index>.reindex`; what they answer
-   (beats, events) is dropped. The cursor moves past it and the thread rests
-   again.
-4. **The switch.** The step whose walk finds nothing left in any topic calls
-   fn `reindex` `switch`: the index's own head names the new index,
-   `<app>/<index>.reindex` the empty one (the kernel has no removal of a
-   head); the service's entry in `<app>/reindex` moves to `last`; root is
-   answered `{fn: "reindex", request, replyTo, result: {service,
-   transactions, steps, from, to}}` (`from`, `to`: the first and last steps'
-   times, ms).
+   a parent comes before its child. The program's hooks run over it exactly
+   as its admission ran them, into the same index head, from the topic's
+   applied record: `admitted` (`outputsToAdmit`, `coinsRetained`), then
+   `spent` for each previous coin (retained and removed, in input order),
+   each argument's `at` the applied record's `at` (the time admission gave
+   it, "The lookup contract"). What the hooks answer (beats, events) is not
+   emitted: the walk re-applies history. The cursor moves past it and the
+   thread rests again.
+4. **Done.** The step whose walk finds nothing left in any topic moves the
+   service's entry in `<app>/reindex` to `last` and answers root `{fn:
+   "reindex", request, replyTo, result: {service, transactions, steps, from,
+   to}}` (`from`, `to`: the first and last steps' times, ms).
 
-While it runs, every read answers from the index's own head, unchanged, and
-the live hooks keep writing it. The walk reads `mined` and the tail again at
-every step, so a transaction admitted while the thread rests is walked
-before the switch; the switch is the same step as the check that finds
-nothing left, so no admission comes between them, and one after it writes
-the new index. A rejection while the reindex runs reaches the program's
-reindex state too (its `rejected` hook with `reindex: true`; the head
-`<app>/reindex` names the programs, `State.reindexing`), since the walk may
-have passed the transaction. An error in a step (a hook's, a read's) ends the
-thread there: fn `reindex` `abort` (`.reindex` the empty index again), the
-entry moved to `last` with `error`, root answered `error: {code: "failed",
-message}`; the index's head untouched. A step that traps (out of fuel) ends
-the thread with nothing written: its entry stays in `running`, so a later
-reindex of the service is refused (`reindex in progress`).
+There is one index head, no second head and no switch: the walk writes the
+index the reads answer from. While the walk runs the instance's host keeps
+it shut to the outside (open-exchange: its router answers 503 "reindexing"
+for the instance from the reindex it sends until the done answer); nothing
+in the engine, a lookup or the front door knows of that. An error in a step
+(a hook's, a read's) ends the thread there: the entry moved to `last` with
+`error`, root answered `error: {code: "failed", message}`; nothing undone,
+nothing retried. A step that traps (out of fuel) ends the thread with nothing
+written: its entry stays in `running`, so a later reindex of the service is
+refused (`reindex in progress`).
+
+OPEN in 0.23.1 (raised to David, not built): the walk re-applies the hooks
+to the index as it stands; an index holding records from before must start
+empty, and nothing names the head empty at the walk's start (the engine does
+not know a program's index head, `Spec.index`; 0.23.0's lookup fn `reindex`
+`begin` did it and is removed).
 
 The record of `<app>/reindex`:
 
@@ -1146,9 +1143,6 @@ The record of `<app>/reindex`:
 {kind: "overlay-reindex", running: {<service>: {thread, role, from}},
  last: {<service>: {service, transactions, steps, from, to} | {service, error, transactions, steps, from, to}}}
 ```
-
-A hook is re-run at the reindex's step: its input's `now` is that step's
-time, not the admission's.
 
 ## The topic contract
 
@@ -1233,17 +1227,18 @@ program's names that listens to the topic), and `program`, the role in
 
 | fn | argument | when |
 |---|---|---|
-| `admitted` | `{kind: "lookup-hook", app, service, program, topic, tx: <CID>, outputsToAdmit: [vout], coinsRetained: [input index]}` | a topic it listens to admitted a transaction (or consumed previous coins) |
-| `spent` | `{kind: "lookup-hook", app, service, program, topic, outpoint: {tx: <CID>, vout}, spendingTx: <CID>}` | for each previous coin that transaction consumed (retained or removed) |
-| `rejected` | `{kind: "lookup-hook", app, service, program, topic, tx: <CID>}` | a judgement of that topic was removed by a rejection |
+| `admitted` | `{kind: "lookup-hook", app, service, program, topic, at, tx: <CID>, outputsToAdmit: [vout], coinsRetained: [input index]}` | a topic it listens to admitted a transaction (or consumed previous coins) |
+| `spent` | `{kind: "lookup-hook", app, service, program, topic, at, outpoint: {tx: <CID>, vout}, spendingTx: <CID>}` | for each previous coin that transaction consumed (retained or removed) |
+| `rejected` | `{kind: "lookup-hook", app, service, program, topic, at, tx: <CID>}` | a judgement of that topic was removed by a rejection |
 | `lookup` | `{kind: "lookup-call", app, service, program, query}` | `POST /lookup`: a read |
-| `reindex` | `{kind: "lookup-reindex", app, service, program, op: "begin" \| "switch" \| "abort"}` → `{kind: "lookup-reindexed", op, index, root?}` | (0.23.0) the engine's reindex thread ("Reindex a lookup service"): begin names `<app>/<index>.reindex` the empty index; switch names the index's head what `.reindex` names (`root`) and `.reindex` the empty index; abort only the latter (`lookup.reindexOp`) |
 
-A hook's argument may carry `reindex: true` (0.23.0): the reindex thread's
-call. `lookup.main` then reads and advances `<app>/<index>.reindex` instead
-of the index's own head; nothing else differs, so a hook that writes only
-through its `Service` (its maps, advanced by `main`) and reads no head is
-re-runnable into a fresh index as it is.
+A hook's `at` (0.23.1) is the time its transaction was admitted: the
+admitting step's time, the topic's applied record's `at` (the `rejected`
+hook: the rejecting step's). A service stamps rows with it, not with its
+input's `now`, so the reindex walk ("Reindex a lookup service"), which calls
+the same hooks with the same arguments, gives every row the time admission
+gave it. A hook that writes only through its `Service` (its maps, advanced by
+`main`) and reads no head is re-runnable over the history as it is.
 
 A hook may be a no-op. It answers `{kind: "lookup-hooked", fn, beats?:
 {<service>: bytes}, events?: [map]}`: `beats` the new beat bodies it set

@@ -4,7 +4,7 @@ The overlay services engine for a [skein](https://github.com/shruggr/skein),
 as an app: BRC-22 submit and BRC-24 lookup, served by the instance's own
 front door, with topic managers and lookup services as programs the engine
 calls. It is also a Zig package: an overlay of your own depends on it for
-the topic and lookup contracts. Version **0.23.0**.
+the topic and lookup contracts. Version **0.23.1**.
 
 ## What it is
 
@@ -1047,6 +1047,16 @@ in progress`); `<app>/reindex` records what runs and what each came to; a
 rejection meanwhile reaches the reindex's state too. docs/OVERLAY.md "Reindex a
 lookup service". A lookup program must be built against this version to take
 fn `reindex` (a re-pin).
+
+0.23.1 (2026-11-07, the re-cut, David: "Yes, simple."): ONE index head. The
+reindex walk calls the lookup's hooks exactly as admission does, into the
+index's own head: the second head `<index>.reindex`, the switch, the hooks'
+`reindex: true` and the lookup fn `reindex` (begin/switch/abort) are gone,
+and so is a rejection's second `rejected` call. Every hook's argument carries
+`at`, the time its transaction was admitted (the applied record's `at`), and
+the walk passes the original time back. An error ends the walk with root
+answered `failed`; nothing is undone. The host keeps the instance shut while
+the walk runs (open-exchange). Lookup programs re-pin and read `at`.
 
 ## Contributing
 
