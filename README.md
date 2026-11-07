@@ -1014,6 +1014,10 @@ way. `MerklePath.combine` is no longer called: it rebuilt and sorted every
 level per merge, O(K²) and worse for K ancestors in one block, and reads ran
 out of fuel near 800 KB. skein-sdk v0.14.0.
 
+0.21.1 (2026-11-07): a re-pin on skein-sdk v0.15.0 (its store map's `rangeBack`, a
+window read greatest first and stopped at a limit, for the lookups built on this
+engine). The engine and the demo modules are the same bytes as 0.21.0's.
+
 ## Contributing
 
 Work is tracked in shruggr/skein; start at issue

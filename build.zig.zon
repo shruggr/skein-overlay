@@ -1,12 +1,12 @@
 .{
     .name = .skein_overlay,
-    .version = "0.21.0",
+    .version = "0.21.1",
     .minimum_zig_version = "0.16.0",
     .fingerprint = 0x61cfd392818dcb20,
     .dependencies = .{
         .skein_sdk = .{
-            .url = "https://github.com/shruggr/skein-sdk/archive/refs/tags/v0.14.0.tar.gz",
-            .hash = "skein_sdk-0.14.0-YroFBNV_GwBt0qvqJ19ugWDA9FpMVNmFSn0Wfnkk3oAN",
+            .url = "https://github.com/shruggr/skein-sdk/archive/refs/tags/v0.15.0.tar.gz",
+            .hash = "skein_sdk-0.15.0-YroFBFGUGwAH738pJK2oAuZqMDPnf64rCaJ6yGoa2xNW",
         },
     },
     .paths = .{
