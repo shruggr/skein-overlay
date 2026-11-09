@@ -20,13 +20,13 @@
 //!
 //! `register {topic, program}` adds it and emits the skein #119 events
 //! `subscribe {topic, program, fn}` for `<topic>` (fn `submit`: one mesh,
-//! two kinds of message, `submit` and `admit`, David 2026-10-09; gossip.zig)
-//! and `<topic>-proof` (`peerProof`), dag-cbor bodies, no filter (the door
+//! two kinds of message, `submit` and `admit`, David 2026-10-09; gossip.zig;
+//! 0.25.0: `<topic>-proof` gone), dag-cbor bodies, no filter (the door
 //! does not look inside a dag-cbor body: a `submit` message's BEEF is the
 //! engine's to decode), where
 //! `program` is the engine's own role (the handler the kernel routes the
 //! topic's messages to); `deregister {topic}` removes it and emits
-//! `unsubscribe {topic}` for the two. Until 0.12.0 a third, `<topic>-admit`
+//! `unsubscribe {topic}` for it. Until 0.12.0 a third, `<topic>-admit`
 //! (`peerAdmit`), carried the verdicts. Both are idempotent: a topic already
 //! registered with the same program, or not registered, changes nothing and
 //! emits nothing. The answer is `{topic, active}` (whether the topic is in
@@ -79,17 +79,14 @@
 //! fn "beat" answers it at the declaration, and a hook's answer may carry a
 //! new one (`{beats: {<service>: bytes}}`, lookup.zig).
 //!
-//! Seeding (0.7.8): `register {topic, program, seed?: [txid hex, …]}` — after
-//! the topic is registered (or found registered with the same program), each
-//! `seed` transaction the chain state holds is judged under that topic alone,
-//! as a submission of it would be (submit.zig `seed`): oldest first over what
-//! is held — the seed's held ancestors the topic takes, then the seed — and
-//! admitted from the state, the chain app having it already. The answer adds
-//! `seeded` (the seeds the topic holds now), `missing` (the seeds the chain
-//! state does not hold, or holds rejected) and `untaken` (held, but the topic
-//! takes nothing of them; only when there is one). A seed already admitted
-//! under the topic is not judged again. A `seed` that is not a list of txids
-//! (64 hex digits) is refused, nothing written.
+//! Seeding (0.25.0, David 2026-11-09: "the whole thing just needs to be the beef"): `register
+//! {topic, program, seed?: <the deploy's BEEF>}` — the door's envelope the caller holds, or its
+//! bytes. After the topic is registered (or found registered with the same program), the seed is
+//! SUBMITTED as an ordinary submission: the message `{fn: "submit", args: {beef: <seed>, topics:
+//! [topic]}}` to the instance itself in the box `<app>/submit` — the topic manager, the chain app's
+//! ingest, the submission's thread on `chain/tx/<txid>`. After setup there is only submit. (0.7.8 to
+//! 0.24.0 judged and admitted held seeds inside the registration step and answered `seeded`,
+//! `missing`, `untaken`: gone.) A `seed` that is not a BEEF is refused, nothing written.
 //!
 //! One box per function class (shruggr/skein#128, 0.6.2; 0.7.5): either
 //! message is taken only in the box the manifest names `register` (resolved
@@ -161,13 +158,12 @@ fn lessThan(_: void, x: Entry, y: Entry) bool {
 }
 
 /// The GossipSub topics an overlay topic is subscribed on, and the engine's function for each
-/// (routes.zig; 0.12.0, David 2026-10-09): `<topic>` one mesh for both kinds, `submit` and `admit`
-/// (the function reads the kind), and `<topic>-proof` its own (people waiting on a proof do not track
-/// admittance). Dag-cbor bodies, no door filter. (`<topic>-live`, the liveness topic, is the runtime's
+/// (routes.zig; 0.12.0, David 2026-10-09): `<topic>`, the announcements (0.25.0: `<topic>-proof` is
+/// gone — proofs come by the host's Arcade feed and its pull, never by gossip). Dag-cbor bodies, no
+/// door filter. (`<topic>-live`, the liveness topic, is the runtime's
 /// beacon and liveness tool: `roleEvents`.)
 pub const gossip_topics = [_]struct { suffix: []const u8, func: []const u8, filter: ?[]const u8 = null }{
     .{ .suffix = "", .func = "submit" },
-    .{ .suffix = "-proof", .func = "peerProof" },
 };
 
 /// The events of one change: `subscribe {topic, program: <self>, fn, filter?}` for each of the
@@ -198,23 +194,19 @@ pub fn events(a: Allocator, subscribe: bool, topic: []const u8, self: []const u8
 /// answer. Or why it is refused (nothing written, nothing emitted).
 pub const Change = union(enum) {
     refused: []const u8,
-    done: struct { list: ?[]const Entry, events: []const Value, answer: Value, seed: ?[]const [32]u8 = null },
+    done: struct { list: ?[]const Entry, events: []const Value, answer: Value, seed: ?Value = null },
 };
 
-/// A register's `seed` (0.7.8): null when absent; a list of txids (hex), each once, in order. Not
-/// that shape: error.BadSeed.
-pub fn seedOf(a: Allocator, args: Value) !?[]const [32]u8 {
+/// A register's `seed` (0.25.0): null when absent; the deploy's BEEF — the door's envelope, or bytes
+/// (submit.zig `Input`). Not that: error.BadSeed.
+pub fn seedOf(args: Value) !?Value {
     const v = args.get("seed") orelse return null;
     if (v == .null) return null;
-    if (v != .array) return error.BadSeed;
-    var out: std.ArrayList([32]u8) = .empty;
-    outer: for (v.array) |x| {
-        if (x != .text or x.text.len != 64) return error.BadSeed;
-        const t = c.header.fromHex(x.text) catch return error.BadSeed;
-        for (out.items) |y| if (eql(u8, &y, &t)) continue :outer;
-        try out.append(a, t);
-    }
-    return out.items;
+    return switch (v) {
+        .bytes => |b| if (b.len > 0) v else error.BadSeed,
+        .map => if (c.record.envelopeOf(v) != null) v else error.BadSeed,
+        else => error.BadSeed,
+    };
 }
 
 fn answerOf(a: Allocator, topic: []const u8, active: bool) !Value {
@@ -230,14 +222,14 @@ fn refused(a: Allocator, comptime fmt: []const u8, args: anytype) !Change {
 
 /// `register {topic, program, seed?}`: `program` a role in `programs` (the app's roles, or the
 /// genesis's); `self` the engine's own role. An unknown role is refused; so is a topic registered
-/// already with another program (deregister it first), and a `seed` that is not a list of txids.
-/// The seeds (0.7.8) are the engine's to judge once the set is written (`done.seed`).
+/// already with another program (deregister it first), and a `seed` that is not a BEEF.
+/// The seed (0.25.0) is the engine's to submit once the set is written (`done.seed`).
 pub fn register(a: Allocator, list: []const Entry, args: Value, programs: Value, self: []const u8) !Change {
     const topic = args.getText("topic") orelse return refused(a, "register: want {{topic, program, seed?}}", .{});
     const program = args.getText("program") orelse return refused(a, "register: want {{topic, program, seed?}}", .{});
     if (topic.len == 0) return refused(a, "register: the topic is empty", .{});
     if (programs.getCid(program) == null) return refused(a, "register: program {s} is not a role in programs", .{program});
-    const seed = seedOf(a, args) catch return refused(a, "register: seed is a list of txids (64 hex digits)", .{});
+    const seed = seedOf(args) catch return refused(a, "register: seed is the deploy's BEEF (the door's envelope, or bytes)", .{});
     if (find(list, topic)) |e| {
         if (!eql(u8, e.program, program)) return refused(a, "register: {s} is registered with program {s}: deregister it first", .{ topic, e.program });
         return .{ .done = .{ .list = null, .events = &.{}, .answer = try answerOf(a, topic, true), .seed = seed } };

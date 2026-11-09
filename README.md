@@ -17,8 +17,9 @@ the topic and lookup contracts. Version **0.20.0**.
   required as `chain/1`) with `ingest`. It is admitted on the chain app's
   first `accepted` or `proven` answer. A message's submitter is answered by message,
   in its own box: **admitted** (status `pending`, the STEAK per topic), then
-  **every proof**, or **rejected**. Nothing persists unless a topic takes
-  it, apart from the request. `/lookup` is a read.
+  **every proof**, or **rejected**. 0.25.0 (D6): a transaction the walk
+  comes to that no topic takes is ingested all the same while the chain app
+  does not hold it (its verdict the fact `rejected`). `/lookup` is a read.
 - **State under its own name.** The engine and its lookup services write
   only `<app>/state`, `<app>/topics`, `<app>/lookups`, `<app>/configured` and
   each lookup program's index `<app>/ls_<…>`; the app record is `<app>/app`. The chain state is the chain app's `chain/state`, read by
@@ -28,8 +29,9 @@ the topic and lookup contracts. Version **0.20.0**.
   verdict, no BEEF), published once by the step that admits a transaction;
   the host reads it and fetches the BEEF from the announcing peer (the sync
   protocol's `tx`), so bytes spread one hop at a time and each node fetches
-  once. `<topic>-proof` carries every proof the chain app takes (a reorg's
-  too); `<topic>-live` the beats, the runtime's liveness tool (unlogged).
+  once. (0.25.0: `<topic>-proof` is gone: proofs come by the host's Arcade
+  feed and its pull of mined history, as `proof` events in box `chain`.)
+  `<topic>-live` the beats, the runtime's liveness tool (unlogged).
 - **Beats** (0.12.0): every skein is a market and a validator, always. Each
   registered or (0.17.0) configured topic beats on `<topic>-live` with its view digest (and the
   app's terms: the head `<app>/terms` when it has written them, else
@@ -579,7 +581,7 @@ With a local SDK checkout: `zig build --fork=../skein-sdk`. skein runs this
 app end to end in `kernel-zig/equiv/overlay.ts` and `install-overlay.ts`,
 which clone this repo at a pinned commit (or take `$SKEIN_OVERLAY_DIR`).
 
-`equiv/overlay-events.ts` (0.24.0) runs this app and skein-chain 0.8.0 on a
+`equiv/overlay-events.ts` (0.25.0) runs this app and skein-chain 0.9.0 on a
 real kernel — the facts, the resting threads, a reorg, a rejection, a child
 woken by its parent's verdict, the store replayed exactly. It runs from a
 skein checkout (0.5.4 or later): copy it into `kernel-zig/equiv/`, then
@@ -605,9 +607,9 @@ the anchors and answers the sync protocol's frames (0.15.0).
 
 | | |
 |---|---|
-| this app and package | 0.24.0 (tag `v0.24.0`) |
-| skein-sdk | v0.17.2, by tag URL and hash in `build.zig.zon` (modules `chain` and, for the engine, `sk`; bsvz comes through it) |
-| requires | `chain/1` (shruggr/skein-chain 0.8.0: its facts `chain/tx/<txid>`) |
+| this app and package | 0.25.0 (tag `v0.25.0`) |
+| skein-sdk | v0.18.0, by tag URL and hash in `build.zig.zon` (modules `chain` and, for the engine, `sk`; bsvz comes through it) |
+| requires | `chain/1` (shruggr/skein-chain 0.9.0: its facts `chain/tx/<txid>`; a proof after a rejection is `mined`) |
 | skein | 0.5.4 or later (the event index, 0.5.0; a thread resting on a name, 0.5.4); the engine and the chain app installed as apps (a genesis program's record names no app, and emits no fact); skein's equivs pin this repo by commit |
 
 0.3.0 moved the state under `<app>/…`, made the chain app's answer the gate
@@ -1073,6 +1075,30 @@ replies, not both): it admits the submit event into `<app>` and waits on
 the subject with a `wait` message, answered when the subject is decided. An
 unproven seed of a registration is admitted and handed to the chain app;
 nothing follows its later statuses (open). skein-sdk v0.17.2.
+
+0.25.0 (2026-11-09): ONE FLOW, THE STATE READ (David 2026-11-09: "There is
+no deciding. There is reading the state"). D2: no proofs by gossip —
+`<topic>-proof`, its subscription, `peerProof`, `gossip.proven`, `proofBody`
+/ `parseProof` / `checkProof`, `proof_suffix` are gone; proofs reach the
+chain app by the host's Arcade feed and its pull (skein 0.6.0). D4: the
+receive row judges a fetched BEEF only under the ONE topic the frame names
+(the TaggedBEEF rule; none named, or one not served, refused). D5: paused and
+pending are one submission at two stages — a copy of a subject in flight is
+a duplicate, ignored (the route's `not isPaused` exception goes); a paused
+submission goes on in its OWN thread when routed whole (no fresh thread from
+`settle`); every wake reads the chain state (accepted or proven admits, oldest
+first); a rejection or a failed ingest deletes nothing (the record stays, not
+in flight; a later `mined` admits it on the same thread); the pending record
+names no thread. The thread's current submit event is its last result's
+`submission`, its awaited ingests its last result's `awaiting`. D6: the facts
+are the wake-ups, emitted for every transaction a submission walks — one no
+topic takes is an item while the chain app does not hold it (`wantedHere`,
+`isWaitedOn` and `pausedOn`'s scan of `pending` go). D7: a register's `seed`
+is the deploy's BEEF (the door's envelope, or bytes), submitted as an
+ordinary submission (a message into `<app>/submit`); `seeded` / `missing` /
+`untaken`, `submit.seed` and `heldAncestry` go; register answers `{topic,
+active}`. The chain state's `rejected` map no longer overrides a proof here
+either (route, `chainPlace`, spenders). skein-sdk v0.18.0.
 
 ## Contributing
 

@@ -1,4 +1,4 @@
-# Overlay services in the VM (0.24.0)
+# Overlay services in the VM (0.25.0)
 
 An overlay is an app (skein docs/APPS.md §6). It judges transactions with
 its topic managers and indexes them with its lookup services; it does not
@@ -9,6 +9,24 @@ its docs/CHAIN.md), under `chain/state`. The overlay reads it by CID and
 asks the chain app to take a transaction; what the chain app says about it
 (accepted, mined, rejected, reorged: its fact `chain/tx/<txid>`, skein-chain
 0.8.0) is the overlay's gate.
+
+**0.25.0 (David 2026-11-09: "There is no deciding. There is reading the
+state")**, over everything below that says otherwise: every wake of a
+submission's thread reads the chain state (an item accepted or proven and
+not applied by its topics is admitted, oldest first); a rejection or a failed
+ingest deletes nothing (the pending record stays, not in flight; a later
+`mined` — skein-chain 0.9.0: a proof is the latest fact, over a rejection —
+admits it on the same thread); paused and pending are one submission at two
+stages, a copy of a subject in flight is a duplicate, ignored; a paused
+submission routed whole goes on in its own thread (its current submit event
+is its last result's `submission`); the pending record names no thread; a
+transaction the walk comes to that no topic takes is an item while the chain
+app does not hold it (its verdict fact `rejected`), whoever listens (no scan
+for waiters); no proofs by gossip (`<topic>-proof`, `peerProof` gone: the
+host's Arcade feed and its pull deliver `proof` events in box `chain`); the
+receive row judges only under the one topic the frame names; a register's
+`seed` is the deploy's BEEF, submitted as an ordinary submission (a message
+into `<app>/submit`), the answer `{topic, active}`.
 
 **Facts, and threads resting on them** (0.24.0, David 2026-11-09). The
 chain app records every status of a transaction and emits it as the fact
@@ -886,8 +904,8 @@ emitted when the set changes:
 
 | call | events |
 |---|---|
-| `register` | `{event: "subscribe", topic: "<topic>", program: <engine's role>, fn: "submit"}` and the same for `<topic>-proof` with `fn: "peerProof"` (0.12.0: no `<topic>-admit`, no `filter`) |
-| `deregister` | `{event: "unsubscribe", topic}` for `<topic>`, `<topic>-proof` |
+| `register` | `{event: "subscribe", topic: "<topic>", program: <engine's role>, fn: "submit"}` (0.12.0: no `<topic>-admit`, no `filter`; 0.25.0: no `<topic>-proof`) |
+| `deregister` | `{event: "unsubscribe", topic}` for `<topic>` |
 | `register` | then `{event: "liveness", topic: "<topic>-live", window}` (the market) and `{event: "beacon", topic: "<topic>-live", every, body}` (the validator; `body` the topic's beat body, "Beats", below) — always (0.12.0) |
 | `deregister` | then `{event: "unliveness", topic: "<topic>-live"}` and `{event: "unbeacon", topic: "<topic>-live"}` |
 | an admission, a rejection, a register's seeds (0.12.0) | `{event: "beacon", topic: "<topic>-live", every, body}` again for each registered topic whose view digest the step changed |
@@ -1389,9 +1407,10 @@ uninstall removes them. That is skein's install and manifest format
 
 ## Gossip: the topics (#74; 0.20.0)
 
-For each overlay topic `<topic>` it runs, an overlay speaks three GossipSub
-topics (`src/gossip.zig`; `-proof` separate, "people waiting on a proof
-don't track admittance"; `-live` separate, unlogged, the liveness tool).
+For each overlay topic `<topic>` it runs, an overlay speaks two GossipSub
+topics (`src/gossip.zig`; `-live` separate, unlogged, the liveness tool;
+0.25.0: `<topic>-proof` is gone, and the `-proof` row and "Receiving `-proof`"
+below are history).
 0.20.0 (David 2026-10-30, "announce, then fetch"): the BEEF never travels
 the mesh. Bodies are dag-cbor; a txid and a block hash are hex in display
 order.
@@ -1399,7 +1418,7 @@ order.
 | topic | body | published | received |
 |---|---|---|---|
 | `<topic>` | `{kind: "admit", txid, topics: {<topic>: {outputsToAdmit: [vout], coinsToRetain: [input index]}}}` — the STEAK and the txid, **no BEEF** | once, by the step that **admits** a transaction, whatever path it came by: an admit is that peer's judgement | **by the host** (skein src/host/sync.ts), never delivered to the instance: unless the instance holds the txid or a fetch of it is under way, the host asks the announcing peer `{kind: "tx", topic, txid}` on the sync protocol and hands the BEEF to the receive row; per txid it keeps the set of announcing peers (on a failure the next; exhausted, it waits for a new admit); GossipSub's verdict is ignore (not forwarded: each node announces its own admission, so bytes spread one hop at a time) |
-| `<topic>-proof` | `{txid, blockHash, blockHeight, bump: bytes}` — `bump` the BRC-74 path of this txid alone | **every time** the chain app answers that a transaction a topic admitted is proven (a reorg's new proof too), unless that proof came by gossip (`via`) | `<topic>-proof` → `peerProof`: checked, then the proof-in path |
+| ~~`<topic>-proof`~~ | (0.20.0 to 0.24.0; gone in 0.25.0) | never | not subscribed |
 | `<topic>-live` | the runtime's beacon frame over the topic's beat body ("Beats", above) | on the host's timer only, every `every` ms (a re-declared body is what the next beat carries) | the runtime's liveness tool (unlogged), never this engine |
 
 Anything that reaches the engine's `<topic>` route (an `admit` from a host

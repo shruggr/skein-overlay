@@ -359,13 +359,13 @@ pub const State = struct {
     // ------------------------------------------------------------ pending submissions
 
     /// A pending record's fields (skein-overlay#1). A transaction handed to the chain app: `ingest`
-    /// (the message its answers name), `submission` (the subject of the submission it came in;
-    /// the thread carrying it), `heard` (an admitting
-    /// answer heard while an earlier transaction of the submission is still pending). A paused
-    /// submission: `waiting` (the parents neither in its BEEF nor held) and `event` (the submit
-    /// event, routed again when one of them arrives).
+    /// (the message its answers name), `submission` (the subject of the submission it came in),
+    /// `heard` (0.25.0: only `failed` — the chain app's answer to its ingest was an error; every
+    /// status is read from the chain state, David 2026-11-09: "There is no deciding. There is
+    /// reading the state"). A paused submission: `waiting` (the parents neither in its BEEF nor
+    /// held) and `event` (the submit event, routed again when one of them arrives). 0.25.0: no
+    /// `thread` — one submission per transaction while it is in flight (a copy is a duplicate).
     pub const Pending = struct {
-        thread: ?[]const u8 = null,
         submission: ?[32]u8 = null,
         ingest: ?[]const u8 = null,
         heard: ?[]const u8 = null,
@@ -389,7 +389,6 @@ pub const State = struct {
             .{ .key = "submission", .value = .{ .text = try a.dupe(u8, &hdr.toHex(p.submission orelse txid)) } },
         });
         if (p.ingest) |m| try fields.append(a, .{ .key = "ingest", .value = .{ .cid = m } });
-        if (p.thread) |t| try fields.append(a, .{ .key = "thread", .value = .{ .cid = t } });
         if (p.heard) |h| try fields.append(a, .{ .key = "heard", .value = .{ .text = h } });
         if (p.waiting.len > 0) {
             const ws = try a.alloc(Value, p.waiting.len);
@@ -436,12 +435,23 @@ pub const State = struct {
         return rec.getCid("ingest") != null;
     }
 
-    /// Whether this transaction is not settled here yet (0.19.0): in flight, or itself a paused
-    /// submission (undecided, or waiting on its own parents). A child spending it waits on it, with
-    /// no want (`heldParents`): judged now, its topic would read the parent's outputs as no coins.
-    pub fn isUnsettled(self: *State, txid: [32]u8) !bool {
+    /// Whether this transaction is in flight here (0.25.0, David 2026-11-09: paused and pending are
+    /// one submission at two stages): paused on parents, or handed to the chain app and neither
+    /// failed there (`heard: failed`) nor rejected by its latest status. A rejected one's record
+    /// stays (a rejection deletes nothing: a later proof admits it), but it is not in flight.
+    pub fn inFlight(self: *State, txid: [32]u8) !bool {
         const rec = (try self.pendingRecord(txid)) orelse return false;
-        return rec.getCid("ingest") != null or rec.get("waiting") != null;
+        if (rec.get("waiting") != null) return true;
+        if (rec.getCid("ingest") == null) return false;
+        if (std.mem.eql(u8, rec.getText("heard") orelse "", "failed")) return false;
+        return (try self.ch.status(txid)) != .rejected;
+    }
+
+    /// Whether this transaction is not settled here yet (0.19.0): in flight (0.25.0: `inFlight`). A
+    /// child spending it waits on it, with no want (`heldParents`): judged now, its topic would read
+    /// the parent's outputs as no coins.
+    pub fn isUnsettled(self: *State, txid: [32]u8) !bool {
+        return self.inFlight(txid);
     }
 
     /// A pending record's `spends` read back (0.20.5).
@@ -463,37 +473,11 @@ pub const State = struct {
             const rec = try self.record(kv.value.cid);
             if (rec.getCid("ingest") == null) continue;
             for (try self.spendsOf(rec)) |s| if (std.mem.eql(u8, &s, &op)) {
-                if (try self.ch.map("rejected").has(kv.key[0..32])) break;
+                if ((try self.ch.status(kv.key[0..32].*)) == .rejected) break;
                 return true;
             };
         }
         return false;
-    }
-
-    // ------------------------------------------------------------ waited-on parents (0.24.0: no index)
-
-    /// Whether a paused submission waits on `txid` (it is ingested when it arrives, taken by a topic or
-    /// not, so that its verdict is a fact and wakes the waiting thread): a scan of the pending records.
-    pub fn isWaitedOn(self: *State, txid: [32]u8) !bool {
-        return (try self.pausedOn(txid, null)).len > 0;
-    }
-
-    /// The paused submissions waiting on `txid` (their `waiting`), each once, in key order; only those
-    /// whose thread is `thread`, when it is named.
-    pub fn pausedOn(self: *State, txid: [32]u8, thread: ?[]const u8) ![][32]u8 {
-        const hex = hdr.toHex(txid);
-        var out: std.ArrayList([32]u8) = .empty;
-        for (try self.map("pending").prefixed("")) |kv| {
-            if (kv.key.len != 32 or kv.value != .cid) continue;
-            const rec = try self.record(kv.value.cid);
-            const ws = rec.getArray("waiting") orelse continue;
-            if (thread) |t| if (!std.mem.eql(u8, rec.getCid("thread") orelse "", t)) continue;
-            for (ws) |w| if (w == .text and std.mem.eql(u8, w.text, &hex)) {
-                try out.append(self.arena, kv.key[0..32].*);
-                break;
-            };
-        }
-        return out.items;
     }
 
     // ------------------------------------------------------------ judgements
@@ -513,7 +497,7 @@ pub const State = struct {
     fn spentByOther(self: *State, op: [36]u8, tx: [32]u8) !bool {
         for (try self.ch.spendersOf(op)) |sp| {
             if (std.mem.eql(u8, &sp, &tx)) continue;
-            if (!(try self.ch.map("rejected").has(&sp))) return true;
+            if ((try self.ch.status(sp)) != .rejected) return true;
         }
         return false;
     }
@@ -807,7 +791,7 @@ pub const State = struct {
         const r = (try self.ch.proofRecord(txid)) orelse return null;
         const block = store_mod.bitcoinHash(r.block) orelse return error.BadIndex;
         const height = (try self.ch.chain().heightOf(block)) orelse return null;
-        if (try self.ch.map("rejected").has(&txid)) return null;
+        // skein-sdk 0.18.0: a proof on our best chain is the latest fact, a rejection before it or not.
         return .{ .height = height, .offset = r.pos.offset, .block = block };
     }
 
@@ -1372,7 +1356,7 @@ pub fn verifyDecoded(a: Allocator, s: Store, ch: *Chain, d: Decoded, door: bool)
         }
     }
     const subject = try subjectOf(a, s, d.subject);
-    if (try ch.map("rejected").has(&d.subject)) return error.TransactionRejected;
+    if ((try ch.status(d.subject)) == .rejected) return error.TransactionRejected;
     const proven = try subjectProven(ch, d);
     for (subject.tx.inputs) |in| {
         const op = store_mod.outpointKey(in.previous_outpoint.txid.bytes, in.previous_outpoint.index);

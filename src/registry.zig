@@ -16,7 +16,7 @@
 //!               kernel call (no `step`: it writes nothing) is answered `bad-args`, nothing kept.
 //!
 //! Either way the same: the set under `<app>/topics` (`<app>/lookups`), the subscribe / liveness /
-//! beacon events (or their ends) emitted on the step, `seed` judged under the topic; the effects
+//! beacon events (or their ends) emitted on the step, `seed` submitted (0.25.0); the effects
 //! through `Fx` (engine_vm.zig `effects`: the `skein` imports; test.zig: in memory).
 const std = @import("std");
 const c = @import("chain");
@@ -140,7 +140,7 @@ fn topicBeat(a: Allocator, fx: Fx, step: Value, fargs: Value, r: topics.Roles) !
     return topics.beatBody(a, try loaded.st.beat(t), r.terms);
 }
 
-/// A registration's outcome: its result (`{topic | service, active, seeded?, missing?, untaken?}`)
+/// A registration's outcome: its result (`{topic | service, active}`)
 /// or why it was refused (nothing written, nothing emitted); the result record's fields either way.
 pub const Done = struct {
     result: ?Value = null,
@@ -152,7 +152,7 @@ pub const Done = struct {
 
 /// `register {topic, program, seed?}` / `deregister {topic}` (`func`), `fargs` its arguments; `gate`
 /// a refusal decided before (the message form's box). The set written under `<app>/topics` and the
-/// events emitted when it changes; with `seed`, the held seeds judged (`seeding`).
+/// events emitted when it changes; with `seed`, the deploy's BEEF submitted (`seeding`).
 pub fn topic(a: Allocator, fx: Fx, step: Value, fargs: Value, func: []const u8, gate: ?[]const u8) !Done {
     const s = fx.store;
     const head = try topics.headName(a, calls.appOf(step));
@@ -182,14 +182,13 @@ pub fn topic(a: Allocator, fx: Fx, step: Value, fargs: Value, func: []const u8, 
                 try fields.append(a, .{ .key = "topics", .value = .{ .cid = rc } });
             }
             for (d.events) |ev| _ = try fx.emit(a, ev);
-            var answer = d.answer;
-            if (d.seed) |seeds| answer = try seeding(a, fx, step, d.list orelse list, answer, seeds, &fields, rl.?);
+            if (d.seed) |sd| try seeding(a, fx, step, d.answer.getText("topic").?, sd, &fields);
             try fields.appendSlice(a, &.{
                 .{ .key = "topic", .value = d.answer.get("topic").? },
                 .{ .key = "active", .value = d.answer.get("active").? },
                 .{ .key = "changed", .value = .{ .boolean = d.list != null } },
             });
-            return .{ .result = answer, .fields = fields.items };
+            return .{ .result = d.answer, .fields = fields.items };
         },
     }
 }
@@ -239,49 +238,20 @@ pub fn lookup(a: Allocator, fx: Fx, step: Value, fargs: Value, func: []const u8,
     }
 }
 
-/// A register's `seed` (0.7.8, submit.zig `seed`): each seed the chain state holds judged under the
-/// topic just registered, with the configuration as it is with the set `list` (the one this step
-/// wrote); the records kept, the state saved. → the answer with `seeded`, `missing` (and `untaken`
-/// when a held seed is taken by nothing); the result record gets them and `state`.
-fn seeding(a: Allocator, fx: Fx, step: Value, list: []const topics.Entry, answer: Value, seeds: []const [32]u8, fields: *std.ArrayList(cbor.Entry), rl: topics.Roles) !Value {
-    const t = answer.getText("topic").?;
-    const in = try config.withTopics(a, step, list);
-    var loaded = try fx.load(a, in);
-    loaded.st.now = @intCast(step.getUint("at") orelse 0);
-    const cx = submit.Ctx{ .a = a, .caller = fx.caller, .wire = try fx.wire(in), .st = &loaded.st, .in = in };
-    const sd = try submit.seed(cx, t, seeds);
-    for (sd.records) |r| try fx.keep(r);
-    // The events the seeds' lookup hooks asked for (0.20.4), in order.
-    for (loaded.st.lookup_events.items) |e| _ = try fx.emit(a, e);
-    // The view the seeds changed: the beacons re-declared (0.12.0), over the set this step wrote.
-    const beats = try topics.beatEvents(a, rl, list, try lookupNames(a, fx, step), try loaded.st.beatChanges(), loaded.st.lookup_beats.items);
-    for (beats) |e| _ = try fx.emit(a, e);
-    if (beats.len > 0) try fields.append(a, .{ .key = "beats", .value = .{ .uint = beats.len } });
-    const new_state = try loaded.st.save();
-    if (loaded.head == null or !eql(u8, loaded.head.?, new_state)) try fx.advance(try stateHead(a, in), new_state);
-    var out: std.ArrayList(cbor.Entry) = .empty;
-    try out.appendSlice(a, answer.map);
-    try out.appendSlice(a, &.{
-        .{ .key = "seeded", .value = .{ .array = try hexes(a, sd.seeded) } },
-        .{ .key = "missing", .value = .{ .array = try hexes(a, sd.missing) } },
-    });
-    if (sd.untaken.len > 0) try out.append(a, .{ .key = "untaken", .value = .{ .array = try hexes(a, sd.untaken) } });
-    try fields.appendSlice(a, out.items[answer.map.len..]);
-    if (sd.admissions.len > 0) {
-        const xs = try a.alloc(Value, sd.admissions.len);
-        for (sd.admissions, xs) |adm, *x| x.* = .{ .map = try a.dupe(cbor.Entry, &.{
-            .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &c.header.toHex(adm.txid)) } },
-            .{ .key = "steak", .value = try steakOf(a, adm.topics, adm.applied) },
-        }) };
-        try fields.append(a, .{ .key = "admissions", .value = .{ .array = xs } });
-    }
-    try fields.append(a, .{ .key = "state", .value = .{ .cid = new_state } });
-    return .{ .map = out.items };
-}
-
-/// The head the overlay's state lives under: `<app>/state` (engine_vm.zig `stateHead`).
-fn stateHead(a: Allocator, in: Value) ![]const u8 {
-    return std.fmt.allocPrint(a, "{s}/state", .{calls.appOf(in)});
+/// A register's `seed` (0.25.0, David 2026-11-09): the deploy's BEEF submitted as an ordinary
+/// submission — the message `{fn: "submit", args: {beef: <seed>, topics: [topic]}}` to the instance
+/// itself in the box `<app>/submit` (routes.zig `submitBox`): the topic manager, the chain app's
+/// ingest, the submission's thread on `chain/tx/<txid>`. The result record names the message (`seed`).
+fn seeding(a: Allocator, fx: Fx, step: Value, t: []const u8, seed: Value, fields: *std.ArrayList(cbor.Entry)) !void {
+    const body: Value = .{ .map = try a.dupe(cbor.Entry, &.{
+        .{ .key = "fn", .value = .{ .text = "submit" } },
+        .{ .key = "args", .value = .{ .map = try a.dupe(cbor.Entry, &.{
+            .{ .key = "beef", .value = seed },
+            .{ .key = "topics", .value = .{ .array = try a.dupe(Value, &.{.{ .text = t }}) } },
+        }) } },
+    }) };
+    const m = try (try fx.wire(step)).send(a, try std.fmt.allocPrint(a, "{s}/submit", .{calls.appOf(step)}), body);
+    try fields.append(a, .{ .key = "seed", .value = .{ .cid = m } });
 }
 
 // ---------------------------------------------------------------- by call (0.18.0)
