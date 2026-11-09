@@ -31,7 +31,6 @@ const calls = @import("src/calls.zig");
 const routes = @import("src/routes.zig");
 const configured = @import("src/configured.zig");
 const registry = @import("src/registry.zig");
-const reindex = @import("src/reindex.zig");
 
 const bsvz = c.bsvz;
 const beef = c.beef;
@@ -213,9 +212,6 @@ const Instance = struct {
     chain_root: ?[]const u8 = null,
     ov_root: ?[]const u8 = null,
     ls_state: ?[]const u8 = null,
-    /// 0.23.0: the lookup's reindex state (the head `<head>.reindex`), and the roles a reindex runs for.
-    ls_reindex: ?[]const u8 = null,
-    reindexing: []const []const u8 = &.{},
     in: Value,
     now: i64 = 1000,
     topic_prog: []const u8,
@@ -277,16 +273,8 @@ const Instance = struct {
         }
         if (std.mem.eql(u8, program, self.lookup_prog)) {
             try std.testing.expectEqualStrings("overlay", arg.getText("app").?);
-            // 0.23.0: fn "reindex" moves the two heads; a hook with `reindex: true` writes the reindex's.
-            if (std.mem.eql(u8, func, "reindex")) {
-                const r = try lookup.reindexOp(a, self.ls_spec, self.current, arg, self.ls_reindex);
-                if (r.live) |l| self.ls_state = l;
-                self.ls_reindex = r.partial;
-                return r.answer;
-            }
-            const rx = lookup.isReindex(arg);
-            const h = try lookup.handle(a, self.ls_spec, self.current, .regtest, if (rx) self.ls_reindex else self.ls_state, self.chain_root, func, arg);
-            if (h.state) |sc| (if (rx) self.ls_reindex else self.ls_state) = sc;
+            const h = try lookup.handle(a, self.ls_spec, self.current, .regtest, self.ls_state, self.chain_root, func, arg);
+            if (h.state) |sc| self.ls_state = sc;
             return h.answer;
         }
         return error.UnknownProgram;
@@ -366,7 +354,6 @@ const Instance = struct {
         ch.* = try c.open(self.a, self.ms.store(), self.chain_root, .regtest);
         var st = try state.State.load(self.a, self.ms.store(), self.ov_root, ch);
         st.now = self.now;
-        st.reindexing = self.reindexing;
         return st;
     }
 
@@ -3241,12 +3228,9 @@ test "one box per function class (skein #128, 0.7.5, 0.7.7): register only in `<
     const mj = try std.json.parseFromSliceLeaky(std.json.Value, a, @embedFile("etc/app.json"), .{});
     const gated = mj.object.get("roles").?.object.get("root").?.array.items;
     // The lookup registrations (0.11.0) listed beside register: the same route, the same gate; no
-    // `market` / `validator` (0.12.0: always both, no switch); 0.23.0: `reindex`, its own box's.
-    try std.testing.expectEqual(@as(usize, 4), gated.len);
-    for ([_][]const u8{ "register", "registerLookup", "deregisterLookup", "reindex" }, gated) |w, g| try std.testing.expectEqualStrings(w, g.string);
-    const rx = (try manifestRoute(a, "mailbox", "reindex")).?;
-    try std.testing.expectEqualStrings("overlay.reindex", rx.get("handler").?.string);
-    try std.testing.expect(rx.get("filters") == null);
+    // `market` / `validator` (0.12.0: always both, no switch).
+    try std.testing.expectEqual(@as(usize, 3), gated.len);
+    for ([_][]const u8{ "register", "registerLookup", "deregisterLookup" }, gated) |w, g| try std.testing.expectEqualStrings(w, g.string);
     try std.testing.expect(mj.object.get("dispatch") == null and mj.object.get("reads") == null);
 
     // Submit accepted in `<app>/submit`: launched, the submitter answered in that box.
@@ -4895,161 +4879,4 @@ test "a truthful answer (0.20.5): a submission whose admission applied nothing i
     try std.testing.expect(try inst.applied(t1.txid));
     var ch = try inst.chain();
     try std.testing.expectEqual(c.state.Status.unproven, try ch.status(se.txid));
-}
-
-/// One step of a reindex's walk (reindex.zig), as the engine's thread runs it: the next transaction,
-/// its hooks with `reindex: true`, the cursor past it. → the transaction, or null (nothing left).
-fn reindexStep(inst: *Instance, t: reindex.Target, cur: *reindex.Cursor) !?[32]u8 {
-    var st = try inst.load();
-    const item = (try reindex.next(inst.a, &st, cur.*)) orelse return null;
-    try std.testing.expect(try reindex.walk(inst.a, inst.caller(), inst.in, &st, t, cur.*, item));
-    cur.* = try reindex.advance(inst.a, cur.*, item);
-    return item.txid;
-}
-
-test "reindex (0.23.0, David 2026-11-07): a lookup's index derived again from the topic's admitted history, mined by height and offset then the tail, a parent before its child; byte for byte the live index; an admission during the walk lands, a rejection during it reaches both; the switch; one at a time" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const a = arena_state.allocator();
-    var ms = c.store.MemStore.init(std.testing.allocator);
-    defer ms.deinit();
-    var inst = try Instance.init(a, &ms);
-    const k = try keys(0x42);
-    const f = try fund(a, 0x5a, 4, &k.p2pkh);
-    try inst.headers(&.{&f.h1});
-    // t1 → t2 (a spend of t1's token: `spent`) mined together at 2, t3 alone at 3, t4 in the tail.
-    const t1 = try spend(a, &f.tx, 0, &.{.{ 1, &k.token }}, k.priv);
-    const t2 = try spend(a, &t1.tx, 0, &.{.{ 1, &k.token }}, k.priv);
-    const t3 = try spend(a, &f.tx, 1, &.{.{ 1, &k.token }}, k.priv);
-    const t4 = try spend(a, &f.tx, 2, &.{.{ 1, &k.token }}, k.priv);
-    // t5 spends t4's token and, admitted at the same time, sorts BEFORE it by txid (the tail's tie-break):
-    // the walk must still take t4 first.
-    var t5: Spent = undefined;
-    var sats: u64 = 1;
-    while (true) : (sats += 1) {
-        t5 = try spend(a, &t4.tx, 0, &.{.{ sats, &k.token }}, k.priv);
-        if (std.mem.order(u8, &t5.txid, &t4.txid) == .lt) break;
-    }
-    const t6 = try spend(a, &f.tx, 3, &.{.{ 1, &k.token }}, k.priv);
-    const h2 = mine(hdr.hash(&f.h1), dbl(t1.txid, t2.txid), 1_700_001_000);
-    const h3 = mine(hdr.hash(&h2), t3.txid, 1_700_001_600);
-    try inst.headers(&.{ &h2, &h3 });
-    const pair = try pairPath(a, 2, t1.txid, t2.txid);
-    try admittedProven(&inst, try withFund(a, f, t1), t1.txid, pair);
-    try admittedProven(&inst, try atomic(a, t2), t2.txid, pair);
-    try admittedProven(&inst, try withFund(a, f, t3), t3.txid, try soloPath(a, 3, t3.txid));
-    _ = try inst.admitted(try withFund(a, f, t4), t4.txid);
-    try std.testing.expectEqual(@as(usize, 3), try inst.lookTopic()); // t2, t3, t4 unspent
-
-    // ------------------------------------------------ the target: ls_demo's role, its one topic, the listener the hooks reach
-    const t = (try reindex.targetOf(a, inst.in, "ls_demo")).?;
-    try std.testing.expectEqualStrings("lookup-demo", t.role);
-    try std.testing.expectEqual(@as(usize, 1), t.topics.len);
-    try std.testing.expectEqualStrings("tm_demo", t.topics[0]);
-    try std.testing.expect((try reindex.targetOf(a, inst.in, "ls_nobody")) == null);
-
-    // ------------------------------------------------ begin: the reindex's head the empty index; the live head untouched
-    const live_before = inst.ls_state.?;
-    const begun = try calls.reindexCall(a, inst.caller(), inst.in, t.listeners[0], "begin");
-    try std.testing.expectEqualStrings("begin", begun.getText("op").?);
-    try std.testing.expectEqualStrings("ls_demo", begun.getText("index").?);
-    try std.testing.expectEqualSlices(u8, live_before, inst.ls_state.?);
-    const empty = inst.ls_reindex.?;
-    inst.reindexing = &.{t.role};
-    var cur = try reindex.start(a, t.topics);
-
-    // ------------------------------------------------ the walk: t1, t2 (mined at 2, in block order), t3 (at 3) …
-    try std.testing.expectEqualSlices(u8, &t1.txid, &(try reindexStep(&inst, t, &cur)).?);
-    // An admission during the walk (t5, spending t4: the tail) — the live hooks write the live head.
-    _ = try inst.admitted(try atomic(a, t5), t5.txid);
-    try std.testing.expectEqualSlices(u8, &t2.txid, &(try reindexStep(&inst, t, &cur)).?);
-    // The index's own head keeps answering (t2, t3, t5), the reindex's holds only what it walked.
-    try std.testing.expectEqual(@as(usize, 3), try inst.lookTopic());
-    try std.testing.expectEqualSlices(u8, &t3.txid, &(try reindexStep(&inst, t, &cur)).?);
-    // … then the tail: t4 before its child t5 though t5 sorts first.
-    {
-        var st = try inst.load();
-        const tail = try st.tailTxids("tm_demo");
-        try std.testing.expectEqualSlices(u8, &t5.txid, &tail[0]);
-    }
-    try std.testing.expectEqualSlices(u8, &t4.txid, &(try reindexStep(&inst, t, &cur)).?);
-    // t6 admitted now (later than t4 and t5), walked, then rejected: its `rejected` hook reaches the
-    // reindex's state too.
-    inst.now = 2000;
-    _ = try inst.admitted(try withFund(a, f, t6), t6.txid);
-    try std.testing.expectEqualSlices(u8, &t5.txid, &(try reindexStep(&inst, t, &cur)).?);
-    try std.testing.expectEqualSlices(u8, &t6.txid, &(try reindexStep(&inst, t, &cur)).?);
-    {
-        try std.testing.expect(!(try inst.watchStart(t6.txid)).done);
-        _ = try inst.chainStatus(t6.txid, "DOUBLE_SPEND_ATTEMPTED", null);
-        const done = try inst.watched(t6.txid, .{ .rejected = "DOUBLE_SPEND_ATTEMPTED" });
-        try std.testing.expect(done.done and done.unapplied.len == 1);
-    }
-    // Nothing left in any topic: the last step.
-    try std.testing.expect((try reindexStep(&inst, t, &cur)) == null);
-    // Byte for byte what the live hooks built.
-    try std.testing.expect(!std.mem.eql(u8, live_before, inst.ls_state.?));
-    try std.testing.expectEqualSlices(u8, inst.ls_state.?, inst.ls_reindex.?);
-
-    // ------------------------------------------------ the switch: the index's head the new index, the reindex's the empty one
-    const rebuilt = inst.ls_reindex.?;
-    const sw = try calls.reindexCall(a, inst.caller(), inst.in, t.listeners[0], "switch");
-    try std.testing.expectEqualSlices(u8, rebuilt, sw.getCid("root").?);
-    try std.testing.expectEqualSlices(u8, rebuilt, inst.ls_state.?);
-    try std.testing.expectEqualSlices(u8, empty, inst.ls_reindex.?);
-    inst.reindexing = &.{};
-    try std.testing.expectEqual(@as(usize, 3), try inst.lookTopic()); // t2, t3, t5
-
-    // ------------------------------------------------ a fresh reindex of the same history: the same index again
-    _ = try calls.reindexCall(a, inst.caller(), inst.in, t.listeners[0], "begin");
-    var again = try reindex.start(a, t.topics);
-    var n: usize = 0;
-    while (try reindexStep(&inst, t, &again)) |_| n += 1;
-    try std.testing.expectEqual(@as(usize, 5), n); // t1, t2, t3, t4, t5 (t6 rejected: no longer applied)
-    try std.testing.expectEqualSlices(u8, inst.ls_state.?, inst.ls_reindex.?);
-    // abort: the reindex's head the empty index; the live head untouched.
-    _ = try calls.reindexCall(a, inst.caller(), inst.in, t.listeners[0], "abort");
-    try std.testing.expectEqualSlices(u8, empty, inst.ls_reindex.?);
-    try std.testing.expectEqualSlices(u8, rebuilt, inst.ls_state.?);
-    try std.testing.expectError(error.BadArgs, lookup.reindexOp(a, ls.spec, ms.store(), .{ .map = try a.dupe(cbor.Entry, &.{
-        .{ .key = "kind", .value = .{ .text = "lookup-reindex" } },
-        .{ .key = "service", .value = .{ .text = "ls_demo" } },
-        .{ .key = "op", .value = .{ .text = "sideways" } },
-    }) }, null));
-}
-
-test "reindex (0.23.0): the engine's record — one reindex at a time per service, the roles a rejection reaches, what each came to; the box; the cursor round-trips" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const a = arena_state.allocator();
-    const thread = try a.dupe(u8, &cbor.cidOf("a thread"));
-    try std.testing.expect(reindex.running(null, "ls_x") == null);
-    const r1 = try reindex.withRunning(a, null, "ls_x", thread, "lookup-x", 1000);
-    try std.testing.expect(reindex.running(r1, "ls_x") != null); // a second reindex of ls_x: refused (engine.zig)
-    try std.testing.expect(reindex.running(r1, "ls_y") == null);
-    const r2 = try reindex.withRunning(a, r1, "ls_y", thread, "lookup-y", 1001);
-    try std.testing.expectEqual(@as(usize, 2), (try reindex.roles(a, r2)).len);
-    const result: Value = .{ .map = try a.dupe(cbor.Entry, &.{.{ .key = "transactions", .value = .{ .uint = 7 } }}) };
-    const r3 = try reindex.withDone(a, r2, "ls_x", result);
-    try std.testing.expect(reindex.running(r3, "ls_x") == null);
-    try std.testing.expectEqual(@as(u64, 7), reindex.last(r3, "ls_x").?.getUint("transactions").?);
-    const roles = try reindex.roles(a, r3);
-    try std.testing.expectEqual(@as(usize, 1), roles.len);
-    try std.testing.expectEqualStrings("lookup-y", roles[0]);
-    // Read back as the store keeps it (canonical dag-cbor): the same.
-    const back = try cbor.decode(a, try cbor.encode(a, r3));
-    try std.testing.expect(reindex.running(back, "ls_y") != null);
-    // The box: `<app>/reindex` only.
-    const in_box: Value = .{ .map = try a.dupe(cbor.Entry, &.{.{ .key = "box", .value = .{ .text = "amm/reindex" } }}) };
-    const other: Value = .{ .map = try a.dupe(cbor.Entry, &.{.{ .key = "box", .value = .{ .text = "amm/register" } }}) };
-    try std.testing.expect(reindex.isBox(in_box, "amm") and !reindex.isBox(other, "amm") and !reindex.isBox(in_box, "overlay"));
-    // The cursor through a record and back.
-    var cur = try reindex.start(a, &.{ "tm_a", "tm_b" });
-    cur = try reindex.advance(a, cur, .{ .topic = 0, .txid = .{1} ** 32, .mined = "key" });
-    cur = try reindex.advance(a, cur, .{ .topic = 1, .txid = .{2} ** 32 });
-    const rt = try reindex.cursorOf(a, try cbor.decode(a, try cbor.encode(a, try reindex.cursorValue(a, cur))));
-    try std.testing.expectEqualStrings("key", rt.topics[0].mined.?);
-    try std.testing.expectEqual(@as(usize, 0), rt.topics[0].tail.len);
-    try std.testing.expect(rt.topics[1].mined == null);
-    try std.testing.expectEqualSlices(u8, &(.{2} ** 32), &rt.topics[1].tail[0]);
 }

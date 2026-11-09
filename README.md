@@ -4,7 +4,7 @@ The overlay services engine for a [skein](https://github.com/shruggr/skein),
 as an app: BRC-22 submit and BRC-24 lookup, served by the instance's own
 front door, with topic managers and lookup services as programs the engine
 calls. It is also a Zig package: an overlay of your own depends on it for
-the topic and lookup contracts. Version **0.23.0**.
+the topic and lookup contracts. Version **0.20.0**.
 
 ## What it is
 
@@ -1032,21 +1032,6 @@ no longer copies the output's `script` and `satoshis` (the transaction it
 links holds them; nothing read them). `placed` stays (without it a reorg's new
 proof leaves the engine no way to find the `mined` row it wrote for the
 transaction, short of a scan of the topic's `mined`).
-
-0.23.0 (2026-11-07): REINDEX (David 2026-11-07). A lookup service's index is
-derived again from its topics' admitted history in place: root's `{fn:
-"reindex", args: {service}}` in the box `<app>/reindex` (the handler
-`overlay.reindex`, gated by root) starts a thread of the engine that walks the
-admitted transactions in admission order (mined by height and offset, then the
-tail; a parent before its child), one per step, resting on a deadline between,
-and re-runs the service's hooks over each with `reindex: true` into the head
-`<app>/<index>.reindex` while the index's own head keeps answering; the step
-that finds nothing left names the index's head the new index (fn `reindex`
-`switch` of the lookup contract). One reindex at a time per service (`reindex
-in progress`); `<app>/reindex` records what runs and what each came to; a
-rejection meanwhile reaches the reindex's state too. docs/OVERLAY.md "Reindex a
-lookup service". A lookup program must be built against this version to take
-fn `reindex` (a re-pin).
 
 ## Contributing
 

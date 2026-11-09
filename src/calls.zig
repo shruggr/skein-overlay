@@ -139,12 +139,6 @@ fn uints(a: Allocator, xs: []const u32) ![]Value {
 }
 
 fn hookArg(a: Allocator, in: Value, l: Listener, topic: []const u8, rest: []const cbor.Entry) !Value {
-    return hookArgOf(a, in, l, topic, rest, false);
-}
-
-/// A hook's argument; `reindex` (0.23.0): the reindex thread's, `reindex: true` (lookup.zig: the
-/// service's state the head `<head>.reindex`).
-fn hookArgOf(a: Allocator, in: Value, l: Listener, topic: []const u8, rest: []const cbor.Entry, reindex: bool) !Value {
     var es: std.ArrayList(cbor.Entry) = .empty;
     try es.appendSlice(a, &.{
         .{ .key = "kind", .value = .{ .text = "lookup-hook" } },
@@ -154,7 +148,6 @@ fn hookArgOf(a: Allocator, in: Value, l: Listener, topic: []const u8, rest: []co
         .{ .key = "topic", .value = .{ .text = topic } },
     });
     try es.appendSlice(a, rest);
-    if (reindex) try es.append(a, .{ .key = "reindex", .value = .{ .boolean = true } });
     return .{ .map = es.items };
 }
 
@@ -185,42 +178,23 @@ fn hooked(a: Allocator, answer: Value, out: *st.State) !void {
 /// `spent(topic, outpoint, spendingTx)` for each previous coin it consumed. The beat bodies the
 /// hooks answer go onto `out.lookup_beats` (0.12.0), their events onto `out.lookup_events` (0.20.4).
 pub fn hookAdmitted(a: Allocator, caller: Caller, in: Value, topic: []const u8, sub: st.Subject, previous: []const u32, applied: st.Applied, out: *st.State) !void {
-    for (try hookTargets(a, in, topic)) |l| try hookAdmittedTo(a, caller, in, l, topic, sub, previous, applied, out, false);
-}
-
-/// One lookup program's `admitted`, then its `spent` for each previous coin, as `hookAdmitted` calls
-/// them; `reindex` (0.23.0, reindex.zig): the reindex thread's call — `reindex: true` on each
-/// argument, and what the hooks answer (beats, events) dropped (`out` is not touched).
-pub fn hookAdmittedTo(a: Allocator, caller: Caller, in: Value, l: Listener, topic: []const u8, sub: st.Subject, previous: []const u32, applied: st.Applied, out: *st.State, reindex: bool) !void {
-    const ans = try caller.call(a, l.program, "admitted", try hookArgOf(a, in, l, topic, &.{
-        .{ .key = "tx", .value = .{ .cid = sub.cid } },
-        .{ .key = "outputsToAdmit", .value = .{ .array = try uints(a, applied.outputs_to_admit) } },
-        .{ .key = "coinsRetained", .value = .{ .array = try uints(a, applied.coins_to_retain) } },
-    }, reindex));
-    if (!reindex) try hooked(a, ans, out);
-    for (previous) |p| {
-        const in_ = sub.tx.inputs[p];
-        const sp = try caller.call(a, l.program, "spent", try hookArgOf(a, in, l, topic, &.{
-            .{ .key = "outpoint", .value = .{ .map = try a.dupe(cbor.Entry, &.{
-                .{ .key = "tx", .value = .{ .cid = try a.dupe(u8, &store_mod.hashCid(.tx, in_.previous_outpoint.txid.bytes)) } },
-                .{ .key = "vout", .value = .{ .uint = in_.previous_outpoint.index } },
-            }) } },
-            .{ .key = "spendingTx", .value = .{ .cid = sub.cid } },
-        }, reindex));
-        if (!reindex) try hooked(a, sp, out);
+    for (try hookTargets(a, in, topic)) |l| {
+        try hooked(a, try caller.call(a, l.program, "admitted", try hookArg(a, in, l, topic, &.{
+            .{ .key = "tx", .value = .{ .cid = sub.cid } },
+            .{ .key = "outputsToAdmit", .value = .{ .array = try uints(a, applied.outputs_to_admit) } },
+            .{ .key = "coinsRetained", .value = .{ .array = try uints(a, applied.coins_to_retain) } },
+        })), out);
+        for (previous) |p| {
+            const in_ = sub.tx.inputs[p];
+            try hooked(a, try caller.call(a, l.program, "spent", try hookArg(a, in, l, topic, &.{
+                .{ .key = "outpoint", .value = .{ .map = try a.dupe(cbor.Entry, &.{
+                    .{ .key = "tx", .value = .{ .cid = try a.dupe(u8, &store_mod.hashCid(.tx, in_.previous_outpoint.txid.bytes)) } },
+                    .{ .key = "vout", .value = .{ .uint = in_.previous_outpoint.index } },
+                }) } },
+                .{ .key = "spendingTx", .value = .{ .cid = sub.cid } },
+            })), out);
+        }
     }
-}
-
-/// A lookup program's fn "reindex" (0.23.0, lookup.zig `reindexOp`): `op` begin, switch or abort, for
-/// the listener `l` → its answer.
-pub fn reindexCall(a: Allocator, caller: Caller, in: Value, l: Listener, op: []const u8) !Value {
-    return caller.call(a, l.program, "reindex", .{ .map = try a.dupe(cbor.Entry, &.{
-        .{ .key = "kind", .value = .{ .text = "lookup-reindex" } },
-        .{ .key = "app", .value = .{ .text = appOf(in) } },
-        .{ .key = "service", .value = .{ .text = l.service } },
-        .{ .key = "program", .value = .{ .text = l.role } },
-        .{ .key = "op", .value = .{ .text = op } },
-    }) });
 }
 
 /// The judgements a rejection removed (`State.unapply`): each topic's lookup programs' (once each,
@@ -231,12 +205,6 @@ pub fn hookRejected(a: Allocator, caller: Caller, in: Value, gone: []const st.Un
         const tc = try a.dupe(u8, &store_mod.hashCid(.tx, g.txid));
         for (try hookTargets(a, in, g.topic)) |l| {
             try hooked(a, try caller.call(a, l.program, "rejected", try hookArg(a, in, l, g.topic, &.{.{ .key = "tx", .value = .{ .cid = tc } }})), out);
-            // 0.23.0: a program being reindexed (`out.reindexing`, its role) hears the rejection in its
-            // reindex's state too — the walk may have passed the transaction already; a hook that was
-            // never told of the transaction does nothing with it. What it answers is dropped.
-            for (out.reindexing) |r| if (std.mem.eql(u8, r, l.role)) {
-                _ = try caller.call(a, l.program, "rejected", try hookArgOf(a, in, l, g.topic, &.{.{ .key = "tx", .value = .{ .cid = tc } }}, true));
-            };
         }
     }
 }
