@@ -275,7 +275,6 @@ fn seeding(a: Allocator, fx: Fx, step: Value, list: []const topics.Entry, answer
         }) };
         try fields.append(a, .{ .key = "admissions", .value = .{ .array = xs } });
     }
-    if (sd.watches.len > 0) try fields.append(a, .{ .key = "watches", .value = .{ .array = try cids(a, sd.watches) } });
     try fields.append(a, .{ .key = "state", .value = .{ .cid = new_state } });
     return .{ .map = out.items };
 }

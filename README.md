@@ -54,7 +54,8 @@ first and judges every transaction of the requested topics before the
 subject; each one a topic takes is ingested through the chain app on its
 own and admitted, in order, on its own answer (skein-overlay#1). A
 submission whose parent is neither in the BEEF nor held pauses, however it
-came: it is noted pending, waiting on those parents (the index `waits`).
+came: it is noted pending, waiting on those parents, and its thread rests
+on each one's verdict (0.24.0: no `waits` index).
 Nothing is asked of anyone for them (0.20.0: the `want` / `unwant` events
 are gone): a parent arrives by any path — a later submission, a BEEF the
 host fetched on a peer's admit or from a peer's tail list, a pull of mined
@@ -69,15 +70,21 @@ topic manager cannot decide — it fails `MissingParents`, naming the input
 sources it cannot read — pauses the same way on those (0.19.0): no
 verdict, nothing rejected, judged again as each arrives; one whose sources
 exist nowhere stays one undecided record (David: "not a big deal"). The
-pause is internal: the submitter hears nothing of it. Every admitted
-transaction sends the app itself a `watch`, which waits for `proven`
-(publishes `-proof`) or `rejected` (unwinds); each proof is published
-(0.20.0: a reorg's new proof too, not one that came by gossip on `-proof`)
-and relayed to a submitter if there is one, and a new watch waits for the
-next. Not built: the decided direction of shruggr/skein#31
-("Decided 2026-10-02 (night)"): a reference to a transaction is a
-registration for the life of the transaction, and a judgement is re-run
-when the chain state it depended on changes.
+pause is internal: the submitter hears nothing of it.
+
+0.24.0 (David 2026-11-09): every status of a transaction is the chain app's
+fact `chain/tx/<txid>` (skein-chain 0.8.0), and the submission's thread
+rests on it for the transaction's life (skein 0.5.4): each wake reads the
+status and updates the state — admits on accepted or mined, unwinds on
+rejected, places it on a proof (published on `-proof`, relayed to a
+submitter), moves it back to the tail on a reorg — and answers a submitter
+still waiting. No watch message, no watch thread. The overlay's verdicts are
+facts too: `<app>/topic/tx/<txid>` `{verdict: undecided | admitted |
+rejected | reverted}` and `<app>/topic/output/<txid>.<vout>` `{state:
+admitted | spent | reverted, spentBy?}`; a paused submission's thread rests
+on its parents' `<app>/topic/tx/<txid>` and is routed again when one is
+decided. Not built: the rest of shruggr/skein#31 ("Decided 2026-10-02
+(night)"): a judgement re-run when the chain state it depended on changes.
 
 ## Use it
 
@@ -282,8 +289,9 @@ handler, and no sender; who may run a function is `roles`.
   recorded and runs nothing). Root may grant the function to others with
   an app role of its own; the manifest declares none.
 - The derived routes on `<app>` take the receive row's admits (a fetched
-  submission's routed event; the `event` route) and the engine's own
-  `watch`, `resume` and `wait` (the `mailbox` route, by the host's loopback). The engine takes only the instance's
+  submission's routed event; the `event` route), POST /submit's admitted
+  submit event (0.24.0) and the engine's own `wait` and `rebeat` (the
+  `mailbox` route, by the host's loopback). The engine takes only the instance's
   own messages there (`NotFromThisInstance` otherwise). An app that puts
   another program on its box `<app>` overrides the derived mailbox route
   and breaks those: keep `<app>` the engine's.
@@ -442,7 +450,8 @@ Per topic the engine keeps BRC-136's anchor chain, in `<app>/state`:
   a view digest (count and sum).
 
 A transaction is placed when the engine learns its proof: admitted at its
-proof, or a watch hearing `proven` (a reorg's proof moves it). A rejection
+proof, or its submission's thread hearing the chain app's `mined` (a reorg's
+proof moves it; `reorged` puts it back in the tail). A rejection
 removes it. The anchors from the lowest height touched to the tip are
 computed again at the end of the step, and the beacon is declared again
 when the beat changed. The beat carries `tipHeight` and `tipAnchor` (absent
@@ -570,6 +579,14 @@ With a local SDK checkout: `zig build --fork=../skein-sdk`. skein runs this
 app end to end in `kernel-zig/equiv/overlay.ts` and `install-overlay.ts`,
 which clone this repo at a pinned commit (or take `$SKEIN_OVERLAY_DIR`).
 
+`equiv/overlay-events.ts` (0.24.0) runs this app and skein-chain 0.8.0 on a
+real kernel — the facts, the resting threads, a reorg, a rejection, a child
+woken by its parent's verdict, the store replayed exactly. It runs from a
+skein checkout (0.5.4 or later): copy it into `kernel-zig/equiv/`, then
+`SKEIN_OVERLAY_DIR=<this repo> SKEIN_CHAIN_DIR=<skein-chain>
+[SKEIN_EQUIV_STORE=rocksdb|wasm] node --experimental-strip-types
+--no-warnings kernel-zig/equiv/overlay-events.ts`.
+
 ## Docs
 
 | what | where |
@@ -588,10 +605,10 @@ the anchors and answers the sync protocol's frames (0.15.0).
 
 | | |
 |---|---|
-| this app and package | 0.20.0 (tag `v0.20.0`) |
-| skein-sdk | v0.14.0, by tag URL and hash in `build.zig.zon` (modules `chain` and, for the engine, `sk`; bsvz comes through it) |
-| requires | `chain/1` (shruggr/skein-chain 0.3.0) |
-| skein | log format 10, the BEEF envelope beside the pointer record (shruggr/skein#146); the routes / filters / roles manifest (shruggr/skein#143); skein's equivs pin this repo by commit |
+| this app and package | 0.24.0 (tag `v0.24.0`) |
+| skein-sdk | v0.17.2, by tag URL and hash in `build.zig.zon` (modules `chain` and, for the engine, `sk`; bsvz comes through it) |
+| requires | `chain/1` (shruggr/skein-chain 0.8.0: its facts `chain/tx/<txid>`) |
+| skein | 0.5.4 or later (the event index, 0.5.0; a thread resting on a name, 0.5.4); the engine and the chain app installed as apps (a genesis program's record names no app, and emits no fact); skein's equivs pin this repo by commit |
 
 0.3.0 moved the state under `<app>/…`, made the chain app's answer the gate
 and exported the modules (shruggr/skein#79).
@@ -1032,6 +1049,30 @@ no longer copies the output's `script` and `satoshis` (the transaction it
 links holds them; nothing read them). `placed` stays (without it a reorg's new
 proof leaves the engine no way to find the `mined` row it wrote for the
 transaction, short of a scan of the topic's `mined`).
+
+0.23.0 (reindex v1, a stopped design) is reverted: 0.24.0's tree starts from
+0.22.0's.
+
+0.24.0 (2026-11-09): FACTS AND THREADS RESTING ON THEM (David 2026-11-09).
+The submission's thread rests on each item's `chain/tx/<txid>` (skein 0.5.4
+`on(name)`; skein-chain 0.8.0 emits every status) for the transaction's
+life; each wake runs one path (`submit.heard`): accepted or mined noted and
+admitted in order, rejected resolved, a later mined placed (published,
+relayed once per place), reorged moved back to the tail, a later rejection
+unwound; an error answer to an ingest is the one answer acted on. The
+`watch` message and the watch thread go; the pending record keeps its
+in-flight job (its thread, its ingest, its inputs, the subject's HTTP
+waiters). The verdicts are facts: `<app>/topic/tx/<txid>` {verdict:
+undecided | admitted | rejected | reverted} and
+`<app>/topic/output/<txid>.<vout>` {state: admitted | spent | reverted,
+spentBy?}. A paused submission's thread rests on each parent's
+`<app>/topic/tx/<txid>` and routes it again when woken (`wokeOn`): the
+`waits` map and the `resume` message go. POST /submit no longer launches the
+submission's thread (it never finishes, and a step waits on threads or on
+replies, not both): it admits the submit event into `<app>` and waits on
+the subject with a `wait` message, answered when the subject is decided. An
+unproven seed of a registration is admitted and handed to the chain app;
+nothing follows its later statuses (open). skein-sdk v0.17.2.
 
 ## Contributing
 

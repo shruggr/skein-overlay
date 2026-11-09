@@ -43,15 +43,17 @@
 //! Every request is appended, and the front door's step calls these (#68).
 //! A submit over HTTP is BRC-22 (0.9.1, shruggr/skein#112, David 2026-10-07: "the HTTP
 //! `/submit` route is BRC-22 or it does not exist"; 0.7.1's route restored): the handler runs the
-//! route's half (submit.zig `route`) and launches the submission's thread, answering {wait:
-//! true}: the request's thread waits on it (#66), and called again (`resolved`) it answers
-//! from the state — the STEAK; 400 if the chain app rejected it; 503 with Retry-After if
-//! nothing is decided (`httpFirst`, `httpAgain`). A bad BEEF answers 400; a valid
-//! transaction no topic took, 200 with the empty STEAK; judged before, the STEAK from the
-//! state, nothing run again; in progress (a resubmission), a wait on its thread. A missing
-//! parent pauses the submission (its thread records the pause); the request then sends the
-//! instance itself `wait {txid}` and awaits it: the engine answers it when the pause ends
-//! (submit.zig `waitOn`), and the request reads the state again.
+//! route's half (submit.zig `route`) and admits the submit event into the app's box for its
+//! thread, answering {wait: true, admit}: the request sends the instance itself `wait {txid}` and
+//! awaits it (0.24.0: the submission's thread rests on its facts for the transaction's life and
+//! never finishes, so the request does not launch it; the engine answers the `wait` when the
+//! subject is admitted or rejected, submit.zig `waitOn`), and
+//! called again (`reply`) it answers from the state — the STEAK; 400 if the chain app rejected
+//! it; 503 with Retry-After if nothing is decided (`httpFirst`, `httpAgain`). A bad BEEF
+//! answers 400; a valid transaction no topic took, 200 with the empty STEAK; judged before, the
+//! STEAK from the state, nothing run again; in progress (a resubmission), the same wait. A
+//! missing parent pauses the submission (its thread records the pause); the request waits the
+//! same way: the engine answers it when the pause ends, and the request reads the state again.
 //!
 //! A lookup is a read: the service's program is called (fn "lookup", the
 //! lookup contract, lookup.zig) and its answer shaped for the wire; it
@@ -326,31 +328,20 @@ fn submit(a: Allocator, in: Value, req: Value) !Value {
         try httpFirst(a, ev_.caller(), &st, in, sub, source);
     switch (next) {
         .answer => |v| return v,
-        // The submission's thread, launched by this request's step, which waits on it (#66); its
-        // answer, when it comes to rest, is the state's (`httpAgain`).
+        // 0.24.0: the submission's thread rests on its facts for the transaction's life (it never
+        // finishes), so this request does not launch it (a step waits on threads or on replies, not
+        // both): the submit event is admitted into the app's box (the answer's `admit`, routed in
+        // this entry, before the step's messages go out: its thread there begins at once), and the
+        // request waits on the subject — the message `wait {txid}` to the instance itself,
+        // awaited; the engine answers it when the subject is admitted or rejected (or, paused, when
+        // the pause ends), and the request reads the state again.
         .launch => |ev| {
-            const self = in.getCid("engine") orelse (in.get("programs") orelse return error.BadInput).getCid("overlay") orelse return error.NoOverlayProgram;
-            const ec = try vm.store().putValue(a, ev);
-            const args = try vm.store().putValue(a, .{ .map = try a.dupe(cbor.Entry, &.{
-                .{ .key = "event", .value = .{ .cid = ec } },
-                .{ .key = "box", .value = .{ .text = "submit" } },
-            }) });
-            _ = try vm.launch(a, self, args);
-            return waiting(a);
+            var w = try waitFor(a, in, try submit_mod.txidOf(ev));
+            w.map = try std.mem.concat(a, cbor.Entry, &.{ w.map, &.{.{ .key = "admit", .value = try admitOne(a, ev, calls.appOf(in)) }} });
+            return w;
         },
-        // In progress in a thread of its own (a resubmission, #66): this request waits on that same
-        // thread. At rest already (the kernel refuses the await): the state answers.
-        .await_thread => |t| {
-            vm.awaitRecord(t) catch return (try steakAnswer(a, &st, try httpSubject(a, &st, sub), try served(a, sub.requested, try configMap(a, in, "overlayTopics")))) orelse undecided(a);
-            return waiting(a);
-        },
-        // Paused on a parent it lacks: this request waits for the pause to end — the message
-        // `wait {txid}` to the instance itself, awaited; the engine answers it when the pause ends.
-        .wait_pause => |txid| {
-            const w = try (try ev_.wire(in)).send(a, calls.appOf(in), try submit_mod.waitBody(a, txid));
-            try vm.awaitRecord(w);
-            return waiting(a);
-        },
+        // In progress (a resubmission, #66), or paused on a parent it lacks: the same wait.
+        .wait => |txid| return waitFor(a, in, txid),
     }
 }
 
@@ -381,28 +372,36 @@ pub fn httpRequest(a: Allocator, req: Value) !union(enum) { refused: Value, ok: 
 }
 
 /// What POST /submit's handler does next (0.9.1, shruggr/skein#112, David 2026-10-07: BRC-22,
-/// synchronous): answer now, launch the submission's thread and wait on it, wait on the thread
-/// already carrying it, or wait for its pause to end.
+/// synchronous): answer now, admit the submit event for its thread and wait on its subject, or
+/// wait on a subject already in flight or paused (0.24.0: a `wait` message, answered when it is
+/// decided).
 pub const HttpNext = union(enum) {
     answer: Value,
-    /// The submit event to launch the submission's thread on (a paused one's records the pause).
+    /// The submit event its thread is to begin on, admitted into the app's box (a paused one's
+    /// records the pause); the request then waits on its subject.
     launch: Value,
-    /// The thread carrying the submission (its pending record's `thread`): await it.
-    await_thread: []const u8,
-    /// The paused submission of this subject: wait for the pause to end (`wait`).
-    wait_pause: [32]u8,
+    /// The subject in flight or paused: wait for it to be decided (`wait`).
+    wait: [32]u8,
 };
 
-/// Whether the handler is called again (#66): the thread it waited on came to rest (`resolved`),
-/// the answer to its `wait` (`reply`), a deadline (`woke`).
+/// The request waits on `txid` being decided: `wait {txid}` to the instance itself, awaited.
+fn waitFor(a: Allocator, in: Value, txid: [32]u8) !Value {
+    const w = try (try ev_.wire(in)).send(a, calls.appOf(in), try submit_mod.waitBody(a, txid));
+    try vm.awaitRecord(w);
+    return waiting(a);
+}
+
+/// Whether the handler is called again (#66): the answer to its `wait` (`reply`), a thread it
+/// waited on come to rest (`resolved`), a deadline (`woke`).
 pub fn httpWoken(req: Value) bool {
     return req.get("resolved") != null or req.get("reply") != null or req.get("woke") != null;
 }
 
 /// The first call: the route's half (verify, judge), then what it came to. A bad BEEF answers 400;
 /// a valid transaction no topic took, 200 with the empty STEAK (BRC-22); judged before, the STEAK
-/// from the state, nothing run again; in progress, a wait on its thread; paused already, a wait
-/// for the pause to end; whole, its thread launched (a pause, its thread launched to record it).
+/// from the state, nothing run again; in progress or paused already, a wait on its subject; whole,
+/// its submit event admitted for its thread and a wait on its subject (a pause, the paused event,
+/// whose thread records it).
 /// Only transactions before the subject taken (the subject by no topic): 200 with the empty STEAK
 /// now, the submit event admitted into the app's box for its thread.
 pub fn httpFirst(a: Allocator, caller: calls.Caller, st: *State, in: Value, sub: HttpSubmit, source: Value) !HttpNext {
@@ -411,8 +410,8 @@ pub fn httpFirst(a: Allocator, caller: calls.Caller, st: *State, in: Value, sub:
         .refused => |why| .{ .answer = try failure(a, 400, why) },
         .nothing => .{ .answer = try emptySteak(a, topics) },
         .unchanged => |t| .{ .answer = (try steakAnswer(a, st, t, topics)) orelse try emptySteak(a, topics) },
-        .pending => |t| try onThread(a, st, t, topics),
-        .paused => |p| if (try st.isPaused(p.txid)) .{ .wait_pause = p.txid } else .{ .launch = p.event },
+        .pending => |t| .{ .wait = t },
+        .paused => |p| if (try st.isPaused(p.txid)) .{ .wait = p.txid } else .{ .launch = p.event },
         .admit => |x| if (submit_mod.subjectTaken(x.event)) .{ .launch = x.event } else blk: {
             var answer = try emptySteak(a, topics);
             answer.map = try std.mem.concat(a, cbor.Entry, &.{ answer.map, &.{.{ .key = "admit", .value = try admitOne(a, x.event, calls.appOf(in)) }} });
@@ -421,8 +420,8 @@ pub fn httpFirst(a: Allocator, caller: calls.Caller, st: *State, in: Value, sub:
     };
 }
 
-/// Called again (#66): what the state says now. Judged → the STEAK; in a thread → wait on it;
-/// paused → wait for the pause to end; rejected by the chain app → 400; held, taken by no topic →
+/// Called again (#66): what the state says now. Judged → the STEAK; in flight or paused → wait on
+/// it again; rejected by the chain app → 400; held, taken by no topic →
 /// the empty STEAK; else the route's answer for what it is now (refused → 400, taken by nothing →
 /// the empty STEAK) or, nothing decided, 503 with Retry-After — the client resubmits, a poll on
 /// the same flow. Nothing is launched again.
@@ -430,8 +429,7 @@ pub fn httpAgain(a: Allocator, caller: calls.Caller, st: *State, in: Value, sub:
     const topics = try served(a, sub.requested, try configMap(a, in, "overlayTopics"));
     const txid = httpSubject(a, st, sub) catch return .{ .answer = try failure(a, 400, "Invalid BEEF") };
     if (try steakAnswer(a, st, txid, topics)) |v| return .{ .answer = v };
-    if (try st.isPaused(txid)) return .{ .wait_pause = txid };
-    if (try st.isPending(txid)) return onThread(a, st, txid, topics);
+    if (try st.isPending(txid)) return .{ .wait = txid };
     if (try st.ch.settlementCid(txid)) |sc| {
         const rec = try st.store.getValue(a, sc);
         return .{ .answer = try failure(a, 400, try std.fmt.allocPrint(a, "Transaction rejected: {s}", .{rec.getText("reason") orelse "rejected"})) };
@@ -458,13 +456,6 @@ fn httpSubject(a: Allocator, st: *State, sub: HttpSubmit) ![32]u8 {
 fn envelopeSubject(a: Allocator, s: c.store.Store, envelope: Value) ![32]u8 {
     const e = c.record.envelopeOf(envelope) orelse return error.BadBeef;
     return c.record.subjectOf(e, try s.getValue(a, e.beef)) orelse error.BadBeef;
-}
-
-/// In progress in a thread (its pending record's): wait on it; no thread named → undecided.
-fn onThread(a: Allocator, st: *State, txid: [32]u8, topics: []const []const u8) !HttpNext {
-    const rec = (try st.pendingRecord(txid)) orelse return .{ .answer = (try steakAnswer(a, st, txid, topics)) orelse try undecided(a) };
-    const thread = rec.getCid("thread") orelse return .{ .answer = try undecided(a) };
-    return .{ .await_thread = thread };
 }
 
 /// A route handler's "not yet" (#66): it launched, or awaits, what its answer depends on.

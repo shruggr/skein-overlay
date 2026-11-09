@@ -10,7 +10,7 @@
 //!
 //! The record, the root of `<app>/state`:
 //!
-//!   {kind: "overlay-state", maps: {admitted, applied, pending, waits, views, ancillary, mined, placed, anchors, tips}}
+//!   {kind: "overlay-state", maps: {admitted, applied, pending, views, ancillary, mined, placed, anchors, tips}}
 //!
 //! The maps (keys bytes, ordered bytewise; `tp` = len ‖ topic):
 //!   admitted   tp ‖ txid ‖ vout → admittance record {kind: "admitted", topic, txid, vout, admittedAt, tx, ancillary?, refs}
@@ -22,19 +22,18 @@
 //!                 {form, beef: <pointer record>, subject?, vout?} as a block (shruggr/skein#121,
 //!                 #146), or the raw block of the bytes — for internalizing; a
 //!                 lookup's BEEF is the chain state's, `beefFor`)
-//!   pending    txid → {kind: "submission", txid, thread?, submission, ingest?, heard?, via?, waiting?, event?}
-//!                a transaction of a submission handed to the chain app and not yet admitted (or
-//!                rejected): `submission` the submission's subject (hex), `ingest` its own ingest
-//!                message, `heard` the chain app's admitting answer while an earlier transaction of
-//!                the same submission is still pending (skein-overlay#1); or a submission paused on
-//!                parents neither in its BEEF nor held, or in flight (handed to the chain app in a
-//!                submission and not yet admitted, skein-overlay#6) (`waiting`: their txids, hex;
-//!                `event`: the submit event to route again, its `held` the ones in flight)
-//!   waits      parent txid ‖ subject txid → true   (0.20.0; `wants` before): the paused submission
-//!                `subject` waits on that parent, neither in its BEEF nor held (in flight ones are
-//!                its event's `held`); nothing is asked of anyone for it — the parent arrives by any
-//!                path (a submission, a peer's admit fetched by the host, a pull), is ingested whether
-//!                a topic takes it or not, and resumes the subject
+//!   pending    txid → {kind: "submission", txid, submission, thread?, ingest?, heard?, spends?, wakes?, waiting?, event?}
+//!                its in-flight job only (0.24.0: the submission's thread holds the context, resting on
+//!                each item's `chain/tx/<txid>`): a transaction of a submission handed to the chain
+//!                app and not yet admitted (or rejected) — `submission` the submission's subject
+//!                (hex), `thread` the submission's thread (another of the same subject is not it), `ingest` its own ingest message (an error answer to it fails it), `heard` the
+//!                chain app's admitting status while an earlier transaction of the same submission is
+//!                still pending (skein-overlay#1), `spends` its inputs (0.20.5), `wakes` (the subject's)
+//!                the HTTP requests waiting on it; or a submission paused on parents neither in its
+//!                BEEF nor held, or not settled here (in flight, paused, undecided: skein-overlay#6,
+//!                0.19.0) — `waiting` their txids (hex), `event` the submit event to route again, its
+//!                `held` the ones in flight, `thread` the thread resting on each one's
+//!                `<app>/topic/tx/<txid>` (0.24.0: no `waits` index; its fact wakes the thread)
 //!   views      tp → bytes(40): count (8 bytes, big-endian) ‖ digest (32 bytes)   the topic's VIEW
 //!                DIGEST (0.12.0, David 2026-10-09): `count` the topic's admitted-and-unspent
 //!                outputs, `digest` an order-independent running digest of them — each outpoint's
@@ -95,7 +94,7 @@ pub const Network = c.chain.Network;
 /// The head the chain state lives under: the chain app's (its name is `chain`).
 pub const chain_head = "chain/state";
 
-pub const map_names = [_][]const u8{ "admitted", "applied", "pending", "waits", "views", "ancillary", "mined", "placed", "anchors", "tips" };
+pub const map_names = [_][]const u8{ "admitted", "applied", "pending", "views", "ancillary", "mined", "placed", "anchors", "tips" };
 
 /// A transaction's place in its block, as the chain state proves it (`mined`, `placed`).
 pub const Placed = struct { height: u32, offset: u64, block: [32]u8 };
@@ -370,11 +369,10 @@ pub const State = struct {
         submission: ?[32]u8 = null,
         ingest: ?[]const u8 = null,
         heard: ?[]const u8 = null,
-        via: ?[]const u8 = null,
         waiting: []const [32]u8 = &.{},
         event: ?[]const u8 = null,
-        /// A paused submission's waiters (0.9.1): the `wait` messages of the HTTP requests waiting on
-        /// it, each answered (`replyTo`) when the pause ends.
+        /// The waiters (0.9.1; 0.24.0 in flight too): the `wait` messages of the HTTP requests waiting
+        /// on a paused submission, or on a subject in flight, each answered (`replyTo`) when it is decided.
         wakes: []const []const u8 = &.{},
         /// The outpoints a transaction handed to the chain app spends (0.20.5): kept with its
         /// record so a later submission spending one of them is refused while it is in flight
@@ -393,7 +391,6 @@ pub const State = struct {
         if (p.ingest) |m| try fields.append(a, .{ .key = "ingest", .value = .{ .cid = m } });
         if (p.thread) |t| try fields.append(a, .{ .key = "thread", .value = .{ .cid = t } });
         if (p.heard) |h| try fields.append(a, .{ .key = "heard", .value = .{ .text = h } });
-        if (p.via) |v| try fields.append(a, .{ .key = "via", .value = .{ .text = v } });
         if (p.waiting.len > 0) {
             const ws = try a.alloc(Value, p.waiting.len);
             for (p.waiting, ws) |w, *o| o.* = .{ .text = try a.dupe(u8, &hdr.toHex(w)) };
@@ -473,62 +470,30 @@ pub const State = struct {
         return false;
     }
 
-    /// The paused submissions waiting on `txid` as a parent in flight (skein-overlay#6: their
-    /// event's `held`; no want stands for it), each once, in key order.
-    pub fn heldWaitersOf(self: *State, txid: [32]u8) ![][32]u8 {
+    // ------------------------------------------------------------ waited-on parents (0.24.0: no index)
+
+    /// Whether a paused submission waits on `txid` (it is ingested when it arrives, taken by a topic or
+    /// not, so that its verdict is a fact and wakes the waiting thread): a scan of the pending records.
+    pub fn isWaitedOn(self: *State, txid: [32]u8) !bool {
+        return (try self.pausedOn(txid, null)).len > 0;
+    }
+
+    /// The paused submissions waiting on `txid` (their `waiting`), each once, in key order; only those
+    /// whose thread is `thread`, when it is named.
+    pub fn pausedOn(self: *State, txid: [32]u8, thread: ?[]const u8) ![][32]u8 {
         const hex = hdr.toHex(txid);
         var out: std.ArrayList([32]u8) = .empty;
         for (try self.map("pending").prefixed("")) |kv| {
             if (kv.key.len != 32 or kv.value != .cid) continue;
             const rec = try self.record(kv.value.cid);
-            if (rec.get("waiting") == null) continue;
-            const ev = try self.store.getValue(self.arena, rec.getCid("event") orelse continue);
-            for (ev.getArray("held") orelse &.{}) |h| {
-                if (h == .text and std.mem.eql(u8, h.text, &hex)) {
-                    try out.append(self.arena, kv.key[0..32].*);
-                    break;
-                }
-            }
+            const ws = rec.getArray("waiting") orelse continue;
+            if (thread) |t| if (!std.mem.eql(u8, rec.getCid("thread") orelse "", t)) continue;
+            for (ws) |w| if (w == .text and std.mem.eql(u8, w.text, &hex)) {
+                try out.append(self.arena, kv.key[0..32].*);
+                break;
+            };
         }
         return out.items;
-    }
-
-    // ------------------------------------------------------------ waited-on parents (skein-overlay#1; 0.20.0)
-
-    /// A `waits` key: parent txid ‖ subject txid.
-    fn waitKey(self: *State, parent: [32]u8, subject: [32]u8) ![]u8 {
-        return cat(self.arena, &.{ &parent, &subject });
-    }
-
-    /// Note that the paused submission `subject` waits on `parent` (missing here: neither in its BEEF
-    /// nor held). Nothing is asked of anyone (0.20.0): the parent arrives by any path.
-    pub fn wait(self: *State, parent: [32]u8, subject: [32]u8) !void {
-        try self.map("waits").put(try self.waitKey(parent, subject), .{ .bool = true });
-    }
-
-    /// Whether a paused submission waits on `txid` (it is ingested when it arrives, taken by a topic or not).
-    pub fn isWaitedOn(self: *State, txid: [32]u8) !bool {
-        return (try self.map("waits").prefixed(&txid)).len > 0;
-    }
-
-    /// The paused submissions waiting on `txid` (each once, in key order).
-    pub fn waitersOf(self: *State, txid: [32]u8) ![][32]u8 {
-        const kvs = try self.map("waits").prefixed(&txid);
-        const out = try self.arena.alloc([32]u8, kvs.len);
-        for (kvs, out) |kv, *o| o.* = if (kv.key.len == 64) kv.key[32..64].* else return error.BadIndex;
-        return out;
-    }
-
-    /// `subject`'s waits (on each of `waiting`) cleared.
-    pub fn unwait(self: *State, subject: [32]u8, waiting: []const [32]u8) !void {
-        for (waiting) |w| _ = try self.map("waits").remove(try self.waitKey(w, subject));
-    }
-
-    /// `txid` has arrived (the chain app answered for it): its waiters, each once, and every wait on it removed.
-    pub fn takeWaiters(self: *State, txid: [32]u8) ![][32]u8 {
-        const out = try self.waitersOf(txid);
-        for (out) |w| _ = try self.map("waits").remove(try self.waitKey(txid, w));
-        return out;
     }
 
     // ------------------------------------------------------------ judgements
@@ -978,11 +943,20 @@ pub const State = struct {
 
     /// Each transaction of `txids` the served `topics` judged, placed where the chain state has it
     /// now (a proof heard: mined; a reorg's: moved; reverted: back in the tail).
-    pub fn settleMined(self: *State, topics: []const []const u8, txid: [32]u8) !void {
+    /// → whether any topic's placement of it moved (0.24.0: a status heard again changes nothing).
+    pub fn settleMined(self: *State, topics: []const []const u8, txid: [32]u8) !bool {
+        var moved = false;
         for (topics) |t| {
             const rec = (try self.appliedRecord(t, txid)) orelse continue;
+            const before = try self.placedOf(t, txid);
             try self.place(t, txid, try uintList(self.arena, rec.getArray("outputsToAdmit")), false);
+            const after = try self.placedOf(t, txid);
+            if ((before == null) != (after == null)) moved = true else if (before) |x| {
+                const y = after.?;
+                if (x.height != y.height or x.offset != y.offset or !std.mem.eql(u8, &x.block, &y.block)) moved = true;
+            }
         }
+        return moved;
     }
 
     /// The topic's blocks with transactions it judged mined in them, from `from` up to `to` (at most

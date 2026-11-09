@@ -28,6 +28,7 @@ pub const sk = struct {
     pub extern "skein" fn emit(msg: [*]const u8, len: u32, out: [*]u8, cap: u32) i32;
     pub extern "skein" fn deadline(until: i64) i32;
     pub extern "skein" fn @"await"(cid: [*]const u8, cid_len: u32) i32;
+    pub extern "skein" fn on(name: [*]const u8, name_len: u32, func: [*]const u8, func_len: u32) i32;
 };
 
 /// The last failed import's error (a failed call's: its callee's last stderr line). 64 KiB: a
@@ -114,6 +115,13 @@ pub fn call(a: std.mem.Allocator, program: []const u8, func: []const u8, arg: Va
 /// Rest the thread until a reply to this record (a message this step sent), or what else names it, arrives.
 pub fn awaitRecord(cid: []const u8) !void {
     if (sk.@"await"(cid.ptr, @intCast(cid.len)) < 0) return failed();
+}
+
+/// Rest the thread on a fact's name (skein 0.5.4, `on(name)` with no fn): every fact emitted under
+/// it wakes the thread (the step's input `event: {event, box: <the name>, place}`), and it rests on
+/// the name again.
+pub fn restOn(name: []const u8) !void {
+    if (sk.on(name.ptr, @intCast(name.len), name.ptr, 0) < 0) return failed();
 }
 
 /// Wake the thread at `until` (ms) if nothing it awaits arrives first.

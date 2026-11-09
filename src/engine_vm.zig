@@ -1,7 +1,7 @@
 //! The engine's wiring over the `skein` imports (the `sk` module, vm.zig):
 //! its configuration (config.zig, through the `head` import), its calls of
 //! topics and lookup services (`call`), messages to the instance itself
-//! (`emit` to `self.identity`: the chain app's ingest, its own watch), the
+//! (`emit` to `self.identity`: the chain app's ingest, a `wait`), the facts and the names a thread rests on (0.24.0), the
 //! gossip out (`emit` to the libp2p provider), and the chain state and the
 //! overlay's state as a step or a call loads them. wasm32-wasi only.
 const std = @import("std");
@@ -75,12 +75,20 @@ fn answerImpl(_: *anyopaque, a: Allocator, to: []const u8, box: []const u8, body
     try answers.append(a, .{ .map = es.items });
 }
 
-/// Messages to the instance itself (the input's `self.identity`): looped back by the host; and the
-/// answers to submitters, sent when a message reaches them.
+fn emitImpl2(_: *anyopaque, a: Allocator, ev: Value) anyerror!void {
+    _ = try vm.emitEvent(a, ev);
+}
+fn restImpl(_: *anyopaque, _: Allocator, name: []const u8) anyerror!void {
+    try vm.restOn(name);
+}
+
+/// Messages to the instance itself (the input's `self.identity`): looped back by the host; the
+/// answers to submitters, sent when a message reaches them; the facts (0.24.0) and the names the
+/// step's thread rests on (skein 0.5.4).
 pub fn wire(in: Value) !submit.Wire {
     self_key = vm.selfKey(in) orelse return error.NoIdentity;
     step_in = in;
-    return .{ .ctx = &dummy, .sendFn = sendImpl, .answerFn = answerImpl };
+    return .{ .ctx = &dummy, .sendFn = sendImpl, .answerFn = answerImpl, .emitFn = emitImpl2, .restFn = restImpl };
 }
 
 /// The libp2p provider's key: the address book's entry at ("local", "libp2p") (the SDK's `peerAt`;
