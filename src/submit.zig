@@ -1188,6 +1188,8 @@ fn admitHeard(cx: Ctx, ev: Value, proof_result: ?Value, out: *Stepped) !void {
     }
     if (admissions.items.len > 0) {
         const last = admissions.items[admissions.items.len - 1];
+        // The result names the transaction its STEAK is of: the last admitted.
+        out.txid = last.txid;
         out.admitted = true;
         out.topics = last.topics;
         out.applied = last.applied;
