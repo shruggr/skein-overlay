@@ -1,4 +1,4 @@
-// skein-overlay 0.24.0 + skein-chain 0.8.0 on a real kernel (David 2026-11-09): every status of
+// skein-overlay 0.25.0 + skein-chain 0.9.0 on a real kernel (David 2026-11-09): every status of
 // a transaction is the chain app's fact `chain/tx/<txid>`; the submission's thread rests on it for
 // the transaction's life (skein 0.5.4) and the overlay's verdicts are facts too
 // (`overlay/topic/tx/<txid>` {verdict}, `overlay/topic/output/<txid>.<vout>` {state}). One router
@@ -17,7 +17,12 @@
 //   (e) t2 posted while Arcade rejects: 400 to the client; chain/tx rejected; topic/tx rejected;
 //   (f) a parent in flight (Arcade busy: no status), its child posted with it in the BEEF: the
 //       child undecided (paused, resting on the parent's verdict); Arcade back: the parent
-//       admitted, the child woken, routed again, admitted — its outputs admitted, the parent's spent.
+//       admitted, the child woken, routed again, admitted — its outputs admitted, the parent's spent;
+//       0.25.0 (case c): a second copy of the paused child is a duplicate — one submission thread;
+//   (g) 0.25.0 (case a): t2, rejected in (e), mined later: chain/tx mined (the latest fact, over the
+//       rejection) and the overlay admits it on the same thread;
+//   (h) 0.25.0 (case e): a topic registered with a seed — the deploy's BEEF — submitted as an
+//       ordinary submission: admitted via its submission thread; mined later, placed.
 //
 // The store then replays to itself exactly (SKEIN_EQUIV_STORE: sqlite, rocksdb, wasm).
 //
@@ -40,6 +45,7 @@ import { BACKEND, routerStore, storeFor } from "./backend.ts";
 import { FakeArcade } from "../../src/host/fake-arcade.ts";
 import { HostDb } from "../../src/host/instances.ts";
 import { Router } from "../../src/host/router.ts";
+import { txCid } from "../../src/host/feeds.ts";
 import { ephemeralWallet } from "../../src/wallet.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -168,7 +174,7 @@ try {
   const chainDir = copyOf(dirOf("SKEIN_CHAIN_DIR"), join(home, "chain"));
   const mf = JSON.parse(readFileSync(join(overlayDir, "etc/app.json"), "utf8")) as { version: string; config: { overlay: Record<string, unknown> } };
   const cmf = JSON.parse(readFileSync(join(chainDir, "etc/app.json"), "utf8")) as { version: string };
-  check(mf.version === "0.24.0" && cmf.version === "0.8.0", `skein-overlay ${mf.version}, skein-chain ${cmf.version}`);
+  check(mf.version === "0.25.0" && cmf.version === "0.9.0", `skein-overlay ${mf.version}, skein-chain ${cmf.version}`);
   mf.config.overlay.gossip = { tm_demo: false };
   writeFileSync(join(overlayDir, "etc/app.json"), JSON.stringify(mf, null, 2));
 
@@ -267,8 +273,12 @@ try {
   const pc = post(both.toBinaryAtomic(idc));
   await until("c undecided", async () => (await field(`overlay/topic/tx/${idc}`, "verdict")).includes("undecided") || undefined);
   check((await field(`overlay/topic/tx/${idc}`, "verdict")).join() === "undecided", "(f) the child, its parent in flight: undecided (paused, resting on the parent's verdict)");
+  // 0.25.0 (case c): a second copy of the paused child — in flight already: a duplicate, ignored.
+  const pc2 = post(both.toBinaryAtomic(idc));
+  await sleep(500);
+  await r.settled();
   arcade.mode = "ok";
-  const [rp, rc] = await Promise.all([pp, pc]);
+  const [rp, rc, rc2] = await Promise.all([pp, pc, pc2]);
   await until("c admitted", async () => (await field(`overlay/topic/tx/${idc}`, "verdict")).includes("admitted") || undefined, 30_000);
   await r.settled();
   check((await field(`overlay/topic/tx/${idp}`, "verdict")).join() === "admitted", `(f) the parent admitted once Arcade took it (its request ${rp.status})`);
@@ -276,6 +286,43 @@ try {
   check((await field(`overlay/topic/output/${idp}.0`, "state")).join() === "admitted,spent", `(f) the parent's token admitted, then spent by the child (${await field(`overlay/topic/output/${idp}.0`, "state")})`);
   const sp = (await events(`overlay/topic/output/${idp}.0`)).at(-1)!.record;
   check(sp.spentBy === idc, "(f) spentBy the child");
+  const childThreads = (await overlayResults(store())).filter((x) => x.op === "submit" && x.txid === idc);
+  const begunHere = (await overlayResults(store())).filter((x) => x.op === "woke" && x.outcome === "begun" && x.txid === idc);
+  check(childThreads.length === 1 && begunHere.length === 1 && rc2.status === 200, `(f) two copies of the paused child: one submission thread, begun once in it (${childThreads.length} first step(s), ${begunHere.length} begun; the copy's request ${rc2.status})`);
+  check((await field(`overlay/topic/tx/${idc}`, "verdict")).join() === "undecided,admitted", "(f) one verdict history for the child");
+
+  // ------------------------------------------------ (g) case a: t2 rejected in (e), mined later — admitted on the same thread
+  const h6 = mine(sha256d(h5), internal(id2), 1_790_302_600);
+  await headers([h6]);
+  // Arcade never took it (rejected at its broadcast): its proof comes as the host's pull delivers one
+  // (skein 0.6.0, D3) — the proof event in box chain.
+  await r.admitEvent(H, "chain", { kind: "proof", subject: txCid(id2), txid: id2, path: Uint8Array.from(new MerklePath(6, [[{ offset: 0, hash: id2, txid: true }]]).toBinary()) });
+  await until("t2 mined", async () => (await field(`chain/tx/${id2}`, "status")).includes("mined") || undefined);
+  await until("t2 admitted", async () => (await field(`overlay/topic/tx/${id2}`, "verdict")).includes("admitted") || undefined);
+  await r.settled();
+  check((await field(`chain/tx/${id2}`, "status")).join() === "rejected,mined", `(g) chain/tx: rejected, then mined — the latest fact (${await field(`chain/tx/${id2}`, "status")})`);
+  check((await field(`overlay/topic/tx/${id2}`, "verdict")).join() === "rejected,admitted", `(g) the overlay admitted it after its rejection (${await field(`overlay/topic/tx/${id2}`, "verdict")})`);
+  const t2Threads = new Set((await overlayResults(store())).filter((x) => x.txid === id2).map((x) => String(x.submission ?? "")).filter((x) => x));
+  check(t2Threads.size === 1, `(g) on the same thread: one submission event (${t2Threads.size})`);
+  check(await until("the topic's tip 6", async () => (await tipOf("tm_ev")) === 6 || undefined).catch(() => false) === true, `(g) placed: the topic's tip 6 (${await tipOf("tm_ev")})`);
+
+  // ------------------------------------------------ (h) case e: a topic registered with the deploy's BEEF as its seed
+  const t3 = await token(fund, 3);
+  const id3 = t3.id("hex");
+  await box.send(identity, "overlay/register", { fn: "register", args: { topic: "tm_seed", program: "topic-demo", seed: Uint8Array.from(t3.toBEEF()) } });
+  await r.settled();
+  await until("the seed admitted", async () => (await field(`overlay/topic/tx/${id3}`, "verdict")).includes("admitted") || undefined);
+  await r.settled();
+  check((await field(`chain/tx/${id3}`, "status")).join() === "accepted", `(h) the seed ingested by the chain app: chain/tx accepted (${await field(`chain/tx/${id3}`, "status")})`);
+  const seeded = (await overlayResults(store())).filter((x) => x.admitted === true && x.txid === id3);
+  check(seeded.length === 1 && JSON.stringify(seeded[0]!.steak ?? {}).includes("tm_seed"), "(h) admitted under tm_seed by its submission thread");
+  const regs = (await overlayResults(store())).filter((x) => x.op === "register" && x.topic === "tm_seed");
+  check(regs.length === 1 && regs[0]!.seed !== undefined && regs[0]!.seeded === undefined, "(h) the register step judged nothing: it sent the seed as a submission (`seed`, no `seeded`)");
+  const h7 = mine(sha256d(h6), internal(id3), 1_790_303_200);
+  await headers([h7]);
+  arcade.emit(id3, proofAt(t3, 7, h7));
+  await until("t3 mined", async () => (await field(`chain/tx/${id3}`, "status")).includes("mined") || undefined);
+  check(await until("tm_seed's tip 7", async () => (await tipOf("tm_seed")) === 7 || undefined).catch(() => false) === true, `(h) mined later: placed, tm_seed's tip 7 (${await tipOf("tm_seed")})`);
   await sleep(500);
   await r.settled();
 } catch (e) {
