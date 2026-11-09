@@ -234,7 +234,6 @@ The manifest (`etc/app.json`, this repo's own, description left out):
   "routes": [
     {"address": "register", "handler": "overlay.register"},
     {"address": "submit", "filters": ["kernel.beef"], "handler": "overlay.submit"},
-    {"transport": "libp2p", "address": "/skein/overlay/beef/1.0.0", "filters": ["kernel.beef"], "handler": "overlay.submit"},
     {"transport": "http", "address": "/listTopicManagers", "filters": ["listTopicManagers"]},
     {"transport": "http", "address": "/listLookupServiceProviders", "filters": ["listLookupServiceProviders"]},
     {"transport": "http", "address": "/getDocumentationForTopicManager", "filters": ["topicDocumentation"]},
@@ -290,22 +289,18 @@ handler, and no sender; who may run a function is `roles`.
   only a key holding root runs it (a message from any other key is
   recorded and runs nothing). Root may grant the function to others with
   an app role of its own; the manifest declares none.
-- The derived routes on `<app>` take the receive row's admits (a fetched
-  submission's routed event; the `event` route), POST /submit's admitted
+- The derived routes on `<app>` take POST /submit's admitted
   submit event (0.24.0) and the engine's own `wait` and `rebeat` (the
   `mailbox` route, by the host's loopback). The engine takes only the instance's
   own messages there (`NotFromThisInstance` otherwise). An app that puts
   another program on its box `<app>` overrides the derived mailbox route
   and breaks those: keep `<app>` the engine's.
-- The libp2p route `/skein/overlay/beef/1.0.0` is the receive row: the
-  host's own entry, not served to peers (0.20.0, David 2026-10-30: a node
-  takes BEEFs only from paths it chose — HTTP submit, the mesh it joined,
-  replies to requests it made; skein's host never handles it inbound). The
-  host writes into it each BEEF it fetched (on a peer's admit, from a
-  peer's tail list, in a pull of mined history), one Atomic BEEF per
-  frame; the door decodes it (`kernel.beef`) and `submit` takes it as a
-  submission from that peer, judged by every served topic. Keep it in your
-  manifest for catch-up to work.
+- No receive row (0.25.1): the host submits each BEEF it fetched (on a peer's
+  admit, from a peer's tail list, in a pull of mined history) as the submit
+  message `{fn: "submit", args: {beef, topics: [<the topic it fetched it
+  for>]}}` in the box `<app>/submit`, signed as the instance itself (skein
+  0.6.1): the same route (`kernel.beef`, then `submit`) as every submission
+  by message, judged only under that topic.
 - The name rule: every head your programs write is under your app's name.
   Install under another name (`amm`, say) and its state is `amm/state`,
   `amm/ls_<service>`.
@@ -508,7 +503,8 @@ no timer, retry or backoff anywhere:
 
 - **Announce, then fetch.** A peer's `admit` on `<topic>`: unless the
   instance holds the txid or a fetch of it is under way, the host asks that
-  peer `{kind: "tx"}` and hands the BEEF to the receive row. Per txid it
+  peer `{kind: "tx"}` and submits the BEEF as the submit message in
+  `<app>/submit` from the instance itself (0.25.1). Per txid it
   keeps the set of peers that announced it: on a failure the next; set
   exhausted, it waits for a new admit. Admitted, the node publishes its own
   admit. Nothing of a peer's admit is logged in the instance.
@@ -607,10 +603,10 @@ the anchors and answers the sync protocol's frames (0.15.0).
 
 | | |
 |---|---|
-| this app and package | 0.25.0 (tag `v0.25.0`) |
+| this app and package | 0.25.1 (tag `v0.25.1`) |
 | skein-sdk | v0.18.0, by tag URL and hash in `build.zig.zon` (modules `chain` and, for the engine, `sk`; bsvz comes through it) |
 | requires | `chain/1` (shruggr/skein-chain 0.9.0: its facts `chain/tx/<txid>`; a proof after a rejection is `mined`) |
-| skein | 0.5.4 or later (the event index, 0.5.0; a thread resting on a name, 0.5.4); the engine and the chain app installed as apps (a genesis program's record names no app, and emits no fact); skein's equivs pin this repo by commit |
+| skein | 0.6.1 or later (the host submits fetched BEEFs as the submit message; 0.25.1) (the event index, 0.5.0; a thread resting on a name, 0.5.4); the engine and the chain app installed as apps (a genesis program's record names no app, and emits no fact); skein's equivs pin this repo by commit |
 
 0.3.0 moved the state under `<app>/…`, made the chain app's answer the gate
 and exported the modules (shruggr/skein#79).
@@ -1099,6 +1095,15 @@ ordinary submission (a message into `<app>/submit`); `seeded` / `missing` /
 `untaken`, `submit.seed` and `heldAncestry` go; register answers `{topic,
 active}`. The chain state's `rejected` map no longer overrides a proof here
 either (route, `chainPlace`, spenders). skein-sdk v0.18.0.
+
+0.25.1 (D10, David 2026-11-09: the host submits through the one submit path):
+the receive row goes — the libp2p protocol `/skein/overlay/beef/1.0.0`, its
+manifest row, and `stream` / `libp2pRouted` / `receiveTopics` and the protocol
+branch of `submit`. The host submits each BEEF it fetched as the submit
+message `{fn: "submit", args: {beef, topics: [<the topic it fetched it
+for>]}}` in `<app>/submit`, signed as the instance itself (skein 0.6.1): the
+existing route, filter and source form. Case f (judged only under the named
+topic) goes through it.
 
 ## Contributing
 

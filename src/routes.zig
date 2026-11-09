@@ -11,12 +11,6 @@
 //!   libp2p:<topic>    fn "submit"   the announcements mesh (gossip.zig): its `admit` messages are the
 //!                                   host's (0.20.0: announce, then fetch); one that reaches the engine,
 //!                                   or anything else there, is ignored, nothing admitted → {verdict: "ignore"}
-//!   libp2p:/skein/overlay/beef/1.0.0   fn "submit"   the receive row (0.20.0: the host's own entry, not
-//!                                           served to peers — skein's host never handles it inbound): one
-//!                                           Atomic BEEF per frame the host fetched (a peer's admit, a
-//!                                           peer's tail list, a pull of mined history), submitted as
-//!                                           from the peer it came from, judged under the ONE topic the
-//!                                           frame names (0.25.0, the TaggedBEEF rule) → {verdict, admit?}
 //!   POST /lookup      fn "lookup"   {service, query} (JSON) → {type: "output-list", outputs: [{beef, outputIndex, context?}]}
 //!                                   X-Aggregation: yes → the compact octet-stream form (count, [txid, index, context], one BEEF)
 //!   GET  /listTopicManagers, /listLookupServiceProviders         fn "listTopicManagers" / "listLookupServiceProviders"
@@ -308,10 +302,7 @@ fn served(a: Allocator, requested: []const []const u8, map: std.json.ObjectMap) 
 }
 
 fn submit(a: Allocator, in: Value, req: Value) !Value {
-    if (eql(u8, req.getText("transport") orelse "", "libp2p")) {
-        if (req.getText("protocol") != null) return stream(a, in, req);
-        return gossip(a, req);
-    }
+    if (eql(u8, req.getText("transport") orelse "", "libp2p")) return gossip(a, req);
     const sub = switch (try httpRequest(a, req)) {
         .refused => |answer| return answer,
         .ok => |x| x,
@@ -524,55 +515,14 @@ pub fn submitBox(a: Allocator, app: []const u8) ![]const u8 {
 
 /// A GossipSub message on `libp2p:<topic>` (gossip.zig; 0.20.0, David 2026-10-30: "announce, then
 /// fetch"). The mesh carries `admit` announcements, which are the host's: it reads them and fetches
-/// the BEEF from the announcing peer, handing it in through the receive row. Nothing on `<topic>` is
+/// the BEEF from the announcing peer and submits it as the submit message (0.25.1: `{fn: "submit",
+/// args: {beef, topics: [<topic>]}}` in `<app>/submit`, from the instance itself). Nothing on `<topic>` is
 /// the instance's: an `admit` that reaches the engine anyway (a host before 0.20.0), the gone
 /// `submit` kind (a peer before 0.20.0), anything else — ignored (no forward, no penalty), nothing
 /// admitted.
 fn gossip(a: Allocator, req: Value) !Value {
     _ = req.getText("topic") orelse return verdictOf(a, "ignore", "not a topic message");
     return verdictOf(a, "ignore", "the <topic> mesh carries the host's announcements: nothing here for the instance (skein-overlay 0.20.0)");
-}
-
-/// The route's half for a BEEF on the receive row → its verdict. skein-overlay#1: a BEEF lacking
-/// parents is accepted as any submission (its thread pauses it); ignored when it is paused already on
-/// the same parents.
-fn libp2pRouted(a: Allocator, in: Value, st: *State, beef: submit_mod.Input, topics: []const []const u8, source: Value) !Value {
-    const routed = switch (try submit_mod.route(a, ev_.caller(), st, in, beef, topics, null, source)) {
-        .refused => |why| return verdictOf(a, "ignore", why),
-        .nothing => |why| return verdictOf(a, "ignore", why),
-        .unchanged => return verdictOf(a, "ignore", "already judged"),
-        .pending => return verdictOf(a, "ignore", "already submitted: awaiting the chain app"),
-        .paused => |p| if (try samePause(st, p.txid, p.waiting))
-            return verdictOf(a, "ignore", "already submitted: waiting for its parents")
-        else
-            p.event,
-        .admit => |x| x.event,
-    };
-    return accepting(a, routed, calls.appOf(in));
-}
-
-/// A frame on the receive row `/skein/overlay/beef/1.0.0` (0.20.0: the host's own entry, never
-/// served to peers): one Atomic BEEF the host fetched — on a peer's admit, from a peer's tail list,
-/// in a pull of mined history — submitted as from the peer it came from (the record's `from`). It
-/// is judged only under the topic the frame names (0.25.0, David 2026-11-09: the TaggedBEEF rule,
-/// as ts-stack's overlay `Engine.submit` — the host names the ONE topic it fetched it for, the
-/// request's `topic`); a frame naming none, or a topic not served here, is refused. It may itself
-/// pause. The answer is the route's verdict (no reply frame: no `body`).
-fn stream(a: Allocator, in: Value, req: Value) !Value {
-    // shruggr/skein#146: the door's envelope (the route's `kernel.beef`), or the bytes as received.
-    const beef: submit_mod.Input = submit_mod.Input.of(req.get("body")) orelse .{ .bytes = "" };
-    if (beef == .bytes and beef.bytes.len == 0) return verdictOf(a, "ignore", "Missing or empty BEEF body");
-    const topics = (try receiveTopics(a, in, req)) orelse return verdictOf(a, "ignore", "the frame names no topic served here");
-    var st = try load(a, in);
-    return libp2pRouted(a, in, &st, beef, topics, try sourceOf(a, req, null));
-}
-
-/// The topics a receive-row frame is judged under (0.25.0): the one it names, when this overlay
-/// serves it; null when it names none, or one not served here.
-pub fn receiveTopics(a: Allocator, in: Value, req: Value) !?[]const []const u8 {
-    const named = req.getText("topic") orelse return null;
-    const topics = try submit_mod.servedOf(a, in, &.{named});
-    return if (topics.len == 0) null else topics;
 }
 
 /// Where a submission came from, carried on its entry: {transport, topic? (the libp2p topic),
@@ -590,14 +540,6 @@ fn sourceOf(a: Allocator, req: Value, topic: ?[]const u8) !Value {
     return .{ .map = es.items };
 }
 
-/// Accept, admitting one event into `box` (after the message's own `p2p` event, which the front door admits first).
-fn accepting(a: Allocator, ev: Value, box: []const u8) !Value {
-    return .{ .map = try a.dupe(cbor.Entry, &.{
-        .{ .key = "verdict", .value = .{ .text = "accept" } },
-        .{ .key = "admit", .value = try admitOne(a, ev, box) },
-    }) };
-}
-
 /// A handler's `admit`: one event into `box` (skein docs/MESSAGES.md: `{event: <record>, box}`).
 fn admitOne(a: Allocator, ev: Value, box: []const u8) !Value {
     return .{ .array = try a.dupe(Value, &.{.{ .map = try a.dupe(cbor.Entry, &.{
@@ -611,15 +553,6 @@ fn verdictOf(a: Allocator, v: []const u8, reason: []const u8) !Value {
         .{ .key = "verdict", .value = .{ .text = v } },
         .{ .key = "reason", .value = .{ .text = reason } },
     }) };
-}
-
-/// Whether the submission of this subject is paused already on exactly these parents (skein-overlay#1).
-fn samePause(st: *State, txid: [32]u8, wanted: []const [32]u8) !bool {
-    const rec = (try st.pendingRecord(txid)) orelse return false;
-    const ws = rec.getArray("waiting") orelse return false;
-    if (ws.len != wanted.len) return false;
-    for (ws, wanted) |w, x| if (!eql(u8, if (w == .text) w.text else return false, &c.header.toHex(x))) return false;
-    return true;
 }
 
 fn lookup(a: Allocator, in: Value, req: Value) !Value {

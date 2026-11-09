@@ -8,7 +8,8 @@
 //!                        transaction, whatever path it came by. It is the HOST's to read: a node
 //!                        that hears one fetches the BEEF from the announcing peer (the sync
 //!                        protocol's `tx` request, skein src/host/sync.ts) unless it holds the
-//!                        transaction, and hands it in through the receive row; once it admits
+//!                        transaction, and submits it (0.25.1: the submit message in `<app>/submit`,
+//!                        from the instance itself, the one topic it fetched it for); once it admits
 //!                        it, it publishes its own `admit`. The host does not deliver admits to
 //!                        the instance: one that reaches the engine's `<topic>` route anyway is
 //!                        ignored, nothing admitted (routes.zig).

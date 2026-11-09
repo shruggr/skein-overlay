@@ -1249,16 +1249,13 @@ test "gossip (#74; 0.20.0; 0.25.0 no -proof): the admit on <topic> — its shape
         try std.testing.expectError(error.BadConfig, gossip.enabled(a, try withDefault(a, inst.in, "overlayGossip", "{\"tm_demo\":\"no\"}"), "tm_demo"));
     }
 
-    // ------------------------------------------------ a submission the host fetched on a peer's admit (the receive
-    // row): only the verdict
+    // ------------------------------------------------ a submission the host fetched on a peer's admit (0.25.1: its
+    // submit message from the instance itself): only the verdict
     const tb = try spend(a, &f.tx, 1, &.{.{ 1, &k.token }}, k.priv);
     const tb_beef = try withFund(a, f, tb);
     const h2 = mine(hdr.hash(&f.h1), tb.txid, 1_700_001_800);
     {
-        const source: Value = .{ .map = try a.dupe(cbor.Entry, &.{
-            .{ .key = "transport", .value = .{ .text = "libp2p" } },
-            .{ .key = "protocol", .value = .{ .text = "/skein/overlay/beef/1.0.0" } },
-        }) };
+        const source = try fromHost(a, "fetch tb");
         const r = try inst.routeFrom(tb_beef, source);
         _ = try inst.begin(r.admit.event);
         _ = try inst.ingest(tb_beef);
@@ -2442,13 +2439,16 @@ fn fromGossip(a: Allocator, peer: []const u8) !Value {
     }) };
 }
 
-/// A frame on the overlay's want-answer stream (skein-overlay#1): sent by `peer`.
-fn fromStream(a: Allocator, peer: []const u8) !Value {
-    return .{ .map = try a.dupe(cbor.Entry, &.{
-        .{ .key = "transport", .value = .{ .text = "libp2p" } },
-        .{ .key = "protocol", .value = .{ .text = "/skein/overlay/beef/1.0.0" } },
-        .{ .key = "from", .value = .{ .bytes = peer } },
-    }) };
+/// A BEEF the host fetched (0.25.1): submitted as the submit message from the instance itself, in
+/// `<app>/submit` (skein src/host/router.ts, Router.signMessage + appendLocal) — the message step's
+/// source (engine.zig `messageSource`). `name` names the message.
+fn fromHost(a: Allocator, name: []const u8) !Value {
+    return mapOf(a, &.{
+        .{ .key = "transport", .value = .{ .text = "mailbox" } },
+        .{ .key = "box", .value = .{ .text = "overlay/submit" } },
+        .{ .key = "sender", .value = .{ .bytes = &(.{0x02} ++ .{0x11} ** 32) } },
+        .{ .key = "request", .value = .{ .cid = try a.dupe(u8, &cbor.cidOf(name)) } },
+    });
 }
 
 /// An Atomic BEEF of `t` with its funding transaction (mined, its BUMP) — what a holder sends for a want.
@@ -2597,7 +2597,7 @@ test "a parent no topic takes, a child paused on it (case d; 0.25.0, D6: an item
     try expectUints(&.{0}, (try begunEvent(&inst, res.begun)).getArray("topics").?[0].get("outputsToAdmit"));
 }
 
-test "the receive row (0.20.0): the host's own entry — a BEEF it fetched, from whichever peer, resumes the pause; nothing wanted, no peer recorded" {
+test "a BEEF the host fetched (0.25.1: the submit message from the instance itself, no receive row) — fetched twice, resumes the pause; nothing wanted, no peer recorded" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -2606,13 +2606,11 @@ test "the receive row (0.20.0): the host's own entry — a BEEF it fetched, from
     var inst = try Instance.init(a, &ms);
     const x = try chain3(a, &inst);
     const child = try atomic(a, x.t2);
-    const pa = peerId('A');
-    const pb = peerId('B');
 
-    // Fetched from A, then again from B: one pause on t1 (no peer anywhere in the state); the copy
-    // from B is in flight already — a duplicate, ignored, no second thread (0.25.0, case c).
-    _ = try inst.begin((try inst.routeFrom(child, try fromStream(a, pa))).paused.event);
-    try std.testing.expect((try inst.routeFrom(child, try fromStream(a, pb))) == .pending);
+    // Fetched from one peer, then again from another (two submit messages): one pause on t1 (no peer
+    // anywhere in the state); the second copy is in flight already — a duplicate, ignored, no second thread (0.25.0, case c).
+    _ = try inst.begin((try inst.routeFrom(child, try fromHost(a, "fetch pa"))).paused.event);
+    try std.testing.expect((try inst.routeFrom(child, try fromHost(a, "fetch pb"))) == .pending);
     var st = try inst.load();
     const ws = try pausedOnScan(&st, x.t1.txid);
     try std.testing.expectEqual(@as(usize, 1), ws.len);
@@ -2624,14 +2622,16 @@ test "the receive row (0.20.0): the host's own entry — a BEEF it fetched, from
     st = try inst.load();
     try std.testing.expectEqual(@as(usize, 1), (try pausedOnScan(&st, x.t1.txid)).len);
 
-    // The receive row is in the manifest (shruggr/skein#143): kernel.beef, then overlay.submit.
-    const stream_route = (try manifestRoute(a, "libp2p", "/skein/overlay/beef/1.0.0")).?;
-    try std.testing.expectEqualStrings("overlay.submit", stream_route.get("handler").?.string);
-    try expectFilters(stream_route, &.{"kernel.beef"});
+    // 0.25.1: no receive row in the manifest; the host's submit message takes the box `submit`'s
+    // route (kernel.beef, then overlay.submit), as any submission by message.
+    try std.testing.expect((try manifestRoute(a, "libp2p", "/skein/overlay/beef/1.0.0")) == null);
+    const sub_route = (try manifestRoute(a, "mailbox", "submit")).?;
+    try std.testing.expectEqualStrings("overlay.submit", sub_route.get("handler").?.string);
+    try expectFilters(sub_route, &.{"kernel.beef"});
 
-    // The host fetches t1 from B (a peer's admit named it): routed with the served topics, as from B.
+    // The host fetches t1 (a peer's admit named it): routed with the served topics, from the instance itself.
     const pbeef = try atomicWithFund(a, x.f, x.t1);
-    const rp = try inst.routeFrom(pbeef, try fromStream(a, pb));
+    const rp = try inst.routeFrom(pbeef, try fromHost(a, "fetch pb"));
     try std.testing.expect(rp == .admit);
     _ = try inst.begin(rp.admit.event);
     _ = try inst.ingest(pbeef);
@@ -2656,14 +2656,12 @@ test "a fetched BEEF that lacks a parent itself (skein-overlay#1): paused, waiti
     defer ms.deinit();
     var inst = try Instance.init(a, &ms);
     const x = try chain3(a, &inst);
-    const pa = peerId('A');
-    const pr = peerId('R');
 
     // t2 fetched from A, lacking t1: waiting on t1.
-    _ = try inst.begin((try inst.routeFrom(try atomic(a, x.t2), try fromStream(a, pa))).paused.event);
+    _ = try inst.begin((try inst.routeFrom(try atomic(a, x.t2), try fromHost(a, "fetch pa"))).paused.event);
     // t1 alone fetched from R: it lacks the funding transaction — paused, waiting on it.
     const t1_only = try atomic(a, x.t1);
-    const r1 = try inst.routeFrom(t1_only, try fromStream(a, pr));
+    const r1 = try inst.routeFrom(t1_only, try fromHost(a, "fetch pr"));
     try std.testing.expect(r1 == .paused);
     _ = try inst.begin(r1.paused.event);
     var st = try inst.load();
@@ -2671,7 +2669,7 @@ test "a fetched BEEF that lacks a parent itself (skein-overlay#1): paused, waiti
 
     // The funding transaction (mined) fetched from A: waited on, no topic takes it — ingested; t1 resumed.
     const fbeef = try beef.serialize(a, .{ .version = beef.V2, .atomic = x.f.txid, .bumps = x.f.bumps, .entries = try a.dupe(beef.Entry, &.{x.f.entry}) });
-    const rf = try inst.routeFrom(fbeef, try fromStream(a, pa));
+    const rf = try inst.routeFrom(fbeef, try fromHost(a, "fetch pa"));
     try std.testing.expect(rf == .admit);
     _ = try inst.begin(rf.admit.event);
     _ = try inst.ingest(fbeef);
@@ -4691,10 +4689,9 @@ const UndecidedRun = struct { root: []const u8 };
 fn undecidedRun(a: Allocator, ms: *c.store.MemStore) !UndecidedRun {
     var inst = try Instance.init(a, ms);
     const x = try strictChain(a, &inst);
-    const pb = peerId('B');
 
     // ------------------------------------------------ t2 alone (mined): the topic cannot read t1 — undecided, no verdict
-    const r2 = try inst.routeFrom(x.b2, try fromStream(a, pb));
+    const r2 = try inst.routeFrom(x.b2, try fromHost(a, "fetch pb"));
     try std.testing.expect(r2 == .paused);
     try std.testing.expectEqual(@as(usize, 1), inst.count("identify")); // judged: the topic said MissingParents
     try std.testing.expectEqual(@as(usize, 1), r2.paused.waiting.len);
@@ -4709,7 +4706,7 @@ fn undecidedRun(a: Allocator, ms: *c.store.MemStore) !UndecidedRun {
     try expectNothingRejected(&inst);
 
     // ------------------------------------------------ t1 (mined) arrives from B by another path (a pull, a peer's admit) — itself undecided (needs F)
-    const r1 = try inst.routeFrom(x.b1, try fromStream(a, pb));
+    const r1 = try inst.routeFrom(x.b1, try fromHost(a, "fetch pb"));
     try std.testing.expect(r1 == .paused);
     try std.testing.expectEqualSlices(u8, &x.f.txid, &r1.paused.waiting[0]);
     _ = try inst.begin(r1.paused.event);
@@ -4727,7 +4724,7 @@ fn undecidedRun(a: Allocator, ms: *c.store.MemStore) !UndecidedRun {
     try std.testing.expectEqual(judged, inst.count("identify"));
 
     // ------------------------------------------------ F arrives (mined; no token: takes nothing, but waited on — ingested)
-    const rf = try inst.routeFrom(x.bf, try fromStream(a, pb));
+    const rf = try inst.routeFrom(x.bf, try fromHost(a, "fetch pb"));
     try std.testing.expect(rf == .admit);
     try std.testing.expect(rf.admit.event.getBool("wanted").?);
     _ = try inst.begin(rf.admit.event);
@@ -4848,7 +4845,7 @@ test "unheld (0.19.0): a parent's block in the store but neither in the BEEF nor
     const x = try strictChain(a, &inst);
     // t1's block is in the store (another instance's, or a later entry's in a replay); the chain app holds nothing.
     _ = try ms.store().putBitcoin(a, .tx, x.t1.raw);
-    const r = try inst.routeFrom(x.b2, try fromStream(a, peerId('B')));
+    const r = try inst.routeFrom(x.b2, try fromHost(a, "fetch B"));
     try std.testing.expect(r == .paused);
     try std.testing.expectEqualSlices(u8, &x.t1.txid, &r.paused.waiting[0]);
     // Its topic-call named it: `unheld`.
@@ -5031,7 +5028,7 @@ test "a proof after a rejection (0.25.0, case a, skein-sdk 0.18.0): rejected, no
     try std.testing.expectEqual(@as(usize, 1), at2.len);
 }
 
-test "the receive row's topic (0.25.0, case f, the TaggedBEEF rule): judged only under the one topic the frame names; none named, or one not served, refused" {
+test "a fetched BEEF's topic (0.25.0 case f; 0.25.1 through the submit message, the TaggedBEEF rule): judged only under the one topic the host names; one not served, dropped" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -5039,31 +5036,26 @@ test "the receive row's topic (0.25.0, case f, the TaggedBEEF rule): judged only
     defer ms.deinit();
     var inst = try Instance.init(a, &ms);
     const two = try replaceDefault(a, inst.in, "overlayTopics", "{\"tm_demo\":\"topic-demo\",\"tm_two\":\"topic-demo\"}");
-    const req = struct {
-        fn of(al: Allocator, topic_: ?[]const u8) !Value {
-            var es: std.ArrayList(cbor.Entry) = .empty;
-            try es.appendSlice(al, &.{
-                .{ .key = "transport", .value = .{ .text = "libp2p" } },
-                .{ .key = "protocol", .value = .{ .text = "/skein/overlay/beef/1.0.0" } },
-            });
-            if (topic_) |t| try es.append(al, .{ .key = "topic", .value = .{ .text = t } });
-            return .{ .map = es.items };
-        }
-    }.of;
-    const got = (try routes.receiveTopics(a, two, try req(a, "tm_two"))).?;
-    try std.testing.expectEqual(@as(usize, 1), got.len);
-    try std.testing.expectEqualStrings("tm_two", got[0]);
-    try std.testing.expect((try routes.receiveTopics(a, two, try req(a, null))) == null);
-    try std.testing.expect((try routes.receiveTopics(a, two, try req(a, "tm_other"))) == null);
-    // Judged under it alone: a BEEF tm_demo would take is not judged by tm_demo when fetched for tm_two.
+    inst.in = two;
     const k = try keys(0x42);
     const f = try fund(a, 0x67, 1, &k.p2pkh);
     try inst.headers(&.{&f.h1});
     const t = try spend(a, &f.tx, 0, &.{.{ 1, &k.token }}, k.priv);
-    inst.in = two;
-    inst.topics = got;
-    const r = try inst.route(try withFund(a, f, t));
-    const js = r.admit.event.getArray("topics").?;
+    const bytes = try withFund(a, f, t);
+    const args = struct {
+        fn of(al: Allocator, b: []const u8, topic_: []const u8) !Value {
+            return mapOf(al, &.{
+                .{ .key = "beef", .value = .{ .bytes = b } },
+                .{ .key = "topics", .value = .{ .array = try al.dupe(Value, &.{.{ .text = topic_ }}) } },
+            });
+        }
+    }.of;
+    // A topic not served here: nothing judged, dropped.
+    try std.testing.expect((try inst.received(try args(a, bytes, "tm_other"), try fromHost(a, "fetch other"))) == .dropped);
+    // Judged under the named topic alone: a BEEF tm_demo would take is not judged by tm_demo when fetched for tm_two.
+    const r = try inst.received(try args(a, bytes, "tm_two"), try fromHost(a, "fetch two"));
+    try std.testing.expect(r == .launch);
+    const js = r.launch.getArray("topics").?;
     try std.testing.expectEqual(@as(usize, 1), js.len);
     try std.testing.expectEqualStrings("tm_two", js[0].getText("topic").?);
 }

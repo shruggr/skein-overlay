@@ -23,8 +23,10 @@ is its last result's `submission`); the pending record names no thread; a
 transaction the walk comes to that no topic takes is an item while the chain
 app does not hold it (its verdict fact `rejected`), whoever listens (no scan
 for waiters); no proofs by gossip (`<topic>-proof`, `peerProof` gone: the
-host's Arcade feed and its pull deliver `proof` events in box `chain`); the
-receive row judges only under the one topic the frame names; a register's
+host's Arcade feed and its pull deliver `proof` events in box `chain`); no
+receive row (0.25.1): the host submits a fetched BEEF as the submit message in
+`<app>/submit` from the instance itself, judged only under the one topic it
+names; a register's
 `seed` is the deploy's BEEF, submitted as an ordinary submission (a message
 into `<app>/submit`), the answer `{topic, active}`.
 
@@ -99,8 +101,8 @@ storage are not ported.
   2026-10-30): the push half — admits announced, BEEFs fetched by the host,
   proofs as they happen — is the gossip (#74, below). The engine's half of
   catch-up is the anchors and their reads ("Anchors", below), the sync
-  protocol's frames (`tail` among them) and the receive row the host
-  writes fetched BEEFs into (`/skein/overlay/beef/1.0.0`); the fetching,
+  protocol's frames (`tail` among them); the host submits each BEEF it
+  fetched as the submit message in `<app>/submit` (0.25.1); the fetching,
   the locator exchange and the ranged pulls are the host's.
 - The `historical-tx` modes.
 - BRC-64 history queries beyond "spent too" (`includeSpent`).
@@ -114,7 +116,7 @@ storage are not ported.
 | `src/state.zig` | The overlay's state (`<app>/state`) over the chain state (read only): the maps, the previous coins, recording a judgement (`apply`), removing one (`unapply`), `inTopic`, `spender`; whether a transaction is reachable (`holds`, the `ancillary` index); the paused submissions waiting on a transaction (`pausedOn`, 0.24.0: a scan, no index); the tail as transactions (`tailTxids`, 0.20.0); the parents a BEEF lacks (`missingParents`) and an item's Atomic BEEF cut from a submission's (`atomicFor`); the door's envelope and pointer record read (`decodeRecord`, #121, #146); the view digest (`views`, `View`, `viewChanges`, 0.12.0) or the one BEEF parse of bytes (`decode`), SPV over the records (`verifyDecoded`; BUMPs only for bytes); the bytes of a BEEF that came as bytes kept as a raw block (`putRaw`), which the `applied` record names; BEEF out for a lookup (`beefFor`, `beefOfMany`); the anchors (0.14.0: `place`, `settleAnchors`, `beat`, `minedBlocks`). |
 | `src/calls.zig` | The configuration as the engine reads it (`configObject`, `listeners`, the app's name) and its calls of topics and lookup services (`Caller`, `hookAdmitted`, `hookRejected`). |
 | `src/registry.zig` | The registrations (`register`, `deregister`, `registerLookup`, `deregisterLookup`): what they write, emit and seed, taken as a message in `<app>/register` (engine.zig) or, 0.18.0, as a call from a program of the instance in its step (`byCall`); the effects through `Fx`. |
-| `src/routes.zig` | The route handlers (#40): the overlay-express wire contract (`/submit` BRC-22, synchronous: `httpFirst`, `httpAgain`, 0.9.1), the gossip's inbound route (`peerProof`, #74), the receive row, and the sync frames (`syncAnswer`; `tail` 0.20.0). |
+| `src/routes.zig` | The route handlers (#40): the overlay-express wire contract (`/submit` BRC-22, synchronous: `httpFirst`, `httpAgain`, 0.9.1), the gossip's inbound route (#74), and the sync frames (`syncAnswer`; `tail` 0.20.0). |
 | `src/gossip.zig` | The gossip topics (#74; 0.20.0: `admit` on `<topic>`, no BEEF): message shapes, what an admission and a proof publish, a peer's proof checked. |
 | `src/config.zig` | Where the engine's configuration comes from: its app record (`<app>/app`), else the genesis. |
 | `src/engine_vm.zig` | The engine's wiring over the `skein` imports. |
@@ -181,7 +183,7 @@ submit, 0.7.7 the registration box named `register`). An overlay app has three b
 |---|---|---|
 | `<app>/submit` | `{"address": "submit", "filters": ["kernel.beef"], "handler": "overlay.submit"}` | **submissions by message**: the `submit` message from anyone whose BEEF validates (and the `submission` event 0.7.3–0.9.0's `POST /submit` admitted, still stepped as one) |
 | `<app>/register` | `{"address": "register", "handler": "overlay.register"}`, gated by `roles: {root: ["register", "registerLookup", "deregisterLookup"]}` | **registration**: `register` / `deregister`, `registerLookup` / `deregisterLookup` from root; refused (`bad-args`) in any other box ("Register a topic", below) |
-| `<app>` | derived by the install: an `event` route and a `mailbox` route (the engine takes only the instance's own messages) | **the engine's own traffic**: the receive row's admits (a fetched submission's routed `submit` event), POST /submit's admitted submit event (0.24.0), its own `wait` (0.9.1) and `rebeat` |
+| `<app>` | derived by the install: an `event` route and a `mailbox` route (the engine takes only the instance's own messages) | **the engine's own traffic**: POST /submit's admitted submit event (0.24.0), its own `wait` (0.9.1) and `rebeat` |
 
 Since shruggr/skein#143 a box has one mailbox route (no sender to tell
 two apart): the app's own box `<app>` is the engine's (its derived mailbox
@@ -268,7 +270,8 @@ A submission's answers are about its subject. A subject no topic takes
 submission) is answered `rejected`, `NotAdmitted`, at once; the
 transactions before it go on as items (below). A resubmission while the
 first is with the chain app is not answered (open, below). A BEEF the host
-fetched (the receive row, libp2p) has no submitter: nothing is answered.
+fetched is a submission by message from the instance itself (0.25.1): its answers
+go to the instance, where no thread awaits them (recorded, nothing runs).
 
 **The proofs and a reorg** (0.24.0). The submission's thread rests on each
 item's `chain/tx/<txid>` for its life, so every later status is heard by
@@ -309,8 +312,8 @@ the parents the BEEF lacks (`state.missingParents`): for every transaction
 its BUMPs do not prove, each input's source that is neither a transaction
 before it in the BEEF nor held by the chain app, and each txid-only entry
 the chain app does not hold. Any → the submission **pauses** (below,
-"Paused on a missing parent"), however it came: a message, `/submit`, a
-a frame on the receive row. "There never is a
+"Paused on a missing parent"), however it came: a message (the host's
+fetched BEEFs among them, 0.25.1) or `/submit`. "There never is a
 missing parent; the status is pending." Nothing is judged.
 
 SPV for the rest (`state.verifyDecoded`), the previous coins and the topic
@@ -366,7 +369,7 @@ state at once; one of a transaction pending (below) is not answered.
 
 **The submission's thread.** Otherwise the submission's step launches the
 submission's thread — the engine on the submit event (args `{event, box:
-"submit"}`). (POST /submit, and a submission on the receive row, admit the
+"submit"}`). (POST /submit admits the
 same event into the app's box `<app>` instead, and the app's row from
 `event` starts the same engine.) The thread holds the submission's context
 (the event, its args) for its life: it never finishes.
@@ -507,9 +510,10 @@ The host (skein src/host/sync.ts) fetches what peers announce (a peer's
 `admit` on `<topic>`), what a peer's tail list names that we lack, and
 what a pull of mined history lists, each by `{kind: "tx", topic, txid}` on
 `/skein/overlay/sync/1.0.0`; the peer's engine answers from `holds` with
-its chain state's Atomic BEEF (`beefFor`); the host hands that to the
-receive row `/skein/overlay/beef/1.0.0` (filter `kernel.beef` → `submit`)
-as from that peer. A parent also arrives inside a later submission's BEEF.
+its chain state's Atomic BEEF (`beefFor`); the host submits that as the
+submit message `{fn: "submit", args: {beef, topics: [<the topic it fetched it
+for>]}}` in `<app>/submit`, signed as the instance itself (0.25.1; filter
+`kernel.beef` → `submit`). A parent also arrives inside a later submission's BEEF.
 
 ### Paused on a missing parent (skein-overlay#1)
 
@@ -522,17 +526,15 @@ source is missing cannot have its script verified, and the chain app's
 ingest refuses the BEEF (`MissingInput`) — no topic could judge it either.
 
 **Every submission lacking a parent pauses** (shruggr/skein#112, 0.7.2):
-from a peer, from a message, over HTTP. The pause is internal: the
+from a message (a BEEF the host fetched among them), over HTTP. The pause is internal: the
 submitter hears nothing until the verdict.
 
-From a peer, the route answers accept, admitting the paused event into box
-`<app>`; by message or HTTP, the submission's step pauses it itself —
+By message or HTTP, the submission's step pauses it itself —
 
 ```
 {kind: "submit", txid (hex), beef, topics: [], requested: [<topic>, …] (the topics requested this overlay serves),
  waiting: [<txid hex>, …] (the parents, in BEEF order), offChainValues?,
- source: {transport: "libp2p", topic? | protocol?, from: <the peer ID's multihash>, request}
-       | {transport: "mailbox" | "http", box, sender?, request}}
+ source: {transport: "mailbox" | "http", box, sender?, request}}
 ```
 
 — a step that notes it pending and rests:
@@ -547,17 +549,14 @@ From a peer, the route answers accept, admitting the paused event into box
   recorded (0.20.0: no `want`, no timed retry anywhere). A parent settled
   between the route and this step (in flight then; missing then and held
   now) brings no fact the thread would hear: the submission is routed again
-  at once. A later submission of the same subject paused on the same parents
-  is `ignore` on the receive row.
+  at once. A later submission of the same subject is a duplicate (in flight).
 
-**The receive row.** `/skein/overlay/beef/1.0.0` (the manifest's row
-`{"transport": "libp2p", "address": "/skein/overlay/beef/1.0.0", "filters":
-["kernel.beef"], "handler": "overlay.submit"}`) is the host's own entry,
-never served to peers (0.20.0: "not a good door to have"): one Atomic BEEF
-per frame the host fetched. The door decodes it (`kernel.beef`) and
-`submit` routes it as a submission from the peer it came from, with every
-served topic. It is an item even if no topic takes it when a paused
-submission waits on it (below), and it may itself pause.
+**No receive row** (0.25.1, David 2026-11-09). Until 0.25.0 the host wrote each
+BEEF it fetched into the libp2p row `/skein/overlay/beef/1.0.0`; it goes. The
+host submits the BEEF through the one submit path: the submit message, signed
+as the instance itself, in `<app>/submit` — judged only under the one topic it
+names (the TaggedBEEF rule). It is an item even if no topic takes it when a
+paused submission waits on it (below), and it may itself pause.
 
 **Woken** (0.24.0). A submission whose BEEF carries a waited-on parent
 makes it an item (above), ingested even if no topic takes it. Its verdict —
@@ -578,7 +577,7 @@ again, and nothing is to do). A submission of the subject that is whole
 **Not woken: a parent fed to the chain app's ingest directly.** A paused
 thread rests on the parent's overlay verdict, which the engine emits only
 when the parent comes through a submission to this overlay (`/submit`, a
-message, the receive row). A BEEF the host feeds to the chain app's
+message — the host's fetched BEEFs among them). A BEEF the host feeds to the chain app's
 `ingest` itself emits `chain/tx/<parent>`, which no paused thread rests on.
 
 **Next (not built).** The rest of the decided direction of shruggr/skein#31
@@ -722,7 +721,7 @@ wire"). Stepped:
 | launched by | input | does |
 |---|---|---|
 | a message in box `<app>/submit` from anyone (the manifest's route `submit`, `kernel.beef`), or the `submission` event 0.7.3–0.9.0's POST /submit admitted there (a log written then) | `{fn: "submit", args: {beef, topics, offChainValues?}}`, or `{kind: "submission", body: <that message>, request, transport: "http", sender?}` | a submission (shruggr/skein#112): routed — its thread launched, paused, or answered (`rejected`, or `admitted` for one judged before); the step's wake at the end of the thread it launched (`resolved`) answers nothing (0.7.4: the submitter is answered once per state change) |
-| a submission's launch (a message's, a parent's verdict routing a pause again), or the submit event in box `<app>` (POST /submit's admit, the receive row's, the derived event route) | `{kind: "submit", …}` | the submission's thread: the ingest messages, pending, resting on each item's `chain/tx/<txid>` (a paused event: the pause recorded, resting on each parent's `<app>/topic/tx/<txid>`); an error answer to an ingest (`reply`): the item failed |
+| a submission's launch (a message's, a parent's verdict routing a pause again), or the submit event in box `<app>` (POST /submit's admit, the derived event route) | `{kind: "submit", …}` | the submission's thread: the ingest messages, pending, resting on each item's `chain/tx/<txid>` (a paused event: the pause recorded, resting on each parent's `<app>/topic/tx/<txid>`); an error answer to an ingest (`reply`): the item failed |
 | a fact under a name the thread rests on (skein 0.5.4: the input's `event`) | `chain/tx/<txid>` {status} (skein-chain 0.8.0) | the submission's thread: the status heard (`heard`) — admit, reject, place, move, unwind; the submitter answered; the subject's HTTP waiters answered when it leaves pending |
 | a fact under a name the thread rests on | `<app>/topic/tx/<txid>` {verdict} | a thread that paused submissions on that parent: each routed again (`wokeOn`) — its thread launched, paused again, or dropped (0.24.0: no `resume` message, no `waits` index) |
 | a message in box `<app>` from the instance itself (row from `$self`) | `{fn: "wait", args: {txid}}` (0.9.1) | an HTTP request waiting on a subject paused or in flight (0.24.0): added to its waiters, or answered at once ("POST /submit", above); a late answer to a `wait`, nothing |
@@ -1329,19 +1328,10 @@ does not deliver them; whatever reaches the engine there is answered
 **ignore**, nothing admitted (before 0.20.0 it carried `{kind: "submit",
 beef}`, judged as a submission, and `admit`, recorded).
 
-**The receive row** (skein-overlay#1; 0.20.0 the host's own entry). The
-libp2p route `/skein/overlay/beef/1.0.0` (`filters: ["kernel.beef"]`)
-names the same fn. Only the host writes it, never a peer (skein's host
-does not handle it inbound): **one Atomic BEEF per frame** it fetched —
-on a peer's admit, from a peer's tail list, in a pull of mined history.
-Each frame is a request (`{kind: "p2p-frame", protocol, from, body}`, skein
-docs/MESSAGES.md "libp2p", "Streams"; `from` the peer it came from); the
-door decodes the BEEF into its envelope, and the handler routes it as a
-submission from `from`, with every served topic. The answer is the
-route's verdict: **accept** admitting the submit event into box `<app>`,
-or **ignore** (nothing new, paused already on the same parents, refused).
-It writes **no reply frame**. An admission publishes its `admit` verdict
-on `<topic>`, never the BEEF.
+**No receive row** (0.25.1). The libp2p route `/skein/overlay/beef/1.0.0`
+(0.20.0 to 0.25.0, the host's own entry for the BEEFs it fetched) is gone: the
+host submits each as the submit message in `<app>/submit` from the instance
+itself. An admission publishes its `admit` verdict on `<topic>`, never the BEEF.
 
 **A lookup writes nothing**, and leaves no entry: it is a read. The
 handler calls the service's program and shapes its answer for the wire.
@@ -1417,7 +1407,7 @@ order.
 
 | topic | body | published | received |
 |---|---|---|---|
-| `<topic>` | `{kind: "admit", txid, topics: {<topic>: {outputsToAdmit: [vout], coinsToRetain: [input index]}}}` — the STEAK and the txid, **no BEEF** | once, by the step that **admits** a transaction, whatever path it came by: an admit is that peer's judgement | **by the host** (skein src/host/sync.ts), never delivered to the instance: unless the instance holds the txid or a fetch of it is under way, the host asks the announcing peer `{kind: "tx", topic, txid}` on the sync protocol and hands the BEEF to the receive row; per txid it keeps the set of announcing peers (on a failure the next; exhausted, it waits for a new admit); GossipSub's verdict is ignore (not forwarded: each node announces its own admission, so bytes spread one hop at a time) |
+| `<topic>` | `{kind: "admit", txid, topics: {<topic>: {outputsToAdmit: [vout], coinsToRetain: [input index]}}}` — the STEAK and the txid, **no BEEF** | once, by the step that **admits** a transaction, whatever path it came by: an admit is that peer's judgement | **by the host** (skein src/host/sync.ts), never delivered to the instance: unless the instance holds the txid or a fetch of it is under way, the host asks the announcing peer `{kind: "tx", topic, txid}` on the sync protocol and submits the BEEF as the submit message in `<app>/submit` from the instance itself (0.25.1); per txid it keeps the set of announcing peers (on a failure the next; exhausted, it waits for a new admit); GossipSub's verdict is ignore (not forwarded: each node announces its own admission, so bytes spread one hop at a time) |
 | ~~`<topic>-proof`~~ | (0.20.0 to 0.24.0; gone in 0.25.0) | never | not subscribed |
 | `<topic>-live` | the runtime's beacon frame over the topic's beat body ("Beats", above) | on the host's timer only, every `every` ms (a re-declared body is what the next beat carries) | the runtime's liveness tool (unlogged), never this engine |
 
