@@ -12,7 +12,10 @@
 //!
 //!   fn "admitted"  {kind: "lookup-hook", app, service, topic, tx: <bitcoin-tx CID>, outputsToAdmit: [vout], coinsRetained: [input index]}
 //!   fn "spent"     {kind: "lookup-hook", app, service, topic, outpoint: {tx: <CID>, vout}, spendingTx: <CID>}
-//!   fn "rejected"  {kind: "lookup-hook", app, service, topic, tx: <CID>}
+//!   fn "rejected"  {kind: "lookup-hook", app, service, topic, tx: <CID>, givenBack: [input index]}
+//!                  (0.26.0: `givenBack` the inputs whose coins are live in the topic again — a coin
+//!                  another admitted transaction consumes, a proven winner, is not among them; a
+//!                  native hook reads it as `svc.given_back`, null from an engine before 0.26.0)
 //!
 //! (each may be a no-op). A hook answers `{kind: "lookup-hooked", fn, beats?:
 //! {<service>: bytes}, events?: [map]}`: `beats` (0.12.0), when the hook changed what a
@@ -129,6 +132,11 @@ pub const Service = struct {
 
     /// The events a hook asked to be emitted (`emit`), in order: the hook's answer carries them (0.20.4).
     events: std.ArrayList(Value) = .empty,
+
+    /// In a `rejected` hook (0.26.0): the input indices of the rejected transaction whose coins are
+    /// live in the topic again (`givenBack`); a coin another admitted transaction consumes is not
+    /// among them. Null: the argument carries none (an engine before 0.26.0).
+    given_back: ?[]const u32 = null,
 
     pub const Beat = struct { service: []const u8, body: []const u8 };
 
@@ -271,6 +279,7 @@ pub fn hook(a: Allocator, spec: Spec, svc: *Service, func: []const u8, arg: Valu
         return f(a, svc, topic, .{ .txid = src, .vout = @intCast(vout) }, try svc.tx(arg.getCid("spendingTx") orelse return error.BadArgs));
     } else if (std.mem.eql(u8, func, "rejected")) {
         const f = spec.rejected orelse return;
+        svc.given_back = if (arg.get("givenBack") != null) try uintList(a, arg.get("givenBack")) else null;
         return f(a, svc, topic, try svc.tx(arg.getCid("tx") orelse return error.BadArgs));
     } else return error.UnknownFunction;
 }

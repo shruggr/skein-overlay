@@ -264,7 +264,10 @@ pub const Held = struct {
 };
 
 /// A topic's judgement a rejection removed: its lookup services are told (`rejected`).
-pub const Unapplied = struct { topic: []const u8, txid: [32]u8 };
+/// A judgement a rejection removed (`unapply`): its topic, its transaction, and (0.26.0) the input
+/// indices whose coins it gives back — live in the topic again, consumed by no other judgement of it
+/// (`counted`): a coin another admitted transaction consumes (a proven winner) is not given back.
+pub const Unapplied = struct { topic: []const u8, txid: [32]u8, given_back: []const u32 = &.{} };
 
 pub fn topicPrefix(a: Allocator, t: []const u8) ![]u8 {
     if (t.len == 0) return error.BadTopic;
@@ -649,13 +652,18 @@ pub const State = struct {
             const rec = try self.record(rc);
             const raw = self.store.get(a, rec.getCid("tx") orelse return error.BadRecord) catch return error.BadRecord;
             const tx = Transaction.parse(a, raw) catch return error.BadRecord;
+            var given: std.ArrayList(u32) = .empty;
             for ([_][]const u8{ "coinsToRetain", "coinsRemoved" }) |field| for (rec.getArray(field) orelse &.{}) |x| {
                 if (x != .uint or x.uint >= tx.inputs.len) return error.BadRecord;
                 const po = tx.inputs[@intCast(x.uint)].previous_outpoint;
-                if (try self.counted(t, po.txid.bytes, po.index)) v.fold(po.txid.bytes, po.index, true);
+                if (try self.counted(t, po.txid.bytes, po.index)) {
+                    v.fold(po.txid.bytes, po.index, true);
+                    try given.append(a, @intCast(x.uint));
+                }
             };
+            std.mem.sort(u32, given.items, {}, std.sort.asc(u32));
             try self.putView(t, v);
-            try out.append(a, .{ .topic = t, .txid = txid });
+            try out.append(a, .{ .topic = t, .txid = txid, .given_back = given.items });
         }
         return out.items;
     }

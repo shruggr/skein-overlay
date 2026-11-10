@@ -98,8 +98,10 @@ fn rejected(a: Allocator, svc: *Service, topic: []const u8, tx: lookup.Tx) anyer
         }
         _ = try svc.map("outputs").remove(key);
     }
-    // What it spent is unspent again.
-    for (tx.tx.inputs) |in| {
+    // What it spent is unspent again — 0.26.0: only the coins the engine gives back (`givenBack`);
+    // one another admitted transaction consumes stays spent.
+    for (tx.tx.inputs, 0..) |in, i| {
+        if (svc.given_back) |gb| if (std.mem.indexOfScalar(u32, gb, @intCast(i)) == null) continue;
         const op = c.store.outpointKey(in.previous_outpoint.txid.bytes, in.previous_outpoint.index);
         const key = try cat(a, &.{ tp, &op });
         const v = (try svc.map("outputs").get(key)) orelse continue;

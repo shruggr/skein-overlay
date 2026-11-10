@@ -605,7 +605,7 @@ the anchors and answers the sync protocol's frames (0.15.0).
 |---|---|
 | this app and package | 0.26.0 (tag `v0.26.0`) |
 | skein-sdk | v0.19.0, by tag URL and hash in `build.zig.zon` (modules `chain` and, for the engine, `sk`; bsvz comes through it) |
-| requires | `chain/1` (shruggr/skein-chain 0.10.0: its `ingest` as an in-VM call; its facts `chain/tx/<txid>` {pending, seen, mined, rejected}; a proof after a rejection is `mined`) |
+| requires | `chain/1` (shruggr/skein-chain v0.10.0: its `ingest` as an in-VM call; its facts `chain/tx/<txid>` {pending, seen, mined, rejected}; a proof after a rejection is `mined`) |
 | skein | 0.6.1 or later (the host submits fetched BEEFs as the submit message; 0.25.1) (the event index, 0.5.0; a thread resting on a name, 0.5.4); the engine and the chain app installed as apps (a genesis program's record names no app, and emits no fact); skein's equivs pin this repo by commit |
 
 0.3.0 moved the state under `<app>/…`, made the chain app's answer the gate
@@ -1122,7 +1122,20 @@ the submission, `InputSpent: input <txid>.<vout> is already spent by
 <txid>`; a proven one never is, and a chain-rejected subject whose BEEF
 proves it is judged again. The `spent` hook, the `topic/output` spent state
 and the view digest are unchanged; an unwound transaction's coin is
-re-stated `admitted` only when no other judgement consumes it.
+re-stated `admitted` only when no other judgement consumes it, and the
+`rejected` lookup hook's argument gains `givenBack: [input index]` (the coins
+live again; a native hook reads `svc.given_back`, null from an older engine).
+
+Re-pin notes (lookups, validators): `Wire` needs `ingestFn` and
+`chainHeadFn`; `submit.answered`, `answerOf`, `ingestBody`, `Ctx.awaiting`,
+`Stepped.awaiting` and `Begun.ingests` are gone (`Begun.ingested`,
+`Begun.stepped`); `Answer` is `pending | seen | mined | rejected | failed |
+other`; `chain_box` is `chain_app`; the refusal `DoubleSpend` is `InputSpent:
+…`; `previousCoins` no longer drops a coin another held transaction spends
+(a validator's "still live" must read the chain state); a `rejected` hook
+gives back only `givenBack` (a `spent` hook may hear a second spender of a
+coin — the proven winner — after the loser). Hook signatures are unchanged.
+Requires skein-chain v0.10.0.
 
 ## Contributing
 

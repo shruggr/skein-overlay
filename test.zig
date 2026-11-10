@@ -299,6 +299,8 @@ const Instance = struct {
     /// How the topic program judges: tm_demo's identify, or it naming ancillary txids (skein-overlay#4).
     identify_: enum { demo, funding, unknown, strict } = .demo,
     calls_: std.StringHashMapUnmanaged(usize) = .empty,
+    /// The arguments of the lookup's `rejected` hook calls, in order (0.26.0: `givenBack`).
+    rejected_args: std.ArrayList(Value) = .empty,
     wire_: *FakeWire,
     out_: *FakeOut,
     /// The submission threads' events, by item txid.
@@ -351,6 +353,7 @@ const Instance = struct {
         }
         if (std.mem.eql(u8, program, self.lookup_prog)) {
             try std.testing.expectEqualStrings("overlay", arg.getText("app").?);
+            if (std.mem.eql(u8, func, "rejected")) try self.rejected_args.append(self.a, arg);
             const h = try lookup.handle(a, self.ls_spec, self.current, .regtest, self.ls_state, self.chain_root, func, arg);
             if (h.state) |sc| self.ls_state = sc;
             return h.answer;
@@ -4950,7 +4953,10 @@ test "one held spender per coin (0.20.5, David 2026-11-06; 0.26.0): a second unm
 
     // (c) A rejected by the chain app: the coin is free; B submitted again is admitted.
     _ = try inst.chainStatus(sa.txid, "REJECTED", null);
+    const rej0 = inst.rejected_args.items.len;
     try std.testing.expect((try inst.watched(sa.txid, .{ .rejected = "REJECTED" })).unapplied.len > 0);
+    // 0.26.0: the coin is given back (no other judgement consumes it): `givenBack` [0].
+    try expectUints(&.{0}, inst.rejected_args.items[rej0].get("givenBack"));
     try std.testing.expect(!(try inst.applied(sa.txid)));
     const rb2 = try inst.route(try atomic(a, sb));
     _ = try inst.begin(rb2.admit.event);
@@ -5146,8 +5152,19 @@ fn provenAgainstHeld(a: Allocator, source_of: enum { message, sync }) !void {
         .{ .key = "reason", .value = .{ .text = "double-spent" } },
         .{ .key = "by", .value = .{ .text = &hdr.toHex(sb.txid) } },
     }));
+    const rej0 = inst.rejected_args.items.len;
     const un = try inst.watched(x.sa.txid, why);
     try std.testing.expect(un.unapplied.len > 0);
+    // The lookup's `rejected` hook is told A gives back nothing: the coin it consumed, B consumes.
+    try std.testing.expectEqual(rej0 + 1, inst.rejected_args.items.len);
+    const rarg = inst.rejected_args.items[rej0];
+    try std.testing.expectEqualSlices(u8, &c.store.hashCid(.tx, x.sa.txid), rarg.getCid("tx").?);
+    try expectUints(&.{}, rarg.get("givenBack"));
+    // So ls_demo keeps t1:0 spent (by B): it lists it only with includeSpent.
+    const live = try inst.look(&.{ .{ .key = "txid", .value = .{ .text = &hdr.toHex(x.t1.txid) } }, .{ .key = "outputIndex", .value = .{ .uint = 0 } }, .{ .key = "topic", .value = .{ .text = "tm_demo" } } });
+    try std.testing.expectEqual(@as(usize, 0), live.len);
+    const any = try inst.look(&.{ .{ .key = "txid", .value = .{ .text = &hdr.toHex(x.t1.txid) } }, .{ .key = "outputIndex", .value = .{ .uint = 0 } }, .{ .key = "topic", .value = .{ .text = "tm_demo" } }, .{ .key = "includeSpent", .value = .{ .boolean = true } } });
+    try std.testing.expectEqual(@as(usize, 1), any.len);
     try std.testing.expect(!(try inst.applied(x.sa.txid)));
     try std.testing.expect(try inst.applied(sb.txid));
     try std.testing.expectEqualDeep(@as([]const []const u8, &.{ "admitted", "reverted" }), inst.wire_.verdicts(x.sa.txid));

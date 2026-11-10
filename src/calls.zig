@@ -198,13 +198,17 @@ pub fn hookAdmitted(a: Allocator, caller: Caller, in: Value, topic: []const u8, 
 }
 
 /// The judgements a rejection removed (`State.unapply`): each topic's lookup programs' (once each,
-/// `hookTargets`) `rejected(topic, tx)`. The beat bodies the hooks answer go onto `out.lookup_beats`
+/// `hookTargets`) `rejected(topic, tx)`, with (0.26.0) `givenBack`: the input indices whose coins
+/// are live in the topic again — not one another admitted judgement consumes. The beat bodies the hooks answer go onto `out.lookup_beats`
 /// (0.12.0), their events onto `out.lookup_events` (0.20.4).
 pub fn hookRejected(a: Allocator, caller: Caller, in: Value, gone: []const st.Unapplied, out: *st.State) !void {
     for (gone) |g| {
         const tc = try a.dupe(u8, &store_mod.hashCid(.tx, g.txid));
         for (try hookTargets(a, in, g.topic)) |l| {
-            try hooked(a, try caller.call(a, l.program, "rejected", try hookArg(a, in, l, g.topic, &.{.{ .key = "tx", .value = .{ .cid = tc } }})), out);
+            try hooked(a, try caller.call(a, l.program, "rejected", try hookArg(a, in, l, g.topic, &.{
+                .{ .key = "tx", .value = .{ .cid = tc } },
+                .{ .key = "givenBack", .value = .{ .array = try uints(a, g.given_back) } },
+            })), out);
         }
     }
 }

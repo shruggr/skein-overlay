@@ -50,7 +50,9 @@ otherwise:
   step), the view digest, verdict facts, sync, seeds, registration, threads.
   One fix with it: an unwound transaction's given-back coin is re-stated
   `admitted` only when no other judgement of the topic consumes it
-  (`State.counted`), so a winner's `spent` stays the coin's latest fact.
+  (`State.counted`), so a winner's `spent` stays the coin's latest fact; the
+  `rejected` lookup hook says the same in its new field `givenBack` (the
+  input indices given back; signature unchanged).
 
 **0.25.0 (David 2026-11-09: "There is no deciding. There is reading the
 state")**, over everything below that says otherwise: every wake of a
@@ -1238,7 +1240,7 @@ program's names that listens to the topic), and `program`, the role in
 |---|---|---|
 | `admitted` | `{kind: "lookup-hook", app, service, program, topic, tx: <CID>, outputsToAdmit: [vout], coinsRetained: [input index]}` | a topic it listens to admitted a transaction (or consumed previous coins) |
 | `spent` | `{kind: "lookup-hook", app, service, program, topic, outpoint: {tx: <CID>, vout}, spendingTx: <CID>}` | for each previous coin that transaction consumed (retained or removed) |
-| `rejected` | `{kind: "lookup-hook", app, service, program, topic, tx: <CID>}` | a judgement of that topic was removed by a rejection |
+| `rejected` | `{kind: "lookup-hook", app, service, program, topic, tx: <CID>, givenBack: [input index]}` | a judgement of that topic was removed by a rejection; `givenBack` (0.26.0) the inputs whose coins are live in the topic again — a coin another admitted transaction consumes (a proven winner) is not among them, so a lookup never revives it (a native hook: `svc.given_back`; null from an older engine) |
 | `lookup` | `{kind: "lookup-call", app, service, program, query}` | `POST /lookup`: a read |
 
 A hook may be a no-op. It answers `{kind: "lookup-hooked", fn, beats?:
