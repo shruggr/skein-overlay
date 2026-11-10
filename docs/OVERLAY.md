@@ -1,4 +1,4 @@
-# Overlay services in the VM (0.25.0)
+# Overlay services in the VM (0.26.0)
 
 An overlay is an app (skein docs/APPS.md §6). It judges transactions with
 its topic managers and indexes them with its lookup services; it does not
@@ -9,6 +9,48 @@ its docs/CHAIN.md), under `chain/state`. The overlay reads it by CID and
 asks the chain app to take a transaction; what the chain app says about it
 (accepted, mined, rejected, reorged: its fact `chain/tx/<txid>`, skein-chain
 0.8.0) is the overlay's gate.
+
+**0.26.0 (David 2026-11-09: "spent-ness is chain state, not topic state";
+double spends; skein-chain 0.10.0)**, over everything below that says
+otherwise:
+
+- **The chain app is called, not sent a message.** A submission's thread
+  hands each item to the chain app by an in-VM call of its `ingest`
+  (`{beef}` → `{txid, status, …}`) in its own step; the box `chain`, the
+  ingest messages, their error answers (`submit.answered`, `awaiting`) and the
+  pending record's `ingest` CID go (the record says `ingested: true`). A call
+  that fails fails the item as an error answer did. The thread still rests on
+  each item's `chain/tx/<txid>`; the same step then reads the chain state (a
+  step does not see its own emits) and admits what it admits — an item that
+  arrived proven is admitted in that step.
+- **Status words** (skein-chain 0.10.0): `chain/tx/<txid>` `{status: pending
+  | seen | mined (height) | rejected (reason, by?)}`; `accepted` is `seen`,
+  and after a reorg a transaction is `seen` with reason "reorged" (acted on
+  as today's reorged: placed where the chain state has it). A rejection's
+  reason reaches the submitter as `<reason>`, or `<reason> by <txid>` (a
+  double spend's winner, an input's rejected root).
+- **Previous coins are the topic's judgement only**: the inputs spending an
+  output the topic admitted. Another held spender of that output no longer
+  takes it out (`spentByOther` goes): a PROVEN transaction is judged with the
+  coin even while an unmined one spends it — the proof wins; the chain app
+  then rejects the loser (double-spent, by the winner) and the loser's own
+  thread unwinds it, as on any rejection.
+- **The intake refuses an unmined spend of a held coin.** Every UNPROVEN
+  transaction the submission would ingest (the subject and every earlier
+  item) whose input a transaction held here already spends — the chain
+  state's spender that is not rejected, or one in flight in another
+  submission of this engine (`inFlightSpender`) — refuses the whole
+  submission: `InputSpent: input <txid>.<vout> is already spent by <txid>`.
+  Nothing of it is stored by the overlay or the chain app, nothing broadcast.
+  A PROVEN transaction is never refused as a double spend, and a subject the
+  chain state has rejected is judged again when its BEEF carries a valid
+  proof (`TransactionRejected` only without one).
+- **Unchanged:** the `spent` lookup hook and the `topic/output` `spent`
+  state (lookups hear spends from the engine's walk, in the admission's
+  step), the view digest, verdict facts, sync, seeds, registration, threads.
+  One fix with it: an unwound transaction's given-back coin is re-stated
+  `admitted` only when no other judgement of the topic consumes it
+  (`State.counted`), so a winner's `spent` stays the coin's latest fact.
 
 **0.25.0 (David 2026-11-09: "There is no deciding. There is reading the
 state")**, over everything below that says otherwise: every wake of a
@@ -325,17 +367,17 @@ write cache), and the chain state, read only (`head("chain/state")`):
   proves is reached from that root through the merkle nodes;
 - every other transaction's inputs come from a transaction decoded before it
   or held by the chain app, with their scripts verified;
-- a subject the chain app has rejected is refused (`TransactionRejected`),
-  and so is one spending an output a proven transaction spends
-  (`DoubleSpend`);
-- one spender per coin (0.20.5): an UNPROVEN subject is refused
-  (`DoubleSpend`) when an input already has another spender that is held
-  and not rejected — held by the chain app (its `spendersOf`), or in flight
-  here: handed to the chain app by another submission of this engine and not
-  yet answered (the `spends` its pending record keeps,
-  `State.inFlightSpender`). The same transaction again is never its own
-  competitor. A PROVEN subject is not refused by this: its proof displaces an
-  unmined spender (the chain state rejects the loser).
+- a subject the chain app has rejected is refused (`TransactionRejected`)
+  unless the BEEF proves it (0.26.0: the proof wins);
+- one spender per coin (0.20.5; 0.26.0 the route, every unproven item): an
+  UNPROVEN transaction the submission would ingest is refused
+  (`InputSpent: input <txid>.<vout> is already spent by <txid>`) when an
+  input already has another spender that is held and not rejected — held by
+  the chain app (its `spendersOf`, any status but rejected: unmined or
+  mined), or in flight here (the `spends` a pending record of this engine
+  keeps, `State.inFlightSpender`). The same transaction again is never its
+  own competitor. A PROVEN transaction is never refused by this: its proof
+  wins (the chain state rejects the loser, double-spent, by it).
 
 In a test build the SDK's `chain/src/beef.zig` counts its parses
 (`beef.parses`); this repo's test.zig asserts one parse per submit of bytes (a pointer record is read, not parsed).
@@ -651,8 +693,9 @@ judgement of the *spending* transaction, its `applied` record
 (`coinsToRetain`). `spender(topic, txid, vout)` gives both.
 
 **Previous coins** (BRC-22's `previousCoins`) are the inputs that spend an
-output live in the topic: admitted, and not spent by another transaction
-the chain holds that is not rejected (the one being judged does not count).
+output the topic admitted (0.26.0: the topic's judgement alone; whether
+another transaction spends it is the chain's, settled at intake and by
+proofs).
 
 **Retained and removed coins.** Both are spent. `coinsToRetain` keeps the
 old output queryable for history (`includeSpent`). overlay-express deletes

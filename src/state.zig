@@ -22,11 +22,11 @@
 //!                 {form, beef: <pointer record>, subject?, vout?} as a block (shruggr/skein#121,
 //!                 #146), or the raw block of the bytes — for internalizing; a
 //!                 lookup's BEEF is the chain state's, `beefFor`)
-//!   pending    txid → {kind: "submission", txid, submission, thread?, ingest?, heard?, spends?, wakes?, waiting?, event?}
+//!   pending    txid → {kind: "submission", txid, submission, ingested?, heard?, spends?, wakes?, waiting?, event?}
 //!                its in-flight job only (0.24.0: the submission's thread holds the context, resting on
 //!                each item's `chain/tx/<txid>`): a transaction of a submission handed to the chain
 //!                app and not yet admitted (or rejected) — `submission` the submission's subject
-//!                (hex), `thread` the submission's thread (another of the same subject is not it), `ingest` its own ingest message (an error answer to it fails it), `heard` the
+//!                (hex), `ingested` handed to the chain app (0.26.0: its `ingest` called; 0.25.x named its ingest message), `heard` the
 //!                chain app's admitting status while an earlier transaction of the same submission is
 //!                still pending (skein-overlay#1), `spends` its inputs (0.20.5), `wakes` (the subject's)
 //!                the HTTP requests waiting on it; or a submission paused on parents neither in its
@@ -358,8 +358,8 @@ pub const State = struct {
 
     // ------------------------------------------------------------ pending submissions
 
-    /// A pending record's fields (skein-overlay#1). A transaction handed to the chain app: `ingest`
-    /// (the message its answers name), `submission` (the subject of the submission it came in),
+    /// A pending record's fields (skein-overlay#1). A transaction handed to the chain app: `ingested`
+    /// (0.26.0: its `ingest` called), `submission` (the subject of the submission it came in),
     /// `heard` (0.25.0: only `failed` — the chain app's answer to its ingest was an error; every
     /// status is read from the chain state, David 2026-11-09: "There is no deciding. There is
     /// reading the state"). A paused submission: `waiting` (the parents neither in its BEEF nor
@@ -367,7 +367,8 @@ pub const State = struct {
     /// `thread` — one submission per transaction while it is in flight (a copy is a duplicate).
     pub const Pending = struct {
         submission: ?[32]u8 = null,
-        ingest: ?[]const u8 = null,
+        /// Handed to the chain app (0.26.0: by an in-VM call of its `ingest`; 0.25.x: the ingest message).
+        ingested: bool = false,
         heard: ?[]const u8 = null,
         waiting: []const [32]u8 = &.{},
         event: ?[]const u8 = null,
@@ -388,7 +389,7 @@ pub const State = struct {
             .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &hdr.toHex(txid)) } },
             .{ .key = "submission", .value = .{ .text = try a.dupe(u8, &hdr.toHex(p.submission orelse txid)) } },
         });
-        if (p.ingest) |m| try fields.append(a, .{ .key = "ingest", .value = .{ .cid = m } });
+        if (p.ingested) try fields.append(a, .{ .key = "ingested", .value = .{ .boolean = true } });
         if (p.heard) |h| try fields.append(a, .{ .key = "heard", .value = .{ .text = h } });
         if (p.waiting.len > 0) {
             const ws = try a.alloc(Value, p.waiting.len);
@@ -414,6 +415,13 @@ pub const State = struct {
         return try self.record(pc);
     }
 
+    /// The chain app's state read again from `root` (0.26.0: an ingest call in this step moved it).
+    pub fn reopenChain(self: *State, root: ?[]const u8) !void {
+        const now = self.ch.now;
+        self.ch.* = try c.state.open(self.arena, self.store, root, self.ch.network);
+        self.ch.now = now;
+    }
+
     pub fn isPending(self: *State, txid: [32]u8) !bool {
         return self.map("pending").has(&txid);
     }
@@ -429,10 +437,10 @@ pub const State = struct {
     }
 
     /// Whether this transaction is handed to the chain app in a submission and awaiting its
-    /// answer (skein-overlay#6): pending with its ingest message (not a paused submission).
+    /// answer (skein-overlay#6): pending and `ingested` (not a paused submission).
     pub fn isInFlight(self: *State, txid: [32]u8) !bool {
         const rec = (try self.pendingRecord(txid)) orelse return false;
-        return rec.getCid("ingest") != null;
+        return rec.getBool("ingested") orelse false;
     }
 
     /// Whether this transaction is in flight here (0.25.0, David 2026-11-09: paused and pending are
@@ -442,7 +450,7 @@ pub const State = struct {
     pub fn inFlight(self: *State, txid: [32]u8) !bool {
         const rec = (try self.pendingRecord(txid)) orelse return false;
         if (rec.get("waiting") != null) return true;
-        if (rec.getCid("ingest") == null) return false;
+        if (!(rec.getBool("ingested") orelse false)) return false;
         if (std.mem.eql(u8, rec.getText("heard") orelse "", "failed")) return false;
         return (try self.ch.status(txid)) != .rejected;
     }
@@ -462,22 +470,43 @@ pub const State = struct {
         return out;
     }
 
-    /// Whether a transaction other than `except`, in flight in a submission of this engine (handed
-    /// to the chain app, its answer not yet acted on) and not rejected by the chain state, spends
-    /// `op` (0.20.5, David 2026-11-06: one held spender per coin; the chain state does not hold it
-    /// yet when the next submission is routed).
-    pub fn inFlightSpender(self: *State, op: [36]u8, except: [32]u8) !bool {
+    /// The transaction other than `except`, in flight in a submission of this engine (handed to the
+    /// chain app, its answer not yet acted on) and not rejected by the chain state, that spends `op`
+    /// (0.20.5, David 2026-11-06: one held spender per coin; the chain state does not hold it yet
+    /// when the next submission is routed), or null.
+    pub fn inFlightSpender(self: *State, op: [36]u8, except: [32]u8) !?[32]u8 {
         for (try self.map("pending").prefixed("")) |kv| {
             if (kv.key.len != 32 or kv.value != .cid) continue;
             if (std.mem.eql(u8, kv.key, &except)) continue;
             const rec = try self.record(kv.value.cid);
-            if (rec.getCid("ingest") == null) continue;
+            if (!(rec.getBool("ingested") orelse false)) continue;
             for (try self.spendsOf(rec)) |s| if (std.mem.eql(u8, &s, &op)) {
                 if ((try self.ch.status(kv.key[0..32].*)) == .rejected) break;
-                return true;
+                return kv.key[0..32].*;
             };
         }
-        return false;
+        return null;
+    }
+
+    /// An input of an unproven transaction already spent by a held one (0.26.0, David 2026-11-09:
+    /// "the only conflict the overlay itself rejects = unmined vs unmined"; a held spender is the
+    /// chain state's — `spendersOf`, any status but rejected — or one in flight in a submission of
+    /// this engine, `inFlightSpender`).
+    pub const Spent = struct { op: [36]u8, by: [32]u8 };
+
+    /// The first input of `tx` (`txid`) that a transaction other than it, held here and not
+    /// rejected, already spends: the outpoint and its spender; null when none.
+    pub fn spentInput(self: *State, txid: [32]u8, tx: Transaction) !?Spent {
+        for (tx.inputs) |in| {
+            const op = store_mod.outpointKey(in.previous_outpoint.txid.bytes, in.previous_outpoint.index);
+            for (try self.ch.spendersOf(op)) |other| {
+                if (std.mem.eql(u8, &other, &txid)) continue;
+                if ((try self.ch.status(other)) == .rejected) continue;
+                return .{ .op = op, .by = other };
+            }
+            if (try self.inFlightSpender(op, txid)) |by| return .{ .op = op, .by = by };
+        }
+        return null;
     }
 
     // ------------------------------------------------------------ judgements
@@ -493,17 +522,10 @@ pub const State = struct {
         return try self.record(rc);
     }
 
-    /// Whether a transaction the chain holds, other than `tx` and not rejected, spends `op`.
-    fn spentByOther(self: *State, op: [36]u8, tx: [32]u8) !bool {
-        for (try self.ch.spendersOf(op)) |sp| {
-            if (std.mem.eql(u8, &sp, &tx)) continue;
-            if ((try self.ch.status(sp)) != .rejected) return true;
-        }
-        return false;
-    }
-
-    /// The input indices of `tx` that spend an output live in the topic (admitted, and not spent by
-    /// another transaction the chain holds that is not rejected): BRC-22's `previousCoins`.
+    /// The input indices of `tx` that spend an output the topic admitted: BRC-22's `previousCoins`.
+    /// 0.26.0 (David 2026-11-09: "spent-ness is chain state, not topic state"): the topic's judgement
+    /// alone — another held spender of the output does not take it out (an unproven conflicting
+    /// transaction never gets here, refused at intake, `spentInput`; a proven one wins: its proof).
     pub fn previousCoins(self: *State, t: []const u8, tx: Transaction) ![]u32 {
         return self.previousCoinsWith(t, tx, &.{});
     }
@@ -514,7 +536,6 @@ pub const State = struct {
     pub fn previousCoinsWith(self: *State, t: []const u8, tx: Transaction, walked: []const [36]u8) ![]u32 {
         const a = self.arena;
         const tp = try topicPrefix(a, t);
-        const self_txid = (try tx.txid(a)).bytes;
         var out: std.ArrayList(u32) = .empty;
         for (tx.inputs, 0..) |in, i| {
             const op = store_mod.outpointKey(in.previous_outpoint.txid.bytes, in.previous_outpoint.index);
@@ -526,7 +547,6 @@ pub const State = struct {
                 continue;
             }
             if (!(try self.map("admitted").has(try cat(a, &.{ tp, &op })))) continue;
-            if (try self.spentByOther(op, self_txid)) continue;
             try out.append(a, @intCast(i));
         }
         return out.items;
@@ -674,7 +694,7 @@ pub const State = struct {
 
     /// Whether the output is in the topic's view: admitted under it, and consumed by no transaction
     /// the topic has a judgement of (its `applied`).
-    fn counted(self: *State, t: []const u8, txid: [32]u8, vout: u32) !bool {
+    pub fn counted(self: *State, t: []const u8, txid: [32]u8, vout: u32) !bool {
         const a = self.arena;
         const tp = try topicPrefix(a, t);
         const op = store_mod.outpointKey(txid, vout);
@@ -1248,6 +1268,11 @@ pub fn parentsFirst(a: Allocator, txs: []const DecodedTx) ![]const DecodedTx {
     return out;
 }
 
+/// Whether the decoded BEEF proves `txid` by one of its BUMPs.
+pub fn provenIn(d: Decoded, txid: [32]u8) bool {
+    return provenAt(d, txid) != null;
+}
+
 fn provenAt(d: Decoded, txid: [32]u8) ?u32 {
     for (d.proven) |p| if (std.mem.eql(u8, &p.txid, &txid)) return p.height;
     return null;
@@ -1316,10 +1341,8 @@ pub fn heldParents(a: Allocator, st: *State, d: Decoded) ![][32]u8 {
 /// reached from it through the merkle nodes; every other transaction's inputs come from a
 /// transaction decoded before it or held by the chain app, read through `get`, with their scripts
 /// verified; a txid-only entry names a transaction the chain holds. A subject the chain has
-/// rejected, or spending an output a proven transaction spends, is refused. An unproven subject
-/// spending an output another transaction the chain holds spends, not rejected, is refused too
-/// (`DoubleSpend`, 0.20.5, David 2026-11-06: one held spender per coin); a proven subject is not
-/// (its proof displaces an unmined spender: the chain state rejects the loser). → the subject.
+/// rejected is refused unless the BEEF proves it (0.26.0: the proof wins). Double spends are the
+/// route's (`State.spentInput`, for every unproven transaction it would ingest). → the subject.
 /// `door`: the kernel's door proved the BUMPs (shruggr/skein#121: a pointer record, `decodeRecord`):
 /// they are not proven again.
 pub fn verifyDecoded(a: Allocator, s: Store, ch: *Chain, d: Decoded, door: bool) !Subject {
@@ -1356,19 +1379,9 @@ pub fn verifyDecoded(a: Allocator, s: Store, ch: *Chain, d: Decoded, door: bool)
         }
     }
     const subject = try subjectOf(a, s, d.subject);
-    if ((try ch.status(d.subject)) == .rejected) return error.TransactionRejected;
-    const proven = try subjectProven(ch, d);
-    for (subject.tx.inputs) |in| {
-        const op = store_mod.outpointKey(in.previous_outpoint.txid.bytes, in.previous_outpoint.index);
-        for (try ch.spendersOf(op)) |other| {
-            if (std.mem.eql(u8, &other, &d.subject)) continue;
-            switch (try ch.status(other)) {
-                .proven => return error.DoubleSpend,
-                .unproven => if (!proven) return error.DoubleSpend,
-                .rejected => {},
-            }
-        }
-    }
+    // 0.26.0 (David 2026-11-09: "what has a valid proof is what wins"): a subject the chain state
+    // has rejected is refused only when the BEEF carries no proof of it.
+    if ((try ch.status(d.subject)) == .rejected and provenAt(d, d.subject) == null) return error.TransactionRejected;
     return subject;
 }
 

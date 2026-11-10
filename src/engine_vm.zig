@@ -82,13 +82,31 @@ fn restImpl(_: *anyopaque, _: Allocator, name: []const u8) anyerror!void {
     try vm.restOn(name);
 }
 
+/// The chain app's `ingest`, an in-VM call (0.26.0, skein-chain 0.10.0): its program is the one the
+/// chain app's record names (`chain/app` `programs.chain`).
+fn ingestImpl(_: *anyopaque, a: Allocator, arg: Value) anyerror!Value {
+    const rc = (try vm.head(a, chain_app_head)) orelse return error.NoChainApp;
+    const app = try vm.store().getValue(a, rc);
+    const program = (app.get("programs") orelse return error.NoChainApp).getCid(submit.chain_app) orelse return error.NoChainApp;
+    return vm.call(a, program, "ingest", arg);
+}
+fn ingestErrorImpl(_: *anyopaque, _: anyerror) []const u8 {
+    return vm.lastError();
+}
+fn chainHeadImpl(_: *anyopaque, a: Allocator) anyerror!?[]const u8 {
+    return vm.head(a, state.chain_head);
+}
+
+/// The chain app's record: `chain/app`.
+const chain_app_head = submit.chain_app ++ "/app";
+
 /// Messages to the instance itself (the input's `self.identity`): looped back by the host; the
 /// answers to submitters, sent when a message reaches them; the facts (0.24.0) and the names the
 /// step's thread rests on (skein 0.5.4).
 pub fn wire(in: Value) !submit.Wire {
     self_key = vm.selfKey(in) orelse return error.NoIdentity;
     step_in = in;
-    return .{ .ctx = &dummy, .sendFn = sendImpl, .answerFn = answerImpl, .emitFn = emitImpl2, .restFn = restImpl };
+    return .{ .ctx = &dummy, .sendFn = sendImpl, .answerFn = answerImpl, .emitFn = emitImpl2, .restFn = restImpl, .ingestFn = ingestImpl, .ingestErrorFn = ingestErrorImpl, .chainHeadFn = chainHeadImpl };
 }
 
 /// The libp2p provider's key: the address book's entry at ("local", "libp2p") (the SDK's `peerAt`;

@@ -1,15 +1,17 @@
-// skein-overlay 0.25.0 + skein-chain 0.9.0 on a real kernel (David 2026-11-09): every status of
+// skein-overlay 0.26.0 + skein-chain 0.10.0 on a real kernel (David 2026-11-09): every status of
 // a transaction is the chain app's fact `chain/tx/<txid>`; the submission's thread rests on it for
-// the transaction's life (skein 0.5.4) and the overlay's verdicts are facts too
+// the transaction's life (skein 0.5.4) and the overlay's verdicts are facts too; 0.26.0: the overlay
+// hands each transaction to the chain app by an in-VM call of its `ingest` (status words pending,
+// seen, mined, rejected; `seen` with reason "reorged" after a reorg)
 // (`overlay/topic/tx/<txid>` {verdict}, `overlay/topic/output/<txid>.<vout>` {state}). One router
 // with an Arcade, one stock-system instance, the chain app and the overlay installed by the
 // owner's messages, the topic tm_ev registered:
 //
 //   (a) t1 posted unmined (POST /submit, BRC-22): the request waits on the subject (no launch),
-//       answered the STEAK once the chain app's `accepted` admits it; the facts chain/tx accepted,
+//       answered the STEAK once the chain app's `seen` admits it; the facts chain/tx pending, seen,
 //       topic/tx admitted, topic/output admitted;
 //   (b) mined at 2 (Arcade's MINED): chain/tx mined {height: 2}; the topic's anchors tip 2;
-//   (c) reorged (a heavier branch without it): chain/tx reorged; the topic's tip gone (back in its
+//   (c) reorged (a heavier branch without it): chain/tx seen (reason reorged); the topic's tip gone (back in its
 //       tail); mined again at 5 in the new branch: chain/tx mined {height: 5}, the tip 5;
 //   (d) a message submission (box overlay/submit) of t1 under a second topic tm_ev2 re-ingests it
 //       (the chain app restates `mined`): the first submission's thread hears it again and
@@ -192,13 +194,14 @@ try {
   await r.settled();
   await headers([h1]);
 
-  // ------------------------------------------------ (a) unmined, posted: admitted on `accepted`, the STEAK
+  // ------------------------------------------------ (a) unmined, posted: admitted on `seen`, the STEAK
   const t1 = await token(fund, 0);
   const id1 = t1.id("hex");
   const s1 = await post(t1.toBEEF());
   const s1t = await s1.text();
   check(s1.status === 200 && /"tm_ev":\{"outputsToAdmit":\[0\]/.test(s1t), `(a) t1 posted unmined: the request waited on the subject and was answered the STEAK (${s1.status} ${s1t})`);
-  check((await field(`chain/tx/${id1}`, "status")).join() === "accepted", `(a) the chain app's fact chain/tx/${id1.slice(0, 8)}…: accepted (${await field(`chain/tx/${id1}`, "status")})`);
+  check((await field(`chain/tx/${id1}`, "status")).join() === "pending,seen", `(a) the chain app's facts chain/tx/${id1.slice(0, 8)}…: pending, seen (${await field(`chain/tx/${id1}`, "status")})`);
+  check((await overlayResults(store())).every((x) => x.ingest === undefined && x.ingests === undefined && x.awaiting === undefined), "(a) 0.26.0: no ingest message, nothing awaited (the chain app called)");
   check((await field(`overlay/topic/tx/${id1}`, "verdict")).join() === "admitted", `(a) overlay/topic/tx: admitted (${await field(`overlay/topic/tx/${id1}`, "verdict")})`);
   check((await field(`overlay/topic/output/${id1}.0`, "state")).join() === "admitted", "(a) overlay/topic/output/<t1>.0: admitted");
   check((await overlayResults(store())).every((x) => x.op !== "watch" && x.op !== "watched" && x.op !== "resume"), "(a) no watch, no resume step (0.24.0)");
@@ -217,9 +220,9 @@ try {
   const fork: Uint8Array[] = [];
   for (let i = 0; i < 3; i++) fork.push(mine(sha256d(fork.at(-1) ?? h1), Buffer.alloc(32, 0x61 + i), 1_790_300_000 + i * 600));
   await headers(fork);
-  await until("chain/tx reorged", async () => (await field(`chain/tx/${id1}`, "status")).includes("reorged") || undefined).catch(() => undefined);
+  await until("chain/tx reorged", async () => (await field(`chain/tx/${id1}`, "reason")).includes("reorged") || undefined).catch(() => undefined);
   await r.settled();
-  check((await field(`chain/tx/${id1}`, "status")).join() === "accepted,mined,reorged", `(c) a heavier branch without it: chain/tx reorged (${await field(`chain/tx/${id1}`, "status")})`);
+  check((await field(`chain/tx/${id1}`, "status")).join() === "pending,seen,mined,seen" && (await field(`chain/tx/${id1}`, "reason")).at(-1) === "reorged", `(c) a heavier branch without it: chain/tx seen, reason reorged (${await field(`chain/tx/${id1}`, "status")} / ${await field(`chain/tx/${id1}`, "reason")})`);
   check((await tipOf("tm_ev")) === undefined, `(c) back in the topic's tail: no tip (${await tipOf("tm_ev")})`);
   const h5 = mine(sha256d(fork.at(-1)!), internal(id1), 1_790_302_000);
   await headers([h5]);
@@ -230,7 +233,7 @@ try {
   check(again.status === "mined" && again.height === 5, `(c) mined again in the new branch: chain/tx mined {height: ${again.height}}`);
   check(await until("the topic's tip 5", async () => (await tipOf("tm_ev")) === 5 || undefined).catch(() => false) === true, `(c) the topic's tip 5 (${await tipOf("tm_ev")})`);
   check((await field(`overlay/topic/tx/${id1}`, "verdict")).join() === "admitted", "(c) its verdict never changed: one fact, admitted");
-  const proofsBefore = (await overlayResults(store())).filter((x) => x.op === "heard" && x.heard === "proven").length;
+  const proofsBefore = (await overlayResults(store())).filter((x) => x.op === "heard" && x.heard === "mined").length;
 
   // ------------------------------------------------ (d) a message submission under tm_ev2 re-ingests it: answered once
   const m1 = (await box.send(identity, "overlay/submit", { fn: "submit", args: { beef: Uint8Array.from(t1.toBEEF()), topics: ["tm_ev2"] } })).id;
@@ -243,7 +246,7 @@ try {
   const mine1 = answers.filter((x) => x.body?.replyTo && String(x.body.replyTo) === String(m1));
   check(mine1.filter((x) => x.body?.result?.state === "admitted").length === 1 && mine1.filter((x) => x.body?.result?.state === "proven").length === 1, `(d) the message submission answered admitted once, its proof once (${mine1.map((x) => x.body?.result?.state).join(", ")})`);
   // The first submission's thread (POST /submit, no submitter to answer) heard `mined` again: nothing moved, nothing published.
-  const heardAgain = results.filter((x) => x.op === "heard" && x.heard === "proven").slice(proofsBefore);
+  const heardAgain = results.filter((x) => x.op === "heard" && x.heard === "mined").slice(proofsBefore);
   const others = heardAgain.filter((x) => x.admitted !== true);
   check(heardAgain.filter((x) => x.admitted === true).length === 1 && others.length >= 1 && others.every((x) => !x.published && !x.unapplied), `(d) the restated mined woke the resting threads: tm_ev2's admitted it, the first one's moved nothing (${others.length} other wake(s))`);
 
@@ -255,7 +258,7 @@ try {
   arcade.mode = "ok";
   const s2t = await s2.text();
   check(s2.status === 400 && /rejected/i.test(s2t), `(e) t2 rejected by Arcade: 400 (${s2.status} ${s2t.slice(0, 120)})`);
-  check((await field(`chain/tx/${id2}`, "status")).join() === "rejected", `(e) chain/tx rejected (${await field(`chain/tx/${id2}`, "status")})`);
+  check((await field(`chain/tx/${id2}`, "status")).join() === "pending,rejected", `(e) chain/tx pending, rejected (${await field(`chain/tx/${id2}`, "status")})`);
   check((await field(`overlay/topic/tx/${id2}`, "verdict")).join() === "rejected", `(e) overlay/topic/tx rejected (${await field(`overlay/topic/tx/${id2}`, "verdict")})`);
 
   // ------------------------------------------------ (f) a parent in flight, its child paused on it, woken by its verdict
@@ -300,7 +303,7 @@ try {
   await until("t2 mined", async () => (await field(`chain/tx/${id2}`, "status")).includes("mined") || undefined);
   await until("t2 admitted", async () => (await field(`overlay/topic/tx/${id2}`, "verdict")).includes("admitted") || undefined);
   await r.settled();
-  check((await field(`chain/tx/${id2}`, "status")).join() === "rejected,mined", `(g) chain/tx: rejected, then mined — the latest fact (${await field(`chain/tx/${id2}`, "status")})`);
+  check((await field(`chain/tx/${id2}`, "status")).join() === "pending,rejected,mined", `(g) chain/tx: pending, rejected, then mined — the latest fact (${await field(`chain/tx/${id2}`, "status")})`);
   check((await field(`overlay/topic/tx/${id2}`, "verdict")).join() === "rejected,admitted", `(g) the overlay admitted it after its rejection (${await field(`overlay/topic/tx/${id2}`, "verdict")})`);
   const t2Threads = new Set((await overlayResults(store())).filter((x) => x.txid === id2).map((x) => String(x.submission ?? "")).filter((x) => x));
   check(t2Threads.size === 1, `(g) on the same thread: one submission event (${t2Threads.size})`);
@@ -313,7 +316,7 @@ try {
   await r.settled();
   await until("the seed admitted", async () => (await field(`overlay/topic/tx/${id3}`, "verdict")).includes("admitted") || undefined);
   await r.settled();
-  check((await field(`chain/tx/${id3}`, "status")).join() === "accepted", `(h) the seed ingested by the chain app: chain/tx accepted (${await field(`chain/tx/${id3}`, "status")})`);
+  check((await field(`chain/tx/${id3}`, "status")).join() === "pending,seen", `(h) the seed ingested by the chain app: chain/tx pending, seen (${await field(`chain/tx/${id3}`, "status")})`);
   const seeded = (await overlayResults(store())).filter((x) => x.admitted === true && x.txid === id3);
   check(seeded.length === 1 && JSON.stringify(seeded[0]!.steak ?? {}).includes("tm_seed"), "(h) admitted under tm_seed by its submission thread");
   const regs = (await overlayResults(store())).filter((x) => x.op === "register" && x.topic === "tm_seed");

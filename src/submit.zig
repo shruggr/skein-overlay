@@ -15,12 +15,13 @@
 //!   nothing (a call); it returns the submit event (0.25.0: a transaction no topic takes is an item
 //!   while the chain app does not hold it, D6).
 //! - **The submission's thread** (`begin`, then `heard`). Its first step hands each item to the
-//!   chain app — the message `{fn: "ingest", args: {beef}}` to the instance itself, box `chain` —
-//!   notes it `pending` (in flight: the ingest message, its inputs, the subject's HTTP waiters; 0.25.0:
-//!   no thread), and **rests on each item's fact** `chain/tx/<txid>` (skein 0.5.4 `on(name)`;
+//!   chain app — 0.26.0: an in-VM call of its `ingest` `{beef}` in this step (skein-chain 0.10.0) —
+//!   notes it `pending` (in flight: `ingested`, its inputs, the subject's HTTP waiters; 0.25.0:
+//!   no thread), reads the chain state the call left (and admits what it admits), and **rests on
+//!   each item's fact** `chain/tx/<txid>` (skein 0.5.4 `on(name)`;
 //!   skein-chain emits every status it comes to) for the transaction's life. 0.25.0 (David
 //!   2026-11-09: "There is no deciding. There is reading the state"): every wake runs one path
-//!   (`heard`) that reads the chain state — an item the chain state has **accepted** or **proven**
+//!   (`heard`) that reads the chain state — an item the chain state has **seen** or **mined**
 //!   and whose topics have not applied it is admitted, oldest first — each topic's judgement
 //!   recorded (`applied`, the admittances), the listening lookup services' hooks called (`admitted`,
 //!   then `spent`), the facts emitted, the gossip out; **rejected** admits nothing and deletes
@@ -28,8 +29,8 @@
 //!   over a rejection) admits it on the same thread. Admitted, a later **mined** places it
 //!   (`mined`, the anchors) and relays the proof to the submitter (once per place; 0.25.0: no
 //!   `-proof` gossip); **reorged** puts it back in the tail; a later **rejected** unwinds it
-//!   (`State.unapply`, the lookup services' `rejected`). The only answer to an ingest message acted on
-//!   is an error (`answered`: the item fails, noted `failed` on its record). The thread never finishes.
+//!   (`State.unapply`, the lookup services' `rejected`). An ingest call that fails fails the item
+//!   (noted `failed` on its record). The thread never finishes.
 //! - **The facts** (0.24.0): `<app>/topic/tx/<txid>` `{verdict: undecided | admitted | rejected |
 //!   reverted}` at each verdict change, and `<app>/topic/output/<txid>.<vout>` `{state: admitted |
 //!   spent | reverted, spentBy?}`. 0.25.0 (D6): the overlay's state is the verdict; the facts are the
@@ -98,7 +99,7 @@ const Allocator = std.mem.Allocator;
 const eql = std.mem.eql;
 
 /// The chain app's box: an ingest message goes there (to the instance itself).
-pub const chain_box = "chain";
+pub const chain_app = "chain";
 
 fn uints(a: Allocator, xs: []const u32) ![]Value {
     const out = try a.alloc(Value, xs.len);
@@ -256,13 +257,10 @@ pub fn routeOf(a: Allocator, caller: calls.Caller, st: *State, in: Value, beef: 
         error.TransactionRejected => return .{ .nothing = @errorName(e) },
         else => return .{ .refused = @errorName(e) },
     };
-    // 0.20.5 (David 2026-11-06, one held spender per coin): an unproven subject spending an output a
-    // transaction in flight here spends — handed to the chain app by another submission, not yet
-    // held by it — is refused as the chain state's spender would be (`verifyDecoded`).
-    if (!(try state.subjectProven(st.ch, d))) for (sub.tx.inputs) |inp| {
-        const op = c.store.outpointKey(inp.previous_outpoint.txid.bytes, inp.previous_outpoint.index);
-        if (try st.inFlightSpender(op, sub.txid)) return .{ .refused = @errorName(error.DoubleSpend) };
-    };
+    // 0.20.5 / 0.26.0 (David 2026-11-09): an unproven subject spending an output a transaction held
+    // here already spends — the chain state's spender not rejected, or one in flight in another
+    // submission of this engine — is refused, the input and its spender named; a proven one never is.
+    if (try spentHere(a, st, d, sub.txid, sub.tx)) |spent| return .{ .refused = spent };
     const served = try calls.configObject(a, in, "overlayTopics");
     var dupes: usize = 0;
     for (topics) |t| {
@@ -323,6 +321,14 @@ pub fn routeOf(a: Allocator, caller: calls.Caller, st: *State, in: Value, beef: 
         // A topic named only transactions that are here: not undecided after all; it took nothing.
         try why.print(a, "{s}MissingParents of transactions held here", .{if (why.items.len > 0) "; " else ""});
     }
+    // 0.26.0 (Q1 (b), David 2026-11-09): every unproven transaction the submission would ingest is
+    // held to the same rule; one already spent here refuses the whole submission — nothing of it is
+    // stored or broadcast.
+    for (items.items) |it| {
+        if (it.subject) continue;
+        const tx = try state.subjectOf(a, st.store, it.txid);
+        if (try spentHere(a, st, d, it.txid, tx.tx)) |spent| return .{ .refused = spent };
+    }
     if (items.items.len == 0) {
         if (dupes > 0) return .{ .unchanged = sub.txid };
         return .{ .nothing = if (why.items.len > 0) why.items else "NotAdmitted: no topic admitted an output or consumed a previous coin" };
@@ -332,6 +338,19 @@ pub fn routeOf(a: Allocator, caller: calls.Caller, st: *State, in: Value, beef: 
     if (!subjectTaken(ev)) ev = .{ .map = try std.mem.concat(a, cbor.Entry, &.{ ev.map, &.{.{ .key = "reason", .value = .{ .text = if (why.items.len > 0) why.items else not_admitted } }} }) };
     return .{ .admit = .{ .event = ev, .txid = sub.txid } };
 }
+
+/// The refusal of an unproven transaction whose input a held transaction already spends (0.26.0):
+/// `InputSpent: input <txid>.<vout> is already spent by <txid>`; null when proven (by the BEEF or the
+/// chain state) or when no input is spent here.
+fn spentHere(a: Allocator, st: *State, d: state.Decoded, txid: [32]u8, tx: c.bsvz.transaction.Transaction) !?[]const u8 {
+    if (state.provenIn(d, txid) or (try st.ch.status(txid)) == .proven) return null;
+    const sp = (try st.spentInput(txid, tx)) orelse return null;
+    const o = try c.store.outpointOf(&sp.op);
+    return try std.fmt.allocPrint(a, "{s}: input {s}.{d} is already spent by {s}", .{ input_spent, &c.header.toHex(o.txid), o.vout, &c.header.toHex(sp.by) });
+}
+
+/// The refusal's name (0.26.0, David 2026-11-09: an explicit "input already spent" failure).
+pub const input_spent = "InputSpent";
 
 /// The transactions a topic's failed `identify` names as missing parents (topic.zig
 /// `MissingParents`, 0.19.0) — the VM's call fails `ImportFailed` with the callee's error line; a
@@ -494,6 +513,13 @@ pub const Wire = struct {
     emitFn: ?*const fn (ctx: *anyopaque, a: Allocator, ev: Value) anyerror!void = null,
     /// The step's thread rests on `name` (skein 0.5.4): every fact under it wakes the thread.
     restFn: ?*const fn (ctx: *anyopaque, a: Allocator, name: []const u8) anyerror!void = null,
+    /// The chain app's `ingest`, an in-VM call in this step (0.26.0, skein-chain 0.10.0): `arg`
+    /// `{beef}` → its answer `{txid, status, height?, reason?, by?}`; an error when it refuses.
+    ingestFn: *const fn (ctx: *anyopaque, a: Allocator, arg: Value) anyerror!Value,
+    /// A failed ingest call's text (the callee's error line), else the error's name.
+    ingestErrorFn: ?*const fn (ctx: *anyopaque, e: anyerror) []const u8 = null,
+    /// The chain app's state as this step sees it now (the head `chain/state`, moved by an ingest call).
+    chainHeadFn: *const fn (ctx: *anyopaque, a: Allocator) anyerror!?[]const u8,
 
     pub fn send(self: Wire, a: Allocator, box: []const u8, body: Value) ![]const u8 {
         return self.sendFn(self.ctx, a, box, body);
@@ -503,6 +529,19 @@ pub const Wire = struct {
     }
     pub fn rest(self: Wire, a: Allocator, name: []const u8) !void {
         if (self.restFn) |f| try f(self.ctx, a, name);
+    }
+    pub fn ingest(self: Wire, a: Allocator, arg: Value) !Value {
+        return self.ingestFn(self.ctx, a, arg);
+    }
+    pub fn ingestError(self: Wire, e: anyerror) []const u8 {
+        if (self.ingestErrorFn) |f| {
+            const t = f(self.ctx, e);
+            if (t.len > 0) return t;
+        }
+        return @errorName(e);
+    }
+    pub fn chainHead(self: Wire, a: Allocator) !?[]const u8 {
+        return self.chainHeadFn(self.ctx, a);
     }
 };
 
@@ -516,25 +555,18 @@ pub const Ctx = struct {
     st: *State,
     /// The configuration (calls.zig: `defaults.overlay*`, `programs`, `app`).
     in: Value,
-    /// The ingest messages this thread sent whose error answer it still awaits, as its last step
-    /// left them (0.25.0: the thread's own — read from its tip's result, never from the pending
-    /// record, which names no thread).
-    awaiting: []const []const u8 = &.{},
 };
 
-/// The ingest message's body: `{fn: "ingest", args: {beef}}` — the pointer record's CID (#121), or bytes.
-pub fn ingestBody(a: Allocator, beef: Input) !Value {
-    return .{ .map = try a.dupe(cbor.Entry, &.{
-        .{ .key = "fn", .value = .{ .text = "ingest" } },
-        .{ .key = "args", .value = .{ .map = try a.dupe(cbor.Entry, &.{.{ .key = "beef", .value = beef.value() }}) } },
-    }) };
+/// The chain app's `ingest` call's argument (0.26.0): `{beef}` — the door's envelope (#121), or bytes.
+pub fn ingestArg(a: Allocator, beef: Input) !Value {
+    return .{ .map = try a.dupe(cbor.Entry, &.{.{ .key = "beef", .value = beef.value() }}) };
 }
 
 // ---------------------------------------------------------------- the names (0.24.0)
 
 /// The chain app's fact about a transaction (skein-chain 0.8.0): `chain/tx/<txid hex>`.
 pub fn chainTxName(a: Allocator, txid: [32]u8) ![]const u8 {
-    return std.fmt.allocPrint(a, "{s}/tx/{s}", .{ chain_box, &c.header.toHex(txid) });
+    return std.fmt.allocPrint(a, "{s}/tx/{s}", .{ chain_app, &c.header.toHex(txid) });
 }
 
 /// The overlay's verdict on a transaction (0.24.0, David 2026-11-09): `<app>/topic/tx/<txid hex>`.
@@ -641,33 +673,41 @@ fn unwind(cx: Ctx, txid: [32]u8, out: *Stepped) !void {
     }
 }
 
+/// Whether a coin a rejected transaction gave back is live again in a served topic: admitted, and
+/// consumed by no other judgement of the topic (`State.counted`, the view's rule). 0.26.0: a proven
+/// spender may hold a judgement of it while the loser is unwound — then it stays spent, by it.
 fn heldByATopic(cx: Ctx, op: [36]u8) !bool {
-    for (try calls.servedTopics(cx.a, cx.in)) |t| {
-        if (try cx.st.map("admitted").has(try std.mem.concat(cx.a, u8, &.{ try state.topicPrefix(cx.a, t), &op }))) return true;
-    }
+    const o = try c.store.outpointOf(&op);
+    for (try calls.servedTopics(cx.a, cx.in)) |t| if (try cx.st.counted(t, o.txid, o.vout)) return true;
     return false;
 }
 
 /// What a submission thread's step that begins (or pauses) a submission did.
 pub const Begun = struct {
-    /// The ingest messages sent, oldest first (the subject's last): an error answer to one fails it.
-    ingests: []const []const u8 = &.{},
+    /// The items handed to the chain app (its `ingest`, an in-VM call: 0.26.0), oldest first.
+    ingested: []const [32]u8 = &.{},
     /// Paused: the parents it waits on.
     paused: bool = false,
     waiting: []const [32]u8 = &.{},
     /// The submit event this thread now works on (0.25.0: a paused submission routed again whole
     /// goes on in its own thread with the event its route came to), put in the store: its CID.
     submission: ?[]const u8 = null,
+    /// What the step did once the chain app had the items (0.26.0: the chain state read in the same
+    /// step, as every wake reads it — an item it holds proven is admitted at once). Null: paused.
+    stepped: ?Stepped = null,
 };
 
 /// The submission thread's first step, or (0.25.0, David 2026-11-09) the step in which a paused
-/// submission's own thread takes it whole. Each item of the event (oldest first) to the chain app —
-/// an ingest message of its own: the subject's carries the submission's BEEF as handed, each earlier
+/// submission's own thread takes it whole. Each item of the event (oldest first) is handed to the
+/// chain app by an in-VM CALL of its `ingest` in this step (0.26.0, David 2026-11-09: "the message
+/// box is wrong"; skein-chain 0.10.0) — the subject with the submission's BEEF as handed, each earlier
 /// one its Atomic BEEF cut from it (`state.atomicFor`) — noted pending (in flight), and the thread
 /// rests on each item's `chain/tx/<txid>` (skein 0.5.4): every status the chain app records for it
-/// wakes the thread (`heard`), for the transaction's life. A paused submission (`waiting`) is noted
-/// pending with its event and the parents it waits on (`pause`); nothing goes to the chain app. The
-/// waiters of a pause it ends wait on the subject in flight.
+/// wakes the thread (`heard`), for the transaction's life. A call that fails fails the item (as an
+/// error answer did). Then, the chain state read again (the call moved it), the step acts on it as a
+/// wake does (`admitHeard`): a step does not see its own emits, so it learns the statuses from the
+/// state. A paused submission (`waiting`) is noted pending with its event and the parents it waits on
+/// (`pause`); nothing goes to the chain app. The waiters of a pause it ends wait on the subject in flight.
 pub fn begin(cx: Ctx, ev: Value) !Begun {
     const a = cx.a;
     const txid = try txidOf(ev);
@@ -679,7 +719,8 @@ pub fn begin(cx: Ctx, ev: Value) !Begun {
     const beef = Input.of(ev.get("beef")) orelse return error.BadEvent;
     const its = try itemsOf(a, ev);
     var bytes: ?[]const u8 = null;
-    var ms: std.ArrayList([]const u8) = .empty;
+    var done: std.ArrayList([32]u8) = .empty;
+    var failed: std.ArrayList(struct { txid: [32]u8, why: []const u8 }) = .empty;
     var has_subject = false;
     var parsed: ?c.beef.Beef = null;
     for (its) |it| {
@@ -687,17 +728,44 @@ pub fn begin(cx: Ctx, ev: Value) !Begun {
         if (bytes == null) bytes = try beef.wire(a, cx.st.store);
         const b: Input = if (it.subject) beef else .{ .bytes = try state.atomicFor(a, bytes.?, it.txid) };
         if (parsed == null) parsed = c.beef.parse(a, bytes.?) catch return error.BadEvent;
-        const m = try cx.wire.send(a, chain_box, try ingestBody(a, b));
-        try cx.st.putPending(it.txid, .{ .submission = txid, .ingest = m, .spends = try spendsIn(a, parsed.?, it.txid), .wakes = if (it.subject) wakes.items else &.{} });
+        var p: State.Pending = .{ .submission = txid, .ingested = true, .spends = try spendsIn(a, parsed.?, it.txid), .wakes = if (it.subject) wakes.items else &.{} };
+        if (cx.wire.ingest(a, try ingestArg(a, b))) |_| {} else |e| {
+            p.heard = "failed";
+            try failed.append(a, .{ .txid = it.txid, .why = try a.dupe(u8, cx.wire.ingestError(e)) });
+        }
+        try cx.st.putPending(it.txid, p);
         try cx.wire.rest(a, try chainTxName(a, it.txid));
-        try ms.append(a, m);
+        try done.append(a, it.txid);
     }
     // A paused submission whose subject is no item now: no longer paused; its waiters answered.
     if (!has_subject) {
         for (wakes.items) |w| _ = try cx.wire.send(cx.a, calls.appOf(cx.in), try wakeBody(cx.a, w, txid));
         if (try cx.st.isPaused(txid)) try cx.st.dropPending(txid);
     }
-    return .{ .ingests = ms.items, .submission = try cx.st.store.putValue(a, ev) };
+    const submission = try cx.st.store.putValue(a, ev);
+    // The chain state as the calls left it (a head a callee advanced reads back as moved).
+    if (done.items.len > 0) try cx.st.reopenChain(try cx.wire.chainHead(a));
+    var out = Stepped{ .txid = txid, .heard = "ingested" };
+    // An item whose call failed is heard `failed` (what an error answer to an ingest message was);
+    // each `heard` admits what the state admits, up to it.
+    for (failed.items) |f| try merge(a, &out, try heard(cx, ev, f.txid, .{ .failed = f.why }));
+    if (failed.items.len == 0) try admitHeard(cx, ev, null, &out);
+    return .{ .ingested = done.items, .submission = submission, .stepped = out };
+}
+
+/// `more` (another pass of the same step) folded into `out`: its admissions, records, unwound
+/// judgements and publishes added; its last admission's STEAK, if it admitted.
+fn merge(a: Allocator, out: *Stepped, more: Stepped) !void {
+    out.admissions = try std.mem.concat(a, Admission, &.{ out.admissions, more.admissions });
+    out.records = try std.mem.concat(a, []const u8, &.{ out.records, more.records });
+    out.unapplied = try std.mem.concat(a, state.Unapplied, &.{ out.unapplied, more.unapplied });
+    out.published += more.published;
+    if (more.admitted) {
+        out.admitted = true;
+        out.txid = more.txid;
+        out.topics = more.topics;
+        out.applied = more.applied;
+    }
 }
 
 /// The outpoints a transaction of the BEEF spends (0.20.5: kept on its pending record).
@@ -834,41 +902,40 @@ pub fn waitOn(cx: Ctx, txid: [32]u8, w: []const u8) !enum { waiting, answered } 
     return .answered;
 }
 
-/// What the chain app said about a transaction: the fact `chain/tx/<txid>` (skein-chain 0.8.0) —
-/// `accepted`, `mined` (`proven`: its `height`), `rejected`, `reorged` — or, as the answer to an
-/// ingest message, an error (`failed`; its other answers are not acted on: the fact carries them).
+/// The chain app's fact `chain/tx/<txid>` as the submission's thread acts on it (skein-chain
+/// 0.10.0: `pending`, `seen` — `seen` with reason "reorged" after a reorg, acted on as an unmined-again
+/// transaction is —, `mined` with its `height`, `rejected` with its reason and `by`), or a failed
+/// ingest call (`failed`).
 pub const Answer = union(enum) {
-    accepted,
+    pending,
+    seen,
     /// `result`: what to relay to the submitter as its proof (`height`; the block is read from the chain state).
-    proven: struct { result: ?Value = null },
+    mined: struct { result: ?Value = null },
     rejected: []const u8,
-    reorged,
     failed: []const u8,
     /// Anything else: nothing to act on.
     other,
 };
 
-/// The answer to an ingest message: an error (`failed`), else nothing to act on (0.24.0: the chain
-/// app's fact carries its status).
-pub fn answerOf(body: Value) Answer {
-    if (body.get("error")) |e| return .{ .failed = e.getText("message") orelse e.getText("code") orelse "failed" };
-    return .other;
-}
-
-/// The fact `chain/tx/<txid>` read: its `status` (and `height`); a rejection's reason from the
+/// The fact `chain/tx/<txid>` read: its `status` (and `height`); a rejection's reason (and the
+/// transaction `by`, a double spend's winner or an input's rejected root) from the fact, else the
 /// chain state's settlement record.
 pub fn factOf(a: Allocator, st: *State, txid: [32]u8, fact: Value) !Answer {
     const s = fact.getText("status") orelse return .other;
-    if (eql(u8, s, "accepted")) return .accepted;
+    if (eql(u8, s, "pending")) return .pending;
+    if (eql(u8, s, "seen")) return .seen;
     if (eql(u8, s, "mined")) {
-        const h = fact.getUint("height") orelse return .{ .proven = .{} };
-        return .{ .proven = .{ .result = .{ .map = try a.dupe(cbor.Entry, &.{.{ .key = "height", .value = .{ .uint = h } }}) } } };
+        const h = fact.getUint("height") orelse return .{ .mined = .{} };
+        return .{ .mined = .{ .result = .{ .map = try a.dupe(cbor.Entry, &.{.{ .key = "height", .value = .{ .uint = h } }}) } } };
     }
     if (eql(u8, s, "rejected")) {
-        const sc = (try st.ch.settlementCid(txid)) orelse return .{ .rejected = "rejected" };
-        return .{ .rejected = (try st.store.getValue(a, sc)).getText("reason") orelse "rejected" };
+        const reason = fact.getText("reason") orelse blk: {
+            const sc = (try st.ch.settlementCid(txid)) orelse break :blk "rejected";
+            break :blk (try st.store.getValue(a, sc)).getText("reason") orelse "rejected";
+        };
+        if (fact.getText("by")) |by| return .{ .rejected = try std.fmt.allocPrint(a, "{s} by {s}", .{ reason, by }) };
+        return .{ .rejected = reason };
     }
-    if (eql(u8, s, "reorged")) return .reorged;
     return .other;
 }
 
@@ -1021,15 +1088,13 @@ pub const Stepped = struct {
     /// The judgements a rejection removed.
     unapplied: []const state.Unapplied = &.{},
     published: usize = 0,
-    /// The ingest messages whose error answer the thread still awaits (items not yet heard of).
-    awaiting: []const []const u8 = &.{},
 };
 
 fn pendingOf(st: *State, rec: Value) !State.Pending {
     return .{
         .spends = try st.spendsOf(rec),
         .submission = if (rec.getText("submission")) |h| c.header.fromHex(h) catch return error.BadState else null,
-        .ingest = rec.getCid("ingest"),
+        .ingested = rec.getBool("ingested") orelse false,
         .heard = rec.getText("heard"),
         .wakes = try wakesOf(st.arena, rec),
     };
@@ -1043,16 +1108,17 @@ fn itemApplied(st: *State, it: EventItem) !bool {
 }
 
 /// What the chain state says of a transaction now (0.25.0, David 2026-11-09: "There is no deciding.
-/// There is reading the state"): proven (its proof on our best chain), accepted (unproven, its
-/// broadcast accepted by the network), rejected (its latest status), or nothing yet.
-const ChainNow = enum { proven, accepted, rejected, waiting };
+/// There is reading the state"): mined (its proof on our best chain), seen (unproven, the network
+/// has it: the broadcast record's `accepted`, skein-chain 0.10.0's `seen`), rejected (its latest
+/// status), or nothing yet (pending, or not held).
+const ChainNow = enum { mined, seen, rejected, waiting };
 
 fn chainNow(st: *State, txid: [32]u8) !ChainNow {
     if (!(try st.ch.holds(txid))) return .waiting;
     return switch (try st.ch.status(txid)) {
-        .proven => .proven,
+        .proven => .mined,
         .rejected => .rejected,
-        .unproven => if (try st.ch.broadcastRecord(txid)) |r| (if (r.getBool("accepted") orelse false) .accepted else .waiting) else .waiting,
+        .unproven => if (try st.ch.broadcastRecord(txid)) |r| (if (r.getBool("accepted") orelse false) .seen else .waiting) else .waiting,
     };
 }
 
@@ -1091,20 +1157,21 @@ pub fn heard(cx: Ctx, ev: Value, txid: [32]u8, ans: Answer) !Stepped {
         if (try itemApplied(st, it)) {
             // Admitted already: what the chain app says later.
             switch (ans) {
-                .proven => |p| if (try st.settleMined(try calls.servedTopics(a, cx.in), it.txid)) {
+                .mined => |p| if (try st.settleMined(try calls.servedTopics(a, cx.in), it.txid)) {
                     if (answering) try answerProof(cx, source, it.txid, p.result);
                 },
-                .reorged => _ = try st.settleMined(try calls.servedTopics(a, cx.in), it.txid),
+                // Unmined again (a reorg: `seen`, reason "reorged"): back in the tail where it was mined.
+                .seen => _ = try st.settleMined(try calls.servedTopics(a, cx.in), it.txid),
                 .rejected => |why| {
                     var o = Stepped{ .txid = it.txid };
                     try unwind(cx, it.txid, &o);
                     try unapplied.appendSlice(a, o.unapplied);
                     if (answering and o.unapplied.len > 0) try answerRejected(cx, source, it.txid, why);
                 },
-                .accepted, .failed, .other => {},
+                .pending, .failed, .other => {},
             }
         } else switch (ans) {
-            .proven => |p| if (it.subject) {
+            .mined => |p| if (it.subject) {
                 proof_result = p.result;
             },
             .rejected, .failed => |why| {
@@ -1113,7 +1180,7 @@ pub fn heard(cx: Ctx, ev: Value, txid: [32]u8, ans: Answer) !Stepped {
                 try emitVerdict(cx, it.txid, .rejected);
                 if (it.subject and subjectTaken(ev)) try answerRejected(cx, source, it.txid, why);
             },
-            .accepted, .reorged, .other => {},
+            .pending, .seen, .other => {},
         }
         break;
     }
@@ -1122,29 +1189,11 @@ pub fn heard(cx: Ctx, ev: Value, txid: [32]u8, ans: Answer) !Stepped {
     return out;
 }
 
-/// The submission's thread stepped with the chain app's answer to one of its ingest messages,
-/// `ingest` (skein-overlay#1: one per item). Only an error answer is acted on (`failed`: the item
-/// is not admitted, as `heard` does a rejection); every status is the chain app's fact, heard by
-/// `heard`.
-pub fn answered(cx: Ctx, ev: Value, ingest: []const u8, ans: Answer) !Stepped {
-    const a = cx.a;
-    const subject = try txidOf(ev);
-    if (ans == .failed) for (try itemsOf(a, ev)) |it| {
-        const rec = (try cx.st.pendingRecord(it.txid)) orelse continue;
-        if (!eql(u8, rec.getCid("ingest") orelse "", ingest)) continue;
-        return heard(cx, ev, it.txid, ans);
-    };
-    var out = Stepped{ .txid = subject, .heard = @tagName(ans) };
-    try admitHeard(cx, ev, null, &out);
-    return out;
-}
-
 /// Admit, oldest first, every item the chain state admits now (accepted or proven) and its own
 /// topics have not applied yet, up to the first it does not admit (0.25.0: the state read, not an
 /// answer noted). An item in flight leaves pending at its admission; one with no record (admitted
 /// before and unwound by a rejection, then proven) is admitted all the same. The facts of each
-/// admission; the subject's submitter answered and its HTTP waiters woken; the ingests this thread
-/// still awaits (an error answer) listed.
+/// admission; the subject's submitter answered and its HTTP waiters woken.
 fn admitHeard(cx: Ctx, ev: Value, proof_result: ?Value, out: *Stepped) !void {
     const a = cx.a;
     const st = cx.st;
@@ -1165,7 +1214,7 @@ fn admitHeard(cx: Ctx, ev: Value, proof_result: ?Value, out: *Stepped) !void {
         if (had) try dropDecided(cx, it.txid);
         if (beef_cid == null) beef_cid = try beefCid(cx, ev);
         const adm = try admitItem(cx, ev, it, beef_cid.?, &records);
-        const proven = now == .proven;
+        const proven = now == .mined;
         // The submitter's answers: the subject's, when a topic took it.
         const answering = it.subject and subjectTaken(ev) and submitterOf(source) != null;
         // 0.20.5: an admission that applied nothing in any topic (no topic took it, or its previous
@@ -1197,17 +1246,6 @@ fn admitHeard(cx: Ctx, ev: Value, proof_result: ?Value, out: *Stepped) !void {
     out.admissions = admissions.items;
     out.records = records.items;
 
-    // The ingests this thread sent whose error answer it still awaits: those whose items are in
-    // flight still (not admitted, not failed).
-    var awaiting: std.ArrayList([]const u8) = .empty;
-    for (cx.awaiting) |m| for (its) |it| {
-        const rec = (try st.pendingRecord(it.txid)) orelse continue;
-        if (!eql(u8, rec.getCid("ingest") orelse "", m)) continue;
-        if (eql(u8, rec.getText("heard") orelse "", "failed")) continue;
-        try awaiting.append(a, m);
-        break;
-    };
-    out.awaiting = awaiting.items;
 }
 
 /// Whether an admission recorded no judgement in any topic (none took anything, none had judged it before).

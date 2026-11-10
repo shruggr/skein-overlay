@@ -577,7 +577,7 @@ With a local SDK checkout: `zig build --fork=../skein-sdk`. skein runs this
 app end to end in `kernel-zig/equiv/overlay.ts` and `install-overlay.ts`,
 which clone this repo at a pinned commit (or take `$SKEIN_OVERLAY_DIR`).
 
-`equiv/overlay-events.ts` (0.25.0) runs this app and skein-chain 0.9.0 on a
+`equiv/overlay-events.ts` (0.25.0; 0.26.0) runs this app and skein-chain 0.10.0 on a
 real kernel — the facts, the resting threads, a reorg, a rejection, a child
 woken by its parent's verdict, the store replayed exactly. It runs from a
 skein checkout (0.5.4 or later): copy it into `kernel-zig/equiv/`, then
@@ -603,9 +603,9 @@ the anchors and answers the sync protocol's frames (0.15.0).
 
 | | |
 |---|---|
-| this app and package | 0.25.1 (tag `v0.25.1`) |
+| this app and package | 0.26.0 (tag `v0.26.0`) |
 | skein-sdk | v0.18.0, by tag URL and hash in `build.zig.zon` (modules `chain` and, for the engine, `sk`; bsvz comes through it) |
-| requires | `chain/1` (shruggr/skein-chain 0.9.0: its facts `chain/tx/<txid>`; a proof after a rejection is `mined`) |
+| requires | `chain/1` (shruggr/skein-chain 0.10.0: its `ingest` as an in-VM call; its facts `chain/tx/<txid>` {pending, seen, mined, rejected}; a proof after a rejection is `mined`) |
 | skein | 0.6.1 or later (the host submits fetched BEEFs as the submit message; 0.25.1) (the event index, 0.5.0; a thread resting on a name, 0.5.4); the engine and the chain app installed as apps (a genesis program's record names no app, and emits no fact); skein's equivs pin this repo by commit |
 
 0.3.0 moved the state under `<app>/…`, made the chain app's answer the gate
@@ -1104,6 +1104,25 @@ message `{fn: "submit", args: {beef, topics: [<the topic it fetched it
 for>]}}` in `<app>/submit`, signed as the instance itself (skein 0.6.1): the
 existing route, filter and source form. Case f (judged only under the named
 topic) goes through it.
+
+0.26.0 (David 2026-11-09: spent-ness is chain state, not topic state; double
+spends; skein-chain 0.10.0): the engine hands each transaction to the chain
+app by an in-VM call of its `ingest` in its own step — no ingest message, no
+error answer awaited (`answered`, `awaiting` go; the pending record's
+`ingested: true`) — and reads the chain state in that step (an item that
+arrived proven is admitted in it). Status words `pending | seen | mined |
+rejected` (`seen` with reason "reorged" after a reorg); a rejection's
+`by` reaches the submitter. `previousCoins` is the topic's judgement alone
+(`spentByOther` goes): a proven transaction spending a coin an unmined held
+one spends is judged with it and admitted; the chain app rejects the loser
+(double-spent, by the winner) and its thread unwinds it. Every unproven
+transaction a submission would ingest whose input a held transaction (the
+chain state's, not rejected, or one in flight here) already spends refuses
+the submission, `InputSpent: input <txid>.<vout> is already spent by
+<txid>`; a proven one never is, and a chain-rejected subject whose BEEF
+proves it is judged again. The `spent` hook, the `topic/output` spent state
+and the view digest are unchanged; an unwound transaction's coin is
+re-stated `admitted` only when no other judgement consumes it.
 
 ## Contributing
 
