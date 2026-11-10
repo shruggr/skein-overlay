@@ -418,9 +418,11 @@ pub fn httpAgain(a: Allocator, caller: calls.Caller, st: *State, in: Value, sub:
     if (try steakAnswer(a, st, txid, topics)) |v| return .{ .answer = v };
     // 0.25.0: in flight (a rejected or failed submission's record stays, not in flight).
     if (try st.inFlight(txid)) return .{ .wait = txid };
-    if (try st.ch.settlementCid(txid)) |sc| {
-        const rec = try st.store.getValue(a, sc);
-        return .{ .answer = try failure(a, 400, try std.fmt.allocPrint(a, "Transaction rejected: {s}", .{rec.getText("reason") orelse "rejected"})) };
+    // skein-sdk 0.21.0: a proof overrides a rejection (the settlement a proof overrode is still read
+    // by `settlementCid`): rejected only when the chain state's status says so.
+    if ((try st.ch.status(txid)) == .rejected) {
+        const why = if (try st.ch.rejectionOf(txid)) |r| r.reason else "rejected";
+        return .{ .answer = try failure(a, 400, try std.fmt.allocPrint(a, "Transaction rejected: {s}", .{if (why.len > 0) why else "rejected"})) };
     }
     if (try st.ch.holds(txid)) return .{ .answer = try emptySteak(a, topics) };
     return switch (try submit_mod.route(a, caller, st, in, sub.beef, topics, sub.off, source)) {

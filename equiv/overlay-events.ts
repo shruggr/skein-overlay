@@ -1,4 +1,4 @@
-// skein-overlay 0.26.0 + skein-chain 0.10.0 on a real kernel (David 2026-11-09): every status of
+// skein-overlay 0.26.1 + skein-chain 0.11.0 on a real kernel (David 2026-11-09): every status of
 // a transaction is the chain app's fact `chain/tx/<txid>`; the submission's thread rests on it for
 // the transaction's life (skein 0.5.4) and the overlay's verdicts are facts too; 0.26.0: the overlay
 // hands each transaction to the chain app by an in-VM call of its `ingest` (status words pending,
@@ -176,7 +176,7 @@ try {
   const chainDir = copyOf(dirOf("SKEIN_CHAIN_DIR"), join(home, "chain"));
   const mf = JSON.parse(readFileSync(join(overlayDir, "etc/app.json"), "utf8")) as { version: string; config: { overlay: Record<string, unknown> } };
   const cmf = JSON.parse(readFileSync(join(chainDir, "etc/app.json"), "utf8")) as { version: string };
-  check(mf.version === "0.26.0" && cmf.version === "0.10.0", `skein-overlay ${mf.version}, skein-chain ${cmf.version}`);
+  check(mf.version === "0.26.1" && cmf.version === "0.11.0", `skein-overlay ${mf.version}, skein-chain ${cmf.version}`);
   mf.config.overlay.gossip = { tm_demo: false };
   writeFileSync(join(overlayDir, "etc/app.json"), JSON.stringify(mf, null, 2));
 

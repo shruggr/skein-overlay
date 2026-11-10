@@ -577,7 +577,7 @@ With a local SDK checkout: `zig build --fork=../skein-sdk`. skein runs this
 app end to end in `kernel-zig/equiv/overlay.ts` and `install-overlay.ts`,
 which clone this repo at a pinned commit (or take `$SKEIN_OVERLAY_DIR`).
 
-`equiv/overlay-events.ts` (0.25.0; 0.26.0) runs this app and skein-chain 0.10.0 on a
+`equiv/overlay-events.ts` (0.25.0; 0.26.1) runs this app and skein-chain 0.11.0 on a
 real kernel — the facts, the resting threads, a reorg, a rejection, a child
 woken by its parent's verdict, the store replayed exactly. It runs from a
 skein checkout (0.5.4 or later): copy it into `kernel-zig/equiv/`, then
@@ -603,9 +603,9 @@ the anchors and answers the sync protocol's frames (0.15.0).
 
 | | |
 |---|---|
-| this app and package | 0.26.0 (tag `v0.26.0`) |
-| skein-sdk | v0.19.0, by tag URL and hash in `build.zig.zon` (modules `chain` and, for the engine, `sk`; bsvz comes through it) |
-| requires | `chain/1` (shruggr/skein-chain v0.10.0: its `ingest` as an in-VM call; its facts `chain/tx/<txid>` {pending, seen, mined, rejected}; a proof after a rejection is `mined`) |
+| this app and package | 0.26.1 |
+| skein-sdk | v0.21.0, by tag URL and hash in `build.zig.zon` (modules `chain` and, for the engine, `sk`; bsvz comes through it) |
+| requires | `chain/1` (shruggr/skein-chain v0.11.0: its `ingest` as an in-VM call; its facts `chain/tx/<txid>` {pending, seen, mined, rejected}; a proof after a rejection is `mined`) |
 | skein | 0.6.1 or later (the host submits fetched BEEFs as the submit message; 0.25.1) (the event index, 0.5.0; a thread resting on a name, 0.5.4); the engine and the chain app installed as apps (a genesis program's record names no app, and emits no fact); skein's equivs pin this repo by commit |
 
 0.3.0 moved the state under `<app>/…`, made the chain app's answer the gate
@@ -1136,6 +1136,15 @@ other`; `chain_box` is `chain_app`; the refusal `DoubleSpend` is `InputSpent:
 gives back only `givenBack` (a `spent` hook may hear a second spender of a
 coin — the proven winner — after the loser). Hook signatures are unchanged.
 Requires skein-chain v0.10.0.
+
+0.26.1 (re-pin): skein-sdk v0.21.0 (a saved merkle path links every
+transaction it covers; a proof overrides a rejection everywhere; what a proof
+settles — double spends, inputs' spent, the broadcast — is the chain app's own
+`proof` step, after the ingest call) and skein-chain v0.11.0. Forced change:
+POST /submit called again reads a rejection from the chain state's status, not
+from `settlementCid` (which still returns the settlement a proof overrode).
+Tests follow the chain app's later `proof` step; a transaction a sibling's path
+linked before its submission is admitted in its thread's first step.
 
 ## Contributing
 

@@ -220,6 +220,9 @@ const FakeWire = struct {
         const got = try ch.ingest(bytes);
         inst.chain_root = try ch.save();
         try self.ingested.append(self.a, got.txid);
+        // skein-sdk 0.21.0: what the linkage settles is the chain app's own `proof` step, later
+        // (`Instance.chainSettle`), not this call.
+        for (ch.linked.items) |l| try inst.unsettled.append(inst.a, l.txid);
         return mapOf(a, &.{
             .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &hdr.toHex(got.txid)) } },
             .{ .key = "status", .value = .{ .text = switch (got.status) {
@@ -299,6 +302,9 @@ const Instance = struct {
     /// How the topic program judges: tm_demo's identify, or it naming ancillary txids (skein-overlay#4).
     identify_: enum { demo, funding, unknown, strict } = .demo,
     calls_: std.StringHashMapUnmanaged(usize) = .empty,
+    /// Transactions a proof linked in an ingest call of the overlay's whose chain-app `proof` step
+    /// (skein-sdk 0.21.0 `settleProven`: double spends, inputs' spent, the broadcast) has not run.
+    unsettled: std.ArrayList([32]u8) = .empty,
     /// The arguments of the lookup's `rejected` hook calls, in order (0.26.0: `givenBack`).
     rejected_args: std.ArrayList(Value) = .empty,
     wire_: *FakeWire,
@@ -386,18 +392,31 @@ const Instance = struct {
         self.chain_root = try ch.save();
     }
     /// The chain app takes an ingest message: → the subject's status.
+    /// The chain app takes an ingest message: → the subject's status. A proof it saves is settled
+    /// by the chain app's `proof` step (skein-sdk 0.21.0), run here right after.
     fn ingest(self: *Instance, bytes: []const u8) !c.state.Status {
         var ch = try self.chain();
         const got = try ch.ingest(bytes);
+        for (ch.linked.items) |l| try ch.settleProven(l.txid);
         self.chain_root = try ch.save();
         return got.status;
     }
-    /// A status (or a proof, "MINED" with its path) reaching the chain app.
+    /// A status (or a proof, "MINED" with its path) reaching the chain app, and (skein-sdk 0.21.0)
+    /// the chain app's `proof` step for what the path linked.
     fn chainStatus(self: *Instance, txid: [32]u8, tx_status: []const u8, path: ?[]const u8) !Chain.Outcome {
         var ch = try self.chain();
         const o = try ch.applyStatus(txid, tx_status, path);
+        for (ch.linked.items) |l| try ch.settleProven(l.txid);
         self.chain_root = try ch.save();
         return o;
+    }
+    /// The chain app's `proof` steps (skein-sdk 0.21.0) for what the overlay's ingest calls linked:
+    /// a proof's double spends rejected, inputs' spent, the broadcast settled.
+    fn chainSettle(self: *Instance) !void {
+        var ch = try self.chain();
+        for (self.unsettled.items) |t| try ch.settleProven(t);
+        self.unsettled.clearRetainingCapacity();
+        self.chain_root = try ch.save();
     }
 
     // ------------------------------------------------ the overlay
@@ -3947,11 +3966,14 @@ fn dbl(x: [32]u8, y: [32]u8) [32]u8 {
 }
 
 /// Admitted at its proof: submitted, ingested, mined by `path`, the proven answer stepped.
+/// skein-sdk 0.21.0: a path saved earlier that covers `txid` (a pair's sibling) linked it already, so
+/// the chain app has it mined at intake and the thread's first step admits it.
 fn admittedProven(inst: *Instance, bytes: []const u8, txid: [32]u8, path: []const u8) !void {
-    _ = try inst.submitted(bytes);
+    const first = try inst.submitted(bytes);
     _ = try inst.ingest(bytes);
     try std.testing.expectEqual(Chain.Outcome.proven, try inst.chainStatus(txid, "MINED", path));
-    try std.testing.expect((try inst.answer(txid, .{ .mined = .{} })).admitted);
+    const later = try inst.answer(txid, .{ .mined = .{} });
+    try std.testing.expect(first.admitted != later.admitted);
 }
 
 test "anchors (0.14.0, shruggr/skein#150): BRC-136's root and anchor per height from the topic's genesis, kept as proofs land; the tail; the beat; the locator; the admitted lists with a compound BUMP" {
@@ -4986,6 +5008,10 @@ test "one held spender per coin (0.20.5, David 2026-11-06; 0.26.0): a second unm
     const dd = try inst.begin(rd.admit.event);
     ch = try inst.chain();
     try std.testing.expectEqual(c.state.Status.proven, try ch.status(sd.txid));
+    // skein-sdk 0.21.0: C is rejected by the chain app's `proof` step for D, after this one.
+    try std.testing.expectEqual(c.state.Status.unproven, try ch.status(sc.txid));
+    try inst.chainSettle();
+    ch = try inst.chain();
     try std.testing.expectEqual(c.state.Status.rejected, try ch.status(sc.txid));
     try std.testing.expect(dd.admitted);
     try std.testing.expectEqualSlices(u32, &.{0}, dd.applied[0].coins_to_retain);
@@ -5144,6 +5170,10 @@ fn provenAgainstHeld(a: Allocator, source_of: enum { message, sync }) !void {
     try std.testing.expect(try inst.applied(sb.txid));
     var ch = try inst.chain();
     try std.testing.expectEqual(c.state.Status.proven, try ch.status(sb.txid));
+    // skein-sdk 0.21.0: A is rejected (double-spent, by B) in the chain app's `proof` step for B.
+    try std.testing.expectEqual(c.state.Status.unproven, try ch.status(x.sa.txid));
+    try inst.chainSettle();
+    ch = try inst.chain();
     try std.testing.expectEqual(c.state.Status.rejected, try ch.status(x.sa.txid));
     try std.testing.expectEqualDeep(@as([]const []const u8, &.{"admitted"}), inst.wire_.verdicts(sb.txid));
     // A's own thread hears its rejection (the chain app's fact: double-spent, by B) and unwinds A.
@@ -5280,5 +5310,32 @@ test "the proof wins (0.26.0, D4): a subject the chain state marks rejected is a
     try std.testing.expectEqual(c.state.Status.proven, try ch.status(t.txid));
     try std.testing.expect(try inst.applied(t.txid));
     const ans = try httpAnswer(a, try inst.http(try httpReq(a, m2.beef, "proved"), true));
+    try std.testing.expectEqual(@as(u64, 200), ans.status);
+}
+
+test "POST /submit again after a proof overrode a rejection (0.26.1, skein-sdk 0.21.0): not answered `rejected` from the settlement the proof overrode" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = c.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var inst = try Instance.init(a, &ms);
+    const k = try keys(0x42);
+    const f = try fund(a, 0x7a, 1, &k.p2pkh);
+    try inst.headers(&.{&f.h1});
+    // A transaction the chain app holds (taken in by another path), rejected, then proven.
+    const t = try spend(a, &f.tx, 0, &.{.{ 1, &k.p2pkh }}, k.priv);
+    const bytes = try withFund(a, f, t);
+    _ = try inst.ingest(bytes);
+    _ = try inst.chainStatus(t.txid, "REJECTED", null);
+    var ch = try inst.chain();
+    try std.testing.expectEqual(c.state.Status.rejected, try ch.status(t.txid));
+    const m2 = try minedAlone(a, f.h1, 2, t);
+    try inst.headers(&.{&m2.header});
+    try std.testing.expectEqual(Chain.Outcome.proven, try inst.chainStatus(t.txid, "MINED", try soloPath(a, 2, t.txid)));
+    ch = try inst.chain();
+    try std.testing.expectEqual(c.state.Status.proven, try ch.status(t.txid));
+    try std.testing.expect((try ch.settlementCid(t.txid)) != null); // the record the proof overrode, still read
+    const ans = try httpAnswer(a, try inst.http(try httpReq(a, bytes, "after the proof"), true));
     try std.testing.expectEqual(@as(u64, 200), ans.status);
 }
