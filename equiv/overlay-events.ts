@@ -176,7 +176,7 @@ try {
   const chainDir = copyOf(dirOf("SKEIN_CHAIN_DIR"), join(home, "chain"));
   const mf = JSON.parse(readFileSync(join(overlayDir, "etc/app.json"), "utf8")) as { version: string; config: { overlay: Record<string, unknown> } };
   const cmf = JSON.parse(readFileSync(join(chainDir, "etc/app.json"), "utf8")) as { version: string };
-  check(mf.version === "0.25.1" && cmf.version === "0.9.0", `skein-overlay ${mf.version}, skein-chain ${cmf.version}`);
+  check(mf.version === "0.26.0" && cmf.version === "0.10.0", `skein-overlay ${mf.version}, skein-chain ${cmf.version}`);
   mf.config.overlay.gossip = { tm_demo: false };
   writeFileSync(join(overlayDir, "etc/app.json"), JSON.stringify(mf, null, 2));
 
@@ -247,8 +247,11 @@ try {
   check(mine1.filter((x) => x.body?.result?.state === "admitted").length === 1 && mine1.filter((x) => x.body?.result?.state === "proven").length === 1, `(d) the message submission answered admitted once, its proof once (${mine1.map((x) => x.body?.result?.state).join(", ")})`);
   // The first submission's thread (POST /submit, no submitter to answer) heard `mined` again: nothing moved, nothing published.
   const heardAgain = results.filter((x) => x.op === "heard" && x.heard === "mined").slice(proofsBefore);
-  const others = heardAgain.filter((x) => x.admitted !== true);
-  check(heardAgain.filter((x) => x.admitted === true).length === 1 && others.length >= 1 && others.every((x) => !x.published && !x.unapplied), `(d) the restated mined woke the resting threads: tm_ev2's admitted it, the first one's moved nothing (${others.length} other wake(s))`);
+  // 0.26.0: tm_ev2's submission is admitted in its thread's first step (the chain app's `ingest`
+  // called, the state read); the restated `mined` then wakes the resting threads — the first one's
+  // and tm_ev2's own (its own emit) — and moves nothing.
+  const firstSteps = results.filter((x) => x.op === "submit" && x.admitted === true && JSON.stringify(x.steak ?? {}).includes("tm_ev2"));
+  check(firstSteps.length === 1 && heardAgain.length >= 1 && heardAgain.every((x) => x.admitted !== true && !x.published && !x.unapplied), `(d) tm_ev2's admitted in its first step; the restated mined woke the resting threads and moved nothing (${firstSteps.length} first step(s), ${heardAgain.length} wake(s))`);
 
   // ------------------------------------------------ (e) rejected by Arcade: 400, the facts rejected
   const t2 = await token(fund, 1);
