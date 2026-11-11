@@ -231,8 +231,8 @@ pub fn route(a: Allocator, caller: calls.Caller, st: *State, in: Value, beef: In
 /// pause is not a copy of it.
 pub fn routeOf(a: Allocator, caller: calls.Caller, st: *State, in: Value, beef: Input, topics: []const []const u8, off: ?[]const u8, source: ?Value, again: bool) !Routed {
     const d = switch (beef) {
-        .envelope => |e| state.decodeRecord(a, st.store, e),
-        .bytes => |b| state.decode(a, st.store, b),
+        .envelope => |e| state.decodeRecord(a, st.store, st.ch, e),
+        .bytes => |b| state.decode(a, st.store, st.ch, b),
     } catch |e| return .{ .refused = @errorName(e) };
     // A copy of a subject paused here is a duplicate, ignored. 0.28.0: nothing else is in flight —
     // a submission handed to the chain app was admitted (or not) in that step; a copy of one is

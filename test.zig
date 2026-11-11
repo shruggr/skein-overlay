@@ -337,6 +337,8 @@ const Instance = struct {
     old_contract: bool = false,
     /// The lookup program's spec the dispatch table runs (ls_demo's unless a test sets another).
     ls_spec: lookup.Spec = ls.spec,
+    /// The store the chain app's state is loaded over (a counting one in a test; else the store).
+    chain_store: ?Store = null,
 
     fn init(a: Allocator, ms: *c.store.MemStore) !Instance {
         const tp = try a.dupe(u8, &cbor.cidOf("topic-demo"));
@@ -420,7 +422,7 @@ const Instance = struct {
     // ------------------------------------------------ the chain app, standing in
 
     fn chain(self: *Instance) !Chain {
-        var ch = try Chain.load(self.a, self.ms.store(), self.chain_root, .regtest);
+        var ch = try Chain.load(self.a, self.chain_store orelse self.ms.store(), self.chain_root, .regtest);
         ch.now = self.now;
         return ch;
     }
@@ -2461,13 +2463,14 @@ test "out of order (skein-sdk 0.11.1, David 2026-10-22): a BEEF with children be
         x.f.entry,
     }) });
     try std.testing.expect(!beef.parentsFirst(try beef.parse(a, back)));
-    const d = try state.decode(a, ms.store(), back);
+    var ch_now = try inst.chain();
+    const d = try state.decode(a, ms.store(), &ch_now, back);
     try std.testing.expectEqualSlices(u8, &x.f.txid, &d.txs[0].txid);
     try std.testing.expectEqualSlices(u8, &x.t1.txid, &d.txs[1].txid);
     try std.testing.expectEqualSlices(u8, &x.t2.txid, &d.txs[2].txid);
     // The door's envelope over the same wire: the record keeps the wire's order, the decoding sorts.
     const env = try pointerOf(a, ms.store(), back);
-    const dr = try state.decodeRecord(a, ms.store(), env);
+    const dr = try state.decodeRecord(a, ms.store(), &ch_now, env);
     try std.testing.expectEqualSlices(u8, &x.f.txid, &dr.txs[0].txid);
     try std.testing.expectEqualSlices(u8, &x.t2.txid, &dr.txs[2].txid);
     try std.testing.expectEqualSlices(u8, back, try c.record.wireOf(a, ms.store(), env));
@@ -5219,4 +5222,171 @@ test "the in-VM intake (0.28.0, David 2026-11-11): a program of the instance han
 
     // Not that shape, or no topic served: rejected, nothing done.
     try std.testing.expectEqualStrings("rejected", (try inst.intake(try mapOf(a, &.{}))).getText("state").?);
+}
+
+// ---------------------------------------------------------------- 0.28.1: a held entry read as txid-only
+
+/// A store counting the bitcoin blocks kept through it (the chain app's keeps).
+const KeepCount = struct {
+    inner: Store,
+    keeps: usize = 0,
+    fn store(self: *KeepCount) Store {
+        return .{ .ptr = self, .getFn = get, .putFn = put, .putBlockFn = putBlock, .keepFn = keep, .edgesFn = edges };
+    }
+    fn get(ptr: *anyopaque, a: Allocator, cid: []const u8) anyerror![]const u8 {
+        const self: *KeepCount = @ptrCast(@alignCast(ptr));
+        return self.inner.get(a, cid);
+    }
+    fn put(ptr: *anyopaque, a: Allocator, bytes: []const u8) anyerror![]const u8 {
+        const self: *KeepCount = @ptrCast(@alignCast(ptr));
+        return self.inner.put(a, bytes);
+    }
+    fn putBlock(ptr: *anyopaque, cid: []const u8, bytes: []const u8) anyerror!void {
+        const self: *KeepCount = @ptrCast(@alignCast(ptr));
+        return self.inner.putBlock(cid, bytes);
+    }
+    fn keep(ptr: *anyopaque, cid: []const u8) anyerror!void {
+        const self: *KeepCount = @ptrCast(@alignCast(ptr));
+        if (c.store.bitcoinHash(cid) != null) self.keeps += 1;
+        return self.inner.keep(cid);
+    }
+    fn edges(ptr: *anyopaque, a: Allocator, to: []const u8, rel: ?[]const u8) anyerror![]const c.store.Edge {
+        const self: *KeepCount = @ptrCast(@alignCast(ptr));
+        return self.inner.edges(a, to, rel);
+    }
+};
+
+/// `t` with its input 0's unlocking script OP_1: a spend whose script fails.
+fn brokenSpend(a: Allocator, t: Spent) !Spent {
+    var tx = t.tx;
+    const ins = try a.dupe(bsvz.transaction.Input, tx.inputs);
+    ins[0].unlocking_script = bsvz.script.Script.init(try a.dupe(u8, &.{0x51}));
+    tx.inputs = ins;
+    const raw = try tx.serialize(a);
+    return .{ .tx = try bsvz.transaction.Transaction.parse(a, raw), .raw = raw, .txid = beef.txidOf(raw) };
+}
+
+const HeldRun = struct { routed: std.meta.Tag(submit.Routed), items: usize, identify: usize, admitted: bool, records: usize, keeps: usize, subject_items: usize };
+
+/// The funding proven and held; N plain spends over it held unmined by the chain app alone (never
+/// judged here), each with a failing script (put straight into the chain state: never run again);
+/// a new subject minting a token from the last. Submitted with the held entries raw (`raw_held`) or
+/// txid-only, as bytes or by the door's envelope.
+fn heldRun(n: usize, raw_held: bool, envelope: bool) !HeldRun {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = c.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var inst = try Instance.init(a, &ms);
+    const k = try keys(0x42);
+    const f = try fund(a, 0x11, 1, &k.p2pkh);
+    try inst.headers(&.{&f.h1});
+    _ = try inst.ingest(try beef.serialize(a, .{ .version = beef.V2, .atomic = f.txid, .bumps = f.bumps, .entries = try a.dupe(beef.Entry, &.{f.entry}) }));
+    var ch = try inst.chain();
+    var held: std.ArrayList(Spent) = .empty;
+    var prev_tx = f.tx;
+    for (0..n) |i| {
+        const t = try brokenSpend(a, try spend(a, &prev_tx, 0, &.{.{ 9_000 - 10 * i, &k.p2pkh }}, k.priv));
+        _ = try ch.putTx(t.txid, t.raw);
+        try held.append(a, t);
+        prev_tx = t.tx;
+    }
+    inst.chain_root = try ch.save();
+    const s = try spend(a, &prev_tx, 0, &.{ .{ 1, &k.token }, .{ 500, &k.p2pkh } }, k.priv);
+    var es: std.ArrayList(beef.Entry) = .empty;
+    try es.append(a, if (raw_held) f.entry else .{ .txid = f.txid, .format = .txid_only });
+    for (held.items) |t| try es.append(a, if (raw_held) .{ .txid = t.txid, .format = .raw, .raw = t.raw, .tx = t.tx } else .{ .txid = t.txid, .format = .txid_only });
+    try es.append(a, .{ .txid = s.txid, .format = .raw, .raw = s.raw, .tx = s.tx });
+    const wire = try beef.serialize(a, .{ .version = beef.V2, .atomic = s.txid, .bumps = if (raw_held) f.bumps else &.{}, .entries = es.items });
+    const r = if (envelope) try inst.routeEnvelope(try pointerOf(a, ms.store(), wire)) else try inst.route(wire);
+    var out: HeldRun = .{ .routed = r, .items = 0, .identify = inst.count("identify"), .admitted = false, .records = 0, .keeps = 0, .subject_items = 0 };
+    if (r != .admit) return out;
+    const items = try submit.itemsOf(a, r.admit.event);
+    out.items = items.len;
+    for (items) |it| if (std.mem.eql(u8, &it.txid, &s.txid)) {
+        out.subject_items += 1;
+    };
+    var kc = KeepCount{ .inner = ms.store() };
+    inst.chain_store = kc.store();
+    const done = try inst.begin(r.admit.event);
+    out.admitted = done.admitted;
+    out.records = done.records.len;
+    out.keeps = kc.keeps;
+    var ch2 = try inst.chain();
+    for (held.items) |t| try std.testing.expectEqual(c.state.Status.unproven, try ch2.status(t.txid));
+    return out;
+}
+
+test "0.28.1 a submission carrying N held raw entries is judged as the same with them txid-only: no scripts, no identify, no item for them; counts independent of N" {
+    inline for (.{ false, true }) |envelope| {
+        const base = try heldRun(1, false, envelope);
+        try std.testing.expectEqual(std.meta.Tag(submit.Routed).admit, base.routed);
+        try std.testing.expectEqual(@as(usize, 1), base.items); // the subject alone
+        try std.testing.expectEqual(@as(usize, 1), base.subject_items);
+        try std.testing.expectEqual(@as(usize, 1), base.identify); // the subject alone
+        try std.testing.expect(base.admitted);
+        try std.testing.expectEqual(@as(usize, 1), base.keeps); // the subject's block, kept by the chain app
+        for ([_]usize{ 1, 6 }) |n| {
+            // Raw held entries whose scripts fail: never run (else ScriptFailed), never judged.
+            try std.testing.expectEqualDeep(base, try heldRun(n, true, envelope));
+            try std.testing.expectEqualDeep(base, try heldRun(n, false, envelope));
+        }
+    }
+}
+
+test "0.28.1 a held unmined entry carried raw with a BUMP we lack, beside a new subject: not judged, its proof checked and linked by the chain app's ingest; the subject admitted" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = c.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var inst = try Instance.init(a, &ms);
+    const k = try keys(0x42);
+    const f = try fund(a, 0x11, 1, &k.p2pkh);
+    try inst.headers(&.{&f.h1});
+    const p = try spend(a, &f.tx, 0, &.{.{ 9_000, &k.p2pkh }}, k.priv);
+    // P held unmined by the chain app (never judged here).
+    _ = try inst.ingest(try withFund(a, f, p));
+    var ch0 = try inst.chain();
+    try std.testing.expectEqual(c.state.Status.unproven, try ch0.status(p.txid));
+    // P mined alone at 2.
+    const h2 = mine(hdr.hash(&f.h1), p.txid, 1_700_001_200);
+    try inst.headers(&.{&h2});
+    const s = try spend(a, &p.tx, 0, &.{ .{ 1, &k.token }, .{ 8_000, &k.p2pkh } }, k.priv);
+    const bumps = try a.dupe(bsvz.spv.MerklePath, &.{ f.bumps[0], try bsvz.spv.MerklePath.parse(a, try soloPath(a, 2, p.txid)) });
+    const wire = try beef.serialize(a, .{ .version = beef.V2, .bumps = bumps, .entries = try a.dupe(beef.Entry, &.{
+        f.entry,
+        .{ .txid = p.txid, .format = .raw_with_bump, .bump = 1, .raw = p.raw, .tx = p.tx },
+        .{ .txid = s.txid, .format = .raw, .raw = s.raw, .tx = s.tx },
+    }) });
+    // A BUMP for P (held, unproven) whose root is not our header's: refused — the proof is checked.
+    {
+        var pb: std.ArrayList(u8) = .empty;
+        try pb.appendSlice(a, &.{ 2, 0x01, 0x02, 0x00, 0x02 });
+        try pb.appendSlice(a, &p.txid);
+        try pb.appendSlice(a, &.{ 0x01, 0x00 });
+        try pb.appendSlice(a, &s.txid);
+        const bad = try beef.serialize(a, .{ .version = beef.V2, .bumps = try a.dupe(bsvz.spv.MerklePath, &.{ f.bumps[0], try bsvz.spv.MerklePath.parse(a, pb.items) }), .entries = try a.dupe(beef.Entry, &.{
+            f.entry,
+            .{ .txid = p.txid, .format = .raw_with_bump, .bump = 1, .raw = p.raw, .tx = p.tx },
+            .{ .txid = s.txid, .format = .raw, .raw = s.raw, .tx = s.tx },
+        }) });
+        try std.testing.expectEqualStrings("RootMismatch", (try inst.route(bad)).refused);
+    }
+    const before = inst.count("identify");
+    const r = try inst.route(wire);
+    try std.testing.expect(r == .admit);
+    try std.testing.expectEqual(before + 1, inst.count("identify")); // the subject alone
+    const items = try submit.itemsOf(a, r.admit.event);
+    try std.testing.expectEqual(@as(usize, 1), items.len);
+    const done = try inst.begin(r.admit.event);
+    try std.testing.expect(done.admitted);
+    // The chain app's ingest linked P (its `chain/proof` fact raised by the chain app), P proven.
+    var linked_p = false;
+    for (inst.unsettled.items) |t| linked_p = linked_p or std.mem.eql(u8, &t, &p.txid);
+    try std.testing.expect(linked_p);
+    var ch = try inst.chain();
+    try std.testing.expectEqual(c.state.Status.proven, try ch.status(p.txid));
+    try std.testing.expect(try inst.applied(s.txid));
 }

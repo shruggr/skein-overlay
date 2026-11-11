@@ -1080,15 +1080,24 @@ fn flagged(p: merkle.MerklePath, txid: [32]u8) bool {
 /// transaction holds it); the transactions are sorted parents-first, a
 /// writer's order not refused (skein-sdk `beef.sorted`; only a cycle is);
 /// the chain and the scripts are `verifyDecoded`'s.
-pub fn decode(a: Allocator, s: Store, bytes: []const u8) !Decoded {
+///
+/// 0.28.1 (David 2026-11-11: "if it's not just a TXID, we calculate what the TXID is and we look it up
+/// the same way"): every raw entry but the subject that the chain state holds (`txs`, the lookup a
+/// txid-only entry gets) is read as its txid-only entry, before anything else (skein-sdk
+/// `State.heldAsTxidOnly`, the chain ingest's own reading): its block is not put, it is not
+/// script-checked, not judged. A BUMP proving only held entries already proven is dropped (not
+/// revealed, not put); one proving a held entry with no proof yet stays (checked against our header
+/// in `verifyDecoded`; the chain app's ingest saves it).
+pub fn decode(a: Allocator, s: Store, ch: *Chain, bytes: []const u8) !Decoded {
     const parsed = beef_mod.parse(a, bytes) catch return error.InvalidBeef;
     const subject = parsed.subject() orelse return error.InvalidBeef;
     const entry = parsed.find(subject) orelse return error.InvalidBeef;
     if (entry.raw == null) return error.InvalidBeef; // a txid-only subject
-    const b = beef_mod.sorted(a, parsed) catch |e| switch (e) {
+    const ordered = beef_mod.sorted(a, parsed) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidBeef => return error.NotParentsFirst,
     };
+    const b = (try ch.heldAsTxidOnly(ordered, subject)).beef;
 
     var bumps: std.ArrayList(Bump) = .empty;
     var nodes: std.ArrayList(merkle.Node) = .empty;
@@ -1149,8 +1158,9 @@ pub fn decode(a: Allocator, s: Store, bytes: []const u8) !Decoded {
 /// proven again (`verifyDecoded`'s `door`). The subject is the envelope's (an Atomic, Outpoint or
 /// Subject BEEF), else the record's last transaction (skein-sdk `record.subjectOf`). A txid-only
 /// subject is refused. The transactions are sorted parents-first (`parentsFirst`); the record keeps
-/// the wire's order.
-pub fn decodeRecord(a: Allocator, s: Store, envelope: Value) !Decoded {
+/// the wire's order. 0.28.1: every raw entry but the subject that the chain state holds (`txs`) is
+/// read as its txid-only entry (its block not read), as `decode` does.
+pub fn decodeRecord(a: Allocator, s: Store, ch: *Chain, envelope: Value) !Decoded {
     const env = c.record.envelopeOf(envelope) orelse return error.InvalidBeef;
     const rec = s.getValue(a, env.beef) catch return error.InvalidBeef;
     if (!c.record.isRecord(rec)) return error.InvalidBeef;
@@ -1167,7 +1177,7 @@ pub fn decodeRecord(a: Allocator, s: Store, envelope: Value) !Decoded {
     for (tv, marks, by) |t, m, p| {
         const tc = if (t == .cid) t.cid else return error.InvalidBeef;
         const txid = store_mod.bitcoinHash(tc) orelse return error.InvalidBeef;
-        if (m == .text) {
+        if (m == .text or (!std.mem.eql(u8, &txid, &subject) and try ch.holds(txid))) {
             try txid_only.append(a, txid);
             continue;
         }

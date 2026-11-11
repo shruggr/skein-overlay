@@ -600,9 +600,9 @@ the anchors and answers the sync protocol's frames (0.15.0).
 
 | | |
 |---|---|
-| this app and package | 0.28.0 (tag `v0.28.0`) |
-| skein-sdk | v0.22.0, by tag URL and hash in `build.zig.zon` (modules `chain` and, for the engine, `sk`; bsvz comes through it) |
-| requires | `chain/1` (shruggr/skein-chain 0.12.0: its `ingest` as an in-VM call; its facts `chain/tx/<txid>` {pending, mined, rejected; seen only after a reorg}; a proof after a rejection is `mined`) |
+| this app and package | 0.28.1 (tag `v0.28.1`) |
+| skein-sdk | v0.22.1, by tag URL and hash in `build.zig.zon` (modules `chain` and, for the engine, `sk`; bsvz comes through it) |
+| requires | `chain/1` (shruggr/skein-chain 0.12.1: its `ingest` as an in-VM call; its facts `chain/tx/<txid>` {pending, mined, rejected; seen only after a reorg}; a proof after a rejection is `mined`) |
 | skein | 0.6.1 or later (the host submits fetched BEEFs as the submit message; 0.25.1) (the event index, 0.5.0; a thread resting on a name, 0.5.4); the engine and the chain app installed as apps (a genesis program's record names no app, and emits no fact); skein's equivs pin this repo by commit |
 
 0.3.0 moved the state under `<app>/…`, made the chain app's answer the gate
@@ -1164,6 +1164,15 @@ where they came after them, at the step's end. ls_demo raises its own facts
 0.27.1 (re-pin): skein-sdk v0.21.3 (`spv.verify` does not script-check again a
 transaction the instance holds that a BEEF carries raw) and skein-chain v0.11.1.
 The overlay's own check (`verifyDecoded`) is unchanged.
+
+0.28.1 (David 2026-11-11: "if it's not just a TXID, we calculate what the TXID is and we look it
+up the same way"; skein-sdk 0.22.1, skein-chain 0.12.1): reading a submission (`decode`,
+`decodeRecord`), every transaction it carries raw that the chain state holds (`txs`), except its
+subject, is read as its txid-only entry: its block is not read or put, its scripts are not run
+(`verifyDecoded`), no topic judges it (`identify`), it is no item. A BUMP that proves only held,
+proven transactions is dropped (`decode`); one proving a held transaction with no proof yet stays,
+checked against our header, and the chain app's ingest saves it (the transaction linked, its
+`chain/proof` fact raised). The state's shape is unchanged.
 
 0.28.0 (David 2026-11-11: one rule for every submission; skein-sdk 0.22.0, skein-chain 0.12.0):
 a submission is admitted in the step that hands it to the chain app — every path (a message,
