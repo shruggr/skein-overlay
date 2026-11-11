@@ -603,9 +603,9 @@ the anchors and answers the sync protocol's frames (0.15.0).
 
 | | |
 |---|---|
-| this app and package | 0.27.0 |
-| skein-sdk | v0.21.0, by tag URL and hash in `build.zig.zon` (modules `chain` and, for the engine, `sk`; bsvz comes through it) |
-| requires | `chain/1` (shruggr/skein-chain v0.11.0: its `ingest` as an in-VM call; its facts `chain/tx/<txid>` {pending, seen, mined, rejected}; a proof after a rejection is `mined`) |
+| this app and package | 0.27.1 |
+| skein-sdk | v0.21.3, by tag URL and hash in `build.zig.zon` (modules `chain` and, for the engine, `sk`; bsvz comes through it) |
+| requires | `chain/1` (shruggr/skein-chain v0.11.1: its `ingest` as an in-VM call; its facts `chain/tx/<txid>` {pending, seen, mined, rejected}; a proof after a rejection is `mined`) |
 | skein | 0.6.1 or later (the host submits fetched BEEFs as the submit message; 0.25.1) (the event index, 0.5.0; a thread resting on a name, 0.5.4); the engine and the chain app installed as apps (a genesis program's record names no app, and emits no fact); skein's equivs pin this repo by commit |
 
 0.3.0 moved the state under `<app>/…`, made the chain app's answer the gate
@@ -1163,6 +1163,10 @@ events now come while its hook runs: before the overlay's `topic/output` /
 `topic/tx` facts of that admission (and, on a rejection, before `reverted`),
 where they came after them, at the step's end. ls_demo raises its own facts
 `<app>/demo/output/<txid>.<vout>`.
+
+0.27.1 (re-pin): skein-sdk v0.21.3 (`spv.verify` does not script-check again a
+transaction the instance holds that a BEEF carries raw) and skein-chain v0.11.1.
+The overlay's own check (`verifyDecoded`) is unchanged.
 
 ## Contributing
 

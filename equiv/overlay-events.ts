@@ -176,7 +176,7 @@ try {
   const chainDir = copyOf(dirOf("SKEIN_CHAIN_DIR"), join(home, "chain"));
   const mf = JSON.parse(readFileSync(join(overlayDir, "etc/app.json"), "utf8")) as { version: string; config: { overlay: Record<string, unknown> } };
   const cmf = JSON.parse(readFileSync(join(chainDir, "etc/app.json"), "utf8")) as { version: string };
-  check(mf.version === "0.27.0" && cmf.version === "0.11.0", `skein-overlay ${mf.version}, skein-chain ${cmf.version}`);
+  check(mf.version === "0.27.1" && cmf.version === "0.11.1", `skein-overlay ${mf.version}, skein-chain ${cmf.version}`);
   mf.config.overlay.gossip = { tm_demo: false };
   writeFileSync(join(overlayDir, "etc/app.json"), JSON.stringify(mf, null, 2));
 
