@@ -6,8 +6,9 @@
 //!   POST /submit      fn "submit"   body BEEF, X-Topics (comma list or JSON array),
 //!                                   x-includes-off-chain-values: true → VarInt(len) ‖ BEEF ‖ off-chain values
 //!                                   → the STEAK {topic: {outputsToAdmit, coinsToRetain, coinsRemoved}}: BRC-22,
-//!                                   synchronous (0.9.1, shruggr/skein#112) — the request waits on the
-//!                                   submission's thread; 503 + Retry-After when nothing is decided
+//!                                   synchronous (0.9.1, shruggr/skein#112) — 0.28.0: admitted in this
+//!                                   call and answered at admission; a paused one waits on its pause;
+//!                                   503 + Retry-After when nothing is decided
 //!   libp2p:<topic>    fn "submit"   the announcements mesh (gossip.zig): its `admit` messages are the
 //!                                   host's (0.20.0: announce, then fetch); one that reaches the engine,
 //!                                   or anything else there, is ignored, nothing admitted → {verdict: "ignore"}
@@ -33,20 +34,24 @@
 //! skein-overlay#10) is no route: a program of the instance registering in its own step, the
 //! message in `<app>/register`'s work (registry.zig `byCall`) → {fn, result} | {fn, error}.
 //!
+//! A call of fn "intake" (0.28.0, David 2026-11-11) is no route either: a program of the instance
+//! (skein-amm's amm-validator) handing a transaction to its overlay in its own step, `{beef,
+//! topics, offChainValues?}` → the verdict (submit.zig `intake`): the same intake as every other
+//! submission, the chain app's ingest and its broadcast and the admission in the caller's step.
+//!
 //! Every request is appended, and the front door's step calls these (#68).
 //! A submit over HTTP is BRC-22 (0.9.1, shruggr/skein#112, David 2026-10-07: "the HTTP
-//! `/submit` route is BRC-22 or it does not exist"; 0.7.1's route restored): the handler runs the
-//! route's half (submit.zig `route`) and admits the submit event into the app's box for its
-//! thread, answering {wait: true, admit}: the request sends the instance itself `wait {txid}` and
-//! awaits it (0.24.0: the submission's thread rests on its facts for the transaction's life and
-//! never finishes, so the request does not launch it; the engine answers the `wait` when the
-//! subject is admitted or rejected, submit.zig `waitOn`), and
-//! called again (`reply`) it answers from the state — the STEAK; 400 if the chain app rejected
-//! it; 503 with Retry-After if nothing is decided (`httpFirst`, `httpAgain`). A bad BEEF
-//! answers 400; a valid transaction no topic took, 200 with the empty STEAK; judged before, the
-//! STEAK from the state, nothing run again; in progress (a resubmission), the same wait. A
-//! missing parent pauses the submission (its thread records the pause); the request waits the
-//! same way: the engine answers it when the pause ends, and the request reads the state again.
+//! `/submit` route is BRC-22 or it does not exist"; 0.7.1's route restored). 0.28.0 (David
+//! 2026-11-11: one rule for every submission): the handler is an in-VM call from the front door's
+//! step, so it runs the intake itself — the route's half (submit.zig `route`), then `settle`: the
+//! chain app's ingest (its broadcast) and the admission in this step — and answers from the state at
+//! once: the STEAK; 400 if the chain app rejected it or its ingest failed; a valid transaction no
+//! topic took, 200 with the empty STEAK; judged before, the STEAK from the state, nothing run
+//! again. A bad BEEF answers 400. A missing parent pauses the submission: its submit event is
+//! admitted into the app's box (its thread records the pause) and the request sends the instance
+//! itself `wait {txid}` and awaits it; the engine answers it when the pause ends (submit.zig
+//! `waitOn`), and the request, called again (`reply`), reads the state again — 503 with Retry-After
+//! if nothing is decided (`httpFirst`, `httpAgain`).
 //!
 //! A lookup is a read: the service's program is called (fn "lookup", the
 //! lookup contract, lookup.zig) and its answer shaped for the wire; it
@@ -249,6 +254,8 @@ pub fn call(a: Allocator, call_in: Value) !void {
     // 0.18.0 (skein-overlay#10): a registration by a program of the instance, in its step — the
     // message form's in the box `<app>/register` (registry.zig `byCall`).
     if (registry.isRegistration(func)) return vm.answer(a, try registry.byCall(a, ev_.effects(), call_in, func, arg));
+    // 0.28.0: a program of the instance's submission in its own step (submit.zig `intake`).
+    if (eql(u8, func, "intake")) return vm.answer(a, try intakeCall(a, call_in, arg));
     // The topics, lookup services and programs: the app record's (#72, config.zig; the route names the
     // engine's program record), else the genesis's.
     const in = try ev_.configured(a, call_in, arg);
@@ -307,29 +314,66 @@ fn submit(a: Allocator, in: Value, req: Value) !Value {
         .refused => |answer| return answer,
         .ok => |x| x,
     };
-    var st = try load(a, in);
+    var loaded = try ev_.load(a, in);
+    // The calling step's time (an in-VM call from the front door's step is replayed with it).
+    loaded.st.now = @intCast((if (in.get("step")) |sv| sv.getUint("at") else null) orelse in.getUint("now") orelse 0);
+    const cx = try callCtx(a, in, &loaded.st);
     const source = try sourceOf(a, req, null);
-    const next = if (httpWoken(req))
-        try httpAgain(a, ev_.caller(), &st, in, sub, source)
-    else
-        try httpFirst(a, ev_.caller(), &st, in, sub, source);
+    const next = if (httpWoken(req)) try httpAgain(cx, sub, source) else try httpFirst(cx, sub, source);
     switch (next) {
         .answer => |v| return v,
-        // 0.24.0: the submission's thread rests on its facts for the transaction's life (it never
-        // finishes), so this request does not launch it (a step waits on threads or on replies, not
-        // both): the submit event is admitted into the app's box (the answer's `admit`, routed in
-        // this entry, before the step's messages go out: its thread there begins at once), and the
-        // request waits on the subject — the message `wait {txid}` to the instance itself,
-        // awaited; the engine answers it when the subject is admitted or rejected (or, paused, when
-        // the pause ends), and the request reads the state again.
+        // 0.28.0: admitted (or not) in this call, in the front door's step: what it wrote kept.
+        .admitted => |x| {
+            try callTail(a, in, &loaded, "submit", x.done);
+            return x.answer;
+        },
+        // A missing parent: the paused submit event is admitted into the app's box (the answer's
+        // `admit`, routed in this entry: its step there records the pause), and the request waits on
+        // the subject — the message `wait {txid}` to the instance itself, awaited; the engine answers
+        // it when the pause ends, and the request reads the state again.
         .launch => |ev| {
             var w = try waitFor(a, in, try submit_mod.txidOf(ev));
             w.map = try std.mem.concat(a, cbor.Entry, &.{ w.map, &.{.{ .key = "admit", .value = try admitOne(a, ev, calls.appOf(in)) }} });
             return w;
         },
-        // In progress (a resubmission, #66), or paused on a parent it lacks: the same wait.
+        // Paused already (a copy, or the request called again while it is): the same wait.
         .wait => |txid| return waitFor(a, in, txid),
     }
+}
+
+/// The context of a call that admits (0.28.0: POST /submit's handler, the in-VM `intake`): the
+/// wire and the gossip out, as a step's.
+fn callCtx(a: Allocator, in: Value, st: *State) !submit_mod.Ctx {
+    return .{ .a = a, .caller = ev_.caller(), .wire = try ev_.wire(in), .out = try ev_.gossipOut(a), .st = st, .in = in };
+}
+
+/// A call that admitted ended (0.28.0): the records it wrote kept, the beats re-declared, the state
+/// saved (the head advanced when it changed), its result record kept — all the calling step's.
+fn callTail(a: Allocator, in: Value, loaded: anytype, op: []const u8, done: ?submit_mod.Stepped) !void {
+    const engine = @import("engine.zig");
+    var fields: std.ArrayList(cbor.Entry) = .empty;
+    if (done) |d| try engine.steppedFields(a, d, &fields);
+    const beats = try engine.emitBeats(a, in, &loaded.st);
+    if (beats > 0) try fields.append(a, .{ .key = "beats", .value = .{ .uint = beats } });
+    const new_state = try loaded.st.save();
+    if (loaded.head == null or !eql(u8, loaded.head.?, new_state)) try vm.advance(try ev_.stateHead(a, in), new_state);
+    try fields.append(a, .{ .key = "state", .value = .{ .cid = new_state } });
+    try vm.keep(try vm.store().putValue(a, try registry.resultRecord(a, op, fields.items)));
+}
+
+/// fn "intake" (0.28.0): a program of the instance's submission in its own step — the configuration
+/// its thread's app's engine reads (registry.zig `callStep`, as a registration by call) — run as
+/// every submission is (submit.zig `intake`) and answered with the verdict. A kernel call (no step)
+/// is refused: it writes.
+fn intakeCall(a: Allocator, call_in: Value, arg: Value) !Value {
+    if (call_in.get("step") == null) return error.IntakeWrites;
+    const in = (try registry.callStep(a, vm.store(), ev_.heads(), call_in)) orelse return error.NoOverlayEngine;
+    var loaded = try ev_.load(a, in);
+    loaded.st.now = @intCast(in.getUint("at") orelse 0);
+    const cx = try callCtx(a, in, &loaded.st);
+    const got = try submit_mod.intake(cx, arg);
+    try callTail(a, in, &loaded, "intake", got.done);
+    return got.result;
 }
 
 /// The Retry-After (whole seconds) of a 503: a submission still undecided past the host's bound.
@@ -359,15 +403,16 @@ pub fn httpRequest(a: Allocator, req: Value) !union(enum) { refused: Value, ok: 
 }
 
 /// What POST /submit's handler does next (0.9.1, shruggr/skein#112, David 2026-10-07: BRC-22,
-/// synchronous): answer now, admit the submit event for its thread and wait on its subject, or
-/// wait on a subject already in flight or paused (0.24.0: a `wait` message, answered when it is
-/// decided).
+/// synchronous): answer now — 0.28.0: having admitted in this call (`admitted`) — or admit the
+/// paused submit event for its thread and wait on its subject, or wait on a subject paused already.
 pub const HttpNext = union(enum) {
     answer: Value,
-    /// The submit event its thread is to begin on, admitted into the app's box (a paused one's
-    /// records the pause); the request then waits on its subject.
+    /// Begun in this call (0.28.0): the answer, and what the step admitted (its records to keep).
+    admitted: struct { answer: Value, done: ?submit_mod.Stepped },
+    /// The paused submit event its thread is to record, admitted into the app's box; the request
+    /// then waits on its subject.
     launch: Value,
-    /// The subject in flight or paused: wait for it to be decided (`wait`).
+    /// The subject paused: wait for its pause to end (`wait`).
     wait: [32]u8,
 };
 
@@ -386,38 +431,54 @@ pub fn httpWoken(req: Value) bool {
 
 /// The first call: the route's half (verify, judge), then what it came to. A bad BEEF answers 400;
 /// a valid transaction no topic took, 200 with the empty STEAK (BRC-22); judged before, the STEAK
-/// from the state, nothing run again; in progress or paused already, a wait on its subject; whole,
-/// its submit event admitted for its thread and a wait on its subject (a pause, the paused event,
-/// whose thread records it).
-/// Only transactions before the subject taken (the subject by no topic): 200 with the empty STEAK
-/// now, the submit event admitted into the app's box for its thread.
-pub fn httpFirst(a: Allocator, caller: calls.Caller, st: *State, in: Value, sub: HttpSubmit, source: Value) !HttpNext {
-    const topics = try served(a, sub.requested, try configMap(a, in, "overlayTopics"));
-    return switch (try submit_mod.route(a, caller, st, in, sub.beef, topics, sub.off, source)) {
+/// from the state, nothing run again; paused already, a wait on its subject; lacking parents, the
+/// paused event admitted for its thread and a wait on its subject. Whole (0.28.0): begun in this call
+/// — ingested, admitted — and answered from the state (`httpNow`).
+pub fn httpFirst(cx: submit_mod.Ctx, sub: HttpSubmit, source: Value) !HttpNext {
+    const a = cx.a;
+    const st = cx.st;
+    const topics = try served(a, sub.requested, try configMap(a, cx.in, "overlayTopics"));
+    const r = try submit_mod.route(a, cx.caller, st, cx.in, sub.beef, topics, sub.off, source);
+    return switch (r) {
         .refused => |why| .{ .answer = try failure(a, 400, why) },
         .nothing => .{ .answer = try emptySteak(a, topics) },
         .unchanged => |t| .{ .answer = (try steakAnswer(a, st, t, topics)) orelse try emptySteak(a, topics) },
         .pending => |t| .{ .wait = t },
         .paused => |p| if (try st.isPaused(p.txid)) .{ .wait = p.txid } else .{ .launch = p.event },
-        .admit => |x| if (submit_mod.subjectTaken(x.event)) .{ .launch = x.event } else blk: {
-            var answer = try emptySteak(a, topics);
-            answer.map = try std.mem.concat(a, cbor.Entry, &.{ answer.map, &.{.{ .key = "admit", .value = try admitOne(a, x.event, calls.appOf(in)) }} });
-            break :blk .{ .answer = answer };
+        .admit => |x| blk: {
+            const outcome = try submit_mod.settle(cx, r, x.txid, topics, source);
+            const b = outcome.begun;
+            break :blk .{ .admitted = .{ .answer = try httpNow(cx, x.txid, topics, b.failed), .done = b.stepped } };
         },
     };
 }
 
-/// Called again (#66): what the state says now. Judged → the STEAK; in flight or paused → wait on
-/// it again; rejected by the chain app → 400; held, taken by no topic →
+/// The answer from the state after the intake (0.28.0): the STEAK when a requested topic applied the
+/// subject; 400 when its ingest failed or the chain app rejects it; else (no topic took it) 200
+/// with the empty STEAK.
+fn httpNow(cx: submit_mod.Ctx, txid: [32]u8, topics: []const []const u8, failed: ?[]const u8) !Value {
+    const a = cx.a;
+    if (try steakAnswer(a, cx.st, txid, topics)) |v| return v;
+    if (failed) |why| return failure(a, 400, why);
+    if ((try cx.st.ch.holds(txid)) and (try cx.st.ch.status(txid)) == .rejected) {
+        const why = if (try cx.st.ch.rejectionOf(txid)) |rj| rj.reason else "rejected";
+        return failure(a, 400, try std.fmt.allocPrint(a, "Transaction rejected: {s}", .{if (why.len > 0) why else "rejected"}));
+    }
+    return emptySteak(a, topics);
+}
+
+/// Called again (#66, the answer to its `wait`: the pause ended): what the state says now. Judged →
+/// the STEAK; paused → wait on it again; rejected by the chain app → 400; held, taken by no topic →
 /// the empty STEAK; else the route's answer for what it is now (refused → 400, taken by nothing →
 /// the empty STEAK) or, nothing decided, 503 with Retry-After — the client resubmits, a poll on
-/// the same flow. Nothing is launched again.
-pub fn httpAgain(a: Allocator, caller: calls.Caller, st: *State, in: Value, sub: HttpSubmit, source: Value) !HttpNext {
-    const topics = try served(a, sub.requested, try configMap(a, in, "overlayTopics"));
+/// the same flow. Nothing is begun again.
+pub fn httpAgain(cx: submit_mod.Ctx, sub: HttpSubmit, source: Value) !HttpNext {
+    const a = cx.a;
+    const st = cx.st;
+    const topics = try served(a, sub.requested, try configMap(a, cx.in, "overlayTopics"));
     const txid = httpSubject(a, st, sub) catch return .{ .answer = try failure(a, 400, "Invalid BEEF") };
     if (try steakAnswer(a, st, txid, topics)) |v| return .{ .answer = v };
-    // 0.25.0: in flight (a rejected or failed submission's record stays, not in flight).
-    if (try st.inFlight(txid)) return .{ .wait = txid };
+    if (try st.isPaused(txid)) return .{ .wait = txid };
     // skein-sdk 0.21.0: a proof overrides a rejection (the settlement a proof overrode is still read
     // by `settlementCid`): rejected only when the chain state's status says so.
     if ((try st.ch.status(txid)) == .rejected) {
@@ -425,7 +486,7 @@ pub fn httpAgain(a: Allocator, caller: calls.Caller, st: *State, in: Value, sub:
         return .{ .answer = try failure(a, 400, try std.fmt.allocPrint(a, "Transaction rejected: {s}", .{if (why.len > 0) why else "rejected"})) };
     }
     if (try st.ch.holds(txid)) return .{ .answer = try emptySteak(a, topics) };
-    return switch (try submit_mod.route(a, caller, st, in, sub.beef, topics, sub.off, source)) {
+    return switch (try submit_mod.route(a, cx.caller, st, cx.in, sub.beef, topics, sub.off, source)) {
         .refused => |why| .{ .answer = try failure(a, 400, why) },
         .nothing => .{ .answer = try emptySteak(a, topics) },
         .unchanged => |t| .{ .answer = (try steakAnswer(a, st, t, topics)) orelse try emptySteak(a, topics) },
@@ -459,7 +520,7 @@ pub fn undecided(a: Allocator) !Value {
         .{ .key = "status", .value = .{ .uint = 503 } },
         .{ .key = "type", .value = .{ .text = "application/json" } },
         .{ .key = "headers", .value = .{ .map = try a.dupe(cbor.Entry, &.{.{ .key = "retry-after", .value = .{ .text = try std.fmt.allocPrint(a, "{d}", .{retry_after}) } }}) } },
-        .{ .key = "body", .value = .{ .bytes = try jsonOf(a, .{ .status = "error", .message = "Not yet decided: nothing is admitted until the network accepts it. Resubmit after Retry-After seconds." }) } },
+        .{ .key = "body", .value = .{ .bytes = try jsonOf(a, .{ .status = "error", .message = "Not yet decided: it waits on parents this instance does not hold. Resubmit after Retry-After seconds." }) } },
     }) };
 }
 

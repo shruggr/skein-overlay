@@ -22,18 +22,16 @@
 //!                 {form, beef: <pointer record>, subject?, vout?} as a block (shruggr/skein#121,
 //!                 #146), or the raw block of the bytes — for internalizing; a
 //!                 lookup's BEEF is the chain state's, `beefFor`)
-//!   pending    txid → {kind: "submission", txid, submission, ingested?, heard?, spends?, wakes?, waiting?, event?}
-//!                its in-flight job only (0.24.0: the submission's thread holds the context, resting on
-//!                each item's `chain/tx/<txid>`): a transaction of a submission handed to the chain
-//!                app and not yet admitted (or rejected) — `submission` the submission's subject
-//!                (hex), `ingested` handed to the chain app (0.26.0: its `ingest` called; 0.25.x named its ingest message), `heard` the
-//!                chain app's admitting status while an earlier transaction of the same submission is
-//!                still pending (skein-overlay#1), `spends` its inputs (0.20.5), `wakes` (the subject's)
-//!                the HTTP requests waiting on it; or a submission paused on parents neither in its
-//!                BEEF nor held, or not settled here (in flight, paused, undecided: skein-overlay#6,
-//!                0.19.0) — `waiting` their txids (hex), `event` the submit event to route again, its
-//!                `held` the ones in flight, `thread` the thread resting on each one's
-//!                `<app>/topic/tx/<txid>` (0.24.0: no `waits` index; its fact wakes the thread)
+//!   pending    txid → {kind: "submission", txid, submission, event?, wakes?, waiting?}
+//!                0.28.0 (David 2026-11-11: no thread is held open per transaction): for each
+//!                transaction a submission handed to the chain app and the chain app holds, the
+//!                context its subscription's step reads (`chain/tx/<txid>` → fn `chainTx`) —
+//!                `submission` the submission's subject (hex), `event` its submit event; kept for the
+//!                transaction's life, as the resting thread was (no in-flight state: it is admitted in
+//!                its intake step). Or a submission paused on parents neither in its BEEF nor held,
+//!                or paused here (undecided: 0.19.0) — `waiting` their txids (hex), `event` the
+//!                submit event to route again, `wakes` the HTTP requests waiting on the pause; its
+//!                thread rests on each one's `<app>/topic/tx/<txid>` (0.24.0)
 //!   views      tp → bytes(40): count (8 bytes, big-endian) ‖ digest (32 bytes)   the topic's VIEW
 //!                DIGEST (0.12.0, David 2026-10-09): `count` the topic's admitted-and-unspent
 //!                outputs, `digest` an order-independent running digest of them — each outpoint's
@@ -359,27 +357,19 @@ pub const State = struct {
 
     // ------------------------------------------------------------ pending submissions
 
-    /// A pending record's fields (skein-overlay#1). A transaction handed to the chain app: `ingested`
-    /// (0.26.0: its `ingest` called), `submission` (the subject of the submission it came in),
-    /// `heard` (0.25.0: only `failed` — the chain app's answer to its ingest was an error; every
-    /// status is read from the chain state, David 2026-11-09: "There is no deciding. There is
-    /// reading the state"). A paused submission: `waiting` (the parents neither in its BEEF nor
-    /// held) and `event` (the submit event, routed again when one of them arrives). 0.25.0: no
-    /// `thread` — one submission per transaction while it is in flight (a copy is a duplicate).
+    /// A pending record's fields (skein-overlay#1). A transaction the chain app holds (0.28.0):
+    /// `submission` (the subject of the submission it came in) and `event` (its submit event) — what
+    /// its `chain/tx/<txid>` subscription's step reads. A paused submission: `waiting` (the parents
+    /// neither in its BEEF nor held) and `event` (the submit event, routed again when one of them
+    /// arrives). 0.28.0: no in-flight state (`ingested`, `heard`, `spends` are gone: a transaction
+    /// is admitted in the step that hands it to the chain app).
     pub const Pending = struct {
         submission: ?[32]u8 = null,
-        /// Handed to the chain app (0.26.0: by an in-VM call of its `ingest`; 0.25.x: the ingest message).
-        ingested: bool = false,
-        heard: ?[]const u8 = null,
         waiting: []const [32]u8 = &.{},
         event: ?[]const u8 = null,
-        /// The waiters (0.9.1; 0.24.0 in flight too): the `wait` messages of the HTTP requests waiting
-        /// on a paused submission, or on a subject in flight, each answered (`replyTo`) when it is decided.
+        /// The waiters (0.9.1): the `wait` messages of the HTTP requests waiting on a paused
+        /// submission, each answered (`replyTo`) when the pause ends.
         wakes: []const []const u8 = &.{},
-        /// The outpoints a transaction handed to the chain app spends (0.20.5): kept with its
-        /// record so a later submission spending one of them is refused while it is in flight
-        /// (`inFlightSpender`), before the chain app holds it.
-        spends: []const [36]u8 = &.{},
     };
 
     pub fn putPending(self: *State, txid: [32]u8, p: Pending) !void {
@@ -390,8 +380,6 @@ pub const State = struct {
             .{ .key = "txid", .value = .{ .text = try a.dupe(u8, &hdr.toHex(txid)) } },
             .{ .key = "submission", .value = .{ .text = try a.dupe(u8, &hdr.toHex(p.submission orelse txid)) } },
         });
-        if (p.ingested) try fields.append(a, .{ .key = "ingested", .value = .{ .boolean = true } });
-        if (p.heard) |h| try fields.append(a, .{ .key = "heard", .value = .{ .text = h } });
         if (p.waiting.len > 0) {
             const ws = try a.alloc(Value, p.waiting.len);
             for (p.waiting, ws) |w, *o| o.* = .{ .text = try a.dupe(u8, &hdr.toHex(w)) };
@@ -402,11 +390,6 @@ pub const State = struct {
             const ws = try a.alloc(Value, p.wakes.len);
             for (p.wakes, ws) |w, *o| o.* = .{ .cid = w };
             try fields.append(a, .{ .key = "wakes", .value = .{ .array = ws } });
-        }
-        if (p.spends.len > 0) {
-            const xs = try a.alloc(Value, p.spends.len);
-            for (p.spends, xs) |op, *o| o.* = .{ .bytes = try a.dupe(u8, &op) };
-            try fields.append(a, .{ .key = "spends", .value = .{ .array = xs } });
         }
         try self.map("pending").putLink(&txid, try self.store.putValue(a, .{ .map = fields.items }));
     }
@@ -423,10 +406,6 @@ pub const State = struct {
         self.ch.now = now;
     }
 
-    pub fn isPending(self: *State, txid: [32]u8) !bool {
-        return self.map("pending").has(&txid);
-    }
-
     /// Whether the submission of this subject is paused on parents it lacks (skein-overlay#1).
     pub fn isPaused(self: *State, txid: [32]u8) !bool {
         const rec = (try self.pendingRecord(txid)) orelse return false;
@@ -437,62 +416,10 @@ pub const State = struct {
         _ = try self.map("pending").remove(&txid);
     }
 
-    /// Whether this transaction is handed to the chain app in a submission and awaiting its
-    /// answer (skein-overlay#6): pending and `ingested` (not a paused submission).
-    pub fn isInFlight(self: *State, txid: [32]u8) !bool {
-        const rec = (try self.pendingRecord(txid)) orelse return false;
-        return rec.getBool("ingested") orelse false;
-    }
-
-    /// Whether this transaction is in flight here (0.25.0, David 2026-11-09: paused and pending are
-    /// one submission at two stages): paused on parents, or handed to the chain app and neither
-    /// failed there (`heard: failed`) nor rejected by its latest status. A rejected one's record
-    /// stays (a rejection deletes nothing: a later proof admits it), but it is not in flight.
-    pub fn inFlight(self: *State, txid: [32]u8) !bool {
-        const rec = (try self.pendingRecord(txid)) orelse return false;
-        if (rec.get("waiting") != null) return true;
-        if (!(rec.getBool("ingested") orelse false)) return false;
-        if (std.mem.eql(u8, rec.getText("heard") orelse "", "failed")) return false;
-        return (try self.ch.status(txid)) != .rejected;
-    }
-
-    /// Whether this transaction is not settled here yet (0.19.0): in flight (0.25.0: `inFlight`). A
-    /// child spending it waits on it, with no want (`heldParents`): judged now, its topic would read
-    /// the parent's outputs as no coins.
-    pub fn isUnsettled(self: *State, txid: [32]u8) !bool {
-        return self.inFlight(txid);
-    }
-
-    /// A pending record's `spends` read back (0.20.5).
-    pub fn spendsOf(self: *State, rec: Value) ![]const [36]u8 {
-        const xs = rec.getArray("spends") orelse return &.{};
-        const out = try self.arena.alloc([36]u8, xs.len);
-        for (xs, out) |x, *o| o.* = if (x == .bytes and x.bytes.len == 36) x.bytes[0..36].* else return error.BadState;
-        return out;
-    }
-
-    /// The transaction other than `except`, in flight in a submission of this engine (handed to the
-    /// chain app, its answer not yet acted on) and not rejected by the chain state, that spends `op`
-    /// (0.20.5, David 2026-11-06: one held spender per coin; the chain state does not hold it yet
-    /// when the next submission is routed), or null.
-    pub fn inFlightSpender(self: *State, op: [36]u8, except: [32]u8) !?[32]u8 {
-        for (try self.map("pending").prefixed("")) |kv| {
-            if (kv.key.len != 32 or kv.value != .cid) continue;
-            if (std.mem.eql(u8, kv.key, &except)) continue;
-            const rec = try self.record(kv.value.cid);
-            if (!(rec.getBool("ingested") orelse false)) continue;
-            for (try self.spendsOf(rec)) |s| if (std.mem.eql(u8, &s, &op)) {
-                if ((try self.ch.status(kv.key[0..32].*)) == .rejected) break;
-                return kv.key[0..32].*;
-            };
-        }
-        return null;
-    }
-
     /// An input of an unproven transaction already spent by a held one (0.26.0, David 2026-11-09:
     /// "the only conflict the overlay itself rejects = unmined vs unmined"; a held spender is the
-    /// chain state's — `spendersOf`, any status but rejected — or one in flight in a submission of
-    /// this engine, `inFlightSpender`).
+    /// chain state's — `spendersOf`, any status but rejected; 0.28.0: nothing is in flight, the
+    /// chain state holds every transaction a submission handed it in that same step).
     pub const Spent = struct { op: [36]u8, by: [32]u8 };
 
     /// The first input of `tx` (`txid`) that a transaction other than it, held here and not
@@ -505,7 +432,6 @@ pub const State = struct {
                 if ((try self.ch.status(other)) == .rejected) continue;
                 return .{ .op = op, .by = other };
             }
-            if (try self.inFlightSpender(op, txid)) |by| return .{ .op = op, .by = by };
         }
         return null;
     }
@@ -553,7 +479,7 @@ pub const State = struct {
         return out.items;
     }
 
-    /// Record a topic's judgement of a submission the chain app has (accepted or proven): each
+    /// Record a topic's judgement of a submission the chain app holds (not rejected): each
     /// admitted output as an admittance record, the judgement in `applied`. `previous` is
     /// `previousCoins` for this topic, taken before any judgement of this step. A transaction the
     /// topic judged before is a dupe: nothing is written. `beef`: the submission's BEEF (its CID:
@@ -1319,20 +1245,21 @@ pub fn missingParents(a: Allocator, ch: *Chain, d: Decoded) ![][32]u8 {
     return out.items;
 }
 
-/// The parents a submission waits on in flight (skein-overlay#6, David 2026-10-23): for every
-/// transaction the walk would judge (the subject and each one before it not pending in a
-/// submission of its own), each input's source handed to the chain app in a submission and not yet
-/// admitted (`State.isInFlight`). Held, not missing: no want for them; the submission pauses on
-/// them and is routed again when the chain app answers for them. Each once, in BEEF order.
+/// The parents a submission waits on paused here (0.19.0): for every transaction the walk would
+/// judge (the subject and each one before it not paused in a submission of its own), each input's
+/// source that is a submission paused here (`State.isPaused`). The submission pauses on them and is
+/// routed again on their verdict. Each once, in BEEF order. 0.28.0: nothing is in flight (a
+/// transaction handed to the chain app is admitted in that step), so a paused parent is the only
+/// one waited on that is not missing (skein-overlay#6's in-flight parents are gone).
 pub fn heldParents(a: Allocator, st: *State, d: Decoded) ![][32]u8 {
     var out: std.ArrayList([32]u8) = .empty;
     for (d.txs) |t| {
         const is_subject = std.mem.eql(u8, &t.txid, &d.subject);
-        if (!is_subject and try st.isPending(t.txid)) continue; // its own submission's: not judged here
+        if (!is_subject and try st.isPaused(t.txid)) continue; // its own submission's: not judged here
         const tx = Transaction.parse(a, t.raw) catch return error.InvalidBeef;
         for (tx.inputs) |in| {
             const src = in.previous_outpoint.txid.bytes;
-            if (!(try st.isUnsettled(src))) continue;
+            if (!(try st.isPaused(src))) continue;
             for (out.items) |x| {
                 if (std.mem.eql(u8, &x, &src)) break;
             } else try out.append(a, src);

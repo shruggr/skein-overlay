@@ -7,29 +7,30 @@
 //!                             submission box `<app>/submit`, open to anyone), or the `submission`
 //!                             event POST /submit admits into that same box `<app>/submit`
 //!                             carrying the same message (shruggr/skein#112; 0.7.3; the box 0.7.6,
-//!                             one box per function class, #128): routed — its thread launched,
+//!                             one box per function class, #128): routed — 0.28.0: admitted in
+//!                             this step (submit.zig `begin`: each item's BEEF to the chain app by
+//!                             an in-VM call of its `ingest`, then admitted on the chain state), or
 //!                             paused, or answered at once; its answers go to the sender, in the
 //!                             box it came in (submit.zig `received`).
-//!   the submission's thread   launched by a submission (args {event, box: "submit"}), or by the
-//!                             submit event admitted into box `<app>` (POST /submit's, the receive
-//!                             row's; row from `event`): first step `begin` — each item's BEEF to the
-//!                             chain app (0.26.0: an in-VM call of its `ingest` {beef}; a failed
-//!                             call fails that item), pending, the thread resting on each item's
-//!                             `chain/tx/<txid>` (0.24.0, skein 0.5.4), then the chain state read
-//!                             and what it admits admitted. It never finishes.
-//!   a wake                    a fact under a name the thread rests on (the input's `event`):
-//!                             `chain/tx/<txid>` (skein-chain 0.8.0) — the status heard
-//!                             (submit.zig `heard`, 0.25.0: the chain state read): admitted on
-//!                             seen or mined, nothing on rejected (nothing deleted: a later
-//!                             mined admits it); later, mined placed, seen (reorged) moved, rejected
-//!                             unwound; `<app>/topic/tx/<txid>` (a parent's verdict) — the
+//!   a paused POST /submit     its submit event admitted into box `<app>` (args {event}): `begin`
+//!                             records the pause, its thread resting on the parents' verdicts.
+//!   fn `chainTx`              0.28.0 (David 2026-11-11: "We have events and we have subscriptions.
+//!                             That is all we need"): the step of the app's subscription to an
+//!                             item's `chain/tx/<txid>`, made at its intake (args {event, box: <the
+//!                             name>, fn}): the chain state read (submit.zig `heard`) — admitted, a
+//!                             mined placed, a seen (reorged) moved, a rejected unwound; not
+//!                             admitted, admitted again when the chain state no longer rejects it.
+//!                             Its context is the item's `pending` record (its submit event). No
+//!                             thread rests on a transaction.
+//!   a wake                    a fact under a name a paused submission's thread rests on (the
+//!                             input's `event`): `<app>/topic/tx/<txid>` (a parent's verdict) — the
 //!                             submission this thread paused on it routed again in this thread
 //!                             (`wokeOn`, 0.25.0). The thread's current submit event is its last
 //!                             result's `submission` (else its launch's `event`).
 //!   a wait                    the message {fn: "wait", args: {txid}} in box `<app>` from the
-//!                             instance itself (0.9.1): a POST /submit request waiting on a subject
-//!                             paused or in flight (0.24.0) — one of its waiters, answered when it is
-//!                             decided, or answered at once (submit.zig `waitOn`).
+//!                             instance itself (0.9.1): a POST /submit request waiting on a paused
+//!                             subject — one of its waiters, answered when the pause ends, or
+//!                             answered at once (submit.zig `waitOn`).
 //!   a rebeat                  the message {fn: "rebeat"} in box `<app>` from the instance itself
 //!                             (0.16.0): sent by the app's program that wrote the head `<app>/terms`
 //!                             (the beat's terms); every registered topic's liveness and beacon
@@ -80,8 +81,10 @@
 //!
 //! Every step keeps its result record and prints its CID:
 //!
-//!   {kind: "overlay-result", op: "submit" | "answer" | "heard", woken?, txid, ingested?,
+//!   {kind: "overlay-result", op: "submit" | "answer" | "heard" | "intake", woken?, txid, ingested?,
 //!    heard?, admitted?, steak?, unapplied?, published?, beats?, answers?, refs, state}
+//!   (0.28.0: op "heard" a `chainTx` subscription's step; "intake" the in-VM entry's, kept by the
+//!   calling step; "received" also carries what its intake admitted)
 //!   (0.26.0: `ingested` the txids handed to the chain app's `ingest` call; op "answer" a late
 //!   answer to a 0.25.x ingest message, nothing done)
 //!   {kind: "overlay-result", op: "woke", woken, submission?, outcome?, …, state}
@@ -131,7 +134,7 @@ const steakOf = registry.steakOf;
 /// The beacons the step re-declares (0.12.0, topics.zig `beatEvents`): each registered topic whose beat
 /// (view digest, tip anchor, tail) it changed, each registered lookup service its hooks gave a new body; emitted. → how
 /// many.
-fn emitBeats(a: Allocator, step: Value, st: *@import("state.zig").State) !usize {
+pub fn emitBeats(a: Allocator, step: Value, st: *@import("state.zig").State) !usize {
     const changes = try st.beatChanges();
     if (changes.len == 0 and st.lookup_beats.items.len == 0) return 0;
     const s = vm.store();
@@ -300,6 +303,8 @@ fn run(a: Allocator) anyerror!void {
     // 0.24.0: a thread resting on a name (skein 0.5.4) woken by a fact under it.
     if (wakeOf(step)) |w| return wakeStep(a, step, w);
     const args = step.get("args") orelse return error.BadInput;
+    // 0.28.0: the app's subscription to an item's `chain/tx/<txid>` (fn `chainTx`), stepped by the fact.
+    if (eql(u8, args.getText("fn") orelse "", submit.chain_tx_fn) and args.getCid("event") != null) return chainTxStep(a, step, args);
     const reply: ?Value = if (step.get("reply")) |r| (if (r == .map) r else null) else null;
 
     var op: []const u8 = undefined;
@@ -400,11 +405,10 @@ fn wakeOf(step: Value) ?Value {
 }
 
 /// A thread resting on a name woken by a fact under it (0.24.0, David 2026-11-09):
-///   `chain/tx/<txid>` (the chain app's, skein-chain 0.8.0) — the submission's thread, its event its
-///     args': the status heard (submit.zig `heard`): admitted, rejected, mined, reorged;
 ///   `<app>/topic/tx/<txid>` (a parent's verdict) — a thread that paused submissions on it: each
 ///     routed again in this thread (submit.zig `wokeOn`, 0.25.0): begun, paused again, or dropped.
-/// Anything else: nothing (result `{op: "woke", name}`).
+/// Anything else: nothing (result `{op: "woke", name}`). 0.28.0: no thread rests on `chain/tx/…`
+/// (an item's later facts step the app's `chainTx` subscription, `chainTxStep`).
 fn wakeStep(a: Allocator, step: Value, w: Value) !void {
     const s = vm.store();
     const name = w.getText("box").?;
@@ -421,11 +425,7 @@ fn wakeStep(a: Allocator, step: Value, w: Value) !void {
     const ev = try s.getValue(a, current);
     if (!eql(u8, ev.getText("kind") orelse "", "submit")) return savedTail(a, step, &loaded, "woke", &fields);
     try fields.append(a, .{ .key = "submission", .value = .{ .cid = current } });
-    if (std.mem.startsWith(u8, name, submit.chain_app ++ "/tx/")) {
-        const fact = try s.getValue(a, w.getCid("event").?);
-        const done = try submit.heard(cx, ev, txid, try submit.factOf(a, st, txid, fact));
-        return steppedTail(a, step, &loaded, "heard", done, &fields);
-    } else if (std.mem.startsWith(u8, name, try std.fmt.allocPrint(a, "{s}/topic/tx/", .{calls.appOf(step)}))) {
+    if (std.mem.startsWith(u8, name, try std.fmt.allocPrint(a, "{s}/topic/tx/", .{calls.appOf(step)}))) {
         // 0.25.0: the paused submission this thread works on, routed again in this thread.
         const outcome = try submit.wokeOn(cx, ev, txid);
         try outcomeFields(a, step, outcome, &fields);
@@ -443,33 +443,39 @@ fn wakeStep(a: Allocator, step: Value, w: Value) !void {
     return savedTail(a, step, &loaded, "woke", &fields);
 }
 
-/// Launch a submission's thread on its submit event (args `{event, box: "submit"}`): the program
-/// the step's thread runs. → the thread.
-fn launchSubmission(a: Allocator, step: Value, ev: Value) !struct { event: []const u8, thread: []const u8 } {
+/// 0.28.0: an item's `chain/tx/<txid>` subscription's step (fn `chainTx`, made at its intake;
+/// args `{event: <the fact's record>, box: <the name>, fn}`): its context read from state — the
+/// item's `pending` record names the submit event it came in — and the chain state acted on
+/// (submit.zig `heard`). No record (a transaction this engine never took in): nothing.
+fn chainTxStep(a: Allocator, step: Value, args: Value) !void {
     const s = vm.store();
-    const thread = step.getCid("thread") orelse return error.BadInput;
-    const self = (try s.getValue(a, thread)).getCid("program") orelse return error.BadInput;
-    const ec = try s.putValue(a, ev);
-    const largs = try s.putValue(a, .{ .map = try a.dupe(cbor.Entry, &.{
-        .{ .key = "event", .value = .{ .cid = ec } },
-        .{ .key = "box", .value = .{ .text = "submit" } },
-    }) });
-    return .{ .event = ec, .thread = try vm.launch(a, self, largs) };
-}
-
-fn launchedField(a: Allocator, step: Value, ev: Value, fields: *std.ArrayList(cbor.Entry)) !void {
-    const l = try launchSubmission(a, step, ev);
-    try fields.appendSlice(a, &.{
-        .{ .key = "event", .value = .{ .cid = l.event } },
-        .{ .key = "launched", .value = .{ .cid = l.thread } },
-    });
-}
-
-/// A step of a submission's thread ended: the records kept, the result record, the ingests still
-/// awaited (an error answer), the facts of the lookup hooks, the beats, the state saved. The thread
-/// rests on its names (skein 0.5.4: carried forward), so it never finishes.
-fn steppedTail(a: Allocator, step: Value, loaded: anytype, op: []const u8, done: submit.Stepped, fields: *std.ArrayList(cbor.Entry)) !void {
+    const name = args.getText("box") orelse return error.BadInput;
+    const txid = submit.txidOfName(name) orelse return error.BadInput;
+    var loaded = try ev_.load(a, step);
     const st = &loaded.st;
+    st.now = @intCast(step.getUint("at") orelse return error.BadInput);
+    var fields: std.ArrayList(cbor.Entry) = .empty;
+    try fields.append(a, .{ .key = "woken", .value = .{ .text = name } });
+    const rec = (try st.pendingRecord(txid)) orelse return savedTail(a, step, &loaded, "heard", &fields);
+    const current = rec.getCid("event") orelse return savedTail(a, step, &loaded, "heard", &fields);
+    const ev = try s.getValue(a, current);
+    try fields.append(a, .{ .key = "submission", .value = .{ .cid = current } });
+    const cx = try fullCtx(a, step, st);
+    const fact = try s.getValue(a, args.getCid("event").?);
+    const done = try submit.heard(cx, ev, txid, try submit.factOf(a, st, txid, fact));
+    return steppedTail(a, step, &loaded, "heard", done, &fields);
+}
+
+/// A step that admitted (or acted on a fact) ended: the records kept, the result record, the facts of
+/// the lookup hooks, the beats, the state saved.
+fn steppedTail(a: Allocator, step: Value, loaded: anytype, op: []const u8, done: submit.Stepped, fields: *std.ArrayList(cbor.Entry)) !void {
+    try steppedFields(a, done, fields);
+    return savedTail(a, step, loaded, op, fields);
+}
+
+/// What a step admitted, for its result record — the records it wrote kept (0.28.0: shared with
+/// the calls that admit, POST /submit's handler and the in-VM `intake`).
+pub fn steppedFields(a: Allocator, done: submit.Stepped, fields: *std.ArrayList(cbor.Entry)) !void {
     for (done.records) |r| try vm.keep(r);
     const tx_cid = try a.dupe(u8, &c.store.hashCid(.tx, done.txid));
     try fields.appendSlice(a, &.{
@@ -501,8 +507,6 @@ fn steppedTail(a: Allocator, step: Value, loaded: anytype, op: []const u8, done:
         try fields.append(a, .{ .key = "unapplied", .value = .{ .array = gone } });
     }
     if (done.published > 0) try fields.append(a, .{ .key = "published", .value = .{ .uint = done.published } });
-    _ = st;
-    return savedTail(a, step, loaded, op, fields);
 }
 
 /// The step's lookup hook events and beats emitted, the answers listed, the state saved, the result kept.
@@ -553,9 +557,16 @@ fn waitStep(a: Allocator, step: Value, args: Value, body: Value) !void {
 fn submissionStep(a: Allocator, step: Value, body: Value, source: Value) !void {
     var loaded = try ev_.load(a, step);
     loaded.st.now = @intCast(step.getUint("at") orelse return error.BadInput);
-    const cx = try stepCtx(a, step, &loaded.st);
+    const cx = try fullCtx(a, step, &loaded.st); // 0.28.0: it admits here, the gossip out with it
     var fields: std.ArrayList(cbor.Entry) = .empty;
-    try settled(a, step, &loaded, try submit.received(cx, body.get("args") orelse .null, source), &fields, "received");
+    const outcome = try submit.received(cx, body.get("args") orelse .null, source);
+    // 0.28.0: begun in this step — what it admitted kept with the result.
+    if (outcome == .begun) if (outcome.begun.stepped) |done| {
+        try outcomeFields(a, step, outcome, &fields);
+        if (outcome.begun.submission) |sc| try fields.append(a, .{ .key = "submission", .value = .{ .cid = sc } });
+        return steppedTail(a, step, &loaded, "received", done, &fields);
+    };
+    try settled(a, step, &loaded, outcome, &fields, "received");
 }
 
 /// A message step's source: `{transport, box, sender?, request: <the message>}`.
@@ -574,8 +585,8 @@ fn stepCtx(a: Allocator, step: Value, st: *@import("state.zig").State) !submit.C
     return .{ .a = a, .caller = ev_.caller(), .wire = try ev_.wire(step), .st = st, .in = step };
 }
 
-/// A routed submission acted on (a submission by message): its thread launched, or paused, or
-/// answered; the state saved; the result kept.
+/// A routed submission acted on (a submission by message): paused, or answered; the state saved;
+/// the result kept.
 fn settled(a: Allocator, step: Value, loaded: anytype, outcome: submit.Resumed, fields: *std.ArrayList(cbor.Entry), op: []const u8) !void {
     try outcomeFields(a, step, outcome, fields);
     return savedTail(a, step, loaded, op, fields);
@@ -592,8 +603,9 @@ fn hasKey(es: []const cbor.Entry, k: []const u8) bool {
     return false;
 }
 
-/// What routing came to, acted on and named in the result: a launch launches the submission's thread.
+/// What routing came to, named in the result.
 fn outcomeFields(a: Allocator, step: Value, outcome: submit.Resumed, fields: *std.ArrayList(cbor.Entry)) !void {
+    _ = step;
     switch (outcome) {
         .none => try fields.append(a, .{ .key = "outcome", .value = .{ .text = "none" } }),
         .paused => |b| {
@@ -609,10 +621,6 @@ fn outcomeFields(a: Allocator, step: Value, outcome: submit.Resumed, fields: *st
                 .{ .key = "outcome", .value = .{ .text = "begun" } },
                 .{ .key = "ingested", .value = .{ .array = try hexes(a, b.ingested) } },
             });
-        },
-        .launch => |ev| {
-            try fields.append(a, .{ .key = "outcome", .value = .{ .text = "launched" } });
-            try launchedField(a, step, ev, fields);
         },
         .dropped => |why| try fields.appendSlice(a, &.{
             .{ .key = "outcome", .value = .{ .text = "dropped" } },

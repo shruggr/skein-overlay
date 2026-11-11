@@ -1,7 +1,8 @@
 //! The engine's wiring over the `skein` imports (the `sk` module, vm.zig):
 //! its configuration (config.zig, through the `head` import), its calls of
 //! topics and lookup services (`call`), messages to the instance itself
-//! (`emit` to `self.identity`: the chain app's ingest, a `wait`), the facts and the names a thread rests on (0.24.0), the
+//! (`emit` to `self.identity`: a `wait`), the chain app's ingest (an in-VM call), the facts, the names a paused
+//! submission's thread rests on (0.24.0) and the subscriptions (0.28.0, `on(name, fn)`), the
 //! gossip out (`emit` to the libp2p provider), and the chain state and the
 //! overlay's state as a step or a call loads them. wasm32-wasi only.
 const std = @import("std");
@@ -81,6 +82,11 @@ fn emitImpl2(_: *anyopaque, a: Allocator, ev: Value) anyerror!void {
 fn restImpl(_: *anyopaque, _: Allocator, name: []const u8) anyerror!void {
     try vm.restOn(name);
 }
+/// 0.28.0: the engine's app subscribes its fn `chainTx` (`<its role>.chainTx`) to `name`.
+fn subscribeImpl(_: *anyopaque, a: Allocator, name: []const u8) anyerror!void {
+    const role = try config.selfRole(a, vm.store(), step_in, null);
+    try vm.on(name, try std.fmt.allocPrint(a, "{s}.{s}", .{ role, submit.chain_tx_fn }));
+}
 
 /// The chain app's `ingest`, an in-VM call (0.26.0, skein-chain 0.10.0): its program is the one the
 /// chain app's record names (`chain/app` `programs.chain`).
@@ -106,7 +112,7 @@ const chain_app_head = submit.chain_app ++ "/app";
 pub fn wire(in: Value) !submit.Wire {
     self_key = vm.selfKey(in) orelse return error.NoIdentity;
     step_in = in;
-    return .{ .ctx = &dummy, .sendFn = sendImpl, .answerFn = answerImpl, .emitFn = emitImpl2, .restFn = restImpl, .ingestFn = ingestImpl, .ingestErrorFn = ingestErrorImpl, .chainHeadFn = chainHeadImpl };
+    return .{ .ctx = &dummy, .sendFn = sendImpl, .answerFn = answerImpl, .emitFn = emitImpl2, .restFn = restImpl, .subscribeFn = subscribeImpl, .ingestFn = ingestImpl, .ingestErrorFn = ingestErrorImpl, .chainHeadFn = chainHeadImpl };
 }
 
 /// The libp2p provider's key: the address book's entry at ("local", "libp2p") (the SDK's `peerAt`;

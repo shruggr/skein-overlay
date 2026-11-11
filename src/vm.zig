@@ -126,6 +126,13 @@ pub fn restOn(name: []const u8) !void {
     if (sk.on(name.ptr, @intCast(name.len), name.ptr, 0) < 0) return failed();
 }
 
+/// Subscribe the calling app's `func` (`"<role>.<fn>"`) to a fact's name (skein 0.5.0 `on(name, fn)`):
+/// every fact emitted under it after this step steps that function (its args `{event, box: <the
+/// name>, fn, place}`), a thread of its own; no thread rests. The kernel keeps one per (name, fn).
+pub fn on(name: []const u8, func: []const u8) !void {
+    if (sk.on(name.ptr, @intCast(name.len), func.ptr, @intCast(func.len)) < 0) return failed();
+}
+
 /// Wake the thread at `until` (ms) if nothing it awaits arrives first.
 pub fn deadline(until: i64) !void {
     if (sk.deadline(until) < 0) return failed();
