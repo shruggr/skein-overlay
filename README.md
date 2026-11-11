@@ -600,8 +600,8 @@ the anchors and answers the sync protocol's frames (0.15.0).
 
 | | |
 |---|---|
-| this app and package | 0.28.0 (branch `one-step-0.28`, untagged) |
-| skein-sdk | 0.22.0 by commit 1a6b875 (branch `one-step-0.22`; rewrite to tag `v0.22.0` at release), URL and hash in `build.zig.zon` (modules `chain` and, for the engine, `sk`; bsvz comes through it) |
+| this app and package | 0.28.0 (tag `v0.28.0`) |
+| skein-sdk | v0.22.0, by tag URL and hash in `build.zig.zon` (modules `chain` and, for the engine, `sk`; bsvz comes through it) |
 | requires | `chain/1` (shruggr/skein-chain 0.12.0: its `ingest` as an in-VM call; its facts `chain/tx/<txid>` {pending, mined, rejected; seen only after a reorg}; a proof after a rejection is `mined`) |
 | skein | 0.6.1 or later (the host submits fetched BEEFs as the submit message; 0.25.1) (the event index, 0.5.0; a thread resting on a name, 0.5.4); the engine and the chain app installed as apps (a genesis program's record names no app, and emits no fact); skein's equivs pin this repo by commit |
 
