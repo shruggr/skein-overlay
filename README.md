@@ -54,7 +54,7 @@ They pull in the SDK's `chain` module only.
 **What is built and where it goes.** Submit walks the whole BEEF oldest
 first and judges every transaction of the requested topics before the
 subject; each one a topic takes is ingested through the chain app on its
-own and admitted, in order, on its own answer (skein-overlay#1). A
+own and (0.28.0) admitted, in order, in that same step (skein-overlay#1). A
 submission whose parent is neither in the BEEF nor held pauses, however it
 came: it is noted pending, waiting on those parents, and its thread rests
 on each one's verdict (0.24.0: no `waits` index).
@@ -62,12 +62,9 @@ Nothing is asked of anyone for them (0.20.0: the `want` / `unwant` events
 are gone): a parent arrives by any path — a later submission, a BEEF the
 host fetched on a peer's admit or from a peer's tail list, a pull of mined
 history, or inside a later BEEF — and when it is in, the paused one is
-routed again. A submission whose parent is held but not yet admitted (in
-flight: its own submission handed to the chain app, the answer not in)
-pauses on it the same way and is routed again when the chain app answers
-for that parent: judged with the parent's outputs admitted, refused on the
-merits if the parent was rejected, or paused again for what it still lacks
-(skein-overlay#6). A transaction a
+routed again. (0.28.0: nothing is in flight — skein-overlay#6's pause on a
+parent handed to the chain app but not yet admitted is gone; a parent paused
+here is waited on.) A transaction a
 topic manager cannot decide — it fails `MissingParents`, naming the input
 sources it cannot read — pauses the same way on those (0.19.0): no
 verdict, nothing rejected, judged again as each arrives; one whose sources
@@ -75,12 +72,12 @@ exist nowhere stays one undecided record (David: "not a big deal"). The
 pause is internal: the submitter hears nothing of it.
 
 0.24.0 (David 2026-11-09): every status of a transaction is the chain app's
-fact `chain/tx/<txid>` (skein-chain 0.8.0), and the submission's thread
-rests on it for the transaction's life (skein 0.5.4): each wake reads the
-status and updates the state — admits on accepted or mined, unwinds on
-rejected, places it on a proof (published on `-proof`, relayed to a
-submitter), moves it back to the tail on a reorg — and answers a submitter
-still waiting. No watch message, no watch thread. The overlay's verdicts are
+fact `chain/tx/<txid>` (skein-chain 0.8.0). 0.28.0 (David 2026-11-11): no
+thread rests on it; the engine's app subscribes fn `chainTx` to it at the
+transaction's intake, and each fact steps that fn — it reads the state and
+updates it: unwinds on rejected, places it on a proof (relayed to a
+submitter), moves it back to the tail on a reorg, admits again once the
+chain state no longer rejects it. No watch message, no watch thread. The overlay's verdicts are
 facts too: `<app>/topic/tx/<txid>` `{verdict: undecided | admitted |
 rejected | reverted}` and `<app>/topic/output/<txid>.<vout>` `{state:
 admitted | spent | reverted, spentBy?}`; a paused submission's thread rests
@@ -603,9 +600,9 @@ the anchors and answers the sync protocol's frames (0.15.0).
 
 | | |
 |---|---|
-| this app and package | 0.27.1 |
-| skein-sdk | v0.21.3, by tag URL and hash in `build.zig.zon` (modules `chain` and, for the engine, `sk`; bsvz comes through it) |
-| requires | `chain/1` (shruggr/skein-chain v0.11.1: its `ingest` as an in-VM call; its facts `chain/tx/<txid>` {pending, seen, mined, rejected}; a proof after a rejection is `mined`) |
+| this app and package | 0.28.0 (branch `one-step-0.28`, untagged) |
+| skein-sdk | 0.22.0 by commit 1a6b875 (branch `one-step-0.22`; rewrite to tag `v0.22.0` at release), URL and hash in `build.zig.zon` (modules `chain` and, for the engine, `sk`; bsvz comes through it) |
+| requires | `chain/1` (shruggr/skein-chain 0.12.0: its `ingest` as an in-VM call; its facts `chain/tx/<txid>` {pending, mined, rejected; seen only after a reorg}; a proof after a rejection is `mined`) |
 | skein | 0.6.1 or later (the host submits fetched BEEFs as the submit message; 0.25.1) (the event index, 0.5.0; a thread resting on a name, 0.5.4); the engine and the chain app installed as apps (a genesis program's record names no app, and emits no fact); skein's equivs pin this repo by commit |
 
 0.3.0 moved the state under `<app>/…`, made the chain app's answer the gate
@@ -1167,6 +1164,25 @@ where they came after them, at the step's end. ls_demo raises its own facts
 0.27.1 (re-pin): skein-sdk v0.21.3 (`spv.verify` does not script-check again a
 transaction the instance holds that a BEEF carries raw) and skein-chain v0.11.1.
 The overlay's own check (`verifyDecoded`) is unchanged.
+
+0.28.0 (David 2026-11-11: one rule for every submission; skein-sdk 0.22.0, skein-chain 0.12.0):
+a submission is admitted in the step that hands it to the chain app — every path (a message,
+POST /submit's handler, the new in-VM `intake`, the host's sync and fetches, a paused one taken
+whole): validated, ingested (the chain app emits its broadcast), and every item the chain state
+holds and does not reject admitted, in that step. No thread rests on `chain/tx/<txid>`: the
+engine records each item's context (`pending` `{submission, event}`) and its app subscribes fn
+`chainTx` to the item's `chain/tx/<txid>`; that step unwinds on a rejection, places on a proof,
+moves on a reorg, and admits again once the chain state no longer rejects it. The in-flight state
+goes (`ingested`/`heard`/`spends` on pending records, `inFlight`, `isPending`, `isUnsettled`,
+`inFlightSpender`, the in-flight HTTP wait, the submission thread's launch, skein-overlay#6's
+pause on an in-flight parent). New: fn `intake` — a program of the instance's in-VM submission in
+its own step, answered with the verdict (`admitted` with the STEAK, `rejected` with the reason,
+or `undecided` with nothing recorded when it lacks parents). POST /submit answers at admission.
+The paused path is unchanged (its thread rests on its parents' verdicts). Release notes: a FRESH
+HOME is required — a submission thread a 0.27.x engine left resting on `chain/tx/<txid>` runs its
+launch-time program, which is no longer installed after the upgrade, so its first state write is
+refused and it ends in error; transactions admitted before have no `chainTx` subscription and no
+context record.
 
 ## Contributing
 

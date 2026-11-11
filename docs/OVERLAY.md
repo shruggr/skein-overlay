@@ -1,4 +1,4 @@
-# Overlay services in the VM (0.26.0)
+# Overlay services in the VM (0.28.0)
 
 An overlay is an app (skein docs/APPS.md §6). It judges transactions with
 its topic managers and indexes them with its lookup services; it does not
@@ -9,6 +9,41 @@ its docs/CHAIN.md), under `chain/state`. The overlay reads it by CID and
 asks the chain app to take a transaction; what the chain app says about it
 (accepted, mined, rejected, reorged: its fact `chain/tx/<txid>`, skein-chain
 0.8.0) is the overlay's gate.
+
+**0.28.0 (David 2026-11-11: one rule for every submission; "We have events and we have
+subscriptions. That is all we need")**, over everything below that says otherwise:
+
+- **Admitted at intake.** Every path — a message submission (`received`), POST /submit (its
+  handler, an in-VM call from the front door's step, runs the intake itself), the in-VM
+  `intake` of a program of the instance (below), the host's sync and fetches (submit
+  messages), a paused submission taken whole — validates, hands each item to the chain app
+  (its in-VM `ingest`, which records it and emits its broadcast), and in that SAME step admits
+  every item the chain state holds and does not reject (topics judge, records, the lookups'
+  `admitted` hooks, the verdict `admitted`, the outputs' facts, the gossip). Nothing waits on a
+  status: the chain app no longer marks a transaction "accepted" (skein-chain 0.12.0), and an
+  instance hears only REJECTED or a proof.
+- **No thread per transaction.** No thread rests on `chain/tx/<txid>`. At intake, for each item
+  the chain app holds, the engine records its context (`pending`: `{submission, event}`, the
+  submit event it came in) and its app subscribes fn `chainTx` to the item's `chain/tx/<txid>`
+  (`on(name, fn)`). That subscription's step (`heard`) reads the state as the thread's wake did:
+  admitted — mined placed (the submitter's proof), seen (only a reorg's now) back in the tail,
+  rejected unwound (`reverted`, the lookups' `rejected`); not admitted (rejected at intake, or
+  unwound) — admitted again once the chain state no longer rejects it (a proof overrides a
+  rejection; a revived input). The record is kept for the transaction's life (the thread was).
+- **Gone:** the in-flight state (`ingested`, `heard`, `spends` on a pending record;
+  `State.inFlight`, `isInFlight`, `isPending`, `isUnsettled`, `inFlightSpender`); the
+  submission thread's launch (`Resumed.launch`); the HTTP wait on a subject in flight (the wait
+  on a pause stays); skein-overlay#6's pause on an in-flight parent (a parent paused here is
+  still waited on). `InputSpent` is the chain state's spender alone.
+- **The in-VM entry**: fn `intake` (`{beef, topics, offChainValues?}`), a call from a step of a
+  program of the instance (its thread's app's engine, as a registration by call): the same
+  intake, in the caller's step; it returns the verdict — `{txid, state: "admitted", status,
+  steak}`, `{txid?, state: "rejected", reason}` (`InputSpent: …`, a bad BEEF, no topic took it,
+  the chain app rejected it, its ingest failed), or `{txid, state: "undecided", waiting}` (it
+  lacks parents: nothing recorded — a pause rests a thread, and the caller's thread is its own).
+- **POST /submit** answers at admission, in its own call: the STEAK; 400 when its ingest failed
+  or the chain app rejects it; 200 with the empty STEAK when no topic took it. Only a pause
+  still admits its event into `<app>` and waits (`wait`).
 
 **0.26.0 (David 2026-11-09: "spent-ness is chain state, not topic state";
 double spends; skein-chain 0.10.0)**, over everything below that says
@@ -645,7 +680,7 @@ submission's thread answers only its own submitter.
 |---|---|---|
 | `admitted` | tp ‖ outpoint → admittance record | an output a topic admitted |
 | `applied` | tp ‖ txid → applied record | the topic's judgement of this transaction: a later submission is a dupe; which previous coins it retained |
-| `pending` | txid → submission record | its in-flight job only (0.24.0): a submission's transaction handed to the chain app, not yet admitted (or rejected), with its thread, its ingest message, its inputs and the subject's HTTP waiters; or a paused submission (skein-overlay#1) with its event, the parents it waits on and the thread resting on them. (0.24.0: the `waits` map is gone; a paused thread rests on each parent's verdict fact.) |
+| `pending` | txid → submission record | 0.28.0: for each transaction a submission handed to the chain app and the chain app holds, the context its `chainTx` subscription's step reads (`submission`, `event`), kept for its life; or a paused submission (skein-overlay#1) with its event, the parents it waits on, its HTTP waiters and the thread resting on them. (0.24.0: the `waits` map is gone; a paused thread rests on each parent's verdict fact.) |
 | `ancillary` | ancillary txid ‖ tp ‖ outpoint → admittance record | a transaction an admittance names in `ancillary`, by the admitted output naming it (skein-overlay#4); removed with the admittance |
 | `mined` | tp ‖ height (u32 BE) ‖ offset (u64 BE) → txid | a transaction the topic judged, mined at that height and offset in its block (0.14.0, "Anchors") |
 | `placed` | tp ‖ txid → height (u32 BE) ‖ offset (u64 BE) ‖ block hash | where the topic has it mined |
@@ -767,7 +802,7 @@ wire"). Stepped:
 |---|---|---|
 | a message in box `<app>/submit` from anyone (the manifest's route `submit`, `kernel.beef`), or the `submission` event 0.7.3–0.9.0's POST /submit admitted there (a log written then) | `{fn: "submit", args: {beef, topics, offChainValues?}}`, or `{kind: "submission", body: <that message>, request, transport: "http", sender?}` | a submission (shruggr/skein#112): routed — its thread launched, paused, or answered (`rejected`, or `admitted` for one judged before); the step's wake at the end of the thread it launched (`resolved`) answers nothing (0.7.4: the submitter is answered once per state change) |
 | a submission's launch (a message's, a parent's verdict routing a pause again), or the submit event in box `<app>` (POST /submit's admit, the derived event route) | `{kind: "submit", …}` | the submission's thread: the ingest messages, pending, resting on each item's `chain/tx/<txid>` (a paused event: the pause recorded, resting on each parent's `<app>/topic/tx/<txid>`); an error answer to an ingest (`reply`): the item failed |
-| a fact under a name the thread rests on (skein 0.5.4: the input's `event`) | `chain/tx/<txid>` {status} (skein-chain 0.8.0) | the submission's thread: the status heard (`heard`) — admit, reject, place, move, unwind; the submitter answered; the subject's HTTP waiters answered when it leaves pending |
+| the app's subscription to an item's `chain/tx/<txid>` (0.28.0: args `{event, box: <the name>, fn: "chainTx"}`) | `chain/tx/<txid>` {status} (skein-chain 0.12.0) | the item's context from its `pending` record: the status heard (`heard`) — place, move, unwind, admit again; the submitter answered |
 | a fact under a name the thread rests on | `<app>/topic/tx/<txid>` {verdict} | a thread that paused submissions on that parent: each routed again (`wokeOn`) — its thread launched, paused again, or dropped (0.24.0: no `resume` message, no `waits` index) |
 | a message in box `<app>` from the instance itself (row from `$self`) | `{fn: "wait", args: {txid}}` (0.9.1) | an HTTP request waiting on a subject paused or in flight (0.24.0): added to its waiters, or answered at once ("POST /submit", above); a late answer to a `wait`, nothing |
 | a message in box `<app>` from the instance itself (row from `$self`) | `{fn: "rebeat"}` (0.16.0) | the app's program that wrote the head `<app>/terms` says so: every registered and configured topic's liveness (0.20.1: the market's window now) and beacon re-declared, its body over its beat now with the new terms, and each registered and configured (0.20.2) lookup service's liveness ("Beats", below); nothing written |

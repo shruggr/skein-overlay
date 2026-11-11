@@ -173,6 +173,8 @@ const FakeWire = struct {
     /// The facts emitted (0.24.0), and the names the step's thread rested on.
     facts: std.ArrayList(Value) = .empty,
     rests: std.ArrayList([]const u8) = .empty,
+    /// 0.28.0: the names the engine's app subscribed its fn `chainTx` to.
+    subs: std.ArrayList([]const u8) = .empty,
     const Sent = struct { box: []const u8, body: Value, cid: []const u8 };
     const Answered = struct { to: []const u8, box: []const u8, body: Value };
 
@@ -204,6 +206,20 @@ const FakeWire = struct {
     fn rest(ctx: *anyopaque, _: Allocator, name: []const u8) anyerror!void {
         const self: *FakeWire = @ptrCast(@alignCast(ctx));
         try self.rests.append(self.a, try self.a.dupe(u8, name));
+    }
+    fn subscribe(ctx: *anyopaque, _: Allocator, name: []const u8) anyerror!void {
+        const self: *FakeWire = @ptrCast(@alignCast(ctx));
+        try self.subs.append(self.a, try self.a.dupe(u8, name));
+    }
+    /// Whether the engine's app subscribed to `name` (0.28.0).
+    fn subscribed(self: *FakeWire, name: []const u8) bool {
+        for (self.subs.items) |x| if (std.mem.eql(u8, x, name)) return true;
+        return false;
+    }
+    /// Whether any thread rested on a `chain/tx/…` name (0.28.0: none may).
+    fn restedOnChainTx(self: *FakeWire) bool {
+        for (self.rests.items) |x| if (std.mem.startsWith(u8, x, "chain/tx/")) return true;
+        return false;
     }
     /// The chain app's `ingest` call, as skein-chain 0.10.0 takes it (the test's chain state).
     fn ingestCall(ctx: *anyopaque, a: Allocator, arg: Value) anyerror!Value {
@@ -241,7 +257,7 @@ const FakeWire = struct {
         return self.inst.?.chain_root;
     }
     fn wire(self: *FakeWire) submit.Wire {
-        return .{ .ctx = self, .sendFn = send, .answerFn = answer, .emitFn = emit, .restFn = rest, .ingestFn = ingestCall, .ingestErrorFn = ingestError, .chainHeadFn = chainHead };
+        return .{ .ctx = self, .sendFn = send, .answerFn = answer, .emitFn = emit, .restFn = rest, .subscribeFn = subscribe, .ingestFn = ingestCall, .ingestErrorFn = ingestError, .chainHeadFn = chainHead };
     }
     /// The facts emitted under `name` (each fact's record).
     fn factsNamed(self: *FakeWire, name: []const u8) []const Value {
@@ -486,6 +502,8 @@ const Instance = struct {
         const ev = try cbor.decode(self.a, try cbor.encode(self.a, event));
         var st = try self.load();
         const b = try submit.begin((try self.cx(&st, true)), ev);
+        self.view_changes = try st.beatChanges();
+        self.lookup_beats = st.lookup_beats.items;
         self.ov_root = try st.save();
         self.begun = b;
         try self.note(b);
@@ -501,20 +519,22 @@ const Instance = struct {
         for (try submit.itemsOf(self.a, ev)) |it| try self.threads.put(self.a, it.txid, .{ .ev = ev });
     }
 
-    /// The submission's thread woken by the chain app's fact about `txid` (0.24.0: `heard`).
-    /// 0.25.0: the step reads the chain state, so a test's chain app has the status first.
+    /// The engine's `chainTx` subscription stepped by the chain app's fact about `txid` (0.28.0: no
+    /// thread; the context is the item's `pending` record, its `event` — engine.zig `chainTxStep`).
+    /// The step reads the chain state, so a test's chain app has the status first.
     fn answer(self: *Instance, txid: [32]u8, ans: submit.Answer) !submit.Stepped {
-        const t = self.threads.get(txid).?;
+        try std.testing.expect(self.wire_.subscribed(try submit.chainTxName(self.a, txid)));
         var st = try self.load();
-        const done = try submit.heard(try self.cx(&st, true), t.ev, txid, ans);
+        const rec = (try st.pendingRecord(txid)).?;
+        const ev = try self.ms.store().getValue(self.a, rec.getCid("event").?);
+        const done = try submit.heard(try self.cx(&st, true), ev, txid, ans);
         self.view_changes = try st.beatChanges();
         self.lookup_beats = st.lookup_beats.items;
         self.ov_root = try st.save();
         return done;
     }
 
-    /// A later status of an admitted transaction, heard by the submission's thread (what the watch
-    /// thread did before 0.24.0).
+    /// A later status of an admitted transaction, heard by its subscription's step.
     fn watched(self: *Instance, txid: [32]u8, ans: submit.Answer) !submit.Stepped {
         return self.answer(txid, ans);
     }
@@ -543,7 +563,10 @@ const Instance = struct {
             const r = try submit.wokeOn((try self.cx(&st2, true)), ev, parent);
             self.ov_root = try st2.save();
             switch (r) {
-                .begun, .paused => |b| try self.note(b),
+                .begun, .paused => |b| {
+                    try self.note(b);
+                    self.begun = b;
+                },
                 else => {},
             }
             try out.append(self.a, .{ .txid = sx[0], .outcome = r });
@@ -557,6 +580,13 @@ const Instance = struct {
         var st = try self.load();
         const r = try submit.received((try self.cx(&st, true)), args, source);
         self.ov_root = try st.save();
+        switch (r) {
+            .begun, .paused => |b| {
+                try self.note(b);
+                self.begun = b;
+            },
+            else => {},
+        }
         return r;
     }
 
@@ -566,27 +596,37 @@ const Instance = struct {
         const r = try submit.resumed((try self.cx(&st, true)), txid);
         self.ov_root = try st.save();
         switch (r) {
-            .begun, .paused => |b| try self.note(b),
+            .begun, .paused => |b| {
+                try self.note(b);
+                self.begun = b;
+            },
             else => {},
         }
         return r;
     }
 
-    /// POST /submit's handler (0.9.1): the first call, or a call again (`again`), over a write cache of its own.
+    /// POST /submit's handler (0.9.1): the first call, or a call again (`again`). 0.28.0: an in-VM
+    /// call from the front door's step — it admits, and its state is saved.
     fn http(self: *Instance, req: Value, again: bool) !routes.HttpNext {
-        var ovl = Overlay{ .inner = self.ms.store(), .arena = self.a };
-        self.current = ovl.store();
-        defer self.current = self.ms.store();
-        const ch = try self.a.create(state.Chain);
-        ch.* = try c.open(self.a, ovl.store(), self.chain_root, .regtest);
-        var st = try state.State.load(self.a, ovl.store(), self.ov_root, ch);
-        st.now = self.now;
+        var st = try self.load();
         const sub = (try routes.httpRequest(self.a, req)).ok;
         const source = try mapOf(self.a, &.{
             .{ .key = "transport", .value = .{ .text = "http" } },
             .{ .key = "request", .value = .{ .cid = req.getCid("request").? } },
         });
-        return if (again) routes.httpAgain(self.a, self.caller(), &st, self.in, sub, source) else routes.httpFirst(self.a, self.caller(), &st, self.in, sub, source);
+        const cxv = try self.cx(&st, true);
+        const r = if (again) try routes.httpAgain(cxv, sub, source) else try routes.httpFirst(cxv, sub, source);
+        self.ov_root = try st.save();
+        return r;
+    }
+
+    /// The in-VM `intake` (0.28.0): a program of the instance's submission in its own step → the verdict.
+    fn intake(self: *Instance, args: Value) !Value {
+        var st = try self.load();
+        const got = try submit.intake(try self.cx(&st, true), args);
+        self.view_changes = try st.beatChanges();
+        self.ov_root = try st.save();
+        return got.result;
     }
 
     /// A `wait` message's step (0.9.1): `w` about `txid`.
@@ -597,16 +637,23 @@ const Instance = struct {
         return r;
     }
 
+    /// Whether the overlay keeps a `pending` record of `txid` (0.28.0: an item's context for its
+    /// subscription, or a pause).
     fn pending(self: *Instance, txid: [32]u8) !bool {
         var st = try self.load();
-        return st.isPending(txid);
+        return (try st.pendingRecord(txid)) != null;
+    }
+    fn paused(self: *Instance, txid: [32]u8) !bool {
+        var st = try self.load();
+        return st.isPaused(txid);
     }
     fn applied(self: *Instance, txid: [32]u8) !bool {
         var st = try self.load();
-        return st.isApplied("tm_demo", txid);
+        for (self.topics) |t| if (try st.isApplied(t, txid)) return true;
+        return false;
     }
 
-    /// Route, then the thread's first step (the chain app called): → what it did.
+    /// Route, then the intake (the chain app called, the admission in that step): → what it did.
     fn submitted(self: *Instance, bytes: []const u8) !submit.Stepped {
         const r = try self.route(bytes);
         if (r != .admit) {
@@ -616,12 +663,11 @@ const Instance = struct {
         return self.begin(r.admit.event);
     }
 
-    /// Submitted, ingested by the chain app, accepted (a RECEIVED status), and the answer stepped.
+    /// Submitted and admitted in its intake step (0.28.0: no status awaited).
     fn admitted(self: *Instance, bytes: []const u8, txid: [32]u8) !submit.Stepped {
-        _ = try self.submitted(bytes);
-        _ = try self.ingest(bytes);
-        try std.testing.expectEqual(Chain.Outcome.accepted, try self.chainStatus(txid, "RECEIVED", null));
-        return self.answer(txid, .seen);
+        const done = try self.submitted(bytes);
+        try std.testing.expect(try self.applied(txid));
+        return done;
     }
 
     /// A lookup (fn "lookup" of the service): the outputs.
@@ -715,7 +761,7 @@ test "the submission flow: parse once, persist only on admission, a lookup servi
         try std.testing.expectEqual(@as(usize, 0), inst.wire_.sent.items.len);
     }
 
-    // ------------------------------------------------ T1 admits a token: the BEEF to the chain app, admitted on its answer
+    // ------------------------------------------------ T1 admits a token: the BEEF to the chain app and admitted in that step (0.28.0)
     const t1 = try spend(a, &f.tx, 0, &.{ .{ 1, &k.token }, .{ 9_000, &k.p2pkh } }, k.priv);
     const t1_beef = try withFund(a, f, t1);
     {
@@ -726,35 +772,28 @@ test "the submission flow: parse once, persist only on admission, a lookup servi
         try std.testing.expectEqualSlices(u8, t1_beef, ev.getBytes("beef").?);
         try std.testing.expect(ev.get("txs") == null);
         const sent0 = inst.wire_.sent.items.len;
-        _ = try inst.begin(ev);
+        const done = try inst.begin(ev);
         // 0.26.0: the chain app's `ingest` called in this step (no message to box `chain`): it holds
-        // the transaction, pending (no network answer yet), so nothing is admitted yet.
+        // the transaction, unproven (its broadcast emitted). 0.28.0: admitted in this same step —
+        // no status awaited.
         try std.testing.expectEqual(sent0, inst.wire_.sent.items.len);
         try std.testing.expectEqualSlices(u8, &t1.txid, &inst.wire_.ingested.items[inst.wire_.ingested.items.len - 1]);
         var ch1 = try inst.chain();
         try std.testing.expect(try ch1.holds(t1.txid));
-        try std.testing.expect(try inst.pending(t1.txid));
-        try std.testing.expect(!(try inst.applied(t1.txid)));
-        try std.testing.expectEqual(@as(usize, 0), inst.count("admitted"));
-        // The pending record says it is with the chain app (its in-flight job; 0.25.0: no thread);
-        // the thread rests on the chain app's fact about it.
-        var st = try inst.load();
-        const rec = (try st.pendingRecord(t1.txid)).?;
-        try std.testing.expect(rec.getBool("ingested").?);
-        try std.testing.expect(rec.get("thread") == null);
-        try std.testing.expectEqualStrings(try submit.chainTxName(a, t1.txid), inst.wire_.rests.items[inst.wire_.rests.items.len - 1]);
-
-        // The chain app ingests it (unproven: broadcast) and the status provider's RECEIVED accepts it.
-        try std.testing.expectEqual(c.state.Status.unproven, try inst.ingest(t1_beef));
-        _ = try inst.chainStatus(t1.txid, "RECEIVED", null);
-        const done = try inst.answer(t1.txid, .seen);
+        try std.testing.expectEqual(c.state.Status.unproven, try ch1.status(t1.txid));
         try std.testing.expect(done.admitted);
         try std.testing.expectEqualSlices(u32, &.{0}, done.applied[0].outputs_to_admit);
         try std.testing.expectEqual(@as(usize, 1), inst.count("admitted"));
         try std.testing.expectEqual(@as(usize, 0), inst.count("spent"));
-        try std.testing.expect(!(try inst.pending(t1.txid)));
-        // Admitted on its acceptance (0.24.0): no watch message (the thread rests on its fact); the
-        // facts — the transaction admitted, its output admitted.
+        // Its context for the subscription's step (the submission and its event); no thread rests on
+        // its `chain/tx`: the engine's app subscribes `chainTx` to it.
+        var st = try inst.load();
+        const rec = (try st.pendingRecord(t1.txid)).?;
+        try std.testing.expect(rec.get("ingested") == null and rec.get("waiting") == null);
+        try std.testing.expectEqualSlices(u8, begunEvent_cid(inst.begun), rec.getCid("event").?);
+        try std.testing.expect(inst.wire_.subscribed(try submit.chainTxName(a, t1.txid)));
+        try std.testing.expect(!inst.wire_.restedOnChainTx());
+        // The facts — the transaction admitted, its output admitted.
         try std.testing.expectEqual(@as(usize, 0), inst.wire_.sentFn("watch"));
         try std.testing.expectEqualDeep(@as([]const []const u8, &.{"admitted"}), inst.wire_.verdicts(t1.txid));
         const of = inst.wire_.factsNamed(try submit.topicOutputName(a, "overlay", t1.txid, 0));
@@ -820,11 +859,11 @@ test "the submission flow: parse once, persist only on admission, a lookup servi
         try std.testing.expect(inst.view_changes[0].before.view.eql(viewOf(&.{.{ t1.txid, 0 }})));
     }
 
-    // ------------------------------------------------ T2 rejected later (its watch hears it): `rejected`, T1's token live again
+    // ------------------------------------------------ T2 rejected later (its subscription's step hears it): `rejected`, T1's token live again
     {
         inst.now = 3000;
-        _ = try inst.chainStatus(t2.txid, "DOUBLE_SPEND_ATTEMPTED", null);
-        const done = try inst.watched(t2.txid, .{ .rejected = "DOUBLE_SPEND_ATTEMPTED" });
+        _ = try inst.chainStatus(t2.txid, "REJECTED", null);
+        const done = try inst.watched(t2.txid, .{ .rejected = "REJECTED" });
         try std.testing.expectEqual(@as(usize, 1), done.unapplied.len);
         try std.testing.expectEqual(@as(usize, 1), inst.count("rejected"));
         try std.testing.expect(!(try inst.applied(t2.txid)));
@@ -857,6 +896,11 @@ test "the submission flow: parse once, persist only on admission, a lookup servi
     }
 }
 
+/// The submit event CID a step began on.
+fn begunEvent_cid(b: submit.Begun) []const u8 {
+    return b.submission.?;
+}
+
 /// The view (0.12.0) of a topic holding exactly `ops` (txid, vout), folded in that order.
 fn viewOf(ops: []const struct { [32]u8, u32 }) state.View {
     var v: state.View = .{};
@@ -864,7 +908,7 @@ fn viewOf(ops: []const struct { [32]u8, u32 }) state.View {
     return v;
 }
 
-test "the gate (#73, the chain app's answer): admitted on the first of accepted or proven; rejected, failed, a later rejection, proven at once" {
+test "the intake (0.28.0, David 2026-11-11): admitted in the step that hands it to the chain app, no status delivered, its broadcast registered there; a later REJECTED reverts it by the subscription, no thread held; a proof after that admits it again; a failed ingest" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -875,31 +919,37 @@ test "the gate (#73, the chain app's answer): admitted on the first of accepted 
     const f = try fund(a, 0x22, 5, &k.p2pkh);
     try inst.headers(&.{&f.h1});
 
-    // ------------------------------------------------ (a) pending; a resubmission joins the same thread; accepted admits; the proof proves
+    // ------------------------------------------------ (a) admitted at intake; its broadcast registered in that step; a copy is judged before; the proof places it
     const ta = try spend(a, &f.tx, 0, &.{.{ 1, &k.token }}, k.priv);
     const h2 = mine(hdr.hash(&f.h1), ta.txid, 1_700_001_200);
     {
         const bytes = try withFund(a, f, ta);
-        _ = try inst.submitted(bytes);
-        try std.testing.expect(try inst.pending(ta.txid));
-        try std.testing.expectEqualSlices(u8, &ta.txid, &(try inst.route(bytes)).pending);
-        _ = try inst.ingest(bytes);
-        // An answer the engine does not act on: still awaiting.
-        const other = try inst.answer(ta.txid, .other);
-        try std.testing.expect(!other.admitted);
-        try std.testing.expect(try inst.pending(ta.txid));
-        _ = try inst.chainStatus(ta.txid, "RECEIVED", null);
-        const ok = try inst.answer(ta.txid, .seen);
+        const calls0 = inst.wire_.ingested.items.len;
+        const ok = try inst.submitted(bytes);
+        // One step: the chain app's ingest called (it records the transaction and registers its
+        // broadcast — skein-chain emits it in that call), and the admission, with no status delivered.
+        try std.testing.expectEqual(calls0 + 2, inst.wire_.ingested.items.len); // the funding (an item, D6) and ta
+        var ch = try inst.chain();
+        try std.testing.expect((try ch.broadcastRecord(ta.txid)) != null);
+        try std.testing.expectEqual(c.state.Status.unproven, try ch.status(ta.txid));
         try std.testing.expect(ok.admitted);
         try std.testing.expectEqual(@as(usize, 1), try inst.lookTopic());
+        try std.testing.expectEqualDeep(@as([]const []const u8, &.{"admitted"}), inst.wire_.verdicts(ta.txid));
+        // No thread rests on its `chain/tx`; the engine's app subscribed `chainTx` to it.
+        try std.testing.expect(!inst.wire_.restedOnChainTx());
+        try std.testing.expect(inst.wire_.subscribed(try submit.chainTxName(a, ta.txid)));
         // Gossip on tm_demo (0.20.0: announce, then fetch): the verdict as an `admit` message, never
-        // the BEEF; no proof yet.
+        // the BEEF; no proof.
         try std.testing.expectEqual(@as(usize, 1), ok.published);
         try std.testing.expectEqualStrings("tm_demo", inst.out_.sent.items[0].topic);
         try std.testing.expectEqualSlices(u8, try gossip.admitBody(a, ta.txid, "tm_demo", &.{0}, &.{}), inst.out_.sent.items[0].body);
         try std.testing.expectEqualSlices(u8, &ta.txid, &(try gossip.parseAdmit(a, inst.out_.sent.items[0].body, "tm_demo")).txid);
-        // The thread rests on (0.24.0, what the watch did): accepted again — nothing; the proof — `-proof`.
-        const again = try inst.watched(ta.txid, .seen);
+        // A copy: judged before, nothing run again (0.28.0: nothing is in flight).
+        try std.testing.expect((try inst.route(bytes)) == .unchanged);
+        // A status that is neither a rejection nor a proof changes nothing (skein-sdk 0.22.0); the
+        // intake fact `pending` delivered to the subscription: nothing.
+        try std.testing.expectEqual(Chain.Outcome.pending, try inst.chainStatus(ta.txid, "RECEIVED", null));
+        const again = try inst.watched(ta.txid, .pending);
         try std.testing.expect(!again.admitted and again.published == 0);
         try inst.headers(&.{&h2});
         try std.testing.expectEqual(Chain.Outcome.proven, try inst.chainStatus(ta.txid, "MINED", try soloPath(a, 2, ta.txid)));
@@ -908,70 +958,44 @@ test "the gate (#73, the chain app's answer): admitted on the first of accepted 
         try std.testing.expectEqual(@as(usize, 0), mined.published);
         try std.testing.expectEqual(@as(usize, 1), inst.out_.sent.items.len);
         try std.testing.expectEqual(@as(usize, 1), inst.count("admitted"));
+        try std.testing.expectEqualDeep(@as([]const []const u8, &.{"admitted"}), inst.wire_.verdicts(ta.txid));
     }
 
-    // ------------------------------------------------ (b) rejected: nothing admitted, no hook
+    // ------------------------------------------------ (b) admitted; REJECTED later: reverted by its subscription's step; a proof after: admitted again
     const tb = try spend(a, &f.tx, 1, &.{.{ 1, &k.token }}, k.priv);
+    const h3 = mine(hdr.hash(&h2), tb.txid, 1_700_001_800);
     {
         const n = inst.count("admitted");
         const bytes = try withFund(a, f, tb);
-        _ = try inst.submitted(bytes);
-        _ = try inst.ingest(bytes);
-        _ = try inst.chainStatus(tb.txid, "REJECTED", null);
-        const done = try inst.answer(tb.txid, .{ .rejected = "REJECTED" });
-        try std.testing.expect(!done.admitted);
-        try std.testing.expectEqualDeep(@as([]const []const u8, &.{"rejected"}), inst.wire_.verdicts(tb.txid));
-        try std.testing.expectEqual(n, inst.count("admitted"));
-        try std.testing.expectEqual(@as(usize, 0), inst.count("rejected"));
-        // 0.25.0: a rejection deletes nothing — its record stays, not in flight.
-        try std.testing.expect(try inst.pending(tb.txid));
-        {
-            var st = try inst.load();
-            try std.testing.expect(!(try st.inFlight(tb.txid)));
-        }
+        try std.testing.expect((try inst.submitted(bytes)).admitted);
+        try std.testing.expectEqual(n + 1, inst.count("admitted"));
+        const live = try inst.lookTopic();
+        try std.testing.expectEqual(Chain.Outcome.rejected, try inst.chainStatus(tb.txid, "REJECTED", null));
+        const rj = try inst.watched(tb.txid, .{ .rejected = "REJECTED" });
+        try std.testing.expectEqual(@as(usize, 1), rj.unapplied.len);
+        try std.testing.expectEqual(@as(usize, 1), inst.count("rejected"));
         try std.testing.expect(!(try inst.applied(tb.txid)));
+        try std.testing.expectEqual(live - 1, try inst.lookTopic());
+        try std.testing.expectEqualDeep(@as([]const []const u8, &.{ "admitted", "reverted" }), inst.wire_.verdicts(tb.txid));
+        try std.testing.expect(!inst.wire_.restedOnChainTx());
+        // A copy now: the chain state refuses it (rejected), nothing admitted.
         try std.testing.expectEqualStrings("TransactionRejected", (try inst.route(bytes)).nothing);
-    }
-
-    // ------------------------------------------------ (c) proven first (no status): admitted at once, `-proof` too; the thread rests on for a later proof (0.20.0, 0.24.0)
-    const tc = try spend(a, &f.tx, 2, &.{.{ 1, &k.token }}, k.priv);
-    const h3 = mine(hdr.hash(&h2), tc.txid, 1_700_001_800);
-    {
-        const bytes = try withFund(a, f, tc);
-        const sent = inst.wire_.sent.items.len;
-        _ = try inst.submitted(bytes);
-        _ = try inst.ingest(bytes);
+        // Mined after all (a proof overrides a rejection): the subscription's step admits it again,
+        // from the context its record keeps.
         try inst.headers(&.{&h3});
-        _ = try inst.chainStatus(tc.txid, "MINED", try soloPath(a, 3, tc.txid));
-        const pubs = inst.out_.sent.items.len;
-        const done = try inst.answer(tc.txid, .{ .mined = .{} });
-        try std.testing.expect(done.admitted);
-        try std.testing.expectEqual(sent, inst.wire_.sent.items.len); // 0.26.0: the ingest a call; no watch (0.24.0)
-        try std.testing.expectEqual(pubs + 1, inst.out_.sent.items.len); // 0.25.0: the admit only, no proof
-        try std.testing.expectEqualStrings("tm_demo", inst.out_.sent.items[pubs].topic);
-        // The same status heard again (another ingest of it, 0.24.0): nothing admitted, nothing published.
-        const twice = try inst.answer(tc.txid, .{ .mined = .{} });
+        try std.testing.expectEqual(Chain.Outcome.proven, try inst.chainStatus(tb.txid, "MINED", try soloPath(a, 3, tb.txid)));
+        const back = try inst.watched(tb.txid, .{ .mined = .{} });
+        try std.testing.expect(back.admitted);
+        try std.testing.expect(try inst.applied(tb.txid));
+        try std.testing.expectEqual(live, try inst.lookTopic());
+        try std.testing.expectEqual(n + 2, inst.count("admitted"));
+        try std.testing.expectEqualDeep(@as([]const []const u8, &.{ "admitted", "reverted", "admitted" }), inst.wire_.verdicts(tb.txid));
+        // Heard again: nothing more.
+        const twice = try inst.watched(tb.txid, .{ .mined = .{} });
         try std.testing.expect(!twice.admitted and twice.published == 0);
     }
 
-    // ------------------------------------------------ (d) proven by a proof the host delivered (its pull, 0.25.0): admitted, the admit published
-    const td = try spend(a, &f.tx, 3, &.{.{ 1, &k.token }}, k.priv);
-    const h4 = mine(hdr.hash(&h3), td.txid, 1_700_002_000);
-    {
-        const bytes = try withFund(a, f, td);
-        _ = try inst.submitted(bytes);
-        _ = try inst.ingest(bytes);
-        try inst.headers(&.{&h4});
-        _ = try inst.chainStatus(td.txid, "MINED", try soloPath(a, 4, td.txid));
-        const pubs = inst.out_.sent.items.len;
-        const done = try inst.answer(td.txid, .{ .mined = .{} });
-        try std.testing.expect(done.admitted);
-        try std.testing.expectEqual(pubs + 1, inst.out_.sent.items.len);
-        try std.testing.expectEqualStrings("tm_demo", inst.out_.sent.items[pubs].topic);
-        _ = try gossip.parseAdmit(a, inst.out_.sent.items[pubs].body, "tm_demo");
-    }
-
-    // ------------------------------------------------ (e) an error answer: nothing admitted, no longer pending; a later rejection unwinds
+    // ------------------------------------------------ (e) an ingest call that fails: not admitted, its verdict `rejected`, no record; submitted again, admitted
     {
         const te = try spend(a, &f.tx, 4, &.{.{ 1, &k.token }}, k.priv);
         const bytes = try withFund(a, f, te);
@@ -980,24 +1004,12 @@ test "the gate (#73, the chain app's answer): admitted on the first of accepted 
         const done = try inst.submitted(bytes);
         try std.testing.expect(!done.admitted);
         try std.testing.expectEqualDeep(@as([]const []const u8, &.{"rejected"}), inst.wire_.verdicts(te.txid));
-        // 0.25.0: the record stays (failed), not in flight.
-        {
-            var st = try inst.load();
-            try std.testing.expect(try st.isPending(te.txid) and !(try st.inFlight(te.txid)));
-        }
-        // Submitted again: admitted on acceptance, then the chain rejects it: the thread hears it and unwinds.
-        _ = try inst.submitted(bytes);
-        _ = try inst.ingest(bytes);
-        _ = try inst.chainStatus(te.txid, "RECEIVED", null);
-        try std.testing.expect((try inst.answer(te.txid, .seen)).admitted);
-        const n = try inst.lookTopic();
-        _ = try inst.chainStatus(te.txid, "REJECTED", null);
-        const w = try inst.watched(te.txid, .{ .rejected = "REJECTED" });
-        try std.testing.expectEqual(@as(usize, 1), w.unapplied.len);
-        try std.testing.expectEqual(n - 1, try inst.lookTopic());
-        try std.testing.expectEqualDeep(@as([]const []const u8, &.{ "rejected", "admitted", "reverted" }), inst.wire_.verdicts(te.txid));
-        const of = inst.wire_.factsNamed(try submit.topicOutputName(a, "overlay", te.txid, 0));
-        try std.testing.expectEqualStrings("reverted", of[of.len - 1].getText("state").?);
+        // The chain app does not hold it: no context, no subscription.
+        try std.testing.expect(!(try inst.pending(te.txid)));
+        try std.testing.expect(!inst.wire_.subscribed(try submit.chainTxName(a, te.txid)));
+        // Submitted again: admitted in that step.
+        try std.testing.expect((try inst.submitted(bytes)).admitted);
+        try std.testing.expectEqualDeep(@as([]const []const u8, &.{ "rejected", "admitted" }), inst.wire_.verdicts(te.txid));
     }
 
     // ------------------------------------------------ the chain app's facts (skein-chain 0.10.0's words)
@@ -1335,17 +1347,19 @@ test "gossip (#74; 0.20.0; 0.25.0 no -proof): the admit on <topic> — its shape
     {
         const source = try fromHost(a, "fetch tb");
         const r = try inst.routeFrom(tb_beef, source);
-        _ = try inst.begin(r.admit.event);
-        _ = try inst.ingest(tb_beef);
-        try inst.headers(&.{&h2});
-        // The chain app records its proof (the host's: Arcade's, or its pull's, skein src/host/sync.ts): its fact `mined`.
-        _ = try inst.chainStatus(tb.txid, "MINED", try soloPath(a, 2, tb.txid));
-        const ok = try inst.answer(tb.txid, .{ .mined = .{} });
+        // 0.28.0: admitted in its intake step — the verdict published there.
+        const ok = try inst.begin(r.admit.event);
         try std.testing.expect(ok.admitted);
         // The verdict (an `admit` message on `tm_demo`), never the BEEF; 0.25.0: never a proof.
         try std.testing.expectEqual(@as(usize, 1), ok.published);
         try std.testing.expectEqualStrings("tm_demo", inst.out_.sent.items[inst.out_.sent.items.len - 1].topic);
         try std.testing.expectEqualSlices(u8, try gossip.admitBody(a, tb.txid, "tm_demo", &.{0}, &.{}), inst.out_.sent.items[inst.out_.sent.items.len - 1].body);
+        // The chain app records its proof (the host's: Arcade's, or its pull's, skein src/host/sync.ts): its fact `mined` — placed, nothing published.
+        try inst.headers(&.{&h2});
+        _ = try inst.chainStatus(tb.txid, "MINED", try soloPath(a, 2, tb.txid));
+        const pubs = inst.out_.sent.items.len;
+        _ = try inst.answer(tb.txid, .{ .mined = .{} });
+        try std.testing.expectEqual(pubs, inst.out_.sent.items.len);
 
         // A late duplicate on `tm_demo`: one decode, "already judged" (`unchanged`) — no topic manager runs.
         const identifies = inst.count("identify");
@@ -1629,10 +1643,7 @@ test "the applied record names the submission's BEEF as handed (#3): the door's 
     const env = try pointerOf(a, ms.store(), w1);
     {
         const r = try inst.routeEnvelope(env);
-        _ = try inst.begin(r.admit.event);
-        _ = try inst.ingest(w1);
-        try std.testing.expectEqual(Chain.Outcome.accepted, try inst.chainStatus(t1.txid, "RECEIVED", null));
-        const done = try inst.answer(t1.txid, .seen);
+        const done = try inst.begin(r.admit.event);
         try std.testing.expect(done.admitted);
         var st = try inst.load();
         const ec = (try st.appliedRecord("tm_demo", t1.txid)).?.getCid("beef").?;
@@ -2123,11 +2134,11 @@ test "a lookup raises its own events (0.27.0, David 2026-11-10: \"The Lookup is 
     try std.testing.expectEqualStrings(&hdr.toHex(t2.txid), of1[1].getText("spentBy").?);
     try std.testing.expect(of1[1].getBool("sawAdmitted").?);
 
-    // A rejection heard by the resting thread: the `rejected` hook's own facts (t2's output reverted,
+    // A rejection heard by the subscription's step: the `rejected` hook's own facts (t2's output reverted,
     // t1's coin admitted again).
     inst.now = 3000;
-    _ = try inst.chainStatus(t2.txid, "DOUBLE_SPEND_ATTEMPTED", null);
-    _ = try inst.watched(t2.txid, .{ .rejected = "DOUBLE_SPEND_ATTEMPTED" });
+    _ = try inst.chainStatus(t2.txid, "REJECTED", null);
+    _ = try inst.watched(t2.txid, .{ .rejected = "REJECTED" });
     const of2 = inst.wire_.factsNamed(try std.fmt.allocPrint(a, "overlay/demo/output/{s}.0", .{&hdr.toHex(t2.txid)}));
     try std.testing.expectEqualStrings("reverted", of2[of2.len - 1].getText("state").?);
     try std.testing.expectEqualStrings("admitted", inst.wire_.factsNamed(own)[2].getText("state").?);
@@ -2162,9 +2173,8 @@ test "a lookup raises its own events (0.27.0, David 2026-11-10: \"The Lookup is 
     // lookup named; nothing emitted for it, nothing dropped silently.
     inst.old_contract = true;
     const t4 = try spend(a, &f.tx, 1, &.{ .{ 1, &k.token }, .{ 9_000, &k.p2pkh } }, k.priv);
-    _ = try inst.submitted(try withFund(a, f, t4));
-    _ = try inst.chainStatus(t4.txid, "RECEIVED", null);
-    try std.testing.expectError(error.LookupHandsBackEvents, inst.answer(t4.txid, .seen));
+    // 0.28.0: admitted in its intake step, so that step fails.
+    try std.testing.expectError(error.LookupHandsBackEvents, inst.submitted(try withFund(a, f, t4)));
     try std.testing.expectEqualStrings("lookup-demo", calls.refused_by);
 }
 
@@ -2346,7 +2356,7 @@ fn expectUints(want: []const u64, v: ?Value) !void {
     try std.testing.expectEqualSlices(u64, want, got);
 }
 
-test "oldest first (skein-overlay#1): a two-transaction BEEF judged in order, each ingested on its own, admitted in order on its own answer" {
+test "oldest first (skein-overlay#1): a two-transaction BEEF judged in order, each ingested on its own, admitted in order in the intake step (0.28.0)" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -2379,11 +2389,11 @@ test "oldest first (skein-overlay#1): a two-transaction BEEF judged in order, ea
     try expectUints(&.{0}, subj.get("coinsToRetain"));
     try expectUints(&.{0}, subj.get("outputsToAdmit"));
 
-    // The thread: one ingest each, oldest first — fund's and t1's Atomic BEEFs cut from the
+    // The intake: one ingest each, oldest first — fund's and t1's Atomic BEEFs cut from the
     // submission, then the submission's BEEF as handed for the subject.
     // 0.26.0: each by the chain app's `ingest` call in this step.
     const calls0 = inst.wire_.ingest_args.items.len;
-    _ = try inst.begin(ev);
+    const both = try inst.begin(ev);
     try std.testing.expectEqual(@as(usize, 3), inst.begun.ingested.len);
     try std.testing.expectEqual(calls0 + 3, inst.wire_.ingest_args.items.len);
     const m1 = inst.wire_.ingest_args.items[calls0 + 1];
@@ -2392,24 +2402,19 @@ test "oldest first (skein-overlay#1): a two-transaction BEEF judged in order, ea
     try std.testing.expectEqual(@as(usize, 2), cut.entries.len);
     try std.testing.expectEqual(@as(usize, 1), cut.bumps.len);
     try std.testing.expectEqualSlices(u8, two, inst.wire_.ingest_args.items[calls0 + 2].getBytes("beef").?);
-    try std.testing.expect(try inst.pending(x.t1.txid));
-    try std.testing.expect(try inst.pending(x.t2.txid));
-    // The chain app took both (the Atomic BEEF verifies as a BEEF of its own): pending.
+    // The chain app took both (the Atomic BEEF verifies as a BEEF of its own): unproven. Each item
+    // the chain app holds: its context and its subscription.
     var chb = try inst.chain();
     try std.testing.expectEqual(c.state.Status.unproven, try chb.status(x.t1.txid));
     try std.testing.expectEqual(c.state.Status.unproven, try chb.status(x.t2.txid));
-
-    // t2 accepted first: not admitted — t1, before it, is not accepted yet (0.25.0: the chain state
-    // read). fund (proven) leaves in flight: its verdict `rejected` (no topic took it).
-    _ = try inst.chainStatus(x.t2.txid, "RECEIVED", null);
-    const first = try inst.answer(x.t2.txid, .seen);
-    try std.testing.expect(!first.admitted);
+    for ([_][32]u8{ x.f.txid, x.t1.txid, x.t2.txid }) |t| {
+        try std.testing.expect(try inst.pending(t));
+        try std.testing.expect(inst.wire_.subscribed(try submit.chainTxName(a, t)));
+    }
+    // fund (proven, taken by no topic): its verdict `rejected` at its intake.
     try std.testing.expectEqualDeep(@as([]const []const u8, &.{"rejected"}), inst.wire_.verdicts(x.f.txid));
-    try std.testing.expectEqual(@as(usize, 0), inst.count("admitted"));
 
-    // t1 accepted: t1 admitted, then t2 — in order, in this step; t2 retains t1's token; the facts.
-    _ = try inst.chainStatus(x.t1.txid, "RECEIVED", null);
-    const both = try inst.answer(x.t1.txid, .seen);
+    // t1 admitted, then t2 — in order, in this step; t2 retains t1's token; the facts.
     try std.testing.expect(both.admitted);
     try std.testing.expectEqual(@as(usize, 2), both.admissions.len);
     try std.testing.expectEqualSlices(u8, &x.t1.txid, &both.admissions[0].txid);
@@ -2433,6 +2438,12 @@ test "oldest first (skein-overlay#1): a two-transaction BEEF judged in order, ea
     try std.testing.expectEqual(@as(usize, 1), (try st.inTopic("tm_demo", false)).len);
     // Resubmitted: judged before.
     try std.testing.expect((try inst.route(two)) == .unchanged);
+    // The intake facts delivered to the subscriptions (each item's `pending`, fund's `mined`): nothing more.
+    const n = inst.count("admitted");
+    for ([_][32]u8{ x.t1.txid, x.t2.txid }) |t| try std.testing.expect(!(try inst.answer(t, .pending)).admitted);
+    try std.testing.expect(!(try inst.answer(x.f.txid, .{ .mined = .{} })).admitted);
+    try std.testing.expectEqual(n, inst.count("admitted"));
+    try std.testing.expectEqualDeep(@as([]const []const u8, &.{"rejected"}), inst.wire_.verdicts(x.f.txid));
 }
 
 test "out of order (skein-sdk 0.11.1, David 2026-10-22): a BEEF with children before parents is sorted, not refused — by bytes and by the door's envelope; judged and ingested oldest first" {
@@ -2567,10 +2578,7 @@ fn pauseAndResume(a: Allocator, ms: *c.store.MemStore) !PauseRun {
     // ------------------------------------------------ t1 arrives by a later submission: admitted, and the paused t2 resumed
     const parent = try withFund(a, x.f, x.t1);
     const rp = try inst.route(parent);
-    _ = try inst.begin(rp.admit.event);
-    _ = try inst.ingest(parent);
-    _ = try inst.chainStatus(x.t1.txid, "RECEIVED", null);
-    const got = try inst.answer(x.t1.txid, .seen);
+    const got = try inst.begin(rp.admit.event);
     try std.testing.expect(got.admitted);
     // Its verdict, the fact the paused thread rests on (0.24.0: no resume message).
     try std.testing.expectEqualDeep(@as([]const []const u8, &.{"admitted"}), inst.wire_.verdicts(x.t1.txid));
@@ -2585,11 +2593,9 @@ fn pauseAndResume(a: Allocator, ms: *c.store.MemStore) !PauseRun {
     try std.testing.expect(res == .begun);
     st = try inst.load();
     try std.testing.expect(!(try waitedOn(&st, x.t1.txid)));
-    try std.testing.expect(!(try st.isPaused(x.t2.txid)) and try st.inFlight(x.t2.txid));
+    try std.testing.expect(!(try st.isPaused(x.t2.txid)) and try st.isApplied("tm_demo", x.t2.txid));
     try expectUints(&.{0}, (try begunEvent(&inst, res.begun)).getArray("topics").?[0].get("previousCoins"));
-    _ = try inst.ingest(child);
-    _ = try inst.chainStatus(x.t2.txid, "RECEIVED", null);
-    const done = try inst.answer(x.t2.txid, .seen);
+    const done = inst.begun.stepped.?; // 0.28.0: admitted in the step that took it whole
     try std.testing.expect(done.admitted);
     try std.testing.expectEqualSlices(u32, &.{0}, done.applied[0].coins_to_retain);
     // Woken again (t1's later fact: mined): not paused any more, nothing to do.
@@ -2646,9 +2652,6 @@ test "a parent no topic takes, a child paused on it (case d; 0.25.0, D6: an item
     try std.testing.expectEqual(@as(usize, 0), rp.admit.event.getArray("topics").?.len);
     _ = try inst.begin(rp.admit.event);
     try std.testing.expectEqual(@as(usize, 2), inst.begun.ingested.len); // fund and plain (0.25.0, D6: fund an item too)
-    _ = try inst.ingest(pb);
-    _ = try inst.chainStatus(plain.txid, "RECEIVED", null);
-    _ = try inst.answer(plain.txid, .seen);
     try std.testing.expect(!(try inst.applied(plain.txid)));
     // Taken by no topic: its verdict `rejected` (0.24.0) — the fact the paused child rests on.
     try std.testing.expectEqualDeep(@as([]const []const u8, &.{"rejected"}), inst.wire_.verdicts(plain.txid));
@@ -2695,10 +2698,7 @@ test "a BEEF the host fetched (0.25.1: the submit message from the instance itse
     const pbeef = try atomicWithFund(a, x.f, x.t1);
     const rp = try inst.routeFrom(pbeef, try fromHost(a, "fetch pb"));
     try std.testing.expect(rp == .admit);
-    _ = try inst.begin(rp.admit.event);
-    _ = try inst.ingest(pbeef);
-    _ = try inst.chainStatus(x.t1.txid, "RECEIVED", null);
-    const got = try inst.answer(x.t1.txid, .seen);
+    const got = try inst.begin(rp.admit.event);
     try std.testing.expect(got.admitted);
     // Its verdict (an `admit` message on tm_demo), never the BEEF; and its fact, which wakes t2's thread.
     try std.testing.expectEqual(@as(usize, 1), got.published);
@@ -2706,7 +2706,7 @@ test "a BEEF the host fetched (0.25.1: the submit message from the instance itse
     const woken = try inst.wokeOn(x.t1.txid);
     try std.testing.expect(woken.len == 1 and woken[0].outcome == .begun);
     st = try inst.load();
-    try std.testing.expect(!(try st.isPaused(x.t2.txid)) and try st.inFlight(x.t2.txid));
+    try std.testing.expect(!(try st.isPaused(x.t2.txid)) and try st.isApplied("tm_demo", x.t2.txid));
     try std.testing.expectEqual(@as(usize, 0), (try pausedOnScan(&st, x.t1.txid)).len);
 }
 
@@ -2746,9 +2746,7 @@ test "a fetched BEEF that lacks a parent itself (skein-overlay#1): paused, waiti
     try std.testing.expect(try waitedOn(&st, x.t1.txid)); // t2's pause stands until t1 comes
 
     // t1 admitted: t2 resumed, whole.
-    _ = try inst.ingest(t1_only);
-    _ = try inst.chainStatus(x.t1.txid, "RECEIVED", null);
-    const g1 = try inst.answer(x.t1.txid, .seen);
+    const g1 = inst.begun.stepped.?; // 0.28.0: admitted in the step that took it whole
     try std.testing.expect(g1.admitted);
     const w1 = try inst.wokeOn(x.t1.txid);
     try std.testing.expect(w1.len == 1 and w1[0].outcome == .begun);
@@ -2787,7 +2785,11 @@ fn httpReq(a: Allocator, bytes: []const u8, name: []const u8) !Value {
 
 /// The answer's status and its JSON body.
 fn httpAnswer(a: Allocator, next: routes.HttpNext) !struct { status: u64, json: std.json.Value, v: Value } {
-    const v = next.answer;
+    const v = switch (next) {
+        .answer => |x| x,
+        .admitted => |x| x.answer,
+        else => return error.NotAnAnswer,
+    };
     return .{ .status = v.getUint("status").?, .json = try std.json.parseFromSliceLeaky(std.json.Value, a, v.getBytes("body").?, .{}), .v = v };
 }
 
@@ -2817,7 +2819,7 @@ fn chainBeef(a: Allocator, x: Chain3) ![]const u8 {
     }) });
 }
 
-test "a parent in flight pauses (skein-overlay#6, David 2026-10-23): no wait; admitted after its parent in one pass, no NotAdmitted; the missing-parent pause unchanged beside it" {
+test "a parent admitted at its intake (0.28.0: nothing in flight, skein-overlay#6's pause on it gone): a child carrying it is judged at once with its token live and admitted in one pass; a copy of the parent judged before" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -2826,98 +2828,28 @@ test "a parent in flight pauses (skein-overlay#6, David 2026-10-23): no wait; ad
     var inst = try Instance.init(a, &ms);
     const x = try chain3(a, &inst);
 
-    // t1 submitted: ingested, its answer not in yet (the chain app has not even taken it in).
+    // t1 submitted: ingested and admitted in that step.
     const parent = try withFund(a, x.f, x.t1);
-    _ = try inst.submitted(parent);
-    try std.testing.expect(try inst.pending(x.t1.txid));
+    try std.testing.expect((try inst.submitted(parent)).admitted);
+    try std.testing.expect(!(try inst.paused(x.t1.txid)));
 
-    // t2 arrives with t1 in its BEEF (the deploy in the pool's, skein#154): before this change judged
-    // at once and refused NotAdmitted; now paused on t1, in flight — waiting on it, no want.
+    // t2 arrives with t1 in its BEEF: no pause — t1 is admitted, not an item again; t2 judged with
+    // t1's token live and admitted in its own intake step.
     const two = try chainBeef(a, x);
     const r = try inst.routeFrom(two, try fromGossip(a, peerId('A')));
-    try std.testing.expect(r == .paused);
-    try std.testing.expectEqual(@as(usize, 1), r.paused.waiting.len);
-    try std.testing.expectEqualSlices(u8, &x.t1.txid, &r.paused.waiting[0]);
-    try std.testing.expectEqualStrings(&hdr.toHex(x.t1.txid), r.paused.event.getArray("held").?[0].text);
-    const sent0 = inst.wire_.sent.items.len;
-    _ = try inst.begin(r.paused.event);
-    try std.testing.expect(inst.begun.paused);
-    try std.testing.expectEqual(sent0, inst.wire_.sent.items.len); // nothing to the chain app
-    var st = try inst.load();
-    try std.testing.expect(try st.isPaused(x.t2.txid));
-    // 0.24.0: the thread rests on t1's verdict (in flight: its own admission or rejection is the fact).
-    try std.testing.expectEqualStrings(try submit.topicTxName(a, "overlay", x.t1.txid), inst.wire_.rests.items[inst.wire_.rests.items.len - 1]);
-    // t2 alone (t1 held by the chain app now, still in flight): t2's submission is in flight itself
-    // (paused) — a copy, ignored (0.25.0).
-    _ = try inst.ingest(parent);
-    const alone = try inst.route(try atomic(a, x.t2));
-    try std.testing.expect(alone == .pending);
-
-    // t1 accepted: admitted — its verdict wakes the paused t2's thread.
-    _ = try inst.chainStatus(x.t1.txid, "RECEIVED", null);
-    const got = try inst.answer(x.t1.txid, .seen);
-    try std.testing.expect(got.admitted);
-    try std.testing.expectEqualDeep(@as([]const []const u8, &.{"admitted"}), inst.wire_.verdicts(x.t1.txid));
-
-    // The wake: t2 judged with t1's token live, launched, admitted — one pass.
-    const woken = try inst.wokeOn(x.t1.txid);
-    try std.testing.expectEqual(@as(usize, 1), woken.len);
-    const res = woken[0].outcome;
-    try std.testing.expect(res == .begun); // 0.25.0: in its own thread
-    const rev = try begunEvent(&inst, res.begun);
-    try expectUints(&.{0}, rev.getArray("topics").?[0].get("previousCoins"));
-    try std.testing.expect(rev.get("earlier") == null); // t1 is admitted: not an item again
-    _ = try inst.ingest(two);
-    _ = try inst.chainStatus(x.t2.txid, "RECEIVED", null);
-    const done = try inst.answer(x.t2.txid, .seen);
+    try std.testing.expect(r == .admit);
+    try std.testing.expect(r.admit.event.get("earlier") == null);
+    try expectUints(&.{0}, r.admit.event.getArray("topics").?[0].get("previousCoins"));
+    const done = try inst.begin(r.admit.event);
     try std.testing.expect(done.admitted);
     try std.testing.expectEqualSlices(u32, &.{0}, done.applied[0].coins_to_retain);
-    st = try inst.load();
-    try std.testing.expect(try st.isApplied("tm_demo", x.t2.txid));
-    try std.testing.expect(!(try st.isPending(x.t2.txid)));
+    try std.testing.expect(try inst.applied(x.t2.txid));
+    try std.testing.expect(!inst.wire_.restedOnChainTx());
+    // A copy of t1 alone: judged before.
+    try std.testing.expect((try inst.route(parent)) == .unchanged);
 }
 
-test "a parent in flight rejected (skein-overlay#6): the waiting child routed once and refused on the merits, its pause dropped" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const a = arena_state.allocator();
-    var ms = c.store.MemStore.init(std.testing.allocator);
-    defer ms.deinit();
-    var inst = try Instance.init(a, &ms);
-    const x = try chain3(a, &inst);
-    const parent = try withFund(a, x.f, x.t1);
-    _ = try inst.submitted(parent);
-    _ = try inst.ingest(parent);
-    const child = try atomic(a, x.t2);
-    _ = try inst.begin((try inst.route(child)).paused.event);
-    try std.testing.expect(inst.begun.paused);
-
-    _ = try inst.chainStatus(x.t1.txid, "REJECTED", null);
-    const got = try inst.answer(x.t1.txid, .{ .rejected = "REJECTED" });
-    try std.testing.expect(!got.admitted);
-    try std.testing.expectEqualDeep(@as([]const []const u8, &.{"rejected"}), inst.wire_.verdicts(x.t1.txid));
-    // Woken, routed once, on the merits: judged without t1's token (no previous coin; tm_demo takes
-    // the new token as a mint), its pause dropped, its thread launched — and the chain app refuses it.
-    const woken = try inst.wokeOn(x.t1.txid);
-    try std.testing.expectEqual(@as(usize, 1), woken.len);
-    const res = woken[0].outcome;
-    try std.testing.expect(res == .begun); // 0.25.0: in its own thread
-    try expectUints(&.{}, (try begunEvent(&inst, res.begun)).getArray("topics").?[0].get("previousCoins"));
-    var st = try inst.load();
-    try std.testing.expect(!(try st.isPaused(x.t2.txid)));
-    // Woken again: nothing paused on t1 any more.
-    try std.testing.expectEqual(@as(usize, 0), (try inst.wokeOn(x.t1.txid)).len);
-    _ = try inst.ingest(child);
-    // The chain app's word on a spend of a rejected transaction (0.25.0: its record kept, not in flight).
-    _ = try inst.chainStatus(x.t2.txid, "REJECTED", null);
-    const done = try inst.answer(x.t2.txid, .{ .rejected = "REJECTED" });
-    try std.testing.expect(!done.admitted);
-    st = try inst.load();
-    try std.testing.expect(!(try st.inFlight(x.t2.txid)));
-    try std.testing.expect(!(try inst.applied(x.t2.txid)));
-}
-
-test "a parent in flight and a parent missing (skein-overlay#6): waits on both, rests on both; the one in flight admitted, paused again on the missing one" {
+test "a parent held and a parent missing (0.28.0): waits on the missing one only; when it comes, the child is taken whole" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -2928,78 +2860,33 @@ test "a parent in flight and a parent missing (skein-overlay#6): waits on both, 
     const f = try fund(a, 0x55, 2, &k.p2pkh);
     try inst.headers(&.{&f.h1});
     const t1 = try spend(a, &f.tx, 0, &.{ .{ 1, &k.token }, .{ 9_000, &k.p2pkh } }, k.priv);
-    const u = try spend(a, &f.tx, 1, &.{.{ 9_500, &k.p2pkh }}, k.priv); // never submitted here: missing
+    const u = try spend(a, &f.tx, 1, &.{.{ 9_500, &k.p2pkh }}, k.priv); // not submitted yet: missing
     const child = try spend2(a, &t1.tx, 0, &u.tx, 0, &.{.{ 1, &k.token }}, k.priv);
 
-    const parent = try withFund(a, f, t1);
-    _ = try inst.submitted(parent);
-    _ = try inst.ingest(parent);
-    const pa = peerId('A');
-    const r = try inst.routeFrom(try atomic(a, child), try fromGossip(a, pa));
+    try std.testing.expect((try inst.submitted(try withFund(a, f, t1))).admitted);
+    const r = try inst.routeFrom(try atomic(a, child), try fromGossip(a, peerId('A')));
     try std.testing.expect(r == .paused);
-    try std.testing.expectEqual(@as(usize, 2), r.paused.waiting.len);
-    try std.testing.expectEqualSlices(u8, &u.txid, &r.paused.waiting[0]); // the missing, then the one in flight
-    try std.testing.expectEqualSlices(u8, &t1.txid, &r.paused.waiting[1]);
+    try std.testing.expectEqual(@as(usize, 1), r.paused.waiting.len);
+    try std.testing.expectEqualSlices(u8, &u.txid, &r.paused.waiting[0]);
+    try std.testing.expect(r.paused.event.get("held") == null);
     const rests0 = inst.wire_.rests.items.len;
     _ = try inst.begin(r.paused.event);
     var st = try inst.load();
     try std.testing.expect(try waitedOn(&st, u.txid));
-    try std.testing.expect(try waitedOn(&st, t1.txid));
-    try std.testing.expectEqual(rests0 + 2, inst.wire_.rests.items.len); // u's verdict, t1's
-
-    // t1 admitted: the child woken, paused again on u alone.
-    _ = try inst.chainStatus(t1.txid, "RECEIVED", null);
-    const got = try inst.answer(t1.txid, .seen);
-    try std.testing.expect(got.admitted);
-    const woken = try inst.wokeOn(t1.txid);
-    try std.testing.expectEqual(@as(usize, 1), woken.len);
-    const res = woken[0].outcome;
-    try std.testing.expect(res == .paused);
-    try std.testing.expectEqual(@as(usize, 1), res.paused.waiting.len);
-    try std.testing.expectEqualSlices(u8, &u.txid, &res.paused.waiting[0]);
-    st = try inst.load();
-    try std.testing.expect(try waitedOn(&st, u.txid));
     try std.testing.expect(!(try waitedOn(&st, t1.txid)));
-    try std.testing.expectEqual(@as(usize, 1), inst.wire_.verdicts(child.txid).len); // undecided, once
-}
+    try std.testing.expectEqual(rests0 + 1, inst.wire_.rests.items.len); // u's verdict only
 
-test "a parent in flight answered for between the route and the pause (skein-overlay#6): the pause step routes it again at once; an error answer's verdict wakes it too" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const a = arena_state.allocator();
-    var ms = c.store.MemStore.init(std.testing.allocator);
-    defer ms.deinit();
-    var inst = try Instance.init(a, &ms);
-    const x = try chain3(a, &inst);
-    const parent = try withFund(a, x.f, x.t1);
-    _ = try inst.submitted(parent);
-    _ = try inst.ingest(parent);
-    // The libp2p route (a call) pauses t2 on t1 in flight; t1's answer lands before the thread's first step.
-    const r = try inst.routeFrom(try atomic(a, x.t2), try fromGossip(a, peerId('A')));
-    try std.testing.expect(r == .paused);
-    _ = try inst.chainStatus(x.t1.txid, "RECEIVED", null);
-    const got = try inst.answer(x.t1.txid, .seen);
-    try std.testing.expect(got.admitted);
-    // The thread's first step: t1 settled since the route (its fact came before anyone rested on
-    // it) — routed again at once, whole, and begun in this same thread (0.25.0); nothing paused.
-    _ = try inst.begin(r.paused.event);
-    try std.testing.expect(!inst.begun.paused);
-    try std.testing.expectEqual(@as(usize, 1), inst.begun.ingested.len);
-    try expectUints(&.{0}, (try begunEvent(&inst, inst.begun)).getArray("topics").?[0].get("previousCoins"));
-    try std.testing.expect(try inst.pending(x.t2.txid));
-
-    // An error answer for a parent in flight: no longer in flight, its verdict `rejected` wakes the child.
-    var inst2 = try Instance.init(a, &ms);
-    const y = try chain3(a, &inst2);
-    _ = try inst2.submitted(try withFund(a, y.f, y.t1));
-    _ = try inst2.begin((try inst2.route(try atomic(a, y.t2))).paused.event);
-    _ = try inst2.answer(y.t1.txid, .{ .failed = "chain app unavailable" });
-    try std.testing.expectEqualDeep(@as([]const []const u8, &.{"rejected"}), inst2.wire_.verdicts(y.t1.txid));
-    const woken = try inst2.wokeOn(y.t1.txid);
+    // u arrives (no topic takes it: its verdict `rejected` at intake) — the child woken, taken whole.
+    _ = try inst.submitted(try withFund(a, f, u));
+    try std.testing.expectEqualDeep(@as([]const []const u8, &.{"rejected"}), inst.wire_.verdicts(u.txid));
+    const woken = try inst.wokeOn(u.txid);
     try std.testing.expectEqual(@as(usize, 1), woken.len);
+    try std.testing.expect(woken[0].outcome == .begun);
+    try std.testing.expect(try inst.applied(child.txid));
+    try std.testing.expect(!inst.wire_.restedOnChainTx());
 }
 
-test "POST /submit is BRC-22 and synchronous (0.9.1, shruggr/skein#112, David 2026-10-07): the thread launched, the request waits on its subject (0.24.0), the STEAK; several waiters; a resubmission judged before answered from the state, nothing run again; undecided 503 with Retry-After; rejected 400; no topic 200 with the empty STEAK" {
+test "POST /submit is BRC-22 and synchronous (0.9.1, shruggr/skein#112; 0.28.0: admitted in its own call and answered at admission): the STEAK at once, no wait, no thread; a resubmission judged before answered from the state, nothing run again; a failed ingest 400; called again after a rejection 400; undecided 503 with Retry-After; no topic 200 with the empty STEAK" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -3015,81 +2902,56 @@ test "POST /submit is BRC-22 and synchronous (0.9.1, shruggr/skein#112, David 20
     const junk = try inst.http(try httpReq(a, "junk", "r0"), false);
     try std.testing.expectEqual(@as(u64, 400), (try httpAnswer(a, junk)).status);
 
-    // Whole: the submission's thread launched on the submit event; the request waits on it (#66).
+    // Whole: ingested and admitted in this call; the STEAK at once — no wait message, nothing
+    // launched, no thread resting on its `chain/tx`; its subscription made.
+    const sent0 = inst.wire_.sent.items.len;
     const first = try inst.http(try httpReq(a, parent, "r1"), false);
-    try std.testing.expect(first == .launch);
-    try std.testing.expectEqualStrings("submit", first.launch.getText("kind").?);
-    try std.testing.expect(first.launch.get("source").?.getCid("request") != null);
-    _ = try inst.begin(first.launch);
-    // 0.24.0: the request waits on the subject (`wait`, the submission's thread never finishes);
-    // called again before a verdict (a deadline, say): the subject in flight — wait on it again.
-    const mid = try inst.http(try httpReq(a, parent, "r1"), true);
-    try std.testing.expectEqualSlices(u8, &x.t1.txid, &mid.wait);
-    // A second request for the same submission while it is in progress: the same wait.
-    const second = try inst.http(try httpReq(a, parent, "r2"), false);
-    try std.testing.expectEqualSlices(u8, &x.t1.txid, &second.wait);
+    try std.testing.expect(first == .admitted);
+    try std.testing.expect(first.admitted.done.?.admitted);
+    const ans = try httpAnswer(a, first);
+    try std.testing.expectEqual(@as(u64, 200), ans.status);
+    const steak = ans.json.object.get("tm_demo").?.object;
+    try std.testing.expectEqual(@as(usize, 1), steak.get("outputsToAdmit").?.array.items.len);
+    try std.testing.expectEqual(@as(i64, 0), steak.get("outputsToAdmit").?.array.items[0].integer);
+    try std.testing.expectEqual(sent0, inst.wire_.sent.items.len);
+    try std.testing.expect(!inst.wire_.restedOnChainTx());
+    try std.testing.expect(inst.wire_.subscribed(try submit.chainTxName(a, x.t1.txid)));
+    var chf = try inst.chain();
+    try std.testing.expect((try chf.broadcastRecord(x.t1.txid)) != null);
     const judged = inst.count("identify");
-    // Their `wait` messages join the subject in flight's waiters (once each).
-    const w1 = try a.dupe(u8, &cbor.cidOf("wait r1"));
-    const w2 = try a.dupe(u8, &cbor.cidOf("wait r2"));
-    try std.testing.expectEqualStrings("waiting", @tagName(try inst.waitOn(x.t1.txid, w1)));
-    try std.testing.expectEqualStrings("waiting", @tagName(try inst.waitOn(x.t1.txid, w2)));
-    try std.testing.expectEqualStrings("waiting", @tagName(try inst.waitOn(x.t1.txid, w1)));
-
-    // The chain app accepts it: admitted; each waiter answered once (replyTo), and answers the STEAK.
-    _ = try inst.ingest(parent);
-    _ = try inst.chainStatus(x.t1.txid, "RECEIVED", null);
-    const sent_before = inst.wire_.sent.items.len;
-    try std.testing.expect((try inst.answer(x.t1.txid, .seen)).admitted);
-    var woken: usize = 0;
-    for (inst.wire_.sent.items[sent_before..]) |m| if (std.mem.eql(u8, m.body.getText("fn") orelse "", "wait")) {
-        const to = m.body.getCid("replyTo").?;
-        try std.testing.expect(std.mem.eql(u8, to, w1) or std.mem.eql(u8, to, w2));
-        woken += 1;
-    };
-    try std.testing.expectEqual(@as(usize, 2), woken);
-    for ([_][]const u8{ "r1", "r2" }) |r| {
-        const ans = try httpAnswer(a, try inst.http(try httpReq(a, parent, r), true));
-        try std.testing.expectEqual(@as(u64, 200), ans.status);
-        const steak = ans.json.object.get("tm_demo").?.object;
-        try std.testing.expectEqual(@as(usize, 1), steak.get("outputsToAdmit").?.array.items.len);
-        try std.testing.expectEqual(@as(i64, 0), steak.get("outputsToAdmit").?.array.items[0].integer);
-    }
-    // Completed: a resubmission is answered from the state with the first submission's STEAK, nothing re-run.
+    // A resubmission: answered from the state with the first submission's STEAK, nothing re-run.
     const again = try httpAnswer(a, try inst.http(try httpReq(a, parent, "r3"), false));
     try std.testing.expectEqual(@as(u64, 200), again.status);
     try std.testing.expectEqual(@as(usize, 1), again.json.object.get("tm_demo").?.object.get("outputsToAdmit").?.array.items.len);
     try std.testing.expectEqual(judged, inst.count("identify"));
 
-    // Nothing decided: no verdict (the chain app's error answer) — 503 with Retry-After; nothing launched again.
+    // The chain app's ingest call fails: 400 at once, nothing admitted.
     const child = try spend(a, &x.t1.tx, 0, &.{.{ 1, &x.k.token }}, x.k.priv);
     const child_beef = try atomic(a, child);
-    const c1 = try inst.http(try httpReq(a, child_beef, "r4"), false);
-    try std.testing.expect(c1 == .launch);
-    inst.wire_.refuse = "the chain app could not take it";
-    _ = try inst.begin(c1.launch);
+    inst.wire_.refuse = "ingest: the chain app could not take it";
+    const failed = try httpAnswer(a, try inst.http(try httpReq(a, child_beef, "r4"), false));
+    try std.testing.expectEqual(@as(u64, 400), failed.status);
+    try std.testing.expect(!(try inst.applied(child.txid)));
+    // Called again (a request's wait answered) with nothing decided and nothing paused: 503.
     const undecided = try httpAnswer(a, try inst.http(try httpReq(a, child_beef, "r4"), true));
     try std.testing.expectEqual(@as(u64, 503), undecided.status);
     try std.testing.expectEqualStrings("30", undecided.v.get("headers").?.getText("retry-after").?);
 
-    // Rejected by the chain app: 400.
-    const c2 = try inst.http(try httpReq(a, child_beef, "r5"), false);
-    try std.testing.expect(c2 == .launch);
-    _ = try inst.begin(c2.launch);
-    _ = try inst.ingest(child_beef);
+    // Admitted, then rejected by the chain app: called again, 400.
+    try std.testing.expectEqual(@as(u64, 200), (try httpAnswer(a, try inst.http(try httpReq(a, child_beef, "r5"), false))).status);
     _ = try inst.chainStatus(child.txid, "REJECTED", null);
     _ = try inst.answer(child.txid, .{ .rejected = "REJECTED" });
     const rejected = try httpAnswer(a, try inst.http(try httpReq(a, child_beef, "r5"), true));
     try std.testing.expectEqual(@as(u64, 400), rejected.status);
 
-    // Valid, taken by no topic (a plain payment): 200 with the empty STEAK (BRC-22), nothing launched.
+    // Valid, taken by no topic (a plain payment): 200 with the empty STEAK (BRC-22).
     const pay = try spend(a, &x.t1.tx, 1, &.{.{ 500, &x.k.p2pkh }}, x.k.priv);
     const none = try httpAnswer(a, try inst.http(try httpReq(a, try atomic(a, pay), "r6"), false));
     try std.testing.expectEqual(@as(u64, 200), none.status);
     try std.testing.expectEqual(@as(usize, 0), none.json.object.get("tm_demo").?.object.get("outputsToAdmit").?.array.items.len);
 }
 
-test "POST /submit whose subject no topic takes, only a transaction before it (0.9.1): 200 with the empty STEAK at once, the submit event admitted into the app's box for its thread (nothing launched)" {
+test "POST /submit whose subject no topic takes, only a transaction before it (0.9.1; 0.28.0: begun in its own call): 200 with the empty STEAK at once; t1 before it admitted, every item ingested" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -3103,23 +2965,21 @@ test "POST /submit whose subject no topic takes, only a transaction before it (0
         .{ .txid = x.t1.txid, .format = .raw, .raw = x.t1.raw, .tx = x.t1.tx },
         .{ .txid = pay.txid, .format = .raw, .raw = pay.raw, .tx = pay.tx },
     }) });
+    const calls0 = inst.wire_.ingested.items.len;
     const next = try inst.http(try httpReq(a, both, "r1"), false);
+    try std.testing.expect(next == .admitted);
     const ans = try httpAnswer(a, next);
     try std.testing.expectEqual(@as(u64, 200), ans.status);
     try std.testing.expectEqual(@as(usize, 0), ans.json.object.get("tm_demo").?.object.get("outputsToAdmit").?.array.items.len);
-    const admit = ans.v.getArray("admit").?;
-    try std.testing.expectEqual(@as(usize, 1), admit.len);
-    try std.testing.expectEqualStrings("overlay", admit[0].getText("box").?);
-    const ev = admit[0].get("event").?;
-    try std.testing.expectEqualStrings("submit", ev.getText("kind").?);
-    try std.testing.expectEqual(@as(usize, 0), ev.getArray("topics").?.len);
+    try std.testing.expect(ans.v.get("admit") == null);
     // 0.25.0 (D6): fund and t1 before it, and the subject itself, are items (fund and the subject
-    // taken by no topic, not held: ingested all the same).
-    try std.testing.expectEqual(@as(usize, 2), ev.getArray("earlier").?.len);
-    try std.testing.expect(ev.getBool("wanted").?);
+    // taken by no topic, not held: ingested all the same) — in this call.
+    try std.testing.expectEqual(calls0 + 3, inst.wire_.ingested.items.len);
+    try std.testing.expect(try inst.applied(x.t1.txid));
+    try std.testing.expectEqualDeep(@as([]const []const u8, &.{"rejected"}), inst.wire_.verdicts(pay.txid));
 }
 
-test "POST /submit on a paused submission (0.9.1): the pause recorded by its thread, the request waits for it (`wait`), several waiters; paused again they wait on; the parent comes, the launched thread keeps them, its admission answers them, each answers the STEAK" {
+test "POST /submit on a paused submission (0.9.1): the pause recorded by its thread, the request waits for it (`wait`), several waiters; paused again they wait on; the parent comes, the child taken whole and admitted in that step (0.28.0), its waiters answered there, each answers the STEAK" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -3163,25 +3023,18 @@ test "POST /submit on a paused submission (0.9.1): the pause recorded by its thr
     try std.testing.expectEqual(@as(usize, 2), (try submit.wakesOf(a, (try st.pendingRecord(x.t2.txid)).?)).len);
     try std.testing.expectEqual(sent0, inst.wire_.sent.items.len);
 
-    // t1 comes: its verdict wakes the paused thread; t2 routed whole, its thread launched; the
-    // waiters wait on in flight (0.24.0), on the launched thread's subject — answered at its admission.
+    // t1 comes: its verdict wakes the paused thread; t2 routed whole and admitted in that step
+    // (0.28.0), the pause over — its waiters answered there.
     const parent = try withFund(a, x.f, x.t1);
-    _ = try inst.begin((try inst.route(parent)).admit.event);
-    _ = try inst.ingest(parent);
-    _ = try inst.chainStatus(x.t1.txid, "RECEIVED", null);
-    try std.testing.expect((try inst.answer(x.t1.txid, .seen)).admitted);
+    try std.testing.expect((try inst.begin((try inst.route(parent)).admit.event)).admitted);
+    const before = inst.wire_.sent.items.len;
     const wk = try inst.wokeOn(x.t1.txid);
     try std.testing.expectEqual(@as(usize, 1), wk.len);
     const res = wk[0].outcome;
-    try std.testing.expect(res == .begun); // 0.25.0: in its own thread, its waiters kept
-    const before = inst.wire_.sent.items.len;
+    try std.testing.expect(res == .begun);
+    try std.testing.expect(try inst.applied(x.t2.txid));
     st = try inst.load();
-    try std.testing.expectEqual(@as(usize, 2), (try submit.wakesOf(a, (try st.pendingRecord(x.t2.txid)).?)).len);
-    // Still undecided for them: each request waits again.
-    try std.testing.expectEqualSlices(u8, &x.t2.txid, &(try inst.http(try httpReq(a, child, "r1"), true)).wait);
-    _ = try inst.ingest(child);
-    _ = try inst.chainStatus(x.t2.txid, "RECEIVED", null);
-    try std.testing.expect((try inst.answer(x.t2.txid, .seen)).admitted);
+    try std.testing.expect(!(try st.isPaused(x.t2.txid)));
     var woken: usize = 0;
     for (inst.wire_.sent.items[before..]) |m| {
         if (!std.mem.eql(u8, m.body.getText("fn") orelse "", "wait")) continue;
@@ -3236,9 +3089,6 @@ test "a submission by message is unchanged by the synchronous route (0.9.1): `<a
     // t1 comes: its verdict wakes the message's thread; t2 routed again and launched.
     const parent = try withFund(a, x.f, x.t1);
     _ = try inst.begin((try inst.route(parent)).admit.event);
-    _ = try inst.ingest(parent);
-    _ = try inst.chainStatus(x.t1.txid, "RECEIVED", null);
-    _ = try inst.answer(x.t1.txid, .seen);
     const wk = try inst.wokeOn(x.t1.txid);
     try std.testing.expect(wk.len == 1 and wk[0].outcome == .begun); // 0.25.0: in the message's own thread
     {
@@ -3262,13 +3112,9 @@ test "answers to the submitter's box (shruggr/skein#112): admitted with status p
     // ------------------------------------------------ t1 by message: launched; accepted → admitted, pending, its STEAK
     const parent = try withFund(a, x.f, x.t1);
     const r = try inst.received(try submitArgs(a, parent), src1);
-    try std.testing.expect(r == .launch);
-    try std.testing.expectEqualSlices(u8, &alice, r.launch.get("source").?.getBytes("sender").?);
-    try std.testing.expectEqual(@as(usize, 0), inst.wire_.answers.items.len); // nothing until the chain app answers
-    _ = try inst.begin(r.launch);
-    _ = try inst.ingest(parent);
-    _ = try inst.chainStatus(x.t1.txid, "RECEIVED", null);
-    const got = try inst.answer(x.t1.txid, .seen);
+    try std.testing.expect(r == .begun); // 0.28.0: admitted in the message step
+    try std.testing.expectEqualSlices(u8, &alice, (try begunEvent(&inst, r.begun)).get("source").?.getBytes("sender").?);
+    const got = r.begun.stepped.?;
     try std.testing.expect(got.admitted);
     try std.testing.expectEqual(@as(usize, 1), inst.wire_.answers.items.len);
     const ans = inst.wire_.answers.items[0];
@@ -3283,8 +3129,9 @@ test "answers to the submitter's box (shruggr/skein#112): admitted with status p
     try std.testing.expectEqualStrings(&hdr.toHex(x.t1.txid), adm.getText("txid").?);
     try expectUints(&.{0}, adm.get("steak").?.get("tm_demo").?.get("outputsToAdmit"));
 
-    // 0.24.0: no watch message; the submission's thread rests on t1's fact for its life.
+    // No watch message; no thread rests on t1's fact (0.28.0: the app's subscription).
     try std.testing.expectEqual(@as(usize, 0), inst.wire_.sentFn("watch"));
+    try std.testing.expect(!inst.wire_.restedOnChainTx());
 
     // ------------------------------------------------ a proof: relayed, with its block from the chain state
     const h2 = mine(hdr.hash(&x.f.h1), x.t1.txid, 1_700_001_200);
@@ -3328,13 +3175,14 @@ test "answers to the submitter's box (shruggr/skein#112): admitted with status p
     // ------------------------------------------------ t2 by message, rejected by the chain app: rejected, with the reason
     const m3 = try a.dupe(u8, &cbor.cidOf("message 3"));
     const r2 = try inst.received(try submitArgs(a, try atomic(a, x.t2)), try byMessage(a, &alice, m3));
-    try std.testing.expect(r2 == .launch);
-    _ = try inst.begin(r2.launch);
-    _ = try inst.answer(x.t2.txid, .{ .rejected = "DOUBLE_SPEND_ATTEMPTED" });
+    try std.testing.expect(r2 == .begun); // 0.28.0: admitted in the message step (answered admitted)
+    try std.testing.expectEqualStrings("admitted", inst.wire_.lastAnswer().getText("state").?);
+    _ = try inst.chainStatus(x.t2.txid, "REJECTED", null);
+    _ = try inst.answer(x.t2.txid, .{ .rejected = "REJECTED" });
     const rej = inst.wire_.answers.items[inst.wire_.answers.items.len - 1];
     try std.testing.expectEqualSlices(u8, m3, rej.body.getCid("request").?);
     try std.testing.expectEqualStrings("rejected", rej.body.get("result").?.getText("state").?);
-    try std.testing.expectEqualStrings("DOUBLE_SPEND_ATTEMPTED", rej.body.get("result").?.getText("reason").?);
+    try std.testing.expectEqualStrings("REJECTED", rej.body.get("result").?.getText("reason").?);
     try std.testing.expectEqualStrings(&hdr.toHex(x.t2.txid), rej.body.get("result").?.getText("txid").?);
 
     // ------------------------------------------------ a BEEF that does not decode: rejected at once; not that shape: bad-args
@@ -3369,12 +3217,9 @@ test "a submission by message is answered once (0.7.4): one `admitted`; the step
 
     // The message step: the submission's thread launched, nobody answered yet.
     const r = try inst.received(args, src1);
-    try std.testing.expect(r == .launch);
+    try std.testing.expect(r == .begun); // 0.28.0: admitted in the message step
     // The thread: begun, ingested, accepted → admitted, answered once.
-    _ = try inst.begin(r.launch);
-    _ = try inst.ingest(parent);
-    _ = try inst.chainStatus(x.t1.txid, "RECEIVED", null);
-    try std.testing.expect((try inst.answer(x.t1.txid, .seen)).admitted);
+    try std.testing.expect(r.begun.stepped.?.admitted);
     // The message step again, woken at that thread's end (`resolved`): nothing routed, nothing answered.
     const first = inst.in;
     var es: std.ArrayList(cbor.Entry) = .empty;
@@ -3453,11 +3298,8 @@ test "one box per function class (skein #128, 0.7.5, 0.7.7): register only in `<
     });
     const parent = try withFund(a, x.f, x.t1);
     const r = try inst.received(try submitArgs(a, parent), src);
-    try std.testing.expect(r == .launch);
-    _ = try inst.begin(r.launch);
-    _ = try inst.ingest(parent);
-    _ = try inst.chainStatus(x.t1.txid, "RECEIVED", null);
-    try std.testing.expect((try inst.answer(x.t1.txid, .seen)).admitted);
+    try std.testing.expect(r == .begun); // 0.28.0: admitted in the message step
+    try std.testing.expect(r.begun.stepped.?.admitted);
     const ans = inst.wire_.answers.items[0];
     try std.testing.expectEqualStrings("overlay/submit", ans.box);
     try std.testing.expectEqualStrings("admitted", ans.body.get("result").?.getText("state").?);
@@ -3492,11 +3334,8 @@ test "one box per function class (skein #128, 0.7.6): a message submission comes
     }) };
     try std.testing.expectEqualStrings("amm/submit", m.source.getText("box").?);
     const r = try inst.received(m.body.get("args").?, m.source);
-    try std.testing.expect(r == .launch);
-    _ = try inst.begin(r.launch);
-    _ = try inst.ingest(parent);
-    _ = try inst.chainStatus(x.t1.txid, "RECEIVED", null);
-    try std.testing.expect((try inst.answer(x.t1.txid, .seen)).admitted);
+    try std.testing.expect(r == .begun); // 0.28.0: admitted in the message step
+    try std.testing.expect(r.begun.stepped.?.admitted);
     const ans = inst.wire_.answers.items[0];
     try std.testing.expectEqualSlices(u8, &bob, ans.to);
     try std.testing.expectEqualStrings("amm/submit", ans.box);
@@ -3581,16 +3420,14 @@ test "register by call with seed (0.25.0, D7, case e): the deploy's BEEF submitt
         .{ .key = "request", .value = .{ .cid = m.cid } },
     });
     const r = try inst.received(margs, source);
-    try std.testing.expect(r == .launch);
-    _ = try inst.begin(r.launch);
+    try std.testing.expect(r == .begun); // 0.28.0: admitted in the message step
     // 0.26.0: the chain app's `ingest` called in the thread's first step.
     try std.testing.expectEqualSlices(u8, &x.t1.txid, &inst.wire_.ingested.items[inst.wire_.ingested.items.len - 1]);
-    _ = try inst.chainStatus(x.t1.txid, "RECEIVED", null);
-    const done = try inst.answer(x.t1.txid, .seen);
+    const done = inst.begun.stepped.?; // 0.28.0: admitted at intake
     try std.testing.expect(done.admitted);
     var st = try inst.load();
     try std.testing.expect(try st.isApplied("tm_seed", x.t1.txid));
-    try std.testing.expect(!(try st.isPending(x.t1.txid)));
+    try std.testing.expect(!(try st.isPaused(x.t1.txid)));
     // Later mined at 2: placed (the topic's mined list at 2 names it).
     const h2 = mine(hdr.hash(&x.f.h1), x.t1.txid, 1_700_001_200);
     try inst.headers(&.{&h2});
@@ -4819,7 +4656,7 @@ fn undecidedRun(a: Allocator, ms: *c.store.MemStore) !UndecidedRun {
     try std.testing.expect(try inst.applied(x.t1.txid) and try inst.applied(x.t2.txid));
     st = try inst.load();
     try std.testing.expect(!(try waitedOn(&st, x.t1.txid)) and !(try waitedOn(&st, x.f.txid)));
-    try std.testing.expect(!(try st.isPending(x.t1.txid)) and !(try st.isPending(x.t2.txid)));
+    try std.testing.expect(!(try st.isPaused(x.t1.txid)) and !(try st.isPaused(x.t2.txid)));
     try expectNothingRejected(&inst);
     // The verdicts: t1 and t2 undecided, then admitted; F taken by no topic, rejected.
     try std.testing.expectEqualDeep(@as([]const []const u8, &.{ "undecided", "admitted" }), inst.wire_.verdicts(x.t2.txid));
@@ -4862,8 +4699,7 @@ test "decided with what is here (0.19.0): a mined funding-only transaction and a
     const mb = try withFund(a, x.f, mint);
     _ = try inst.submitted(mb);
     _ = try inst.ingest(mb);
-    _ = try inst.chainStatus(mint.txid, "RECEIVED", null);
-    try std.testing.expect((try inst.answer(mint.txid, .seen)).admitted);
+    try std.testing.expect(try inst.applied(mint.txid)); // 0.28.0: admitted at intake
 
     // A spend of the mint's token, then a second spend of the same token: the second's source is
     // readable and no coin of the topic (spent) — refused, nothing paused or wanted. 0.20.5: refused
@@ -4872,14 +4708,13 @@ test "decided with what is here (0.19.0): a mined funding-only transaction and a
     const s1 = try spend(a, &mint.tx, 0, &.{.{ 1, &x.k.token }}, x.k.priv);
     _ = try inst.submitted(try atomic(a, s1));
     _ = try inst.ingest(try atomic(a, s1));
-    _ = try inst.chainStatus(s1.txid, "RECEIVED", null);
-    try std.testing.expect((try inst.answer(s1.txid, .seen)).admitted);
+    try std.testing.expect(try inst.applied(s1.txid)); // 0.28.0: admitted at intake
     const s2 = try spend(a, &mint.tx, 0, &.{.{ 2, &x.k.token }}, x.k.priv);
     const r = try inst.route(try atomic(a, s2));
     try std.testing.expect(r == .refused);
     try std.testing.expectEqualStrings(try spentText(a, mint.txid, 0, s1.txid), r.refused);
     st = try inst.load();
-    try std.testing.expect(!(try st.isPending(s2.txid)));
+    try std.testing.expect((try st.pendingRecord(s2.txid)) == null);
     try std.testing.expect(!(try waitedOn(&st, x.f.txid)));
 }
 
@@ -4941,11 +4776,13 @@ test "one held spender per coin (0.20.5, David 2026-11-06; 0.26.0): a second unm
     const alice: [33]u8 = .{0x03} ++ .{0xa1} ** 32;
 
     // (a) The incident's order: A routed and handed to the chain app (0.26.0: by the `ingest` call
-    // in its thread's first step, so the chain app holds it at once, pending); B routed before any
-    // network answer — refused, by the route and by message; nothing of B kept.
+    // in its intake step, so the chain app holds it at once; 0.28.0: admitted in that step, its
+    // lookup hooks run); B routed before any network answer — refused, by the route and by
+    // message; nothing of B kept.
+    const admitted0 = inst.count("admitted");
+    const spent0 = inst.count("spent");
     const ra = try inst.route(try atomic(a, sa));
-    _ = try inst.begin(ra.admit.event);
-    try std.testing.expect(try inst.pending(sa.txid));
+    const da = try inst.begin(ra.admit.event);
     var ch = try inst.chain();
     try std.testing.expect(try ch.holds(sa.txid));
     const ingested0 = inst.wire_.ingested.items.len;
@@ -4962,21 +4799,14 @@ test "one held spender per coin (0.20.5, David 2026-11-06; 0.26.0): a second unm
     try std.testing.expectEqual(ingested0, inst.wire_.ingested.items.len); // nothing of B to the chain app
     ch = try inst.chain();
     try std.testing.expect(!(try ch.holds(sb.txid)));
-    // A itself again, in flight: its own submission, not a competitor.
-    try std.testing.expect((try inst.route(try atomic(a, sa))) == .pending);
-    // A admitted on its answer, its lookup hooks run.
-    const admitted0 = inst.count("admitted");
-    const spent0 = inst.count("spent");
-    _ = try inst.ingest(try atomic(a, sa));
-    _ = try inst.chainStatus(sa.txid, "RECEIVED", null);
-    const da = try inst.answer(sa.txid, .seen);
+    // A itself again: judged before, not a competitor.
+    try std.testing.expect((try inst.route(try atomic(a, sa))) == .unchanged);
     try std.testing.expect(da.admitted);
     try std.testing.expectEqualSlices(u32, &.{0}, da.applied[0].coins_to_retain);
     try std.testing.expectEqual(admitted0 + 1, inst.count("admitted"));
     try std.testing.expectEqual(spent0 + 1, inst.count("spent"));
 
-    // (b) B after A is held by the chain app (no longer pending here): refused.
-    try std.testing.expect(!(try inst.pending(sa.txid)));
+    // (b) B again: refused.
     try std.testing.expectEqualStrings(why_b, (try inst.route(try atomic(a, sb))).refused);
 
     // (c) A rejected by the chain app: the coin is free; B submitted again is admitted.
@@ -4987,10 +4817,7 @@ test "one held spender per coin (0.20.5, David 2026-11-06; 0.26.0): a second unm
     try expectUints(&.{0}, inst.rejected_args.items[rej0].get("givenBack"));
     try std.testing.expect(!(try inst.applied(sa.txid)));
     const rb2 = try inst.route(try atomic(a, sb));
-    _ = try inst.begin(rb2.admit.event);
-    _ = try inst.ingest(try atomic(a, sb));
-    _ = try inst.chainStatus(sb.txid, "RECEIVED", null);
-    const db = try inst.answer(sb.txid, .seen);
+    const db = try inst.begin(rb2.admit.event);
     try std.testing.expect(db.admitted);
     try std.testing.expectEqualSlices(u32, &.{0}, db.applied[0].coins_to_retain);
     try std.testing.expect(try inst.applied(sb.txid));
@@ -5043,26 +4870,26 @@ test "spent-ness is not the topic's (0.26.0, David 2026-11-09): a spender the ch
     const alice: [33]u8 = .{0x03} ++ .{0xa1} ** 32;
     const m1 = try a.dupe(u8, &cbor.cidOf("message E"));
 
-    // E burns the token (no token output; consumes the coin): taken at the route, previous [0].
+    // E burns the token (no token output; consumes the coin): taken at the route, previous [0];
+    // 0.28.0: admitted in the message step.
     const se = try spend(a, &t1.tx, 0, &.{.{ 1, &k.p2pkh }}, k.priv);
     const r = try inst.received(try submitArgs(a, try atomic(a, se)), try byMessage(a, &alice, m1));
-    try std.testing.expect(r == .launch);
-    _ = try inst.begin(r.launch);
-    // Before E's answer, the chain app comes to hold another spender of the coin (not by this
-    // engine's route). 0.25.x took the coin out of E's previous coins here (`spentByOther`); 0.26.0:
-    // the topic's judgement is the topic's, the network settles the conflict.
+    try std.testing.expect(r == .begun);
+    const done = r.begun.stepped.?;
+    // Then the chain app comes to hold another spender of the coin (not by this engine's route).
+    // 0.25.x took the coin out of E's previous coins (`spentByOther`); 0.26.0: the topic's
+    // judgement is the topic's, the network settles the conflict — its later fact steps E's
+    // subscription: nothing changes.
     const sf = try spend(a, &t1.tx, 0, &.{.{ 2, &k.p2pkh }}, k.priv);
     _ = try inst.ingest(try atomic(a, sf));
-    _ = try inst.ingest(try atomic(a, se));
-    _ = try inst.chainStatus(se.txid, "SEEN_ON_NETWORK", null);
-    const done = try inst.answer(se.txid, .seen);
+    try std.testing.expect(!(try inst.answer(se.txid, .pending)).admitted);
     try std.testing.expect(done.admitted);
     try std.testing.expectEqualSlices(u32, &.{0}, done.applied[0].coins_removed);
     try std.testing.expect(try inst.applied(se.txid));
     try std.testing.expect(try inst.applied(t1.txid));
 }
 
-test "a proof after a rejection (0.25.0, case a, skein-sdk 0.18.0): rejected, not admitted, nothing deleted; the later `mined` admits it on the same thread" {
+test "a proof after a rejection (0.25.0, case a, skein-sdk 0.18.0; 0.28.0): admitted at intake, rejected — reverted; its context kept; the later `mined` admits it again by its subscription" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -5074,27 +4901,25 @@ test "a proof after a rejection (0.25.0, case a, skein-sdk 0.18.0): rejected, no
     try inst.headers(&.{&f.h1});
     const t = try spend(a, &f.tx, 0, &.{.{ 1, &k.token }}, k.priv);
     const bytes = try withFund(a, f, t);
-    _ = try inst.submitted(bytes);
-    _ = try inst.ingest(bytes);
+    try std.testing.expect((try inst.submitted(bytes)).admitted);
     _ = try inst.chainStatus(t.txid, "REJECTED", null);
     const r = try inst.answer(t.txid, .{ .rejected = "REJECTED" });
-    try std.testing.expect(!r.admitted);
-    try std.testing.expectEqualDeep(@as([]const []const u8, &.{"rejected"}), inst.wire_.verdicts(t.txid));
+    try std.testing.expect(!r.admitted and r.unapplied.len == 1);
+    try std.testing.expectEqualDeep(@as([]const []const u8, &.{ "admitted", "reverted" }), inst.wire_.verdicts(t.txid));
     {
         var st = try inst.load();
-        try std.testing.expect(try st.isPending(t.txid) and !(try st.inFlight(t.txid))); // kept, not in flight
+        try std.testing.expect((try st.pendingRecord(t.txid)) != null and !(try st.isApplied("tm_demo", t.txid))); // its context kept
     }
-    // Mined at 2: the chain app's latest fact is `mined` (its proof over the rejection); the same
-    // thread (the same event) admits it, placed at 2.
+    // Mined at 2: the chain app's latest fact is `mined` (its proof over the rejection); the
+    // subscription's step (the same event, from its record) admits it, placed at 2.
     const h2 = mine(hdr.hash(&f.h1), t.txid, 1_700_001_200);
     try inst.headers(&.{&h2});
     try std.testing.expectEqual(Chain.Outcome.proven, try inst.chainStatus(t.txid, "MINED", try soloPath(a, 2, t.txid)));
     const m = try inst.answer(t.txid, .{ .mined = .{} });
     try std.testing.expect(m.admitted);
-    try std.testing.expectEqualDeep(@as([]const []const u8, &.{ "rejected", "admitted" }), inst.wire_.verdicts(t.txid));
+    try std.testing.expectEqualDeep(@as([]const []const u8, &.{ "admitted", "reverted", "admitted" }), inst.wire_.verdicts(t.txid));
     var st = try inst.load();
     try std.testing.expect(try st.isApplied("tm_demo", t.txid));
-    try std.testing.expect(!(try st.isPending(t.txid)));
     const at2 = try st.minedAt("tm_demo", 2);
     try std.testing.expectEqual(@as(usize, 1), at2.len);
 }
@@ -5125,8 +4950,8 @@ test "a fetched BEEF's topic (0.25.0 case f; 0.25.1 through the submit message, 
     try std.testing.expect((try inst.received(try args(a, bytes, "tm_other"), try fromHost(a, "fetch other"))) == .dropped);
     // Judged under the named topic alone: a BEEF tm_demo would take is not judged by tm_demo when fetched for tm_two.
     const r = try inst.received(try args(a, bytes, "tm_two"), try fromHost(a, "fetch two"));
-    try std.testing.expect(r == .launch);
-    const js = r.launch.getArray("topics").?;
+    try std.testing.expect(r == .begun); // 0.28.0: admitted in the message step
+    const js = (try begunEvent(&inst, r.begun)).getArray("topics").?;
     try std.testing.expectEqual(@as(usize, 1), js.len);
     try std.testing.expectEqualStrings("tm_two", js[0].getText("topic").?);
 }
@@ -5163,14 +4988,14 @@ fn provenAgainstHeld(a: Allocator, source_of: enum { message, sync }) !void {
     };
     // Not refused (proven), and judged WITH the coin: B's token output admitted, the coin retained.
     const r = try inst.received(try submitArgs(a, m2.beef), source);
-    try std.testing.expect(r == .launch);
-    const topics = r.launch.getArray("topics").?;
+    try std.testing.expect(r == .begun); // 0.28.0: admitted in the message step
+    const topics = (try begunEvent(&inst, r.begun)).getArray("topics").?;
     try std.testing.expectEqual(@as(usize, 1), topics.len);
     try expectUints(&.{0}, topics[0].get("previousCoins"));
     try expectUints(&.{0}, topics[0].get("outputsToAdmit"));
     // Its thread's first step: the chain app's `ingest` (B mined; A rejected, double-spent by B),
     // the state read: B admitted at once.
-    const done = try inst.begin(r.launch);
+    const done = r.begun.stepped.?;
     try std.testing.expect(done.admitted);
     try std.testing.expectEqualSlices(u32, &.{0}, done.applied[0].coins_to_retain);
     try std.testing.expect(try inst.applied(sb.txid));
@@ -5223,7 +5048,7 @@ test "a proven spender against a held unmined one (0.26.0, case ii): the same in
     try provenAgainstHeld(arena_state.allocator(), .sync);
 }
 
-test "an unproven spender against a held unmined one (0.26.0): refused, the input and its spender named; nothing to the chain app; also when only this engine's pending record knows the spender" {
+test "an unproven spender against a held unmined one (0.26.0): refused, the input and its spender named; nothing to the chain app (0.28.0: the chain state alone names the spender — nothing is in flight)" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -5242,19 +5067,6 @@ test "an unproven spender against a held unmined one (0.26.0): refused, the inpu
     try inst.headers(&.{&ma.header});
     try std.testing.expectEqual(Chain.Outcome.proven, try inst.chainStatus(x.sa.txid, "MINED", try soloPath(a, 2, x.sa.txid)));
     try std.testing.expectEqualStrings(try spentText(a, x.t1.txid, 0, x.sa.txid), (try inst.route(try atomic(a, sb))).refused);
-
-    // The engine's own in-flight set (`inFlightSpender`, kept): a pending record handed to the chain
-    // app whose transaction the chain state does not hold names the spender too.
-    const t9 = try spend(a, &x.f.tx, 1, &.{ .{ 1, &x.k.token }, .{ 9_000, &x.k.p2pkh } }, x.k.priv);
-    try std.testing.expect((try inst.admitted(try withFund(a, x.f, t9), t9.txid)).admitted);
-    const ghost: [32]u8 = .{0x9a} ** 32;
-    {
-        var st = try inst.load();
-        try st.putPending(ghost, .{ .submission = ghost, .ingested = true, .spends = &.{c.store.outpointKey(t9.txid, 0)} });
-        inst.ov_root = try st.save();
-    }
-    const sc = try spend(a, &t9.tx, 0, &.{.{ 1, &x.k.token }}, x.k.priv);
-    try std.testing.expectEqualStrings(try spentText(a, t9.txid, 0, ghost), (try inst.route(try atomic(a, sc))).refused);
 }
 
 test "an earlier item spending a held coin refuses the submission (0.26.0, Q1 (b)): nothing of it stored or broadcast" {
@@ -5309,8 +5121,8 @@ test "the proof wins (0.26.0, D4): a subject the chain state marks rejected is a
     const m2 = try minedAlone(a, f.h1, 2, t);
     try inst.headers(&.{&m2.header});
     const c1 = try inst.http(try httpReq(a, m2.beef, "proved"), false);
-    try std.testing.expect(c1 == .launch);
-    const done = try inst.begin(c1.launch);
+    try std.testing.expect(c1 == .admitted); // 0.28.0: admitted in the handler's call
+    const done = c1.admitted.done.?;
     try std.testing.expect(done.admitted);
     var ch = try inst.chain();
     try std.testing.expectEqual(c.state.Status.proven, try ch.status(t.txid));
@@ -5344,4 +5156,67 @@ test "POST /submit again after a proof overrode a rejection (0.26.1, skein-sdk 0
     try std.testing.expect((try ch.settlementCid(t.txid)) != null); // the record the proof overrode, still read
     const ans = try httpAnswer(a, try inst.http(try httpReq(a, bytes, "after the proof"), true));
     try std.testing.expectEqual(@as(u64, 200), ans.status);
+}
+
+test "the in-VM intake (0.28.0, David 2026-11-11): a program of the instance hands a transaction to its overlay in its own step — the same intake, the chain app's ingest and the admission in that step, the call returns the verdict; judged before; InputSpent; undecided records nothing" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ms = c.store.MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    var inst = try Instance.init(a, &ms);
+    const x = try chain3(a, &inst);
+
+    // Admitted: the verdict with its STEAK, status pending; ingested and subscribed in the call; no
+    // message, no thread resting, no submitter answered.
+    const parent = try withFund(a, x.f, x.t1);
+    const sent0 = inst.wire_.sent.items.len;
+    const calls0 = inst.wire_.ingested.items.len;
+    const v = try inst.intake(try submitArgs(a, parent));
+    try std.testing.expectEqualStrings("admitted", v.getText("state").?);
+    try std.testing.expectEqualStrings("pending", v.getText("status").?);
+    try std.testing.expectEqualStrings(&hdr.toHex(x.t1.txid), v.getText("txid").?);
+    try expectUints(&.{0}, v.get("steak").?.get("tm_demo").?.get("outputsToAdmit"));
+    try std.testing.expectEqual(calls0 + 2, inst.wire_.ingested.items.len); // the funding (an item) and t1
+    try std.testing.expectEqual(sent0, inst.wire_.sent.items.len);
+    try std.testing.expectEqual(@as(usize, 0), inst.wire_.answers.items.len);
+    try std.testing.expect(try inst.applied(x.t1.txid));
+    try std.testing.expect(inst.wire_.subscribed(try submit.chainTxName(a, x.t1.txid)));
+    try std.testing.expect(!inst.wire_.restedOnChainTx());
+    try std.testing.expectEqualDeep(@as([]const []const u8, &.{"admitted"}), inst.wire_.verdicts(x.t1.txid));
+    // Its later rejection reaches it by the subscription, as any submission's.
+    var ch = try inst.chain();
+    try std.testing.expect((try ch.broadcastRecord(x.t1.txid)) != null);
+
+    // Again: judged before — admitted, from the state, nothing run again.
+    const n = inst.count("identify");
+    const again = try inst.intake(try submitArgs(a, parent));
+    try std.testing.expectEqualStrings("admitted", again.getText("state").?);
+    try std.testing.expectEqual(n, inst.count("identify"));
+
+    // A second spender of t1's token while t1's first spender (t2) is held: refused InputSpent, the
+    // input and its spender named; nothing to the chain app.
+    try std.testing.expectEqualStrings("admitted", (try inst.intake(try submitArgs(a, try atomic(a, x.t2)))).getText("state").?);
+    const rival = try spend(a, &x.t1.tx, 0, &.{.{ 2, &x.k.token }}, x.k.priv);
+    const calls1 = inst.wire_.ingested.items.len;
+    const refused = try inst.intake(try submitArgs(a, try atomic(a, rival)));
+    try std.testing.expectEqualStrings("rejected", refused.getText("state").?);
+    try std.testing.expectEqualStrings(try spentText(a, x.t1.txid, 0, x.t2.txid), refused.getText("reason").?);
+    try std.testing.expectEqual(calls1, inst.wire_.ingested.items.len);
+
+    // Lacking a parent: undecided, the parent named — nothing recorded, nothing rests, nothing ingested.
+    const k2 = try keys(0x43);
+    const f2 = try fund(a, 0x91, 1, &k2.p2pkh);
+    const orphan_parent = try spend(a, &f2.tx, 0, &.{.{ 1, &k2.token }}, k2.priv);
+    const orphan = try spend(a, &orphan_parent.tx, 0, &.{.{ 1, &k2.token }}, k2.priv);
+    const rests0 = inst.wire_.rests.items.len;
+    const u = try inst.intake(try submitArgs(a, try atomic(a, orphan)));
+    try std.testing.expectEqualStrings("undecided", u.getText("state").?);
+    try std.testing.expectEqualStrings(&hdr.toHex(orphan_parent.txid), u.getArray("waiting").?[0].text);
+    try std.testing.expect(!(try inst.pending(orphan.txid)));
+    try std.testing.expectEqual(rests0, inst.wire_.rests.items.len);
+    try std.testing.expectEqual(calls1, inst.wire_.ingested.items.len);
+
+    // Not that shape, or no topic served: rejected, nothing done.
+    try std.testing.expectEqualStrings("rejected", (try inst.intake(try mapOf(a, &.{}))).getText("state").?);
 }
