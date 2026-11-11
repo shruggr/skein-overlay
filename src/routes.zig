@@ -35,7 +35,7 @@
 //! message in `<app>/register`'s work (registry.zig `byCall`) → {fn, result} | {fn, error}.
 //!
 //! A call of fn "intake" (0.28.0, David 2026-11-11) is no route either: a program of the instance
-//! (skein-amm's amm-validator) handing a transaction to its overlay in its own step, `{beef,
+//! (skein-amm's amm-validator) handing a transaction to its overlay in its own step, `{app, beef,
 //! topics, offChainValues?}` → the verdict (submit.zig `intake`): the same intake as every other
 //! submission, the chain app's ingest and its broadcast and the admission in the caller's step.
 //!
@@ -67,6 +67,7 @@ const submit_mod = @import("submit.zig");
 const calls = @import("calls.zig");
 const state = @import("state.zig");
 const registry = @import("registry.zig");
+const config = @import("config.zig");
 
 const cbor = c.cbor;
 const Value = cbor.Value;
@@ -361,19 +362,29 @@ fn callTail(a: Allocator, in: Value, loaded: anytype, op: []const u8, done: ?sub
     try vm.keep(try vm.store().putValue(a, try registry.resultRecord(a, op, fields.items)));
 }
 
-/// fn "intake" (0.28.0): a program of the instance's submission in its own step — the configuration
-/// its thread's app's engine reads (registry.zig `callStep`, as a registration by call) — run as
-/// every submission is (submit.zig `intake`) and answered with the verdict. A kernel call (no step)
-/// is refused: it writes.
+/// fn "intake" (0.28.0): a program of the instance's submission in its own step, run as every
+/// submission is (submit.zig `intake`) and answered with the verdict. `args.app` names the app whose
+/// overlay it is (the caller's own: skein-amm's amm-validator runs in the front door's request
+/// thread, so the calling step's thread names no app to derive it from); its configuration is that
+/// app's record, its engine the role `overlay`, as a read route's (`config.matchedApp`). The writes
+/// are the engine's own scope's (the kernel's rule for a callee): another app named writes nothing.
+/// A kernel call (no step) is refused: it writes.
 fn intakeCall(a: Allocator, call_in: Value, arg: Value) !Value {
-    if (call_in.get("step") == null) return error.IntakeWrites;
-    const in = (try registry.callStep(a, vm.store(), ev_.heads(), call_in)) orelse return error.NoOverlayEngine;
+    const sv = call_in.get("step") orelse return error.IntakeWrites;
+    const app = arg.getText("app") orelse return error.IntakeNamesNoApp;
+    const match = try mapOf(a, &.{.{ .key = "match", .value = try mapOf(a, &.{.{ .key = "app", .value = .{ .text = app } }}) }});
+    if ((try config.matchedApp(a, ev_.heads(), vm.store(), call_in, match)) == null) return error.NoOverlayEngine;
+    const in = try ev_.configured(a, call_in, match);
     var loaded = try ev_.load(a, in);
-    loaded.st.now = @intCast(in.getUint("at") orelse 0);
+    loaded.st.now = @intCast(sv.getUint("at") orelse 0);
     const cx = try callCtx(a, in, &loaded.st);
     const got = try submit_mod.intake(cx, arg);
     try callTail(a, in, &loaded, "intake", got.done);
     return got.result;
+}
+
+fn mapOf(a: Allocator, es: []const cbor.Entry) !Value {
+    return .{ .map = try a.dupe(cbor.Entry, es) };
 }
 
 /// The Retry-After (whole seconds) of a 503: a submission still undecided past the host's bound.

@@ -35,8 +35,10 @@ subscriptions. That is all we need")**, over everything below that says otherwis
   submission thread's launch (`Resumed.launch`); the HTTP wait on a subject in flight (the wait
   on a pause stays); skein-overlay#6's pause on an in-flight parent (a parent paused here is
   still waited on). `InputSpent` is the chain state's spender alone.
-- **The in-VM entry**: fn `intake` (`{beef, topics, offChainValues?}`), a call from a step of a
-  program of the instance (its thread's app's engine, as a registration by call): the same
+- **The in-VM entry**: fn `intake` (`{app, beef, topics, offChainValues?}`), a call from a step of
+  a program of the instance — `app` the app whose overlay it is, its configuration resolved as a
+  read route's (its record, its engine the role `overlay`; the caller may run in the front door's
+  request thread, which names no app); the writes are the engine's own scope's: the same
   intake, in the caller's step; it returns the verdict — `{txid, state: "admitted", status,
   steak}`, `{txid?, state: "rejected", reason}` (`InputSpent: …`, a bad BEEF, no topic took it,
   the chain app rejected it, its ingest failed), or `{txid, state: "undecided", waiting}` (it

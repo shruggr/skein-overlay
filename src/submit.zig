@@ -1354,7 +1354,8 @@ pub fn received(cx: Ctx, args: Value, source: Value) !Resumed {
 
 /// The in-VM entry (0.28.0, David 2026-11-11): a program of the instance (skein-amm's
 /// amm-validator) hands a transaction to its overlay in its own step — `fn "intake"`, `args` the
-/// message form's `{beef, topics, offChainValues?}` — and the same intake runs as for every other
+/// message form's `{beef, topics, offChainValues?}` and the `app` whose overlay it is (routes.zig
+/// `intakeCall`) — and the same intake runs as for every other
 /// submission (`route`, `settle`, `begin`: the chain app's ingest and its broadcast, the admission,
 /// the subscriptions), in the caller's step. The call RETURNS with the verdict, read from the state:
 ///   `{txid, state: "admitted", status: "pending" | "proven", steak}` — a requested topic applied it

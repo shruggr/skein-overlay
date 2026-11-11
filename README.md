@@ -1175,8 +1175,8 @@ engine records each item's context (`pending` `{submission, event}`) and its app
 moves on a reorg, and admits again once the chain state no longer rejects it. The in-flight state
 goes (`ingested`/`heard`/`spends` on pending records, `inFlight`, `isPending`, `isUnsettled`,
 `inFlightSpender`, the in-flight HTTP wait, the submission thread's launch, skein-overlay#6's
-pause on an in-flight parent). New: fn `intake` — a program of the instance's in-VM submission in
-its own step, answered with the verdict (`admitted` with the STEAK, `rejected` with the reason,
+pause on an in-flight parent). New: fn `intake` (`{app, beef, topics, offChainValues?}`) — a program of the instance's in-VM
+submission in its own step, answered with the verdict (`admitted` with the STEAK, `rejected` with the reason,
 or `undecided` with nothing recorded when it lacks parents). POST /submit answers at admission.
 The paused path is unchanged (its thread rests on its parents' verdicts). Release notes: a FRESH
 HOME is required — a submission thread a 0.27.x engine left resting on `chain/tx/<txid>` runs its
