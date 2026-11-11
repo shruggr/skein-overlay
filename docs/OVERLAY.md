@@ -955,7 +955,9 @@ emitted when the set changes:
 | an admission, a rejection, a register's seeds (0.12.0) | `{event: "beacon", topic: "<topic>-live", every, body}` again for each registered topic whose view digest the step changed |
 | `registerLookup` / `deregisterLookup` (0.12.0, 0.12.1) | `{event: "liveness", topic: "<service>-live", window}` then `{event: "beacon", topic: "<service>-live", every, body}` (the program's fn `beat`) / `unliveness` then `unbeacon` on `<service>-live` |
 | a step whose lookup hooks answered `beats` (0.12.0) | `{event: "beacon", topic: "<service>-live", every, body}` for each registered service named |
-| a step whose lookup hooks answered `events` (0.20.4) | each event as the hook gave it (`{event: <name>, topic: <text>, …fields}`), in the order the hooks ran, before the beacons |
+
+A lookup's own events are not the engine's (0.27.0): the lookup raises them itself
+(`Service.emit`), in its hook's execution — "Lookup services", below.
 
 `program` is the engine's own role in `programs` (`overlay` in this repo's
 manifest) and `fn` its function for that topic: the handler the host routes
@@ -1244,13 +1246,20 @@ program's names that listens to the topic), and `program`, the role in
 | `lookup` | `{kind: "lookup-call", app, service, program, query}` | `POST /lookup`: a read |
 
 A hook may be a no-op. It answers `{kind: "lookup-hooked", fn, beats?:
-{<service>: bytes}, events?: [map]}`: `beats` the new beat bodies it set
-(`Service.beat`, "Beats" above); `events` (0.20.4) the events it asks to be
-emitted, each a map `{event: <name>, topic: <text>, …fields}`
-(`Service.emit(event)`, collected in order). The engine emits each with
-`emitEvent` in the same step, in order, for `admitted`, `spent` and
-`rejected` (and a register's seeds); an entry that is not a map with a text
-`event` is passed over. **Own storage:** a program keeps named maps (the
+{<service>: bytes}}`: `beats` the new beat bodies it set (`Service.beat`,
+"Beats" above). **Its events are its own** (0.27.0, David 2026-11-10: "The
+Lookup is what handles its own storage and events. The overlay is completely
+ignorant to it"): `Service.emit(event)` raises `{event: <name>, …fields}`
+with the kernel there and then, in the hook's own execution (an in-VM callee
+of the engine's step, as the chain app emits from its `ingest`); the kernel
+stamps the lookup program's app, and the name is under that app's name.
+`Service.events` / `Service.latest` read the event index the same way.
+Nothing is collected or handed back. An answer that still carries `events`
+(a lookup built for the 0.20.4 contract) fails the step,
+`LookupHandsBackEvents`, the program named on the error line — the engine
+neither emits those events nor drops them. Natively (tests),
+`lookup.handleWith(…, kernel)` passes the kernel; `lookup.handle` passes
+none (an emit is then `NoKernel`). **Own storage:** a program keeps named maps (the
 SDK chain library's `store.zig`) under one head, its **index**
 `<app>/<index>`, whatever names it serves (0.11.0; before, one head per
 called name, `<app>/ls_<service>`, while the hooks wrote under the

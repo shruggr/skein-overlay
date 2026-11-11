@@ -14,6 +14,13 @@
 //!   {scriptHash (hex sha256 of the locking script), topic?}   unspent outputs with that script
 //!   {txid (hex), outputIndex, topic}    that output, if admitted and unspent
 //! Spent outputs too with `includeSpent: true`. Answers are output-lists.
+//!
+//! Its own facts (0.27.0: a lookup raises its own events, `Service.emit`, in its hook's execution):
+//!   <app>/demo/output/<txid>.<vout>   {state: "admitted"} at `admitted`;
+//!                                     {state: "spent", spentBy, sawAdmitted} at `spent` —
+//!                                     `sawAdmitted` whether its own `admitted` fact for the output was
+//!                                     readable then (`Service.latest`; skein 0.8.0: also when raised
+//!                                     earlier in the same step); {state: "reverted"} at `rejected`.
 const std = @import("std");
 const c = @import("chain");
 const lookup = @import("lookup");
@@ -61,6 +68,15 @@ fn move(a: Allocator, svc: *Service, tp: []const u8, sh: []const u8, op: []const
     try svc.map("byScript").add(new[1]);
 }
 
+/// Its fact's name: `<app>/demo/output/<txid hex>.<vout>`.
+fn factName(a: Allocator, svc: *Service, txid: [32]u8, vout: u32) ![]const u8 {
+    return std.fmt.allocPrint(a, "{s}/demo/output/{s}.{d}", .{ svc.app, &c.header.toHex(txid), vout });
+}
+
+fn fact(a: Allocator, svc: *Service, txid: [32]u8, vout: u32, fields: []const c.cbor.Entry) !void {
+    try svc.emit(.{ .map = try std.mem.concat(a, c.cbor.Entry, &.{ &.{.{ .key = "event", .value = .{ .text = try factName(a, svc, txid, vout) } }}, fields }) });
+}
+
 fn admitted(a: Allocator, svc: *Service, topic: []const u8, tx: lookup.Tx, outputs_to_admit: []const u32, _: []const u32) anyerror!void {
     const tp = try topicPrefix(a, topic);
     for (outputs_to_admit) |vout| {
@@ -69,6 +85,7 @@ fn admitted(a: Allocator, svc: *Service, topic: []const u8, tx: lookup.Tx, outpu
         const op = c.store.outpointKey(tx.txid, vout);
         try svc.map("outputs").put(try cat(a, &.{ tp, &op }), .{ .bytes = try a.dupe(u8, &sh) });
         try move(a, svc, tp, &sh, &op, 0);
+        try fact(a, svc, tx.txid, vout, &.{.{ .key = "state", .value = .{ .text = "admitted" } }});
     }
 }
 
@@ -81,6 +98,12 @@ fn spent(a: Allocator, svc: *Service, topic: []const u8, outpoint: lookup.Outpoi
     const sh = v.bytes[0..32];
     try svc.map("outputs").put(key, .{ .bytes = try cat(a, &.{ sh, &spending.txid }) });
     try move(a, svc, tp, sh, &op, 1);
+    const saw = if (try svc.latest(try factName(a, svc, outpoint.txid, outpoint.vout))) |r| std.mem.eql(u8, r.getText("state") orelse "", "admitted") else false;
+    try fact(a, svc, outpoint.txid, outpoint.vout, &.{
+        .{ .key = "state", .value = .{ .text = "spent" } },
+        .{ .key = "spentBy", .value = .{ .text = try a.dupe(u8, &c.header.toHex(spending.txid)) } },
+        .{ .key = "sawAdmitted", .value = .{ .boolean = saw } },
+    });
 }
 
 fn rejected(a: Allocator, svc: *Service, topic: []const u8, tx: lookup.Tx) anyerror!void {
@@ -97,6 +120,7 @@ fn rejected(a: Allocator, svc: *Service, topic: []const u8, tx: lookup.Tx) anyer
             _ = try svc.map("byScript").remove(k[1]);
         }
         _ = try svc.map("outputs").remove(key);
+        try fact(a, svc, tx.txid, @intCast(vout), &.{.{ .key = "state", .value = .{ .text = "reverted" } }});
     }
     // What it spent is unspent again — 0.26.0: only the coins the engine gives back (`givenBack`);
     // one another admitted transaction consumes stays spent.
@@ -109,6 +133,7 @@ fn rejected(a: Allocator, svc: *Service, topic: []const u8, tx: lookup.Tx) anyer
         const sh = v.bytes[0..32];
         try svc.map("outputs").put(key, .{ .bytes = try a.dupe(u8, sh) });
         try move(a, svc, tp, sh, &op, 0);
+        try fact(a, svc, in.previous_outpoint.txid.bytes, in.previous_outpoint.index, &.{.{ .key = "state", .value = .{ .text = "admitted" } }});
     }
 }
 

@@ -65,9 +65,9 @@
 //! marketplace AND validator from install, always"): a message {fn: "market" | "validator"} is
 //! no function of the engine. A step that changes a registered topic's view digest (an admission,
 //! a rejection, a seed) re-declares its beacon with the new body, and one whose lookup hooks
-//! answered new beat bodies re-declares those services' beacons (topics.zig `beatEvents`). The
-//! events the lookup hooks asked for (0.20.4, `lookup.Service.emit`) are emitted in the same step,
-//! in order, before the beacons.
+//! answered new beat bodies re-declares those services' beacons (topics.zig `beatEvents`). 0.27.0:
+//! a lookup raises its own events in its hook's execution (`lookup.Service.emit`); the engine emits
+//! none for it, and a hook answer that still hands back `events` fails the step (the lookup named).
 //!
 //! The state is the overlay's own, under its app's name (state.zig: `<app>/state`), over the
 //! chain app's (`chain/state`), read only. The topics and lookup services are the app's (#72,
@@ -111,7 +111,16 @@ const Allocator = std.mem.Allocator;
 const eql = std.mem.eql;
 
 pub fn main() u8 {
-    return vm.main("overlay", run);
+    return vm.main("overlay", runNamed);
+}
+
+/// `run`, the lookup the engine refused named on the step's error line (0.27.0: a hook answer that
+/// still hands back `events`).
+fn runNamed(a: Allocator) anyerror!void {
+    run(a) catch |e| {
+        if (e == error.LookupHandsBackEvents) vm.noteError(std.fmt.allocPrint(a, "lookup program {s} handed back `events` (built for the 0.20.4 contract): rebuild it against skein-overlay 0.27.0, where a lookup raises its own events", .{calls.refused_by}) catch "a lookup handed back `events`");
+        return e;
+    };
 }
 
 const resultRecord = registry.resultRecord;
@@ -136,11 +145,6 @@ fn emitBeats(a: Allocator, step: Value, st: *@import("state.zig").State) !usize 
     const evs = try topics.beatEvents(a, roles, try std.mem.concat(a, topics.Entry, &.{ tl, conf.topics }), try std.mem.concat(a, []const u8, &.{ services, try configured.lookupNames(a, conf) }), changes, st.lookup_beats.items);
     for (evs) |e| _ = try vm.emitEvent(a, e);
     return evs.len;
-}
-
-/// The events the step's lookup hooks asked for (0.20.4, `Service.emit`), emitted in order.
-fn emitHookEvents(a: Allocator, st: *@import("state.zig").State) !void {
-    for (st.lookup_events.items) |e| _ = try vm.emitEvent(a, e);
 }
 
 /// The engine's roles (config.zig `rolesOf`; null: a bad configuration, error.BadRoles) with the
@@ -504,7 +508,6 @@ fn steppedTail(a: Allocator, step: Value, loaded: anytype, op: []const u8, done:
 /// The step's lookup hook events and beats emitted, the answers listed, the state saved, the result kept.
 fn savedTail(a: Allocator, step: Value, loaded: anytype, op: []const u8, fields: *std.ArrayList(cbor.Entry)) !void {
     const s = vm.store();
-    try emitHookEvents(a, &loaded.st);
     const beats = try emitBeats(a, step, &loaded.st);
     if (beats > 0) try fields.append(a, .{ .key = "beats", .value = .{ .uint = beats } });
     try answersField(fields, a);

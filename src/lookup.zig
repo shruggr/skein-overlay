@@ -18,13 +18,16 @@
 //!                  native hook reads it as `svc.given_back`, null from an engine before 0.26.0)
 //!
 //! (each may be a no-op). A hook answers `{kind: "lookup-hooked", fn, beats?:
-//! {<service>: bytes}, events?: [map]}`: `beats` (0.12.0), when the hook changed what a
+//! {<service>: bytes}}`: `beats` (0.12.0), when the hook changed what a
 //! service it serves says on its beat (`Service.beat`), the new body per
 //! service name — the engine re-declares that service's beacon on
-//! `<service>-live` with it (a registered service; topics.zig `beatEvents`);
-//! `events` (0.20.4), the events the hook asks to be emitted (`Service.emit`),
-//! each `{event: <name>, topic: <text>, …fields}` — the engine emits each, in
-//! order, in the same step.
+//! `<service>-live` with it (a registered service; topics.zig `beatEvents`).
+//! **Events are the lookup's own** (0.27.0, David 2026-11-10: "The Lookup is what handles its own
+//! storage and events. The overlay is completely ignorant to it"): `Service.emit` raises the event
+//! with the kernel right there, in the hook's own execution (an in-VM callee of the engine's step,
+//! as the chain app emits from its `ingest`); nothing is collected or handed back. `Service.events`
+//! reads the event index the same way. A hook answer that still carries `events` (a lookup built
+//! for the 0.20.4 contract) fails the step: `error.LookupHandsBackEvents`, the lookup named.
 //! The body at the declaration (`registerLookup`) is fn "beat"'s:
 //!
 //!   fn "beat"      {kind: "lookup-beat", app, service, program}  →  {kind: "lookup-beat", body: bytes}
@@ -130,8 +133,12 @@ pub const Service = struct {
     /// The beat bodies a hook set (`beat`), in order: the hook's answer carries them (0.12.0).
     beats: std.ArrayList(Beat) = .empty,
 
-    /// The events a hook asked to be emitted (`emit`), in order: the hook's answer carries them (0.20.4).
-    events: std.ArrayList(Value) = .empty,
+    /// The kernel the service raises and reads events with (0.27.0): `main`'s is the VM's (the
+    /// `emit` and `events` imports, in the hook's own execution); a native caller passes its own
+    /// (`handleWith`), or none (`handle`: an emit is refused, `error.NoKernel`).
+    kernel: ?Kernel = null,
+    /// The app the call names (`appOf`): what a service's event names start with.
+    app: []const u8 = "overlay",
 
     /// In a `rejected` hook (0.26.0): the input indices of the rejected transaction whose coins are
     /// live in the topic again (`givenBack`); a coin another admitted transaction consumes is not
@@ -140,10 +147,29 @@ pub const Service = struct {
 
     pub const Beat = struct { service: []const u8, body: []const u8 };
 
-    /// A hook's word that `event` (`{event: <name>, topic: <text>, …fields}`) be emitted (0.20.4): the
-    /// engine emits it with the step, after the events of the hooks called before it.
+    /// Raise `event` (`{event: <name>, …fields}`, the name under the app's own name) with the kernel,
+    /// now, in this hook's execution (0.27.0): the kernel stamps the emitting program's app. Nothing
+    /// goes back to the engine.
     pub fn emit(self: *Service, event: Value) !void {
-        try self.events.append(self.arena, event);
+        const k = self.kernel orelse return error.NoKernel;
+        try k.emitFn(k.ctx, self.arena, event);
+    }
+
+    /// The event index read (skein 0.5.0 `events`: `{name | prefix, after?, limit?, latest?}` →
+    /// `[{name, place, cid, record}]`), with the kernel the service was given.
+    pub fn events(self: *Service, query: Value) !Value {
+        const k = self.kernel orelse return error.NoKernel;
+        return k.eventsFn(k.ctx, self.arena, query);
+    }
+
+    /// The latest record under exactly `name`, or null.
+    pub fn latest(self: *Service, name: []const u8) !?Value {
+        const got = try self.events(.{ .map = try self.arena.dupe(cbor.Entry, &.{
+            .{ .key = "name", .value = .{ .text = name } },
+            .{ .key = "latest", .value = .{ .boolean = true } },
+        }) });
+        if (got != .array or got.array.len == 0) return null;
+        return got.array[got.array.len - 1].get("record");
     }
 
     /// A hook's word that `service` (a name this program serves) now beats `body` on
@@ -241,6 +267,13 @@ pub fn describe(a: Allocator, comptime Program: type, func: []const u8, args: Va
     return error.UnknownFunction;
 }
 
+/// What a service raises and reads events with (0.27.0): the VM's imports in a program, a test's own natively.
+pub const Kernel = struct {
+    ctx: *anyopaque,
+    emitFn: *const fn (ctx: *anyopaque, a: Allocator, event: Value) anyerror!void,
+    eventsFn: *const fn (ctx: *anyopaque, a: Allocator, query: Value) anyerror!Value,
+};
+
 pub const Spec = struct {
     /// The names of the service's maps (its state record's `maps`).
     maps: []const []const u8,
@@ -326,8 +359,15 @@ pub const Handled = struct { answer: Value, state: ?[]const u8 = null };
 /// `chain/state`'s record; its network is its own, else `network`). What
 /// `main` runs; the tests call it directly.
 pub fn handle(a: Allocator, spec: Spec, s: Store, network: c.chain.Network, state: ?[]const u8, chain: ?[]const u8, func: []const u8, arg: Value) !Handled {
+    return handleWith(a, spec, s, network, state, chain, func, arg, null);
+}
+
+/// `handle` with the kernel the service raises and reads events with (0.27.0; null: none).
+pub fn handleWith(a: Allocator, spec: Spec, s: Store, network: c.chain.Network, state: ?[]const u8, chain: ?[]const u8, func: []const u8, arg: Value, kernel: ?Kernel) !Handled {
     const service = arg.getText("service") orelse return error.BadArgs;
     var svc = try Service.loadIndex(a, s, service, try indexOf(a, spec, arg), spec.maps, state);
+    svc.kernel = kernel;
+    svc.app = appOf(arg);
     if (std.mem.eql(u8, func, "lookup")) {
         var ch = try c.open(a, s, chain, network);
         return .{ .answer = try answerRecord(a, spec, &svc, &ch, arg) };
@@ -351,7 +391,6 @@ pub fn handle(a: Allocator, spec: Spec, s: Store, network: c.chain.Network, stat
         for (svc.beats.items, bs) |b, *o| o.* = .{ .key = b.service, .value = .{ .bytes = b.body } };
         try es.append(a, .{ .key = "beats", .value = .{ .map = bs } });
     }
-    if (svc.events.items.len > 0) try es.append(a, .{ .key = "events", .value = .{ .array = svc.events.items } });
     return .{ .answer = .{ .map = es.items }, .state = if (svc.dirty()) try svc.save() else null };
 }
 
@@ -361,6 +400,16 @@ pub fn handle(a: Allocator, spec: Spec, s: Store, network: c.chain.Network, stat
 /// — a head under its own app's name, so the kernel lets it).
 pub fn main(comptime spec: Spec) u8 {
     const vm = @import("sk");
+    const K = struct {
+        var dummy: u8 = 0;
+        fn emit(_: *anyopaque, a: Allocator, ev: Value) anyerror!void {
+            _ = try vm.emitEvent(a, ev);
+        }
+        fn events(_: *anyopaque, a: Allocator, q: Value) anyerror!Value {
+            return vm.events(a, q);
+        }
+    };
+    const vm_kernel: Kernel = .{ .ctx = &K.dummy, .emitFn = K.emit, .eventsFn = K.events };
     const S = struct {
         fn run(a: Allocator) anyerror!void {
             const in = try vm.input(a);
@@ -373,7 +422,7 @@ pub fn main(comptime spec: Spec) u8 {
             const chain_state = if (std.mem.eql(u8, func, "lookup")) try vm.head(a, chain_head) else null;
             const net_name = if (in.get("defaults")) |d| d.getText("walletNetwork") orelse "main" else "main";
             const network = c.chain.Network.parse(net_name) orelse return error.BadConfig;
-            const h = try handle(a, spec, vm.store(), network, try vm.head(a, head), chain_state, func, arg);
+            const h = try handleWith(a, spec, vm.store(), network, try vm.head(a, head), chain_state, func, arg, vm_kernel);
             if (h.state) |sc| try vm.advance(head, sc);
             try vm.answer(a, h.answer);
         }

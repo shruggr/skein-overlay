@@ -603,7 +603,7 @@ the anchors and answers the sync protocol's frames (0.15.0).
 
 | | |
 |---|---|
-| this app and package | 0.26.1 |
+| this app and package | 0.27.0 |
 | skein-sdk | v0.21.0, by tag URL and hash in `build.zig.zon` (modules `chain` and, for the engine, `sk`; bsvz comes through it) |
 | requires | `chain/1` (shruggr/skein-chain v0.11.0: its `ingest` as an in-VM call; its facts `chain/tx/<txid>` {pending, seen, mined, rejected}; a proof after a rejection is `mined`) |
 | skein | 0.6.1 or later (the host submits fetched BEEFs as the submit message; 0.25.1) (the event index, 0.5.0; a thread resting on a name, 0.5.4); the engine and the chain app installed as apps (a genesis program's record names no app, and emits no fact); skein's equivs pin this repo by commit |
@@ -1007,7 +1007,7 @@ beats. The hook's answer `{kind: "lookup-hooked", fn, beats?, events?}`:
 emits each with `emitEvent`, in order, in the same step, for the
 `admitted`, `spent` and `rejected` hooks (and a register's seeds); an entry
 that is not a map with a text `event` is passed over. No wire, manifest,
-host or kernel change.
+host or kernel change. (Withdrawn in 0.27.0: a lookup raises its own events.)
 
 0.20.5 (2026-11-06): ONE HELD SPENDER PER COIN (David 2026-11-06). An
 unproven submission is refused at intake (`DoubleSpend`, as for a proven
@@ -1145,6 +1145,24 @@ POST /submit called again reads a rejection from the chain state's status, not
 from `settlementCid` (which still returns the settlement a proof overrode).
 Tests follow the chain app's later `proof` step; a transaction a sibling's path
 linked before its submission is admitted in its thread's first step.
+
+0.27.0 (David 2026-11-10: "The Lookup is what handles its own storage and
+events. The overlay is completely ignorant to it. It just knows once items
+are admitted it fires the lookup and the lookup takes care of itself"): the
+0.20.4 hand-back goes. `lookup.Service.emit(event)` raises the event with the
+kernel in the hook's own execution (the `emit` import; the kernel stamps the
+lookup program's app); `Service.events(query)` / `Service.latest(name)` read
+the event index. The hook answer is `{kind: "lookup-hooked", fn, beats?}`;
+`calls.eventsOf`, `State.lookup_events` and the engine's end-of-step emit go.
+An answer still carrying `events` fails the step, `LookupHandsBackEvents`,
+the lookup program named. For lookup authors: `svc.emit` keeps its name and
+signature (it now fails `NoKernel` with no kernel); a native caller passes one
+with `lookup.handleWith(…, kernel)` (`lookup.handle` passes none); a test that
+read `answer.events` reads the facts its kernel received instead. A lookup's
+events now come while its hook runs: before the overlay's `topic/output` /
+`topic/tx` facts of that admission (and, on a rejection, before `reverted`),
+where they came after them, at the step's end. ls_demo raises its own facts
+`<app>/demo/output/<txid>.<vout>`.
 
 ## Contributing
 

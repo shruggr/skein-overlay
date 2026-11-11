@@ -317,7 +317,8 @@ const Instance = struct {
     view_changes: []const state.BeatChange = &.{},
     lookup_beats: []const state.LookupBeat = &.{},
     /// The events the last thread or watch step's lookup hooks asked for (0.20.4).
-    lookup_events: []const Value = &.{},
+    /// A lookup built for the 0.20.4 contract: its answer still hands back `events` (0.27.0 refuses it).
+    old_contract: bool = false,
     /// The lookup program's spec the dispatch table runs (ls_demo's unless a test sets another).
     ls_spec: lookup.Spec = ls.spec,
 
@@ -360,8 +361,9 @@ const Instance = struct {
         if (std.mem.eql(u8, program, self.lookup_prog)) {
             try std.testing.expectEqualStrings("overlay", arg.getText("app").?);
             if (std.mem.eql(u8, func, "rejected")) try self.rejected_args.append(self.a, arg);
-            const h = try lookup.handle(a, self.ls_spec, self.current, .regtest, self.ls_state, self.chain_root, func, arg);
+            const h = try lookup.handleWith(a, self.ls_spec, self.current, .regtest, self.ls_state, self.chain_root, func, arg, self.kernelOf());
             if (h.state) |sc| self.ls_state = sc;
+            if (self.old_contract and !std.mem.eql(u8, func, "lookup") and !std.mem.eql(u8, func, "beat")) return .{ .map = try std.mem.concat(a, cbor.Entry, &.{ h.answer.map, &.{.{ .key = "events", .value = .{ .array = &.{} } }} }) };
             return h.answer;
         }
         return error.UnknownProgram;
@@ -371,6 +373,26 @@ const Instance = struct {
     fn errorImpl(ctx: *anyopaque) []const u8 {
         const self: *Instance = @ptrCast(@alignCast(ctx));
         return std.mem.concat(self.a, u8, &.{ "call topic-demo.identify: topic: ", topic.missingText(self.a, topic.lastNeeds()) catch return "" }) catch "";
+    }
+    /// The kernel a lookup raises and reads its events with (0.27.0), natively: its facts join the
+    /// step's (the FakeWire's, in order); a read sees every fact so far (as skein 0.8.0's own-step read).
+    fn kernelOf(self: *Instance) lookup.Kernel {
+        return .{ .ctx = self, .emitFn = kEmit, .eventsFn = kEvents };
+    }
+    fn kEmit(ctx: *anyopaque, _: Allocator, ev: Value) anyerror!void {
+        const self: *Instance = @ptrCast(@alignCast(ctx));
+        try self.wire_.facts.append(self.a, ev);
+    }
+    fn kEvents(ctx: *anyopaque, a: Allocator, q: Value) anyerror!Value {
+        const self: *Instance = @ptrCast(@alignCast(ctx));
+        const name = q.getText("name") orelse return error.BadQuery;
+        var out: std.ArrayList(Value) = .empty;
+        for (self.wire_.facts.items) |f| if (std.mem.eql(u8, f.getText("event") orelse "", name)) try out.append(a, try mapOf(a, &.{
+            .{ .key = "name", .value = .{ .text = name } },
+            .{ .key = "record", .value = f },
+        }));
+        if ((q.getBool("latest") orelse false) and out.items.len > 1) return .{ .array = out.items[out.items.len - 1 ..] };
+        return .{ .array = out.items };
     }
     fn caller(self: *Instance) calls.Caller {
         return .{ .ctx = self, .callFn = callImpl, .errorFn = errorImpl };
@@ -487,7 +509,6 @@ const Instance = struct {
         const done = try submit.heard(try self.cx(&st, true), t.ev, txid, ans);
         self.view_changes = try st.beatChanges();
         self.lookup_beats = st.lookup_beats.items;
-        self.lookup_events = st.lookup_events.items;
         self.ov_root = try st.save();
         return done;
     }
@@ -2062,104 +2083,89 @@ test "lookup beats (0.12.0, David 2026-10-09): <service>-live for each registere
     try std.testing.expectEqualStrings("ls_x-live", off[1].getText("topic").?);
 }
 
-test "lookup hook events (0.20.4): a hook's `events` emitted by the engine in order, for admitted, spent and rejected; an entry that is not a map with a text `event` passed over" {
+test "a lookup raises its own events (0.27.0, David 2026-11-10: \"The Lookup is what handles its own storage and events\"): in its hook's own execution, in the order its hooks run, before the overlay's facts of that admission; nothing handed back; an answer still carrying `events` fails the step, the lookup named" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
     var ms = c.store.MemStore.init(std.testing.allocator);
     defer ms.deinit();
-
-    // ls_demo's hooks, each also asking for one event naming the hook (and one entry that is no event).
-    const P = struct {
-        fn ev(a_: Allocator, svc: *lookup.Service, hook_: []const u8, txid: [32]u8) !void {
-            try svc.emit(.{ .map = try a_.dupe(cbor.Entry, &.{
-                .{ .key = "event", .value = .{ .text = "pool" } },
-                .{ .key = "topic", .value = .{ .text = "ls_demo" } },
-                .{ .key = "hook", .value = .{ .text = hook_ } },
-                .{ .key = "txid", .value = .{ .text = try a_.dupe(u8, &hdr.toHex(txid)) } },
-            }) });
-            try svc.emit(.{ .map = try a_.dupe(cbor.Entry, &.{.{ .key = "topic", .value = .{ .text = "ls_demo" } }}) });
-            try svc.emit(.{ .text = "not a map" });
-        }
-        fn admitted(a_: Allocator, svc: *lookup.Service, t: []const u8, tx: lookup.Tx, o: []const u32, r: []const u32) anyerror!void {
-            try ls.spec.admitted.?(a_, svc, t, tx, o, r);
-            try ev(a_, svc, "admitted", tx.txid);
-        }
-        fn spent(a_: Allocator, svc: *lookup.Service, t: []const u8, op: lookup.Outpoint, tx: lookup.Tx) anyerror!void {
-            try ls.spec.spent.?(a_, svc, t, op, tx);
-            try ev(a_, svc, "spent", op.txid);
-        }
-        fn rejected(a_: Allocator, svc: *lookup.Service, t: []const u8, tx: lookup.Tx) anyerror!void {
-            try ls.spec.rejected.?(a_, svc, t, tx);
-            try ev(a_, svc, "rejected", tx.txid);
-        }
-    };
-    var spec = ls.spec;
-    spec.admitted = P.admitted;
-    spec.spent = P.spent;
-    spec.rejected = P.rejected;
-
     var inst = try Instance.init(a, &ms);
-    inst.ls_spec = spec;
     const k = try keys(0x42);
     const f = try fund(a, 0x11, 2, &k.p2pkh);
     try inst.headers(&.{&f.h1});
 
+    // t1 admitted: ls_demo's own fact for its output, raised while its `admitted` hook ran — before
+    // the overlay's `topic/output` fact for the same output (emitted after the hooks).
     const t1 = try spend(a, &f.tx, 0, &.{ .{ 1, &k.token }, .{ 9_000, &k.p2pkh } }, k.priv);
-    _ = try inst.admitted(try withFund(a, f, t1), t1.txid);
-    try std.testing.expectEqual(@as(usize, 1), inst.lookup_events.len);
-    try std.testing.expectEqualStrings("pool", inst.lookup_events[0].getText("event").?);
-    try std.testing.expectEqualStrings("ls_demo", inst.lookup_events[0].getText("topic").?);
-    try std.testing.expectEqualStrings("admitted", inst.lookup_events[0].getText("hook").?);
+    const f0 = inst.wire_.facts.items.len;
+    const d1 = try inst.admitted(try withFund(a, f, t1), t1.txid);
+    try std.testing.expect(d1.admitted);
+    const own = try std.fmt.allocPrint(a, "overlay/demo/output/{s}.0", .{&hdr.toHex(t1.txid)});
+    const topic_out = try submit.topicOutputName(a, "overlay", t1.txid, 0);
+    var at_own: ?usize = null;
+    var at_topic: ?usize = null;
+    for (inst.wire_.facts.items[f0..], f0..) |fx, i| {
+        const n = fx.getText("event").?;
+        if (at_own == null and std.mem.eql(u8, n, own)) at_own = i;
+        if (at_topic == null and std.mem.eql(u8, n, topic_out)) at_topic = i;
+    }
+    try std.testing.expect(at_own.? < at_topic.?);
+    try std.testing.expectEqualStrings("admitted", inst.wire_.facts.items[at_own.?].getText("state").?);
 
-    // A spend: the admitted hook's event, then the spent hook's, in the order the hooks ran.
+    // t2 spends it: `admitted` (t2's output) then `spent` (t1's), in the order the hooks ran; the
+    // `spent` hook read its own earlier fact for the coin (`Service.latest`).
     const t2 = try spend(a, &t1.tx, 0, &.{.{ 1, &k.token }}, k.priv);
     inst.now = 2000;
     _ = try inst.admitted(try atomic(a, t2), t2.txid);
-    try std.testing.expectEqual(@as(usize, 2), inst.lookup_events.len);
-    try std.testing.expectEqualStrings("admitted", inst.lookup_events[0].getText("hook").?);
-    try std.testing.expectEqualStrings(&hdr.toHex(t2.txid), inst.lookup_events[0].getText("txid").?);
-    try std.testing.expectEqualStrings("spent", inst.lookup_events[1].getText("hook").?);
-    try std.testing.expectEqualStrings(&hdr.toHex(t1.txid), inst.lookup_events[1].getText("txid").?);
+    const of1 = inst.wire_.factsNamed(own);
+    try std.testing.expectEqual(@as(usize, 2), of1.len);
+    try std.testing.expectEqualStrings("spent", of1[1].getText("state").?);
+    try std.testing.expectEqualStrings(&hdr.toHex(t2.txid), of1[1].getText("spentBy").?);
+    try std.testing.expect(of1[1].getBool("sawAdmitted").?);
 
-    // A rejection heard by the resting thread: the rejected hook's event.
+    // A rejection heard by the resting thread: the `rejected` hook's own facts (t2's output reverted,
+    // t1's coin admitted again).
     inst.now = 3000;
     _ = try inst.chainStatus(t2.txid, "DOUBLE_SPEND_ATTEMPTED", null);
     _ = try inst.watched(t2.txid, .{ .rejected = "DOUBLE_SPEND_ATTEMPTED" });
-    try std.testing.expectEqual(@as(usize, 1), inst.lookup_events.len);
-    try std.testing.expectEqualStrings("rejected", inst.lookup_events[0].getText("hook").?);
+    const of2 = inst.wire_.factsNamed(try std.fmt.allocPrint(a, "overlay/demo/output/{s}.0", .{&hdr.toHex(t2.txid)}));
+    try std.testing.expectEqualStrings("reverted", of2[of2.len - 1].getText("state").?);
+    try std.testing.expectEqualStrings("admitted", inst.wire_.factsNamed(own)[2].getText("state").?);
 
-    // The hook's answer: `events` as the hook gave them; calls.zig keeps only maps with a text `event`.
-    var raw_tx: [10]u8 = .{ 1, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
-    var h1: [32]u8 = undefined;
-    var h2: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(&raw_tx, &h1, .{});
-    std.crypto.hash.sha2.Sha256.hash(&h1, &h2, .{});
-    const tc = try a.dupe(u8, &c.store.hashCid(.tx, h2));
-    try ms.store().putBlock(tc, &raw_tx);
-    const hooked = try lookup.handle(a, spec, ms.store(), .regtest, null, null, "rejected", try mapOf(a, &.{
+    // Nothing comes back in the answer: no `events` field.
+    const hooked = try lookup.handleWith(a, ls.spec, ms.store(), .regtest, null, null, "admitted", try mapOf(a, &.{
         .{ .key = "kind", .value = .{ .text = "lookup-hook" } },
         .{ .key = "app", .value = .{ .text = "overlay" } },
         .{ .key = "service", .value = .{ .text = "ls_demo" } },
         .{ .key = "program", .value = .{ .text = "lookup-demo" } },
         .{ .key = "topic", .value = .{ .text = "tm_demo" } },
-        .{ .key = "tx", .value = .{ .cid = tc } },
-    }));
-    try std.testing.expectEqual(@as(usize, 3), hooked.answer.getArray("events").?.len);
-    var got: std.ArrayList(Value) = .empty;
-    try calls.eventsOf(a, hooked.answer, &got);
-    try std.testing.expectEqual(@as(usize, 1), got.items.len);
-    try std.testing.expectEqualStrings("rejected", got.items[0].getText("hook").?);
-    // A hook that asks for none: no `events` field.
-    const plain = try lookup.handle(a, ls.spec, ms.store(), .regtest, null, null, "rejected", try mapOf(a, &.{
+        .{ .key = "tx", .value = .{ .cid = try a.dupe(u8, &c.store.hashCid(.tx, t1.txid)) } },
+        .{ .key = "outputsToAdmit", .value = .{ .array = &.{} } },
+        .{ .key = "coinsRetained", .value = .{ .array = &.{} } },
+    }), inst.kernelOf());
+    try std.testing.expect(hooked.answer.get("events") == null);
+    // With no kernel (`handle`), a hook that emits is refused.
+    const t3 = try spend(a, &f.tx, 1, &.{ .{ 1, &k.token }, .{ 9_000, &k.p2pkh } }, k.priv);
+    try ms.store().putBlock(try a.dupe(u8, &c.store.hashCid(.tx, t3.txid)), t3.raw);
+    try std.testing.expectError(error.NoKernel, lookup.handle(a, ls.spec, ms.store(), .regtest, null, null, "admitted", try mapOf(a, &.{
         .{ .key = "kind", .value = .{ .text = "lookup-hook" } },
         .{ .key = "app", .value = .{ .text = "overlay" } },
         .{ .key = "service", .value = .{ .text = "ls_demo" } },
         .{ .key = "program", .value = .{ .text = "lookup-demo" } },
         .{ .key = "topic", .value = .{ .text = "tm_demo" } },
-        .{ .key = "tx", .value = .{ .cid = tc } },
-    }));
-    try std.testing.expect(plain.answer.get("events") == null);
+        .{ .key = "tx", .value = .{ .cid = try a.dupe(u8, &c.store.hashCid(.tx, t3.txid)) } },
+        .{ .key = "outputsToAdmit", .value = .{ .array = try a.dupe(Value, &.{.{ .uint = 0 }}) } },
+        .{ .key = "coinsRetained", .value = .{ .array = &.{} } },
+    })));
+
+    // A lookup built for the 0.20.4 contract (its answer hands back `events`): the step fails, the
+    // lookup named; nothing emitted for it, nothing dropped silently.
+    inst.old_contract = true;
+    const t4 = try spend(a, &f.tx, 1, &.{ .{ 1, &k.token }, .{ 9_000, &k.p2pkh } }, k.priv);
+    _ = try inst.submitted(try withFund(a, f, t4));
+    _ = try inst.chainStatus(t4.txid, "RECEIVED", null);
+    try std.testing.expectError(error.LookupHandsBackEvents, inst.answer(t4.txid, .seen));
+    try std.testing.expectEqualStrings("lookup-demo", calls.refused_by);
 }
 
 test "the beat's terms (0.16.0): the head <app>/terms's record, opaque, copied into each topic's beat body as `terms`; no head, no field; a change re-declares every topic's beacon; config.overlay.terms is no more" {

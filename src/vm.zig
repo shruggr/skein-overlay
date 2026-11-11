@@ -29,6 +29,8 @@ pub const sk = struct {
     pub extern "skein" fn deadline(until: i64) i32;
     pub extern "skein" fn @"await"(cid: [*]const u8, cid_len: u32) i32;
     pub extern "skein" fn on(name: [*]const u8, name_len: u32, func: [*]const u8, func_len: u32) i32;
+    /// The event index read (skein 0.5.0): `{name | prefix, after?, limit?, latest?}` → `[{name, place, cid, record}]`.
+    pub extern "skein" fn events(q: [*]const u8, len: u32, out: [*]u8, cap: u32) i32;
 };
 
 /// The last failed import's error (a failed call's: its callee's last stderr line). 64 KiB: a
@@ -216,6 +218,20 @@ pub fn selfKey(in: Value) ?[]const u8 {
 
 /// An event (skein #119, docs/VM.md "emit"): `{event: <name>, …fields}`, recorded by the kernel as
 /// `{kind: "event", event, app?, …fields}` and handed to the host after the step → the record's CID.
+/// The event index read (skein 0.5.0 `events`; 0.27.0, a lookup's own reads, lookup.zig `Service.events`).
+pub fn events(a: std.mem.Allocator, query: Value) !Value {
+    const q = try cbor.encode(a, query);
+    return cbor.decode(a, try result(a, sk.events, .{ q.ptr, @as(u32, @intCast(q.len)) }));
+}
+
+/// A line for the step's error (the engine's `main` writes it after the error's name), e.g. the
+/// lookup whose answer the engine refused (0.27.0).
+pub fn noteError(text: []const u8) void {
+    const n = @min(text.len, last_error.len);
+    @memcpy(last_error[0..n], text[0..n]);
+    last_error_len = n;
+}
+
 pub fn emitEvent(a: std.mem.Allocator, ev: Value) ![]const u8 {
     const bytes = try cbor.encode(a, ev);
     return result(a, sk.emit, .{ bytes.ptr, @as(u32, @intCast(bytes.len)) });

@@ -176,7 +176,7 @@ try {
   const chainDir = copyOf(dirOf("SKEIN_CHAIN_DIR"), join(home, "chain"));
   const mf = JSON.parse(readFileSync(join(overlayDir, "etc/app.json"), "utf8")) as { version: string; config: { overlay: Record<string, unknown> } };
   const cmf = JSON.parse(readFileSync(join(chainDir, "etc/app.json"), "utf8")) as { version: string };
-  check(mf.version === "0.26.1" && cmf.version === "0.11.0", `skein-overlay ${mf.version}, skein-chain ${cmf.version}`);
+  check(mf.version === "0.27.0" && cmf.version === "0.11.0", `skein-overlay ${mf.version}, skein-chain ${cmf.version}`);
   mf.config.overlay.gossip = { tm_demo: false };
   writeFileSync(join(overlayDir, "etc/app.json"), JSON.stringify(mf, null, 2));
 
@@ -331,6 +331,38 @@ try {
   check(await until("tm_seed's tip 7", async () => (await tipOf("tm_seed")) === 7 || undefined).catch(() => false) === true, `(h) mined later: placed, tm_seed's tip 7 (${await tipOf("tm_seed")})`);
   await sleep(500);
   await r.settled();
+
+  // ------------------------------------------------ (i) 0.27.0: a lookup raises its own events, in its hook's execution
+  // A mint and its spend mined in one block, posted in one BEEF: both admitted in the thread's first
+  // step (the chain app's ingest call left both mined). ls_demo raises its own facts
+  // `overlay/demo/output/<txid>.<vout>`, stamped with its program's app (`overlay`, the engine's).
+  // Its `spent` hook for the mint's token reads its own `admitted` fact for it, raised earlier in the
+  // SAME step: `sawAdmitted` — true only on a kernel whose step reads its own events (skein 0.8.0,
+  // branch events-own-step: SKEIN_EVENTS_OWN_STEP=1); on skein 0.7.0 false (the documented reproduction).
+  const i_m = await token(fund, 4);
+  const i_mc = await transfer(i_m, 0);
+  const i_idm = i_m.id("hex"), i_idmc = i_mc.id("hex");
+  const i_h8 = mine(sha256d(h7), sha256d(Buffer.concat([internal(i_idm), internal(i_idmc)])), 1_790_303_800);
+  await headers([i_h8]);
+  const i_pair = new MerklePath(8, [[{ offset: 0, hash: i_idm, txid: true }, { offset: 1, hash: i_idmc, txid: true }]]);
+  i_m.merklePath = i_pair;
+  i_mc.merklePath = i_pair;
+  // Both in the BEEF (a proven transaction's own toBEEF carries no ancestry): the mint, then the spend.
+  const i_beef = new Beef();
+  i_beef.mergeTransaction(i_m);
+  i_beef.mergeTransaction(i_mc);
+  const i_sp = await post(i_beef.toBinary(), "tm_demo"); // ls_demo listens to tm_demo (config.overlay.lookups)
+  await i_sp.text();
+  await until("the spend admitted", async () => (await field(`overlay/topic/tx/${i_idmc}`, "verdict")).includes("admitted") || undefined);
+  await r.settled();
+  const i_own = await events(`overlay/demo/output/${i_idm}.0`);
+  check(i_own.length === 2 && i_own[0]!.record.state === "admitted" && i_own[1]!.record.state === "spent" && i_own[1]!.record.spentBy === i_idmc, `(i) ls_demo's own facts for the mint's token: admitted, then spent by the spend (${i_own.map((x) => x.record.state).join(",")})`);
+  check(i_own.every((x) => x.record.app === "overlay"), `(i) stamped with the lookup program's app, the engine's: overlay (${i_own.map((x) => String(x.record.app)).join(",")})`);
+  const i_sameStep = (await overlayResults(store())).filter((x) => x.admitted === true && (x.txid === i_idmc || x.txid === i_idm));
+  check(i_sameStep.length === 1, `(i) both admitted in one step (${i_sameStep.length} step(s) that admitted)`);
+  const i_saw = i_own[1]?.record.sawAdmitted;
+  if (process.env.SKEIN_EVENTS_OWN_STEP) check(i_saw === true, `(i) skein 0.8.0: the spent hook read its own fact raised earlier in the same step (sawAdmitted ${String(i_saw)})`);
+  else check(i_saw === false, `(i) skein 0.7.0 (documented): a step does not read its own events yet — sawAdmitted false; SKEIN_EVENTS_OWN_STEP=1 on skein 0.8.0 expects true (${String(i_saw)})`);
 } catch (e) {
   check(false, `threw: ${(e as Error).stack}`);
 } finally {

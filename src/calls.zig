@@ -159,34 +159,35 @@ pub fn beatsOf(a: Allocator, answer: Value, out: *std.ArrayList(st.LookupBeat)) 
     for (bs.map) |e| if (e.value == .bytes) try out.append(a, .{ .service = e.key, .body = e.value.bytes });
 }
 
-/// The events a hook's answer carries (`{events: [map]}`, lookup.zig, 0.20.4), onto `out` in order.
-/// An entry that is not a map with a text `event` is passed over.
-pub fn eventsOf(a: Allocator, answer: Value, out: *std.ArrayList(Value)) !void {
-    const es = answer.get("events") orelse return;
-    if (es != .array) return;
-    for (es.array) |e| if (e == .map and e.getText("event") != null) try out.append(a, e);
-}
+/// The lookup program whose answer the engine refused last (0.27.0): its role, for the step's error line.
+pub var refused_by: []const u8 = "";
 
-/// A hook's answer: its beat bodies onto `st.lookup_beats`, its events onto `st.lookup_events`.
-fn hooked(a: Allocator, answer: Value, out: *st.State) !void {
+/// A hook's answer: its beat bodies onto `st.lookup_beats`. 0.27.0: a lookup raises its own events
+/// (lookup.zig `Service.emit`); an answer still carrying `events` is a lookup built for the 0.20.4
+/// contract — the engine neither emits nor drops them: the step fails (`LookupHandsBackEvents`),
+/// `refused_by` naming the program.
+fn hooked(a: Allocator, l: Listener, answer: Value, out: *st.State) !void {
+    if (answer.get("events") != null) {
+        refused_by = l.role;
+        return error.LookupHandsBackEvents;
+    }
     try beatsOf(a, answer, &out.lookup_beats);
-    try eventsOf(a, answer, &out.lookup_events);
 }
 
 /// A topic admitted a transaction (in the step that recorded it): each of its lookup programs'
 /// (once each, `hookTargets`) `admitted(topic, tx, outputsToAdmit, coinsRetained)`, then
 /// `spent(topic, outpoint, spendingTx)` for each previous coin it consumed. The beat bodies the
-/// hooks answer go onto `out.lookup_beats` (0.12.0), their events onto `out.lookup_events` (0.20.4).
+/// hooks answer go onto `out.lookup_beats` (0.12.0); 0.27.0: a hook raises its own events.
 pub fn hookAdmitted(a: Allocator, caller: Caller, in: Value, topic: []const u8, sub: st.Subject, previous: []const u32, applied: st.Applied, out: *st.State) !void {
     for (try hookTargets(a, in, topic)) |l| {
-        try hooked(a, try caller.call(a, l.program, "admitted", try hookArg(a, in, l, topic, &.{
+        try hooked(a, l, try caller.call(a, l.program, "admitted", try hookArg(a, in, l, topic, &.{
             .{ .key = "tx", .value = .{ .cid = sub.cid } },
             .{ .key = "outputsToAdmit", .value = .{ .array = try uints(a, applied.outputs_to_admit) } },
             .{ .key = "coinsRetained", .value = .{ .array = try uints(a, applied.coins_to_retain) } },
         })), out);
         for (previous) |p| {
             const in_ = sub.tx.inputs[p];
-            try hooked(a, try caller.call(a, l.program, "spent", try hookArg(a, in, l, topic, &.{
+            try hooked(a, l, try caller.call(a, l.program, "spent", try hookArg(a, in, l, topic, &.{
                 .{ .key = "outpoint", .value = .{ .map = try a.dupe(cbor.Entry, &.{
                     .{ .key = "tx", .value = .{ .cid = try a.dupe(u8, &store_mod.hashCid(.tx, in_.previous_outpoint.txid.bytes)) } },
                     .{ .key = "vout", .value = .{ .uint = in_.previous_outpoint.index } },
@@ -200,12 +201,12 @@ pub fn hookAdmitted(a: Allocator, caller: Caller, in: Value, topic: []const u8, 
 /// The judgements a rejection removed (`State.unapply`): each topic's lookup programs' (once each,
 /// `hookTargets`) `rejected(topic, tx)`, with (0.26.0) `givenBack`: the input indices whose coins
 /// are live in the topic again — not one another admitted judgement consumes. The beat bodies the hooks answer go onto `out.lookup_beats`
-/// (0.12.0), their events onto `out.lookup_events` (0.20.4).
+/// (0.12.0); 0.27.0: a hook raises its own events.
 pub fn hookRejected(a: Allocator, caller: Caller, in: Value, gone: []const st.Unapplied, out: *st.State) !void {
     for (gone) |g| {
         const tc = try a.dupe(u8, &store_mod.hashCid(.tx, g.txid));
         for (try hookTargets(a, in, g.topic)) |l| {
-            try hooked(a, try caller.call(a, l.program, "rejected", try hookArg(a, in, l, g.topic, &.{
+            try hooked(a, l, try caller.call(a, l.program, "rejected", try hookArg(a, in, l, g.topic, &.{
                 .{ .key = "tx", .value = .{ .cid = tc } },
                 .{ .key = "givenBack", .value = .{ .array = try uints(a, g.given_back) } },
             })), out);
